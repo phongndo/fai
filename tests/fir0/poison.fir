@@ -7,7 +7,7 @@
 // run: @freeze(poison) -> returned i32 0
 // run: @freeze(7) -> returned i32 7
 // Branching on poison is UB.
-// run: @branch(poison) -> ub poison @2:1
+// run: @branch(poison) -> ub poison @2:1 (branch on poison)
 // run: @branch(1) -> returned i32 10
 // run: @branch(0) -> returned i32 20
 // run: @select(1, 3, 4) -> returned i32 3

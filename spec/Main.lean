@@ -10,7 +10,8 @@ fir-ref fmt FILE [--no-locs]                   print canonical text
 fir-ref test PATH...                           run the test files (.fir) under PATH
 ```
 
-Arguments are integers or `poison`. `freeze` of `poison` picks `0`.
+Arguments are integers, `null` (for pointers), or `poison`. Every free choice takes the oracle's
+answer `0`: `freeze` gives `0`, allocations succeed, and addresses are assigned first-fit.
 
 A test file is a `.fir` module with expectations in comments:
 
@@ -28,10 +29,14 @@ open Fir
 def defaultFuel : Nat := 1000000
 
 def parseArg (t : Ty) (s : String) : Except String RVal :=
-  if s == "poison" then .ok ⟨t.width, .poison⟩
-  else match s.toInt? with
-    | some n => .ok ⟨t.width, Sem.const t.width n⟩
+  match t, s with
+  | .int w, "poison" => .ok (.int w .poison)
+  | .int w, _ => match s.toInt? with
+    | some n => .ok (.int w (Sem.const w n))
     | none => .error s!"bad argument '{s}': expected an integer or poison"
+  | .ptr, "null" => .ok (.ptr (some .null))
+  | .ptr, "poison" => .ok (.ptr none)
+  | _, _ => .error s!"bad argument '{s}' for {t}"
 
 partial def drive (m : Machine) (steps limit : Nat) : String :=
   if steps ≥ limit then
@@ -47,8 +52,8 @@ def runFunc (m : Module) (name : String) (args : List String) (fuel : Nat) :
   let some f := m.find? name | throw s!"no function @{name}"
   if args.length != f.params.length then
     throw s!"@{name} takes {f.params.length} arguments but got {args.length}"
-  let vals ← (f.params.zip args).mapM fun ((_, t), a) => parseArg t a
-  match Machine.init (fun _ => 0) f vals with
+  let vals ← (f.params.zip args).mapM fun (r, a) => parseArg r.ty a
+  match Machine.init (fun _ => 0) m f vals with
   | .error h => pure (renderHalt h)
   | .ok mach => pure (drive mach 0 fuel)
 

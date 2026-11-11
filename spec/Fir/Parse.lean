@@ -97,10 +97,12 @@ def sepBy (p : P α) (close : String) : P (List α) := do
 def ty : P Ty := do
   let s ← ident
   match s.toList with
-  | 'i' :: digits =>
-    match (String.ofList digits).toNat? with
-    | some w => pure (.int w)
-    | none => fail s!"unknown type '{s}'"
+  | ['p', 't', 'r'] => pure .ptr
+  | c :: digits =>
+    match c, (String.ofList digits).toNat? with
+    | 'i', some w => pure (.int w)
+    | 'b', some w => pure (.byte w)
+    | _, _ => fail s!"unknown type '{s}'"
   | _ => fail s!"unknown type '{s}'"
 
 def trust : P Trust := do
@@ -110,16 +112,27 @@ def trust : P Trust := do
   | "proved" => pure .proved
   | s => fail s!"expected assume, check, or proved but found '{s}'"
 
-def fact : P TrustedFact := do
-  let name ← ident
+def nat : P Nat := do
+  let n ← int
+  if n < 0 then fail "expected a non-negative integer" else pure n.toNat
+
+def range : P (Int × Int) := do
   expectSym "("
   let lo ← int
   expectSym ","
   let hi ← int
   expectSym ")"
+  pure (lo, hi)
+
+def fact : P TrustedFact := do
+  let name ← ident
   let f ← match name with
-    | "range.s" => pure (Fact.rangeS lo hi)
-    | "range.u" => pure (Fact.rangeU lo hi)
+    | "range.s" => do let (lo, hi) ← range; pure (Fact.rangeS lo hi)
+    | "range.u" => do let (lo, hi) ← range; pure (Fact.rangeU lo hi)
+    | "nonnull" => pure .nonnull
+    | "noalias" => pure .noalias
+    | "readonly" => pure .readonly
+    | "align" => do expectSym "("; let n ← nat; expectSym ")"; pure (.align n)
     | _ => fail s!"unknown fact '{name}'"
   pure ⟨f, ← trust⟩
 
@@ -149,6 +162,12 @@ def variadic : P (List Operand) := do
   match ← peek with
   | .value _ | .hole _ => sepBy1 operand
   | _ => pure []
+
+/-- `, align N` -/
+def alignArg : P Nat := do
+  expectSym ","
+  unless ← tryIdent "align" do fail "expected 'align'"
+  nat
 
 def optLoc : P (Option Loc) := do
   match ← peek with
@@ -233,18 +252,33 @@ def opKind (name : String) : Option OpKind :=
   | ["cf", "break"] => some .brk
   | ["cf", "continue"] => some .cont
   | ["func", "ret"] => some .ret
+  | ["ptr", "offset", "inbounds"] => some (.ptrOffset true)
+  | ["ptr", "offset", "wrap"] => some (.ptrOffset false)
+  | ["ptr", "addr"] => some .ptrAddr
+  | ["ptr", "expose"] => some .ptrExpose
+  | ["ptr", "from_exposed"] => some .ptrFromExposed
+  | ["ptr", "with_addr"] => some .ptrWithAddr
+  | ["ptr", "null"] => some .ptrNull
+  | ["ptr", "cmp", p] => (pred p).map .ptrCmp
+  | ["mem", "stack"] => some (.memStack 0 1)
+  | ["mem", "alloc", "null"] => some (.memAlloc .null "" 1)
+  | ["mem", "alloc", "trap"] => some (.memAlloc .trap "" 1)
+  | ["mem", "free"] => some (.memFree "")
+  | ["mem", "load"] => some (.load 1)
+  | ["mem", "store"] => some (.store .ptr 1)
+  | ["func", "call"] => some (.call "")
   | _ => none
 
 /-- How many operands an op without regions takes, or `none` if variadic. -/
 def arity : OpKind → Option Nat
-  | .const _ | .poison => some 0
-  | .freeze | .zext | .sext | .trunc _ => some 1
+  | .const _ | .poison | .ptrNull => some 0
+  | .freeze | .zext | .sext | .trunc _ | .ptrAddr | .ptrExpose | .ptrFromExposed => some 1
   | .select => some 3
   | .yield | .brk | .cont | .ret => none
   | _ => some 2
 
 mutual
-  partial def region (params : List (String × Ty)) : P Region := do
+  partial def region (params : List Result) : P Region := do
     expectSym "{"
     let mut ops := #[]
     while !(← trySym "}") do
@@ -266,6 +300,37 @@ mutual
     | .const _ =>
       let n ← int
       pure (.mk (.const n) results [] [] (← optLoc))
+    | .memStack .. =>
+      let size ← nat
+      let align ← alignArg
+      pure (.mk (.memStack size align) results [] [] (← optLoc))
+    | .memAlloc fail .. =>
+      let family ← ident
+      let n ← operand
+      let align ← alignArg
+      pure (.mk (.memAlloc fail family align) results [n] [] (← optLoc))
+    | .memFree _ =>
+      let family ← ident
+      let p ← operand
+      pure (.mk (.memFree family) results [p] [] (← optLoc))
+    | .load _ =>
+      let p ← operand
+      let align ← alignArg
+      pure (.mk (.load align) results [p] [] (← optLoc))
+    | .store .. =>
+      let t ← ty
+      let v ← operand
+      expectSym ","
+      let p ← operand
+      let align ← alignArg
+      pure (.mk (.store t align) results [v, p] [] (← optLoc))
+    | .call _ =>
+      let callee ← match ← next with
+        | .global s => pure s
+        | t => fail s!"expected a function name like @f but found {t.describe}"
+      expectSym "("
+      let args ← sepBy operand ")"
+      pure (.mk (.call callee) results args [] (← optLoc))
     | .if_ =>
       let c ← operand
       let loc ← optLoc
@@ -288,18 +353,11 @@ mutual
       pure (.mk k results args [] (← optLoc))
 
   /-- `%name: type = %init` -/
-  partial def iterArg : P ((String × Ty) × Operand) := do
-    let n ← value
-    expectSym ":"
-    let t ← ty
+  partial def iterArg : P (Result × Operand) := do
+    let r ← result
     expectSym "="
-    pure ((n, t), ← operand)
+    pure (r, ← operand)
 end
-
-def param : P (String × Ty) := do
-  let n ← value
-  expectSym ":"
-  pure (n, ← ty)
 
 def func : P Func := do
   unless ← tryIdent "func" do fail "expected 'func'"
@@ -307,7 +365,7 @@ def func : P Func := do
     | .global s => pure s
     | t => fail s!"expected a function name like @main but found {t.describe}"
   expectSym "("
-  let params ← sepBy param ")"
+  let params ← sepBy result ")"
   let rets ← if ← trySym "->" then do
       if ← trySym "(" then sepBy ty ")" else pure [← ty]
     else pure []
@@ -319,11 +377,22 @@ def func : P Func := do
   let body ← region params
   pure { name, rets, file, body }
 
+/-- `memspace default ptr 64 addr 64` -/
+def memspace : P SpaceCfg := do
+  let name ← ident
+  unless name == "default" do fail "only the default memory space can be declared for now"
+  unless ← tryIdent "ptr" do fail "expected 'ptr'"
+  let ptrBits ← nat
+  unless ← tryIdent "addr" do fail "expected 'addr'"
+  pure { ptrBits, addrBits := ← nat }
+
 def module : P Module := do
   let mut funcs := #[]
+  let mut space : SpaceCfg := {}
   while (← peek) != .eof do
-    funcs := funcs.push (← func)
-  pure { funcs := funcs.toList }
+    if ← tryIdent "memspace" then space ← memspace
+    else funcs := funcs.push (← func)
+  pure { space, funcs := funcs.toList }
 
 end P
 

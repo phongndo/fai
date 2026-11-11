@@ -1,5 +1,6 @@
 import Fir.Basic
 import Fir.Syntax
+import Fir.Interp
 
 /-!
 # Printer
@@ -67,6 +68,19 @@ def OpKind.name : OpKind → String
   | .brk => "cf.break"
   | .cont => "cf.continue"
   | .ret => "func.ret"
+  | .memStack .. => "mem.stack"
+  | .memAlloc f .. => s!"mem.alloc.{match f with | .null => "null" | .trap => "trap"}"
+  | .memFree _ => "mem.free"
+  | .load _ => "mem.load"
+  | .store .. => "mem.store"
+  | .ptrOffset ib => if ib then "ptr.offset.inbounds" else "ptr.offset.wrap"
+  | .ptrAddr => "ptr.addr"
+  | .ptrExpose => "ptr.expose"
+  | .ptrFromExposed => "ptr.from_exposed"
+  | .ptrWithAddr => "ptr.with_addr"
+  | .ptrNull => "ptr.null"
+  | .ptrCmp p => s!"ptr.cmp.{p.name}"
+  | .call _ => "func.call"
 
 def Trust.name : Trust → String
   | .assume => "assume"
@@ -74,8 +88,15 @@ def Trust.name : Trust → String
   | .proved => "proved"
 
 def TrustedFact.render : TrustedFact → String
-  | ⟨.rangeS lo hi, t⟩ => s!"range.s({lo}, {hi}) {t.name}"
-  | ⟨.rangeU lo hi, t⟩ => s!"range.u({lo}, {hi}) {t.name}"
+  | ⟨f, t⟩ =>
+    let body := match f with
+      | .rangeS lo hi => s!"range.s({lo}, {hi})"
+      | .rangeU lo hi => s!"range.u({lo}, {hi})"
+      | .nonnull => "nonnull"
+      | .align n => s!"align({n})"
+      | .noalias => "noalias"
+      | .readonly => "readonly"
+    s!"{body} {t.name}"
 
 def Result.render (r : Result) : String :=
   let facts := if r.facts.isEmpty then "" else
@@ -86,7 +107,7 @@ def Operand.render : Operand → String
   | .var n => s!"%{n}"
   | .hole n t => s!"?{n}: {t}"
 
-def renderLoc (showLocs : Bool) : Option Loc → String
+def renderOpLoc (showLocs : Bool) : Option Loc → String
   | some l => if showLocs then s!" @{l.line}:{l.col}" else ""
   | none => ""
 
@@ -100,7 +121,7 @@ mutual
   partial def renderOp (showLocs : Bool) (indent : String) (op : Op) : String :=
     let results := if op.results.isEmpty then "" else
       commas (op.results.map Result.render) ++ " = "
-    let loc := renderLoc showLocs op.loc
+    let loc := renderOpLoc showLocs op.loc
     let args := commas (op.args.map Operand.render)
     let line := match op.kind, op.regions with
       | .const n, _ => s!"int.const {n}{loc}"
@@ -111,10 +132,16 @@ mutual
       | .loop p, [body] =>
         let prog := if p then " progress" else ""
         let iter := if body.params.isEmpty then "" else
-          let items := (body.params.zip op.args).map fun ((n, t), a) =>
-            s!"%{n}: {t} = {a.render}"
+          let items := (body.params.zip op.args).map fun (r, a) =>
+            s!"{r.render} = {a.render}"
           s!" iter({commas items})"
         s!"cf.loop{prog}{iter}{loc} " ++ renderRegion showLocs indent body
+      | .memStack size align, _ => s!"mem.stack {size}, align {align}{loc}"
+      | .memAlloc _ family align, _ => s!"{op.kind.name} {family} {args}, align {align}{loc}"
+      | .memFree family, _ => s!"mem.free {family} {args}{loc}"
+      | .load align, _ => s!"mem.load {args}, align {align}{loc}"
+      | .store t align, _ => s!"mem.store {t} {args}, align {align}{loc}"
+      | .call callee, _ => s!"func.call @{callee}({args}){loc}"
       | k, _ =>
         let sep := if args.isEmpty then "" else " "
         s!"{k.name}{sep}{args}{loc}"
@@ -122,7 +149,7 @@ mutual
 end
 
 def Func.render (showLocs : Bool) (f : Func) : String :=
-  let params := commas (f.params.map fun (n, t) => s!"%{n}: {t}")
+  let params := commas (f.params.map Result.render)
   let rets := match f.rets with
     | [] => ""
     | [t] => s!" -> {t}"
@@ -133,25 +160,47 @@ def Func.render (showLocs : Bool) (f : Func) : String :=
   s!"func @{f.name}({params}){rets}{file} " ++ renderRegion showLocs "" f.body ++ "\n"
 
 def Module.render (m : Module) (showLocs := true) : String :=
-  "\n".intercalate (m.funcs.map (Func.render showLocs))
+  let header := if m.space == {} then "" else
+    s!"memspace default ptr {m.space.ptrBits} addr {m.space.addrBits}\n\n"
+  header ++ "\n".intercalate (m.funcs.map (Func.render showLocs))
 
-/-- Integers print signed, except `i1`, which prints as `0` or `1`. -/
+def hex (n : Nat) : String := "0x" ++ String.ofList (Nat.toDigits 16 n)
+
+def Ptr.render : Ptr → String
+  | .rel a _ off => if off == 0 then s!"#{a}" else if off > 0 then s!"#{a}+{off}" else s!"#{a}{off}"
+  | .abs 0 [] => "null"
+  | .abs addr _ => hex addr
+
+def Byte.render : Byte → String
+  | .bits b => hex b.toNat
+  | .poison => "poison"
+  | .frag p i => s!"{p.render}[{i}]"
+
+/-- Integers print signed, except `i1`, which prints as `0` or `1`. Pointers print as their
+allocation and offset (`#2+8`), or as an address. -/
 def RVal.render : RVal → String
-  | ⟨w, .poison⟩ => s!"i{w} poison"
-  | ⟨w, .bits b⟩ => if w = 1 then s!"i1 {b.toNat}" else s!"i{w} {b.toInt}"
+  | .int w .poison => s!"i{w} poison"
+  | .int w (.bits b) => if w = 1 then s!"i1 {b.toNat}" else s!"i{w} {b.toInt}"
+  | .ptr none => "ptr poison"
+  | .ptr (some p) => s!"ptr {p.render}"
+  | .bytes bs => s!"b{bs.length * 8} ({commas (bs.map Byte.render)})"
 
 def renderHaltLoc : Option Loc → String
   | some l => s!" @{l.line}:{l.col}"
   | none => ""
 
 /-- One line describing how a run ended. Tests compare against this text. -/
-def renderHalt : Behavior × Option Loc → String
-  | (.ret [], _) => "returned"
-  | (.ret vs, _) => s!"returned {commas (vs.map RVal.render)}"
-  | (.trap r, l) => s!"trap {r.name}{renderHaltLoc l}"
-  | (.ub k, l) => s!"ub {k.name}{renderHaltLoc l}"
-  | (.hole n, l) => s!"hole ?{n}{renderHaltLoc l}"
-  | (.stuck msg, l) => s!"stuck{renderHaltLoc l}: {msg}"
-  | (.diverge, _) => "diverges"
+def renderHalt (h : Halt) : String :=
+  let l := renderHaltLoc h.loc
+  let main := match h.behavior with
+    | .ret [] => "returned"
+    | .ret vs => s!"returned {commas (vs.map RVal.render)}"
+    | .trap r => s!"trap {r.name}{l}"
+    | .ub k => s!"ub {k.name}{l}"
+    | .hole n => s!"hole ?{n}{l}"
+    | .stuck msg => s!"stuck{l}: {msg}"
+    | .diverge => "diverges"
+  let note := if h.note.isEmpty then "" else s!" ({h.note})"
+  "; ".intercalate ((main ++ note) :: h.leaks)
 
 end Fir

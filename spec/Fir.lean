@@ -2,6 +2,8 @@ import Fir.Basic
 import Fir.Refinement
 import Fir.Syntax
 import Fir.Sem
+import Fir.Mem
+import Fir.MemRules
 import Fir.Interp
 import Fir.Behavior
 import Fir.Verify

@@ -188,10 +188,12 @@ def trunc (mode : TruncMode) (v : Nat) : Val w → Val v
 
 /-! ## Facts -/
 
-/-- Whether a value satisfies a fact. `poison` satisfies every fact. -/
+/-- Whether an integer satisfies a fact. `poison` satisfies every fact; pointer facts are
+checked by the interpreter, which knows the memory. -/
 def _root_.Fir.Fact.holds : Fact → Val w → Bool
   | _, .poison => true
   | .rangeS lo hi, .bits b => lo ≤ b.toInt && b.toInt ≤ hi
   | .rangeU lo hi, .bits b => lo ≤ (b.toNat : Int) && (b.toNat : Int) ≤ hi
+  | _, .bits _ => true
 
 end Fir.Sem

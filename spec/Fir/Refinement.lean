@@ -69,64 +69,131 @@ theorem OpOut.Refines.trans {a b c : OpOut w} : a.Refines b → b.Refines c → 
   cases a <;> cases b <;> cases c <;> simp only [OpOut.Refines] at h₁ h₂ ⊢
   all_goals first | trivial | contradiction | exact Val.Refines.trans h₁ h₂ | exact h₁.trans h₂
 
-/-! ## Runtime values -/
+/-! ## Lists -/
 
-/-- `t.Refines s` for values whose widths are only known at runtime: same width, and `t` refines
-`s` as a value. -/
-def RVal.Refines (t s : RVal) : Prop :=
-  ∃ h : t.w = s.w, Val.Refines (h ▸ t.v) s.v
-
-def RVal.refines (t s : RVal) : Bool :=
-  if h : t.w = s.w then Val.refines (h ▸ t.v) s.v else false
-
-theorem RVal.refines_iff {t s : RVal} : t.refines s = true ↔ t.Refines s := by
-  unfold RVal.refines RVal.Refines
-  split
-  · rename_i h
-    exact ⟨fun hr => ⟨h, Val.refines_iff.mp hr⟩, fun ⟨_, hr⟩ => Val.refines_iff.mpr hr⟩
-  · rename_i h
-    simp [h]
-
-@[refl] theorem RVal.Refines.refl (v : RVal) : v.Refines v := ⟨rfl, Val.Refines.refl _⟩
-
-theorem RVal.Refines.trans {a b c : RVal} : a.Refines b → b.Refines c → a.Refines c := by
-  obtain ⟨aw, av⟩ := a
-  obtain ⟨bw, bv⟩ := b
-  obtain ⟨cw, cv⟩ := c
-  intro ⟨hab, h₁⟩ ⟨hbc, h₂⟩
-  dsimp only at hab hbc h₁ h₂
-  subst hab hbc
-  exact ⟨rfl, Val.Refines.trans h₁ h₂⟩
-
-/-- Element-wise refinement of value lists of equal length. -/
-def RVal.RefinesList : List RVal → List RVal → Prop
+/-- Two lists of equal length, related element by element. -/
+def Forall2 (r : α → β → Prop) : List α → List β → Prop
   | [], [] => True
-  | t :: ts, s :: ss => t.Refines s ∧ RefinesList ts ss
+  | a :: as, b :: bs => r a b ∧ Forall2 r as bs
   | _, _ => False
 
-def RVal.refinesList : List RVal → List RVal → Bool
+def all2 (f : α → β → Bool) : List α → List β → Bool
   | [], [] => true
-  | t :: ts, s :: ss => t.refines s && refinesList ts ss
+  | a :: as, b :: bs => f a b && all2 f as bs
   | _, _ => false
 
-theorem RVal.refinesList_iff {ts ss : List RVal} :
-    RVal.refinesList ts ss = true ↔ RVal.RefinesList ts ss := by
-  induction ts generalizing ss with
-  | nil => cases ss <;> simp [refinesList, RefinesList]
-  | cons t ts ih => cases ss <;> simp [refinesList, RefinesList, RVal.refines_iff, ih]
+theorem all2_iff {f : α → β → Bool} {r : α → β → Prop} (h : ∀ a b, f a b = true ↔ r a b)
+    {as : List α} {bs : List β} : all2 f as bs = true ↔ Forall2 r as bs := by
+  induction as generalizing bs with
+  | nil => cases bs <;> simp [all2, Forall2]
+  | cons a as ih => cases bs <;> simp [all2, Forall2, h, ih]
 
-theorem RVal.RefinesList.refl (vs : List RVal) : RVal.RefinesList vs vs := by
-  induction vs with
+theorem Forall2.refl {r : α → α → Prop} (h : ∀ a, r a a) (as : List α) : Forall2 r as as := by
+  induction as with
   | nil => trivial
-  | cons v vs ih => exact ⟨RVal.Refines.refl v, ih⟩
+  | cons a as ih => exact ⟨h a, ih⟩
+
+theorem Forall2.trans {r : α → α → Prop} (h : ∀ a b c, r a b → r b c → r a c)
+    {as bs cs : List α} : Forall2 r as bs → Forall2 r bs cs → Forall2 r as cs := by
+  induction as generalizing bs cs with
+  | nil => cases bs <;> cases cs <;> simp [Forall2]
+  | cons a as ih =>
+    cases bs <;> cases cs <;> simp only [Forall2, imp_self, implies_true, false_implies]
+    exact fun ⟨h₁, t₁⟩ ⟨h₂, t₂⟩ => ⟨h _ _ _ h₁ h₂, ih t₁ t₂⟩
+
+/-! ## Bytes -/
+
+/-- A `poison` byte may be replaced by any byte; other bytes must stay the same. -/
+def Byte.Refines (t s : Byte) : Prop := s = .poison ∨ t = s
+
+def Byte.refines (t s : Byte) : Bool := s == .poison || t == s
+
+theorem Byte.refines_iff {t s : Byte} : t.refines s = true ↔ t.Refines s := by
+  simp [Byte.refines, Byte.Refines]
+
+theorem Byte.Refines.refl (b : Byte) : b.Refines b := .inr rfl
+
+theorem Byte.Refines.trans {a b c : Byte} : a.Refines b → b.Refines c → a.Refines c := by
+  rintro (h₁ | rfl) (h₂ | rfl)
+  · exact .inl h₂
+  · exact .inl h₁
+  · exact .inl h₂
+  · exact .inr rfl
+
+/-! ## Runtime values -/
+
+/-- `t.Refines s` for runtime values: the same kind and width, with `poison` replaceable by any
+value of its type. -/
+def RVal.Refines : RVal → RVal → Prop
+  | .int w v, .int w' v' => ∃ h : w = w', Val.Refines (h ▸ v) v'
+  | .ptr _, .ptr none => True
+  | .ptr (some p), .ptr (some p') => p = p'
+  | .bytes bs, .bytes bs' => Forall2 Byte.Refines bs bs'
+  | _, _ => False
+
+def RVal.refines : RVal → RVal → Bool
+  | .int w v, .int w' v' => if h : w = w' then Val.refines (h ▸ v) v' else false
+  | .ptr _, .ptr none => true
+  | .ptr (some p), .ptr (some p') => p == p'
+  | .bytes bs, .bytes bs' => all2 Byte.refines bs bs'
+  | _, _ => false
+
+theorem RVal.refines_iff {t s : RVal} : t.refines s = true ↔ t.Refines s := by
+  cases t with
+  | int w v =>
+    cases s with
+    | int w' v' =>
+      simp only [RVal.refines, RVal.Refines]
+      split
+      · rename_i h
+        exact ⟨fun hr => ⟨h, Val.refines_iff.mp hr⟩, fun ⟨_, hr⟩ => Val.refines_iff.mpr hr⟩
+      · rename_i h
+        simp [h]
+    | _ => simp [RVal.refines, RVal.Refines]
+  | ptr p => cases s with
+    | ptr q => cases p <;> cases q <;> simp [RVal.refines, RVal.Refines]
+    | _ => simp [RVal.refines, RVal.Refines]
+  | bytes bs => cases s with
+    | bytes bs' => simp [RVal.refines, RVal.Refines, all2_iff (fun _ _ => Byte.refines_iff)]
+    | _ => simp [RVal.refines, RVal.Refines]
+
+theorem RVal.Refines.refl (v : RVal) : v.Refines v := by
+  cases v with
+  | int w v => exact ⟨rfl, Val.Refines.refl v⟩
+  | ptr p => cases p <;> simp [RVal.Refines]
+  | bytes bs => exact Forall2.refl Byte.Refines.refl bs
+
+theorem RVal.Refines.trans {a b c : RVal} : a.Refines b → b.Refines c → a.Refines c := by
+  intro h₁ h₂
+  cases a <;> cases b <;> cases c <;> simp only [RVal.Refines] at h₁ h₂ ⊢
+  case int.int.int =>
+    obtain ⟨hab, h₁⟩ := h₁
+    obtain ⟨hbc, h₂⟩ := h₂
+    subst hab hbc
+    exact ⟨rfl, Val.Refines.trans h₁ h₂⟩
+  case bytes.bytes.bytes => exact Forall2.trans (r := Byte.Refines) (fun _ _ _ => Byte.Refines.trans) h₁ h₂
+  all_goals
+    first
+    | trivial
+    | contradiction
+    | (rename_i p q r; cases p <;> cases q <;> cases r <;>
+        simp_all)
+
+/-- Element-wise refinement of value lists of equal length. -/
+abbrev RVal.RefinesList := Forall2 RVal.Refines
+
+def RVal.refinesList : List RVal → List RVal → Bool := all2 RVal.refines
+
+theorem RVal.refinesList_iff {ts ss : List RVal} :
+    RVal.refinesList ts ss = true ↔ RVal.RefinesList ts ss :=
+  all2_iff (fun _ _ => RVal.refines_iff)
+
+theorem RVal.RefinesList.refl (vs : List RVal) : RVal.RefinesList vs vs :=
+  Forall2.refl RVal.Refines.refl vs
 
 theorem RVal.RefinesList.trans {as bs cs : List RVal} :
-    RVal.RefinesList as bs → RVal.RefinesList bs cs → RVal.RefinesList as cs := by
-  induction as generalizing bs cs with
-  | nil => cases bs <;> cases cs <;> simp [RefinesList]
-  | cons a as ih =>
-    cases bs <;> cases cs <;> simp only [RefinesList, imp_self, implies_true, false_implies]
-    exact fun ⟨h₁, t₁⟩ ⟨h₂, t₂⟩ => ⟨RVal.Refines.trans h₁ h₂, ih t₁ t₂⟩
+    RVal.RefinesList as bs → RVal.RefinesList bs cs → RVal.RefinesList as cs :=
+  Forall2.trans (r := RVal.Refines) (fun _ _ _ => RVal.Refines.trans)
 
 /-! ## Function behaviors -/
 

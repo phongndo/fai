@@ -54,6 +54,11 @@
 | Pointer width | Each memory space declares a pointer size and an address (index) size, equal by default and 64 bits by default. The address size is what `ptr.addr`, `ptr.expose`, offsets, and allocation sizes use; the pointer size is how many bytes a pointer takes in memory. CHERI capabilities are 128/64, like LLVM's data-layout index size | One module can mix, e.g., 64-bit host pointers and 32-bit GPU-shared or Wasm pointers; capability hardware fits without special cases |
 | Volatile | Reserved: volatile loads and stores will be ops with the `extern` effect (never removed, duplicated, or reordered with other `extern` effects), added together with external calls, when behaviors become event traces | Device memory and signal handlers need it; nothing in FIR-1 does |
 | FIR-1 scope | Memory under the decisions above, plus direct calls between FIR functions (external calls later). Headline proof: promoting stack slots to SSA values (mem2reg) for slots only loaded and stored at one type and never escaping, threading values through `cf.if` results and loop state. Also proved: store-to-load forwarding, dead stores, dead allocations, loads of fresh memory giving `poison`, and reordering across `noalias`, each with a rejected look-alike | mem2reg is the first optimization every C compiler runs and needs a whole-machine simulation proof, which every later memory proof reuses |
+| Stack lifetime | `mem.stack` memory lives until its region ends: each loop iteration gets fresh memory, and a callee's memory ends when it returns | Matches C block scope; dangling stack pointers are caught at the exact access |
+| Alignment rule | An access with `align N` needs its offset to be a multiple of N and its allocation aligned to at least N, whatever address the allocation gets | Alignment never depends on where an allocation happens to land, so lazy addresses stay invisible |
+| In-bounds offsets | `ptr.offset.inbounds` gives `poison` if the pointer or the result is outside `[0, size]` of a live allocation; an offset of 0 is always fine | Matches LLVM's `getelementptr inbounds`, which alias analysis relies on |
+| Freeing null | `mem.free` of null does nothing, for every family | C `free(NULL)` and C++ `delete nullptr` are both no-ops |
+| Byte order | Little-endian until data layouts are designed | Every mainstream target today |
 | Tail calls | `func.call.tail` is guaranteed: it becomes a real tail call or compilation fails | Functional languages, Wasm tail calls, fast threaded interpreters for the VM kit |
 | Attributes | Two kinds, enforced by the verifier. *Semantic* attributes change meaning and are never dropped. *Discardable* attributes (hints, metadata, facts) are always safe to drop | Gives passes a simple rule. Dropping a fact only makes a program more defined, so it is always a refinement |
 
@@ -63,6 +68,7 @@ Ordered by dependency.
 
 ### AOT phase (now)
 
+0. FIR-1 program-level proofs: a simulation framework over the machine, then mem2reg, store-to-load forwarding, dead stores, dead allocations, and reordering across `noalias` as op-level rewrites (the byte-level lemmas they rest on are proved). Also: when an address from `ptr.from_exposed` matches several exposed tags of one allocation, the interpreter picks the first valid one instead of the one that avoids UB
 1. Structure details: symbol visibility and linkage, graph (unordered) regions for dataflow hardware
 2. Control flow details: coroutines, async, and generators (an HFIR building block lowered to a state machine; decided in the building-blocks round)
 3. Types details: function and closure types, arrays, tagged unions (building-blocks round)

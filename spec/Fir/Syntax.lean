@@ -5,7 +5,8 @@ The shape of a FIR-0 program. Following the structure decision, everything is an
 kind, typed results, operands, nested regions, and a source location. A region has typed
 parameters (block arguments) and a list of ops.
 
-FIR-0 covers integers and structured control flow. Memory, calls, and floats come later.
+FIR-1 covers integers, structured control flow, memory, and calls between FIR functions. Floats,
+external calls, and threads come later.
 -/
 
 namespace Fir
@@ -16,15 +17,33 @@ structure Loc where
   col : Nat
   deriving DecidableEq, Repr, Inhabited
 
-/-- A type. FIR-0 has only signless integers `iN`. -/
+/-- A type: signless integers `iN`, pointers, and byte types `bN` (raw memory, copied exactly). -/
 inductive Ty where
   | int (w : Nat)
+  | ptr
+  | byte (w : Nat)
   deriving DecidableEq, Repr, Inhabited
 
+/-- The bit width of an integer or byte type. -/
 def Ty.width : Ty → Nat
-  | .int w => w
+  | .int w | .byte w => w
+  | .ptr => 0
 
-instance : ToString Ty := ⟨fun t => s!"i{t.width}"⟩
+def Ty.isInt : Ty → Bool
+  | .int _ => true
+  | _ => false
+
+instance : ToString Ty := ⟨fun
+  | .int w => s!"i{w}"
+  | .ptr => "ptr"
+  | .byte w => s!"b{w}"⟩
+
+/-- A memory space's sizes, in bits. The pointer size is how much memory a pointer takes; the
+address (index) size is what `ptr.addr`, offsets, and allocation sizes use. -/
+structure SpaceCfg where
+  ptrBits : Nat := 64
+  addrBits : Nat := 64
+  deriving DecidableEq, Repr, Inhabited
 
 /-- How much a fact is trusted. All three mean the same thing (a violation is UB); they differ in
 how the compiler treats the fact: relied on, checked at runtime, or proved. -/
@@ -40,6 +59,16 @@ inductive Fact where
   | rangeS (lo hi : Int)
   /-- Unsigned range, inclusive. -/
   | rangeU (lo hi : Int)
+  /-- A pointer that isn't null. -/
+  | nonnull
+  /-- A pointer aligned to `n` bytes. -/
+  | align (n : Nat)
+  /-- On a function parameter: for the call, a byte accessed through this pointer (or one
+  derived from it) and written by anyone may only be accessed through derived pointers. -/
+  | noalias
+  /-- On a function parameter: no writes through this pointer or ones derived from it during
+  the call. -/
+  | readonly
   deriving DecidableEq, Repr
 
 structure TrustedFact where
@@ -119,6 +148,14 @@ inductive ShiftOp where
   | shl | shrU | shrS
   deriving DecidableEq, Repr
 
+/-- What `mem.alloc` does when allocation fails. -/
+inductive AllocFail where
+  /-- Return null, like C `malloc`. -/
+  | null
+  /-- Trap, like Rust and Java. -/
+  | trap
+  deriving DecidableEq, Repr
+
 inductive OpKind where
   /-- `int.const n` -/
   | const (n : Int)
@@ -134,6 +171,30 @@ inductive OpKind where
   | zext
   | sext
   | trunc (mode : TruncMode)
+  /-- `mem.stack 16, align 4`: stack memory, freed when its region ends. -/
+  | memStack (size align : Nat)
+  /-- `mem.alloc.null c.malloc %n, align 16`: heap memory from an allocator family. -/
+  | memAlloc (fail : AllocFail) (family : String) (align : Nat)
+  /-- `mem.free c.malloc %p` -/
+  | memFree (family : String)
+  /-- `mem.load %p, align 4`: the result type is the accessed type. -/
+  | load (align : Nat)
+  /-- `mem.store i32 %v, %p, align 4` -/
+  | store (ty : Ty) (align : Nat)
+  /-- `ptr.offset.inbounds %p, %n` (poison if it leaves the allocation) or `ptr.offset.wrap`. -/
+  | ptrOffset (inbounds : Bool)
+  /-- `ptr.addr %p`: the address, without exposing the allocation. -/
+  | ptrAddr
+  /-- `ptr.expose %p`: the address, and `ptr.from_exposed` may reach the allocation from now on. -/
+  | ptrExpose
+  | ptrFromExposed
+  /-- `ptr.with_addr %p, %a`: a new address in `%p`'s allocation. -/
+  | ptrWithAddr
+  | ptrNull
+  /-- `ptr.cmp.eq` and friends; ordered comparisons are unsigned. -/
+  | ptrCmp (p : Pred)
+  /-- `func.call @f(%a, %b)` -/
+  | call (callee : String)
   /-- `cf.if %c { … } else { … }`: two regions. -/
   | if_
   /-- `cf.loop [progress] iter(…) { … }`: one region whose parameters are the loop state. -/
@@ -169,8 +230,9 @@ mutual
   inductive Op where
     | mk (kind : OpKind) (results : List Result) (args : List Operand) (regions : List Region)
         (loc : Option Loc)
+  /-- A region's parameters are written like results, and can carry facts. -/
   inductive Region where
-    | mk (params : List (String × Ty)) (ops : List Op)
+    | mk (params : List Result) (ops : List Op)
 end
 
 instance : Inhabited Op := ⟨.mk .poison [] [] [] none⟩
@@ -181,7 +243,7 @@ def Op.results : Op → List Result | .mk _ rs .. => rs
 def Op.args : Op → List Operand | .mk _ _ as .. => as
 def Op.regions : Op → List Region | .mk _ _ _ rs _ => rs
 def Op.loc : Op → Option Loc | .mk _ _ _ _ l => l
-def Region.params : Region → List (String × Ty) | .mk ps _ => ps
+def Region.params : Region → List Result | .mk ps _ => ps
 def Region.ops : Region → List Op | .mk _ ops => ops
 
 /-- A function. Its parameters are the parameters of its body region. -/
@@ -192,9 +254,11 @@ structure Func where
   body : Region
   deriving Inhabited
 
-def Func.params (f : Func) : List (String × Ty) := f.body.params
+def Func.params (f : Func) : List Result := f.body.params
 
 structure Module where
+  /-- The default memory space. -/
+  space : SpaceCfg := {}
   funcs : List Func
 
 def Module.find? (m : Module) (name : String) : Option Func :=
