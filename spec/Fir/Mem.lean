@@ -1,4 +1,4 @@
-import Std.Data.HashMap
+import Std.Data.ExtTreeMap
 import Fir.Basic
 import Fir.Syntax
 
@@ -7,6 +7,10 @@ import Fir.Syntax
 
 Memory is a set of separate allocations, not one big array. Each allocation has a size, an
 alignment, bytes, and a lifetime. It gets a numeric address only when one is first observed.
+
+Maps here are extensional (`Std.ExtTreeMap`): two maps with the same entries are equal, however
+they were built. So two runs that leave memory reading the same have equal states, which keeps
+proofs about rewrites short.
 
 Values are stored little-endian. Per-target byte order comes with data layouts.
 -/
@@ -18,12 +22,15 @@ inductive AllocKind where
   | heap (family : String)
   deriving DecidableEq, Repr
 
+/-- An allocation's bytes, by offset. Unwritten bytes are `poison`. -/
+abbrev Bytes := Std.ExtTreeMap Nat Byte
+
+/-- An allocation, apart from its bytes (which the machine keeps separately, so that writing
+memory never changes this record). -/
 structure Alloc where
   size : Nat
   align : Nat
   kind : AllocKind
-  /-- Bytes written so far; unwritten bytes are `poison`. -/
-  contents : Std.HashMap Nat Byte := {}
   live : Bool := true
   /-- The address, once one has been observed. -/
   base : Option Nat := none
@@ -33,15 +40,12 @@ structure Alloc where
   freedAt : Option Loc := none
 
 /-- Write bytes starting at `off`. -/
-def writeBytes (m : Std.HashMap Nat Byte) (off : Nat) : List Byte → Std.HashMap Nat Byte
+def writeBytes (m : Bytes) (off : Nat) : List Byte → Bytes
   | [] => m
   | b :: bs => writeBytes (m.insert off b) (off + 1) bs
 
-def Alloc.read (a : Alloc) (off n : Nat) : List Byte :=
-  (List.range n).map fun i => a.contents.getD (off + i) .poison
-
-def Alloc.write (a : Alloc) (off : Nat) (bs : List Byte) : Alloc :=
-  { a with contents := writeBytes a.contents off bs }
+def readBytes (m : Bytes) (off n : Nat) : List Byte :=
+  (List.range n).map fun i => m.getD (off + i) .poison
 
 /-- Whether byte `off` of the allocation is aligned to `n`: the offset is a multiple of `n` and
 the allocation is aligned to at least `n`, or the allocation already has an address and the byte's

@@ -11,3 +11,6 @@ import Fir.Lex
 import Fir.Parse
 import Fir.Print
 import Fir.Rules
+import Fir.Sim
+import Fir.CodeRel
+import Fir.Dse

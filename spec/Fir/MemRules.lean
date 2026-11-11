@@ -14,14 +14,14 @@ The facts about memory that the memory optimizations rest on:
 
 namespace Fir.MemRules
 
-theorem getD_writeBytes (m : Std.HashMap Nat Byte) (off i : Nat) (bs : List Byte) (d : Byte) :
+theorem getD_writeBytes (m : Bytes) (off i : Nat) (bs : List Byte) (d : Byte) :
     (writeBytes m off bs).getD i d =
       if off ≤ i ∧ i < off + bs.length then bs.getD (i - off) d else m.getD i d := by
   induction bs generalizing m off with
   | nil => simp only [writeBytes, List.length_nil]; rw [ite_eq_right (by omega)]
   | cons b bs ih =>
     rw [writeBytes, ih]
-    simp only [Std.HashMap.getD_insert, beq_iff_eq, List.length_cons]
+    simp only [Std.ExtTreeMap.getD_insert, Nat.compare_eq_eq, List.length_cons]
     by_cases h1 : off + 1 ≤ i ∧ i < off + 1 + bs.length
     · rw [ite_eq_left h1, ite_eq_left (by omega), show i - off = (i - (off + 1)) + 1 by omega]
       simp
@@ -30,41 +30,63 @@ theorem getD_writeBytes (m : Std.HashMap Nat Byte) (off i : Nat) (bs : List Byte
       · subst h2; simp
       · rw [ite_eq_right h2, ite_eq_right (by omega)]
 
+theorem getElem?_writeBytes (m : Bytes) (off i : Nat) (bs : List Byte) :
+    (writeBytes m off bs)[i]? = if off ≤ i ∧ i < off + bs.length then bs[i - off]? else m[i]? := by
+  induction bs generalizing m off with
+  | nil => simp only [writeBytes, List.length_nil]; rw [ite_eq_right (by omega)]
+  | cons b bs ih =>
+    rw [writeBytes, ih]
+    simp only [Std.ExtTreeMap.getElem?_insert, Nat.compare_eq_eq, List.length_cons]
+    by_cases h1 : off + 1 ≤ i ∧ i < off + 1 + bs.length
+    · rw [ite_eq_left h1, ite_eq_left (by omega), show i - off = (i - (off + 1)) + 1 by omega]
+      simp
+    · rw [ite_eq_right h1]
+      by_cases h2 : off = i
+      · subst h2; simp
+      · rw [ite_eq_right h2, ite_eq_right (by omega)]
+
+/-- A second write of the same length to the same place leaves memory exactly as if only the
+second write happened. (The read-level version is `write_write_same`.) -/
+theorem writeBytes_writeBytes (m : Bytes) (off : Nat) (bs bs' : List Byte)
+    (h : bs.length = bs'.length) :
+    writeBytes (writeBytes m off bs) off bs' = writeBytes m off bs' := by
+  apply Std.ExtTreeMap.ext_getElem?
+  intro i
+  simp only [getElem?_writeBytes, h]
+  split <;> simp
+
 /-- Reading back what was just written gives it back. -/
-theorem read_write_same (a : Alloc) (off : Nat) (bs : List Byte) :
-    (a.write off bs).read off bs.length = bs := by
-  apply List.ext_getElem (by simp [Alloc.read])
+theorem read_write_same (m : Bytes) (off : Nat) (bs : List Byte) :
+    readBytes (writeBytes m off bs) off bs.length = bs := by
+  apply List.ext_getElem (by simp [readBytes])
   intro i _ h₂
-  simp only [Alloc.read, Alloc.write, List.getElem_map, List.getElem_range, getD_writeBytes]
+  simp only [readBytes, List.getElem_map, List.getElem_range, getD_writeBytes]
   rw [ite_eq_left (by omega)]
   simp [List.getD_eq_getElem?_getD, h₂]
 
 /-- A write doesn't change bytes outside its range. -/
-theorem read_write_disjoint (a : Alloc) (off off' n : Nat) (bs : List Byte)
+theorem read_write_disjoint (m : Bytes) (off off' n : Nat) (bs : List Byte)
     (h : off' + n ≤ off ∨ off + bs.length ≤ off') :
-    (a.write off bs).read off' n = a.read off' n := by
-  apply List.ext_getElem (by simp [Alloc.read])
+    readBytes (writeBytes m off bs) off' n = readBytes m off' n := by
+  apply List.ext_getElem (by simp [readBytes])
   intro i h₁ _
-  have hi : i < n := by simpa [Alloc.read] using h₁
-  simp only [Alloc.read, Alloc.write, List.getElem_map, List.getElem_range, getD_writeBytes]
+  have hi : i < n := by simpa [readBytes] using h₁
+  simp only [readBytes, List.getElem_map, List.getElem_range, getD_writeBytes]
   rw [ite_eq_right (by omega)]
 
 /-- A second write to the same bytes hides the first: every read sees the same bytes as if only
 the second write happened. -/
-theorem write_write_same (a : Alloc) (off off' n : Nat) (bs bs' : List Byte)
+theorem write_write_same (m : Bytes) (off off' n : Nat) (bs bs' : List Byte)
     (h : bs.length = bs'.length) :
-    ((a.write off bs).write off bs').read off' n = (a.write off bs').read off' n := by
-  apply List.ext_getElem (by simp [Alloc.read])
-  intro i _ _
-  simp only [Alloc.read, Alloc.write, List.getElem_map, List.getElem_range, getD_writeBytes, h]
-  split <;> simp
+    readBytes (writeBytes (writeBytes m off bs) off bs') off' n =
+      readBytes (writeBytes m off bs') off' n := by
+  rw [writeBytes_writeBytes m off bs bs' h]
 
 /-- Fresh memory reads as `poison`. -/
-theorem read_fresh (size align : Nat) (kind : AllocKind) (off n : Nat) :
-    ({ size, align, kind } : Alloc).read off n = List.replicate n .poison := by
-  apply List.ext_getElem (by simp [Alloc.read])
+theorem read_fresh (off n : Nat) : readBytes ∅ off n = List.replicate n .poison := by
+  apply List.ext_getElem (by simp [readBytes])
   intro i _ _
-  simp [Alloc.read]
+  simp [readBytes, Std.ExtTreeMap.getD_empty]
 
 theorem undigits_digits (k n : Nat) : undigits (digits k n) = n % 256 ^ k := by
   induction k generalizing n with
@@ -121,17 +143,27 @@ Each lemma above has a near miss that Lean rejects. -/
 
 /-- Forwarding a store to a load that only partly overlaps it is wrong. -/
 theorem read_write_overlap_wrong :
-    ¬ ∀ (a : Alloc) (bs : List Byte), (a.write 0 bs).read 2 bs.length = bs := by
+    ¬ ∀ (m : Bytes) (bs : List Byte), readBytes (writeBytes m 0 bs) 2 bs.length = bs := by
   intro h
-  have := h { size := 4, align := 1, kind := .stack } [.bits 1, .bits 2, .bits 3, .bits 4]
-  simp [Alloc.read, Alloc.write, getD_writeBytes, List.range_succ] at this
+  have := h ∅ [.bits 1, .bits 2, .bits 3, .bits 4]
+  simp [readBytes, getD_writeBytes, List.range_succ, Std.ExtTreeMap.getD_empty] at this
+
+/-- A shorter second write doesn't hide the first: the first write's last byte survives. So dead
+store elimination needs the second store to be at least as large (`Fir.Dse` requires equal sizes). -/
+theorem writeBytes_shorter_wrong :
+    ¬ ∀ (m : Bytes) (bs bs' : List Byte),
+      writeBytes (writeBytes m 0 bs) 0 bs' = writeBytes m 0 bs' := by
+  intro h
+  have := congrArg (·[1]?) (h ∅ [.bits 1, .bits 2] [.bits 3])
+  simp [getElem?_writeBytes] at this
 
 /-- Two writes to the same bytes can't swap places. -/
 theorem write_write_swap_wrong :
-    ¬ ∀ (a : Alloc) (x y : Byte),
-      ((a.write 0 [x]).write 0 [y]).read 0 1 = ((a.write 0 [y]).write 0 [x]).read 0 1 := by
+    ¬ ∀ (m : Bytes) (x y : Byte),
+      readBytes (writeBytes (writeBytes m 0 [x]) 0 [y]) 0 1 =
+        readBytes (writeBytes (writeBytes m 0 [y]) 0 [x]) 0 1 := by
   intro h
-  have := h { size := 1, align := 1, kind := .stack } (.bits 1) (.bits 2)
-  simp [Alloc.read, Alloc.write, getD_writeBytes] at this
+  have := h ∅ (.bits 1) (.bits 2)
+  simp [readBytes, getD_writeBytes] at this
 
 end Fir.MemRules

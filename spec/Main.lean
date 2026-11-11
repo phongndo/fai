@@ -42,8 +42,8 @@ partial def drive (m : Machine) (steps limit : Nat) : String :=
   if steps ≥ limit then
     s!"out of fuel after {limit} steps" ++ (if m.inProgressLoop then " in a progress loop" else "")
   else
-    match step.run m with
-    | .ok ((), m') => drive m' (steps + 1) limit
+    match step m with
+    | .ok m' => drive m' (steps + 1) limit
     | .error h => renderHalt h
 
 /-- Run a function and describe the outcome in one line. -/

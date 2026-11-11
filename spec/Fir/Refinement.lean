@@ -197,25 +197,26 @@ theorem RVal.RefinesList.trans {as bs cs : List RVal} :
 
 /-! ## Function behaviors -/
 
-/-- `t.Refines s` for the observable behavior of a run. An `ambiguous` run has an unknown
-behavior: as a target it refines only UB, and as a source nothing refines it. So refinement is not
+/-- `t.Refines s` for the observable behavior of a run. A source that is UB or stuck (malformed;
+verified programs never get stuck) allows anything. An `ambiguous` run has an unknown behavior:
+as a target it refines only those, and as a source nothing refines it. So refinement is not
 reflexive on `ambiguous`. -/
 def Behavior.Refines : Behavior → Behavior → Prop
   | _, .ub _ => True
+  | _, .stuck _ => True
   | .ret vs, .ret vs' => RVal.RefinesList vs vs'
   | .trap r, .trap r' => r = r'
   | .diverge, .diverge => True
   | .hole n, .hole n' => n = n'
-  | .stuck _, .stuck _ => True
   | _, _ => False
 
 def Behavior.refines : Behavior → Behavior → Bool
   | _, .ub _ => true
+  | _, .stuck _ => true
   | .ret vs, .ret vs' => RVal.refinesList vs vs'
   | .trap r, .trap r' => r == r'
   | .diverge, .diverge => true
   | .hole n, .hole n' => n == n'
-  | .stuck _, .stuck _ => true
   | _, _ => false
 
 theorem Behavior.refines_iff {t s : Behavior} : t.refines s = true ↔ t.Refines s := by
@@ -223,6 +224,14 @@ theorem Behavior.refines_iff {t s : Behavior} : t.refines s = true ↔ t.Refines
 
 theorem Behavior.Refines.refl (b : Behavior) (h : b ≠ .ambiguous) : b.Refines b := by
   cases b <;> simp_all [Behavior.Refines, RVal.RefinesList.refl]
+
+/-- A source behavior that every target behavior refines: UB, or stuck. -/
+def Behavior.Absorbing : Behavior → Prop
+  | .ub _ | .stuck _ => True
+  | _ => False
+
+theorem Behavior.Refines.of_absorbing {t s : Behavior} (h : s.Absorbing) : t.Refines s := by
+  cases s <;> cases t <;> simp_all [Behavior.Absorbing, Behavior.Refines]
 
 theorem Behavior.Refines.trans {a b c : Behavior} :
     a.Refines b → b.Refines c → a.Refines c := by

@@ -10,16 +10,14 @@ replace another.
 
 namespace Fir
 
-/-- From step `N` on, the machine never leaves some `progress` loop: the frames from the bottom of
-the stack up to and including that loop never change again. Since FIR-0 has no side effects, this
-is exactly a `cf.loop progress` that never exits. Once memory and I/O exist, the condition also
-requires that the loop performs no effects. -/
+/-- From step `N` on, the frame `d` from the bottom of the stack is always a `progress` loop:
+that loop never exits. (Frames below the top change only by being popped, and a loop frame is
+replaced only by itself on `cf.continue`, so this is the same as the frames up to and including
+the loop never changing.) This is exactly a `cf.loop progress` that runs forever, including one
+whose body never returns from a call. -/
 def StuckInProgressLoop (oracle : Nat → Int) (mod : Module) (f : Func) (args : List RVal) :
     Prop :=
-  ∃ N d mN, stateAt oracle mod f args N = .ok mN ∧
-    ∀ n, N ≤ n → ∃ m, stateAt oracle mod f args n = .ok m ∧
-      (∃ body rs loc, m.stack.reverse[d]? = some (.loop true body rs loc)) ∧
-      m.stack.reverse.take (d + 1) = mN.stack.reverse.take (d + 1)
+  ∃ N d, ∀ n, N ≤ n → ∃ m, stateAt oracle mod f args n = .ok m ∧ m.inProgressLoopAt d
 
 /-- `Behaves mod f args b`: calling `f` (in module `mod`) with `args` can have behavior `b`, for
 some choice of the oracle's answers. A run either halts, or runs forever; running forever inside
