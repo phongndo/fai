@@ -1,0 +1,10 @@
+name = "fir"
+version = "0.1.0"
+defaultTargets = ["Fir", "fir-ref"]
+
+[[lean_lib]]
+name = "Fir"
+
+[[lean_exe]]
+name = "fir-ref"
+root = "Main"
