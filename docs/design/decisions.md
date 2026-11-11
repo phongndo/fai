@@ -38,19 +38,23 @@
 | Allocation | First-class ops: `mem.stack` (freed at scope end), `mem.alloc` / `mem.free` tagged with an allocator family (`c.malloc`, `cpp.new`, custom), and globals | Cross-language allocation optimizations (removing dead allocations, moving heap allocations to the stack); catches mismatched and double frees; leak reports with source provenance |
 | Aliasing | Non-overlap information is trust-tagged facts: `[noalias(%in)] assume|check|proved`, covering C `restrict`, Rust `&mut`, and Fortran arguments. `check` mode inserts runtime overlap checks (a `restrict` sanitizer). Type-based aliasing (C strict aliasing) is an opt-in fact, off by default | One checkable mechanism instead of LLVM's three trusted ones; strict aliasing is notoriously subtle (smtgcc can't model it; the Linux kernel disables it) |
 | Concurrency | Based on the C++20 memory model (RC11): atomic orderings `relaxed`/`acquire`/`release`/`acq_rel`/`seq_cst`, and races on plain accesses are UB. Extensions: `unordered` racy-but-defined accesses (a racy read returns some written value) for Java, JS, and Wasm threads; scoped atomics (`workgroup`/`device`/`system`) following the GPU memory models. Proofs are phased: sequential semantics first, concurrency proofs later, with concurrent optimizations conservative until then and the assurance report stating it | Covers C/C++/Rust, VM languages, and GPUs, each with a published formal model; matches the state of the art in verified compilation (CompCert is sequential) |
+| Op syntax | Each op declares its readable text format in its definition, and the Rust and Lean parsers and printers are generated from it. Every op also has a generic form that always parses: `%s: i32 = "int.add"(%a, %b) {overflow = nsw}` | Readable text without hand-written parsers; unknown and new dialect ops still round-trip; the two parsers can't drift apart |
+| Facts in text | In brackets between the result type and `=`, with a mandatory trust tag: `%p: ptr [nonnull proved, align(8) assume] = ...` | Facts sit next to the value they describe; deleting a bracket is always safe, matching the discardable-attribute rule |
+| Locations in text | A short trailing `@line:col` on each op, with the file declared once per function (`loc "main.c"`). The printer can hide them (`--no-locs`), and text without them parses with an unknown location | Source mapping survives text tests and agent edits without cluttering every line |
+| Holes | `?name: T` is a placeholder for a value that hasn't been written yet. A program with holes parses, verifies, and can be partly interpreted; tools report what each hole must satisfy (type, facts, effects). It can't be compiled to code | Lets people and agents write programs step by step with the checker guiding them; cheap now, hard to add to a grammar later |
 | Tail calls | `func.call.tail` is guaranteed: it becomes a real tail call or compilation fails | Functional languages, Wasm tail calls, fast threaded interpreters for the VM kit |
 | Attributes | Two kinds, enforced by the verifier. *Semantic* attributes change meaning and are never dropped. *Discardable* attributes (hints, metadata, facts) are always safe to drop | Gives passes a simple rule. Dropping a fact only makes a program more defined, so it is always a refinement |
 
 ## Open
 
-Ordered by dependency. The text syntax is paused until the semantics are settled.
+Ordered by dependency.
 
 1. Structure details: symbol visibility and linkage, graph (unordered) regions for dataflow hardware
 2. Control flow details: coroutines, async, and generators (an HFIR building block lowered to a state machine; decided in the building-blocks round)
 3. Types details: function and closure types, arrays, tagged unions (building-blocks round); the `gc` dialect (later)
 4. Runtime and VM interface: deoptimization, safepoints and stack maps, on-stack replacement, patchpoints, unwinding
 5. ABI: C calling conventions, owned by FIR
-6. Representations: text syntax, binary format, versioning
+6. Representations: the full text grammar (written alongside FIR-0), binary format, versioning
 7. Transformations: pass manager, rule DSL, analyses, incremental compilation
 8. Lowering: target description format, ISA semantics sources, register allocation, linking, debug info
 9. Execution modes: AOT driver, JIT tiers, VM embedding, web output
