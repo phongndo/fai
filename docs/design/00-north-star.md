@@ -19,12 +19,12 @@ Most verified compilers keep their proofs internal, so only the compiler author 
 ## Goals
 
 1. **One uniform IR for all hardware.** One structure and one semantics for CPUs, GPUs, accelerators, and Wasm. Hardware differences are explicit target dialects, never special cases.
-2. **Formally backed.** Every op has a meaning defined in Lean. Every transformation is proved once, validated on each run, or SMT-checked in CI. Each build reports which of these applies.
+2. **Formally backed.** Every op has a meaning defined in Lean. Every step is proved once, certificate-checked on each run by a checker proved in Lean, SMT-validated, or trusted. Each build reports which of these applies.
 3. **Excellent developer experience** for people and agents: readable canonical text, fast feedback on rules, clear errors, and explanations of what the compiler did.
 
 ## Principles
 
-- **The Lean spec is the source of truth.** The Rust implementation is checked against it by generated rule matchers, differential testing against the reference interpreter, and translation validation.
+- **The Lean spec is the source of truth.** The Rust implementation is checked against it by generated rule matchers, differential testing against the reference interpreter, certificate checkers proved in Lean, and SMT translation validation.
 - **No op without semantics.** Every op has one of three trust tiers:
   - *verified*: Lean semantics with proofs;
   - *specified*: SMT-checkable semantics;
@@ -48,7 +48,7 @@ Most verified compilers keep their proofs internal, so only the compiler author 
 - Target instruction semantics, imported from official ISA specs where they exist.
 - Instruction-selection rules checked against those semantics.
 - Proved legalization for operations the target doesn't support natively.
-- A register allocator whose output is validated on every run.
+- A register allocator whose output is checked on every run by a checker proved in Lean.
 - A conformance suite that compares the target against the reference interpreter.
 
 ## What everyone gets

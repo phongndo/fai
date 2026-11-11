@@ -63,7 +63,7 @@ All frontends, MFIR optimizations, and tools then work on the new chip.
 | HFIR → MFIR | Building-block lowerings proved once, for every frontend |
 | MFIR → MFIR | Each rewrite rule proved in Lean or SMT-checked in CI |
 | MFIR → LFIR | Legalization and instruction selection checked against ISA semantics |
-| LFIR → code | Register allocation and scheduling validated on each run; encoding tested by the conformance suite |
+| LFIR → code | Register allocation certificate-checked on each run by a checker proved in Lean; scheduling SMT-validated; encoding tested by the conformance suite |
 
 ## Execution paths
 

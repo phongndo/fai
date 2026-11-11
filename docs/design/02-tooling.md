@@ -13,7 +13,7 @@ All of these work for every language with a FIR frontend, including C and C++.
 | Inputs that trigger bugs | Symbolic execution and SMT over the exact semantics | Bounded |
 | Data races | Follows from the concurrency semantics | Later |
 | Why the code looks this way | `--explain`: the provenance chain of rules back to source | Compile time |
-| Trust status of a build | Assurance report: which steps were proved, validated, or trusted; which facts were assumed or checked | Per build |
+| Trust status of a build | Assurance report: which steps were proved, certificate-checked, SMT-validated, or trusted; which facts were assumed or checked | Per build |
 
 ## Limits
 
