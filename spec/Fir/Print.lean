@@ -200,6 +200,7 @@ def renderHalt (h : Halt) : String :=
     | .hole n => s!"hole ?{n}{l}"
     | .stuck msg => s!"stuck{l}: {msg}"
     | .diverge => "diverges"
+    | .ambiguous => s!"ambiguous{l}"
   let note := if h.note.isEmpty then "" else s!" ({h.note})"
   "; ".intercalate ((main ++ note) :: h.leaks)
 

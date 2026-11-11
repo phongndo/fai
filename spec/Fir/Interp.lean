@@ -199,8 +199,13 @@ where
       | some (some p) => go fuel p
       | _ => false
 
-/-- The allocation, tag, and offset a pointer accesses. A bare address picks the candidate
-whose live range contains the access. -/
+/-- The allocation, tag, and offset a pointer accesses. A bare address may fit several exposed
+`(allocation, tag)` pairs. The intended rule picks the one that avoids UB. Until that is
+implemented, the run halts as `ambiguous` whenever the choice could matter: the pairs name
+different allocations, or an active `noalias` or `readonly` scope tells their tags apart. (Tags
+matter only to scopes, and a fresh scope's tag is never an ancestor of an older tag.) Reporting
+`ambiguous` instead of picking one keeps the reference tool from reporting UB that the intended
+rule wouldn't, which would hide miscompiles in differential testing. -/
 def resolve (loc : Option Loc) (p : Ptr) (size : Nat) : SM (Nat × Nat × Int) := do
   match p with
   | .rel a t off => pure (a, t, off)
@@ -212,13 +217,19 @@ def resolve (loc : Option Loc) (p : Ptr) (size : Nat) : SM (Nat × Nat × Int) :
         | some b => al.live && b ≤ addr && addr + size ≤ b + al.size
         | none => false
       | none => false
-    match cands.find? fitsIn with
-    | some (a, t) =>
-      let b := ((m.allocs[a]?.bind (·.base)).getD 0 : Int)
-      pure (a, t, addr - b)
-    | none =>
+    match cands.filter fitsIn with
+    | [] =>
       if cands.isEmpty then ub .noProvenance loc s!"address {addr} belongs to no exposed allocation"
       else ub .outOfBounds loc s!"address {addr} is outside every allocation it may belong to"
+    | (a, t) :: rest =>
+      if let some (a', _) := rest.find? (·.1 != a) then
+        halt .ambiguous loc s!"address {addr} may belong to #{a} or #{a'}"
+      let tellApart (t' : Nat) : Bool := m.scopes.toList.any fun (_, s) =>
+        s.alloc == a && isDerived m.tags s.tag t != isDerived m.tags s.tag t'
+      if let some (_, t') := rest.find? (tellApart ·.2) then
+        halt .ambiguous loc s!"address {addr} may carry tag {t} or {t'} of #{a}, and an active noalias or readonly scope tells them apart"
+      let b := ((m.allocs[a]?.bind (·.base)).getD 0 : Int)
+      pure (a, t, addr - b)
 
 /-- Record an access in the active `noalias` and `readonly` scopes. -/
 def checkScopes (loc : Option Loc) (a t : Nat) (off size : Nat) (write : Bool) : SM Unit := do
@@ -250,8 +261,10 @@ def access (loc : Option Loc) (p : Ptr) (size align : Nat) (write : Bool) : SM (
   unless al.live do ub .useAfterFree loc (deadNote al)
   unless 0 ≤ off && off + size ≤ al.size do
     ub .outOfBounds loc s!"offset {off}, {size} bytes, allocation size {al.size}"
-  unless off % align == 0 && al.align ≥ align do
-    ub .misaligned loc s!"offset {off} in an allocation aligned to {al.align}, access needs {align}"
+  unless al.alignedAt off align do
+    ub .misaligned loc <| match al.base with
+      | some b => s!"address {b + off} is not a multiple of {align}"
+      | none => s!"offset {off} in an allocation aligned to {al.align} with no address yet, access needs {align}"
   checkScopes loc a t off.toNat size write
   pure (a, off.toNat)
 
@@ -355,9 +368,7 @@ def cmpPtrs (loc : Option Loc) (pred : Pred) (p q : Ptr) : SM Bool := do
 def ptrFactHolds (loc : Option Loc) (f : Fact) (p : Ptr) : SM Bool := do
   match f, p with
   | .nonnull, .abs 0 _ => pure false
-  | .align n, .rel a _ off => do
-    let al ← getAlloc loc a
-    pure (off % n == 0 && al.align ≥ n)
+  | .align n, .rel a _ off => do pure ((← getAlloc loc a).alignedAt off n)
   | .align n, .abs addr _ => pure (addr % n == 0)
   | _, _ => pure true
 
@@ -572,7 +583,9 @@ def enterCall (loc : Option Loc) (params : List Result) (vs : List RVal) : SM (L
     let readonly := r.facts.any (·.fact == .readonly)
     if !(noalias || readonly) then continue
     let .ptr (some p) := v | continue
-    let some (a, t, off) ← tryCatch (some <$> resolve loc p 0) (fun _ => pure none) | continue
+    -- A pointer that can't access memory (null, dangling) opens no scope. An ambiguous one halts.
+    let some (a, t, off) ← tryCatch (some <$> resolve loc p 0)
+        (fun h => if h.behavior matches .ub _ then pure none else throw h) | continue
     let t' ← freshTag (some t)
     let m ← get
     let id := m.nextScope

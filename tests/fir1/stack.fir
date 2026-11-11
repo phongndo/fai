@@ -2,7 +2,7 @@
 // run: @roundtrip(42) -> returned i32 42
 // run: @uninit() -> returned i32 poison
 // run: @out_of_bounds() -> ub out-of-bounds @3:3 (offset 4, 8 bytes, allocation size 8)
-// run: @misaligned() -> ub misaligned @3:3 (offset 2 in an allocation aligned to 4, access needs 4)
+// run: @misaligned() -> ub misaligned @3:3 (offset 2 in an allocation aligned to 4 with no address yet, access needs 4)
 // A callee's stack memory ends when it returns.
 // run: @dangling() -> ub use-after-free @2:3 (stack memory from @1:3, whose region has ended)
 func @roundtrip(%x: i32) -> i32 {

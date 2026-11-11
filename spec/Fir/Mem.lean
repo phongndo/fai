@@ -43,6 +43,16 @@ def Alloc.read (a : Alloc) (off n : Nat) : List Byte :=
 def Alloc.write (a : Alloc) (off : Nat) (bs : List Byte) : Alloc :=
   { a with contents := writeBytes a.contents off bs }
 
+/-- Whether byte `off` of the allocation is aligned to `n`: the offset is a multiple of `n` and
+the allocation is aligned to at least `n`, or the allocation already has an address and the byte's
+address is a multiple of `n`. The second case allows aligning by hand. Checking it never assigns an
+address. -/
+def Alloc.alignedAt (al : Alloc) (off : Int) (n : Nat) : Bool :=
+  (off % n == 0 && al.align ≥ n) ||
+    match al.base with
+    | some b => (b + off) % n == 0
+    | none => false
+
 /-! ## Encoding values as bytes -/
 
 /-- The low `k` base-256 digits of `n`, least significant first. -/

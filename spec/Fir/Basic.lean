@@ -113,6 +113,11 @@ inductive Behavior where
   | hole (name : String)
   /-- The program is malformed. Verified programs never get stuck. -/
   | stuck (msg : String)
+  /-- The run reached a choice the reference semantics doesn't decide yet: an address that may
+  belong to several exposed (allocation, tag) pairs, where the choice changes what happens. The
+  intended rule picks the pair that avoids UB; until that is implemented, the run's behavior is
+  unknown, so it refines nothing and is refined by nothing but UB. -/
+  | ambiguous
   deriving DecidableEq, Repr
 
 def TrapReason.name : TrapReason → String

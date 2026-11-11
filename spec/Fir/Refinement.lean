@@ -197,7 +197,9 @@ theorem RVal.RefinesList.trans {as bs cs : List RVal} :
 
 /-! ## Function behaviors -/
 
-/-- `t.Refines s` for the observable behavior of a run. -/
+/-- `t.Refines s` for the observable behavior of a run. An `ambiguous` run has an unknown
+behavior: as a target it refines only UB, and as a source nothing refines it. So refinement is not
+reflexive on `ambiguous`. -/
 def Behavior.Refines : Behavior → Behavior → Prop
   | _, .ub _ => True
   | .ret vs, .ret vs' => RVal.RefinesList vs vs'
@@ -219,8 +221,8 @@ def Behavior.refines : Behavior → Behavior → Bool
 theorem Behavior.refines_iff {t s : Behavior} : t.refines s = true ↔ t.Refines s := by
   cases t <;> cases s <;> simp [Behavior.refines, Behavior.Refines, RVal.refinesList_iff]
 
-@[refl] theorem Behavior.Refines.refl (b : Behavior) : b.Refines b := by
-  cases b <;> simp [Behavior.Refines, RVal.RefinesList.refl]
+theorem Behavior.Refines.refl (b : Behavior) (h : b ≠ .ambiguous) : b.Refines b := by
+  cases b <;> simp_all [Behavior.Refines, RVal.RefinesList.refl]
 
 theorem Behavior.Refines.trans {a b c : Behavior} :
     a.Refines b → b.Refines c → a.Refines c := by

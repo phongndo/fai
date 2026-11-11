@@ -38,8 +38,12 @@ allocates less. -/
 def Func.Refines (mod : Module) (tgt src : Func) : Prop :=
   ∀ args b, Behaves mod tgt args b → ∃ b', Behaves mod src args b' ∧ b.Refines b'
 
-theorem Func.Refines.refl (mod : Module) (f : Func) : f.Refines mod f :=
-  fun _ b h => ⟨b, h, Behavior.Refines.refl b⟩
+/-- No run of `f` reaches a choice the reference semantics doesn't decide. -/
+def Func.Decided (mod : Module) (f : Func) : Prop :=
+  ∀ args, ¬ Behaves mod f args .ambiguous
+
+theorem Func.Refines.refl (mod : Module) (f : Func) (h : f.Decided mod) : f.Refines mod f :=
+  fun args b hb => ⟨b, hb, Behavior.Refines.refl b (by rintro rfl; exact h args hb)⟩
 
 theorem Func.Refines.trans {mod : Module} {a b c : Func} :
     a.Refines mod b → b.Refines mod c → a.Refines mod c := by
