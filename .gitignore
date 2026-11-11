@@ -1,0 +1,10 @@
+# Build output
+/build*/
+/result*
+
+# direnv
+/.direnv/
+
+# Lean
+.lake/
+/target/
