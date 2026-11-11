@@ -34,13 +34,13 @@ MFIR is where optimization happens. Building blocks have been lowered by proved 
 - core ops;
 - facts;
 - per-op effects;
-- JIT speculation ops (`spec.assume` and `spec.anchor`, following CoreJIT).
+- JIT speculation ops (`spec.assume` and `spec.anchor`, following CoreJIT), added in the JIT phase.
 
 **Target legality rule.** MFIR is core ops plus whatever ops the chosen target declares it handles natively. For example, a CPU target lowers `tensor.matmul` to loops, while an accelerator keeps `tensor.matmul` intact down to LFIR.
 
 Upper layers ask the target questions through the target-query API ("vector width?", "native matmul?"). Information flows up as answers; code never moves back up.
 
-Serialized MFIR is the portable bytecode shipped to JITs.
+In the JIT phase, serialized MFIR becomes the portable bytecode shipped to JITs.
 
 ## LFIR
 
@@ -67,9 +67,9 @@ All frontends, MFIR optimizations, and tools then work on the new chip.
 
 ## Execution paths
 
-- **AOT:** HFIR → MFIR → LFIR (native target) → object file.
-- **JIT:** HFIR → MFIR, shipped as bytecode. At runtime: interpreter or baseline tier, then an optimizing tier that reruns MFIR passes with speculation, then LFIR, then code in memory.
-- **Web:** HFIR → MFIR → LFIR (`wasm`) → `.wasm`.
+- **AOT (the first phase):** HFIR → MFIR → LFIR (native target) → object file.
+- **JIT (later):** HFIR → MFIR, shipped as bytecode. At runtime: interpreter or baseline tier, then an optimizing tier that reruns MFIR passes with speculation, then LFIR, then code in memory.
+- **Web (later):** HFIR → MFIR → LFIR (`wasm`) → `.wasm`.
 
 ## Why three layers
 

@@ -2,6 +2,18 @@
 
 FIR is a compiler environment for AOT, JIT, VM-based, and web (Wasm) targets, built around one formal semantics.
 
+## Phasing
+
+The first phase is the **AOT compiler** only, with a C subset as the first frontend. Nothing else is being built yet.
+
+Planned for later phases:
+
+- **JIT:** serialized MFIR as portable bytecode, tiered compilation, and proved speculation.
+- **VM embedding:** a kit for language VMs, with an interpreter tier, a GC interface, and deoptimization.
+- **Web:** WebAssembly output.
+
+Decisions made with these later phases in mind stay in the design, such as speculation ops, guaranteed tail calls, room for GC references, and `unordered` memory accesses. That way, adding a phase later won't change the core. Nothing is implemented for a phase until that phase starts.
+
 Most verified compilers keep their proofs internal, so only the compiler author benefits. FIR exposes its semantics and proofs as the API that frontends, backends, and tools are built on. A frontend or backend that plugs into FIR gets correctness checking, debugging tools, and optimization for free.
 
 ## Goals

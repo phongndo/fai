@@ -6,7 +6,7 @@
 |---|---|---|
 | Architecture | The Lean 4 spec is the source of truth; the production compiler is in Rust, with a self-hosted implementation as the long-term goal | Proofs need a precise reference; the spec outlives any one implementation language. Rust is chosen for correctness first: memory safety and data-race freedom rule out whole bug classes in the compiler itself, and exhaustive `match` on op kinds catches missing cases at compile time |
 | North star | Semantics as the platform | See [00-north-star.md](00-north-star.md) |
-| Scope | General-purpose target; a C subset is the first frontend | C has the hardest well-understood UB and large existing test corpora |
+| Scope | General-purpose target. The first phase is the AOT compiler only, with a C subset as the first frontend. JIT, VM embedding, and web (Wasm) are later phases; see [Phasing](00-north-star.md#phasing) | One execution mode keeps the first phase small, and the core is designed so later phases don't change it. C has the hardest well-understood UB and large existing test corpora |
 | Layers | HFIR / MFIR / LFIR as fixed contracts, with the target legality rule | See [01-layers.md](01-layers.md) |
 | Extensibility | Dialect-ready from day one: generic op representation, three trust tiers per op | Retrofitting generic ops is costly |
 | Deferred UB | `poison` plus `freeze`; no `undef`; branching on poison is UB | Lessons from LLVM's PLDI'17 work and the byte-type RFC |
@@ -49,12 +49,19 @@
 
 Ordered by dependency.
 
+### AOT phase (now)
+
 1. Structure details: symbol visibility and linkage, graph (unordered) regions for dataflow hardware
 2. Control flow details: coroutines, async, and generators (an HFIR building block lowered to a state machine; decided in the building-blocks round)
-3. Types details: function and closure types, arrays, tagged unions (building-blocks round); the `gc` dialect (later)
-4. Runtime and VM interface: deoptimization, safepoints and stack maps, on-stack replacement, patchpoints, unwinding
-5. ABI: C calling conventions, owned by FIR
-6. Representations: the full text grammar (written alongside FIR-0), binary format, versioning
-7. Transformations: pass manager, rule DSL, analyses, incremental compilation
-8. Lowering: target description format, ISA semantics sources, register allocation, linking, debug info
-9. Execution modes: AOT driver, JIT tiers, VM embedding, web output
+3. Types details: function and closure types, arrays, tagged unions (building-blocks round)
+4. ABI: C calling conventions, owned by FIR
+5. Representations: the full text grammar (written alongside FIR-0), binary format, versioning
+6. Transformations: pass manager, rule DSL, analyses, incremental compilation
+7. Lowering: target description format, first targets, ISA semantics sources, register allocation, linking, debug info
+8. AOT driver: command line, compilation pipeline, object file output
+
+### Later phases
+
+- Runtime and VM interface: deoptimization, safepoints and stack maps, on-stack replacement, patchpoints, unwinding
+- JIT tiers, VM embedding, and web (Wasm) output
+- The `gc` dialect
