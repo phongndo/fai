@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 // The API's version: the major version times 65536, plus the minor version.
-#define FIR_API_VERSION ((1 << 16) | 4)
+#define FIR_API_VERSION ((1 << 16) | 5)
 
 // No id: what a call returns when it fails.
 #define FIR_INVALID UINT32_MAX
@@ -887,7 +887,8 @@ FirStatus fir_type_layout(struct FirModule *m, FirType t, uint64_t *size, uint32
 FirStatus fir_type_field_offset(struct FirModule *m, FirType t, uint32_t index, uint64_t *offset);
 
 // Declare a function `@name(params) -> rets`, to call it or take its address, and define it
-// with `fir_func_begin`.
+// with `fir_func_begin`. Parameters and results are value types: scalars and structs and arrays
+// (which calls pass by value as the C ABI does; version 1.5), in HFIR also unions and slices.
 //
 // # Safety
 //
@@ -938,7 +939,9 @@ FirFunc fir_func_declare_va(struct FirModule *m,
 FirFunc fir_func_find(struct FirModule *m, const char *name);
 
 // `extern func @name(params) -> rets effects[…] trust`: a function outside the module, with the
-// `FIR_EFFECT_*` it may have.
+// `FIR_EFFECT_*` it may have. Parameters and results are scalars, or structs and arrays passed
+// and returned by value as the C ABI does (version 1.5; a struct or array result is the only
+// one).
 //
 // # Safety
 //

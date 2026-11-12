@@ -682,6 +682,153 @@ static void va_expected(char *out, size_t cap) {
   len += (size_t)snprintf(out + len, cap - len, "vforward %d\nvsum ok\n", k);
 }
 
+/* Structs and arrays by value across the C boundary (decision: C ABI for aggregates): every
+ * AAPCS64 class as an argument and a result of FIR functions C calls and of C functions FIR
+ * calls, directly and through `...`. */
+static FirModule *build_structs(void) {
+  FirModule *m = cur = fir_module_new();
+  FirType i16 = fir_type_int(16), i32 = fir_type_int(32), i64 = fir_type_int(64),
+          f32 = FIR_TYPE_F32, f64 = FIR_TYPE_F64, ptr = FIR_TYPE_PTR;
+  FirType pf[2] = {i32, f32};
+  FirType pair = ID(fir_type_struct(m, FIR_POLICY_C, pf, 2)); /* 8 bytes: x0 */
+  FirType hf[3] = {f64, f64, f64};
+  FirType hfa = ID(fir_type_struct(m, FIR_POLICY_C, hf, 3)); /* HFA: d0-d2 */
+  FirType shorts = ID(fir_type_array(m, 4, i16));
+  FirType bf[3] = {i64, ptr, shorts};
+  FirType big = ID(fir_type_struct(m, FIR_POLICY_C, bf, 3)); /* 24 bytes: by reference */
+  FirType two = ID(fir_type_array(m, 2, f32));               /* HFA: s0, s1 */
+  FirEffect rd[1] = {FIR_EFFECT_READ_ARGS};
+  FirType cps[4] = {pair, hfa, big, two};
+  FirFunc c_mix = ID(fir_extern_declare(m, "c_mix", cps, 4, &hfa, 1, rd, 1, FIR_TRUST_ASSUME));
+  FirFunc c_va = ID(fir_extern_declare_va(m, "c_va", &i32, 1, &i64, 1, true, rd, 1,
+                                          FIR_TRUST_ASSUME));
+  FirType mps[5] = {pair, hfa, big, two, i32};
+  FirFunc fir_mix = ID(fir_func_declare(m, "fir_mix", mps, 5, &big, 1));
+  FirFunc fir_calls = ID(fir_func_declare(m, "fir_calls", &ptr, 1, &f64, 1));
+  FirFunc fir_va = ID(fir_func_declare_va(m, "fir_va", &i32, 1, &pair, 1, true));
+
+  /* @fir_mix(%p: pair, %h: hfa, %b: big, %t: two, %k: i32) -> big: {b.0 + p.0 + k, b.1,
+   * [i16 of h.2, b.2[1], b.2[2], i16 of t.1 + load(b.1)]}: every class in, a large one out. */
+  FirBuilder *b = fir_func_begin(m, fir_mix);
+  FirValue p = ID(fir_builder_param(b, 0)), h = ID(fir_builder_param(b, 1)),
+           bg = ID(fir_builder_param(b, 2)), t = ID(fir_builder_param(b, 3)),
+           k = ID(fir_builder_param(b, 4));
+  FirValue p0 = ID(fir_int_sext(b, i64, ID(fir_agg_extract(b, i32, p, 0))));
+  FirValue b0 = ID(fir_agg_extract(b, i64, bg, 0)), b1 = ID(fir_agg_extract(b, ptr, bg, 1));
+  FirValue b2 = ID(fir_agg_extract(b, shorts, bg, 2));
+  FirValue s0 = ID(fir_int_arith(b, FIR_ARITH_OP_ADD, FIR_OVF_WRAP, b0, p0));
+  s0 = ID(fir_int_arith(b, FIR_ARITH_OP_ADD, FIR_OVF_WRAP, s0, ID(fir_int_sext(b, i64, k))));
+  FirValue h2 = ID(fir_agg_extract(b, f64, h, 2));
+  FirValue e0 = ID(fir_float_to_int(b, i16, true, FIR_CVT_EDGE_SAT, h2));
+  FirValue t1 = ID(fir_agg_extract(b, f32, t, 1));
+  FirValue e3 = ID(fir_float_to_int(b, i16, true, FIR_CVT_EDGE_SAT, t1));
+  e3 = ID(fir_int_arith(b, FIR_ARITH_OP_ADD, FIR_OVF_WRAP, e3, ID(fir_mem_load(b, i16, b1, 2))));
+  FirValue es[4] = {e0, ID(fir_agg_extract(b, i16, b2, 1)), ID(fir_agg_extract(b, i16, b2, 2)),
+                    e3};
+  FirValue bs[3] = {s0, b1, ID(fir_agg_make(b, shorts, es, 4))};
+  FirValue r = ID(fir_agg_make(b, big, bs, 3));
+  ID(fir_func_ret(b, &r, 1));
+  OK(fir_func_end(b));
+
+  /* @fir_calls(%q: ptr) -> f64: c_mix of constants (the sum of the HFA it gives back), plus
+   * c_va(3, ... pair, big, hfa) converted. */
+  b = fir_func_begin(m, fir_calls);
+  FirValue q = ID(fir_builder_param(b, 0));
+  FirValue pv[2] = {ID(fir_int_const(b, i32, -40)), ID(fir_float_const_f32(b, 2.5f))};
+  FirValue pr = ID(fir_agg_make(b, pair, pv, 2));
+  FirValue hv[3] = {ID(fir_float_const_f64(b, 0.25)), ID(fir_float_const_f64(b, 1e10)),
+                    ID(fir_float_const_f64(b, -3.0))};
+  FirValue hh = ID(fir_agg_make(b, hfa, hv, 3));
+  FirValue sv[4] = {ID(fir_int_const(b, i16, 1)), ID(fir_int_const(b, i16, -2)),
+                    ID(fir_int_const(b, i16, 3)), ID(fir_int_const(b, i16, -4))};
+  FirValue bv[3] = {ID(fir_int_const(b, i64, 1234567890123)), q, ID(fir_agg_make(b, shorts, sv, 4))};
+  FirValue bb = ID(fir_agg_make(b, big, bv, 3));
+  FirValue tv[2] = {ID(fir_float_const_f32(b, 0.5f)), ID(fir_float_const_f32(b, -8.0f))};
+  FirValue tt = ID(fir_agg_make(b, two, tv, 2));
+  FirValue ca[4] = {pr, hh, bb, tt};
+  FirValue got = result(b, ID(fir_func_call(b, c_mix, ca, 4)), 0);
+  FirValue g0 = ID(fir_agg_extract(b, f64, got, 0)), g1 = ID(fir_agg_extract(b, f64, got, 1)),
+           g2 = ID(fir_agg_extract(b, f64, got, 2));
+  FirValue sum = ID(fir_float_bin(b, FIR_FBIN_OP_ADD, g0, g1));
+  sum = ID(fir_float_bin(b, FIR_FBIN_OP_ADD, sum, g2));
+  FirValue va[4] = {ID(fir_int_const(b, i32, 3)), pr, bb, hh};
+  FirValue n = result(b, ID(fir_func_call(b, c_va, va, 4)), 0);
+  FirValue nf = ID(fir_int_to_float(b, f64, true, n));
+  sum = ID(fir_float_bin(b, FIR_FBIN_OP_ADD, sum, nf));
+  ID(fir_func_ret(b, &sum, 1));
+  OK(fir_func_end(b));
+
+  /* @fir_va(%n: i32, ...) -> pair: reads a pair, a big, and an HFA; gives {pair.0 + n + big.0
+   * (as i32), pair.1 + hfa.1 (as f32)}. */
+  b = fir_func_begin(m, fir_va);
+  FirValue cnt = ID(fir_builder_param(b, 0));
+  FirValue ap = ID(fir_mem_stack_of(b, FIR_TYPE_VA_LIST, 8));
+  ID(fir_va_start(b, ap));
+  FirValue vp = ID(fir_va_arg(b, pair, ap)), vb = ID(fir_va_arg(b, big, ap)),
+           vh = ID(fir_va_arg(b, hfa, ap));
+  ID(fir_va_end(b, ap));
+  FirValue x = ID(fir_agg_extract(b, i32, vp, 0));
+  x = ID(fir_int_arith(b, FIR_ARITH_OP_ADD, FIR_OVF_WRAP, x, cnt));
+  FirValue big0 = ID(fir_int_trunc(b, i32, FIR_TRUNC_MODE_WRAP, ID(fir_agg_extract(b, i64, vb, 0))));
+  x = ID(fir_int_arith(b, FIR_ARITH_OP_ADD, FIR_OVF_WRAP, x, big0));
+  FirValue y = ID(fir_float_bin(b, FIR_FBIN_OP_ADD, ID(fir_float_ext(b, f64, ID(fir_agg_extract(b, f32, vp, 1)))),
+                                ID(fir_agg_extract(b, f64, vh, 1))));
+  FirValue xy[2] = {x, ID(fir_float_trunc(b, f32, y))};
+  FirValue out = ID(fir_agg_make(b, pair, xy, 2));
+  ID(fir_func_ret(b, &out, 1));
+  OK(fir_func_end(b));
+  return m;
+}
+
+/* The structs module's native side: C calls the FIR functions with constants, and defines the
+ * C functions FIR calls; each check prints `ok` or what differs. */
+static const char *struct_main =
+    "#include <stdarg.h>\n"
+    "#include <stdint.h>\n"
+    "#include <stdio.h>\n"
+    "void __fir_trap(uint32_t r, uint32_t line, uint32_t col) {\n"
+    "  printf(\"trap %u @%u:%u\\n\", r, line, col);\n"
+    "}\n"
+    "struct pair { int32_t a; float b; };\n"
+    "struct hfa { double a, b, c; };\n"
+    "struct big { int64_t a; int16_t *p; int16_t s[4]; };\n"
+    "struct two { float e[2]; };\n"
+    "struct big fir_mix(struct pair, struct hfa, struct big, struct two, int32_t);\n"
+    "double fir_calls(int16_t *);\n"
+    "struct pair fir_va(int32_t, ...);\n"
+    "static int bad = 0;\n"
+    "static void check(int ok, const char *what) { printf(\"%s %s\\n\", what, ok ? \"ok\" : \"WRONG\"); bad |= !ok; }\n"
+    "struct hfa c_mix(struct pair p, struct hfa h, struct big b, struct two t) {\n"
+    "  check(p.a == -40 && p.b == 2.5f, \"c_mix pair\");\n"
+    "  check(h.a == 0.25 && h.b == 1e10 && h.c == -3.0, \"c_mix hfa\");\n"
+    "  check(b.a == 1234567890123 && b.p[0] == 77 && b.s[0] == 1 && b.s[1] == -2 && b.s[2] == 3 && b.s[3] == -4, \"c_mix big\");\n"
+    "  check(t.e[0] == 0.5f && t.e[1] == -8.0f, \"c_mix array\");\n"
+    "  b.a = 0; /* the callee's copy */\n"
+    "  return (struct hfa){1.5, 2.5, -0.5};\n"
+    "}\n"
+    "int64_t c_va(int32_t n, ...) {\n"
+    "  va_list ap;\n"
+    "  va_start(ap, n);\n"
+    "  struct pair p = va_arg(ap, struct pair);\n"
+    "  struct big b = va_arg(ap, struct big);\n"
+    "  struct hfa h = va_arg(ap, struct hfa);\n"
+    "  va_end(ap);\n"
+    "  check(n == 3 && p.a == -40 && p.b == 2.5f && b.a == 1234567890123 && b.s[3] == -4 && h.b == 1e10, \"c_va\");\n"
+    "  return p.a + b.s[2] + (int64_t)h.c;\n"
+    "}\n"
+    "int main(void) {\n"
+    "  int16_t cell[1] = {77};\n"
+    "  struct big b = {5000000000, cell, {10, 20, 30, 40}};\n"
+    "  struct big r = fir_mix((struct pair){7, 0.5f}, (struct hfa){1.0, 2.0, 300.75}, b, (struct two){{9.0f, 41.5f}}, -3);\n"
+    "  check(r.a == 5000000004 && r.p == cell && r.s[0] == 300 && r.s[1] == 20 && r.s[2] == 30 && r.s[3] == 118, \"fir_mix\");\n"
+    "  check(b.a == 5000000000, \"fir_mix leaves the caller's copy\");\n"
+    "  double d = fir_calls(cell);\n"
+    "  check(d == 3.5 + (-40 + 3 - 3), \"fir_calls\");\n"
+    "  struct pair v = fir_va(5, (struct pair){100, 1.25f}, b, (struct hfa){0, 0.5, 0});\n"
+    "  check(v.a == 100 + 5 + (int32_t)5000000000 && v.b == 1.75f, \"fir_va\");\n"
+    "  return bad;\n"
+    "}\n";
+
 static int write_file(const char *path, const char *text) {
   FILE *f = fopen(path, "w");
   if (f == NULL) return 0;
@@ -907,6 +1054,75 @@ int main(void) {
     printf("native varargs: %d of 2 programs match the host's printf\n", matched);
   }
   fir_module_free(vm);
+
+  /* Structs and arrays by value across the C boundary. */
+  FirModule *sm = build_structs();
+  OK(fir_module_verify(sm));
+  char *sout = NULL;
+  OK(fir_module_run(sm, "fir_calls", (const char *[]){"null"}, 1, FIR_DEFAULT_FUEL, &sout));
+  CHECK(sout != NULL &&
+        strstr(sout, "@c_mix({i32 -40, f32 2.5}, {f64 0.25, f64 10000000000.0, f64 -3.0}, {i64 "
+                     "1234567890123, ptr null, {i16 1, i16 -2, i16 3, i16 -4}}, {f32 0.5, f32 "
+                     "-8.0}) -> {f64 0.0, f64 0.0, f64 0.0}") != NULL);
+  printf("fir run @fir_calls(null): %s\n", sout ? sout : "?");
+  fir_string_free(sout);
+  /* Apple's ABI packs stack arguments: a struct passed on the stack is a compile error there. */
+  {
+    FirModule *dm = cur = fir_module_new();
+    FirType i64 = fir_type_int(64), fs[2] = {i64, i64};
+    FirType w2 = ID(fir_type_struct(dm, FIR_POLICY_C, fs, 2));
+    FirType ps[5] = {w2, w2, w2, w2, w2};
+    FirFunc f = ID(fir_func_declare(dm, "five", ps, 5, NULL, 0));
+    FirBuilder *b = fir_func_begin(dm, f);
+    ID(fir_func_ret(b, NULL, 0));
+    OK(fir_func_end(b));
+    char *das = NULL;
+    CHECK(fir_module_compile(dm, "aarch64", false, FIR_OS_DARWIN, &das) == FIR_ERR_COMPILE &&
+          strstr(fir_module_error(dm), "on the stack") != NULL);
+    OK(fir_module_compile(dm, "aarch64", false, FIR_OS_LINUX, &das));
+    fir_string_free(das);
+    fir_module_free(dm);
+  }
+  cur = sm;
+  if (cc != NULL && *cc != '\0' && dir != NULL) {
+    int matched = 0;
+    for (int opt = 0; opt < 2; opt++) {
+      char *sas = NULL;
+      OK(fir_module_compile(sm, "aarch64", opt == 1, FIR_OS_LINUX, &sas));
+      char sf[1024], cf[1024], bin[1024], cmd[4096];
+      const char *name = opt ? "structs-O" : "structs";
+      snprintf(sf, sizeof sf, "%s/%s.s", dir, name);
+      snprintf(cf, sizeof cf, "%s/%s_main.c", dir, name);
+      snprintf(bin, sizeof bin, "%s/%s", dir, name);
+      if (sas == NULL || !write_file(sf, sas) || !write_file(cf, struct_main)) {
+        failures++;
+        fir_string_free(sas);
+        continue;
+      }
+      fir_string_free(sas);
+      snprintf(cmd, sizeof cmd, "\"%s\" -O1 -w \"%s\" \"%s\" -o \"%s\"", cc, cf, sf, bin);
+      if (system(cmd) != 0) {
+        fprintf(stderr, "building %s failed\n", bin);
+        failures++;
+        continue;
+      }
+      snprintf(cmd, sizeof cmd, "%s%s\"%s\"", runner ? runner : "", runner && *runner ? " " : "",
+               bin);
+      FILE *pipe = popen(cmd, "r");
+      char got[2048];
+      size_t len = pipe != NULL ? fread(got, 1, sizeof got - 1, pipe) : 0;
+      got[len] = '\0';
+      int status = pipe != NULL ? pclose(pipe) : -1;
+      printf("native%s structs:\n%s", opt ? " -O" : "", got);
+      if (status == 0 && strstr(got, "WRONG") == NULL && strstr(got, "fir_va ok") != NULL) {
+        matched++;
+      } else {
+        failures++;
+      }
+    }
+    printf("native structs: %d of 2 programs pass every check\n", matched);
+  }
+  fir_module_free(sm);
   if (failures > 0) {
     fprintf(stderr, "%d checks failed\n", failures);
     return 1;

@@ -84,7 +84,7 @@ mod ops;
 pub use ops::*;
 
 /// The API's version: the major version times 65536, plus the minor version.
-pub const FIR_API_VERSION: u32 = (1 << 16) | 4;
+pub const FIR_API_VERSION: u32 = (1 << 16) | 5;
 
 /// No id: what a call returns when it fails.
 pub const FIR_INVALID: u32 = u32::MAX;
@@ -1619,7 +1619,8 @@ pub unsafe extern "C" fn fir_type_field_offset(
 // Declarations.
 
 /// Declare a function `@name(params) -> rets`, to call it or take its address, and define it
-/// with `fir_func_begin`.
+/// with `fir_func_begin`. Parameters and results are value types: scalars and structs and arrays
+/// (which calls pass by value as the C ABI does; version 1.5), in HFIR also unions and slices.
 ///
 /// # Safety
 ///
@@ -1707,7 +1708,9 @@ pub unsafe extern "C" fn fir_func_find(m: *mut FirModule, name: *const c_char) -
 }
 
 /// `extern func @name(params) -> rets effects[…] trust`: a function outside the module, with the
-/// `FIR_EFFECT_*` it may have.
+/// `FIR_EFFECT_*` it may have. Parameters and results are scalars, or structs and arrays passed
+/// and returned by value as the C ABI does (version 1.5; a struct or array result is the only
+/// one).
 ///
 /// # Safety
 ///

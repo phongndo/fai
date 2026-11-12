@@ -834,7 +834,7 @@ static void building_blocks(void) {
   expect_run(m, "blocks", ovf_args, 2, "trap overflow");
   expect_run(m, "blocks", oob_args, 2, "trap bounds");
 
-  /* Lowered to MFIR: the same runs, and @swap passes its struct as two i32s. */
+  /* Lowered to MFIR: the same runs, and @swap passes its struct whole, as the C ABI does. */
   FirModule *l = NULL;
   OK(fir_module_lower(m, &l));
   CHECK(l != NULL);
@@ -844,7 +844,7 @@ static void building_blocks(void) {
     expect_run(l, "blocks", oob_args, 2, "trap bounds");
     char *text = fir_module_print(l, false);
     CHECK(text != NULL && strncmp(text, "layer mfir\n", 11) == 0);
-    CHECK(text != NULL && strstr(text, "func @swap(%s.0: i32, %s.1: i32) -> (i32, i32)") != NULL);
+    CHECK(text != NULL && strstr(text, "func @swap(%s: struct<C>{i32, i32}) -> struct<C>{i32, i32}") != NULL);
     fir_string_free(text);
     cur = l;
     FirModule *again = NULL;
