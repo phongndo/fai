@@ -1,6 +1,6 @@
 /* Dynamic programming over arrays: 0/1 knapsack, longest common subsequence with
- * reconstruction, and edit distance. */
-#include "fai_test.h"
+ * reconstruction, and edit distance; printed with printf. */
+#include <stdio.h>
 
 static int max(int a, int b) { return a > b ? a : b; }
 static int min3(int a, int b, int c) { return a < b ? (a < c ? a : c) : (b < c ? b : c); }
@@ -47,13 +47,12 @@ static int edit(const char *a, const char *b) {
 
 int main(void) {
   int w[] = {12, 7, 11, 8, 9, 6, 15, 3, 4, 10}, v[] = {24, 13, 23, 15, 16, 11, 29, 5, 7, 19};
-  show("knapsack 26", knapsack(w, v, 10, 26));
-  show("knapsack 50", knapsack(w, v, 10, 50));
+  printf("knapsack 26: %d\n", knapsack(w, v, 10, 26));
+  printf("knapsack 50: %d\n", knapsack(w, v, 10, 50));
   char out[64];
-  show("lcs", lcs("AGGTABQRSTUVW", "GXTXAYBRTUW", out));
-  print_str(out);
-  fai_put_char('\n');
-  show("edit kitten sitting", edit("kitten", "sitting"));
-  show("edit intention execution", edit("intention", "execution"));
+  int n = lcs("AGGTABQRSTUVW", "GXTXAYBRTUW", out);
+  printf("lcs %d \"%s\"\n", n, out);
+  printf("edit kitten sitting: %d\n", edit("kitten", "sitting"));
+  printf("edit intention execution: %d\n", edit("intention", "execution"));
   return 0;
 }

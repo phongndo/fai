@@ -1,8 +1,9 @@
-/* The corpus's output helpers. Until fai-cc has varargs (track V) there is no printf, so the
- * programs print through two external functions, defined in fai_runtime.c for native runs; in
- * `fir run` each call is an event (`@fai_put_long(i64 42) -> ();`), which the test harness turns
- * back into the same text. Floats print as their exact bits in hexadecimal and a rounded
- * decimal, both computed in C on top of the two. */
+/* The corpus's output helpers: two external functions, defined in fai_runtime.c for native
+ * runs; in `fir run` each call is an event (`@fai_put_long(i64 42) -> ();`), which the test
+ * harness turns back into the same text. Programs that print through printf instead run only
+ * natively: the interpreter's world answers printf with zeros, so their output isn't comparable
+ * there. Floats print as their exact bits in hexadecimal and a rounded decimal, both computed
+ * in C on top of the two. */
 #ifndef FAI_TEST_H
 #define FAI_TEST_H
 

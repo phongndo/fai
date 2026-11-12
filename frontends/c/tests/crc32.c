@@ -1,7 +1,8 @@
 /* CRC-32 (IEEE) with a table built at run time, and Adler-32, over strings and a generated
- * buffer: unsigned 32-bit arithmetic, shifts, and table lookups. */
-#include "fai_test.h"
+ * buffer: unsigned 32-bit arithmetic, shifts, and table lookups; printed with printf. */
+#include <inttypes.h>
 #include <stdint.h>
+#include <stdio.h>
 
 static uint32_t table[256];
 
@@ -34,16 +35,21 @@ static unsigned long len(const char *s) {
   return n;
 }
 
+/* "label hex decimal" */
+static void show32(const char *label, uint32_t v) {
+  printf("%-16s %08" PRIx32 " %10" PRIu32 "\n", label, v, v);
+}
+
 int main(void) {
   build();
   const char *s = "The quick brown fox jumps over the lazy dog";
-  show("crc32", crc32((const unsigned char *)s, len(s)));
-  show("crc32 empty", crc32((const unsigned char *)"", 0));
-  show("crc32 123456789", crc32((const unsigned char *)"123456789", 9));
-  show("adler32", adler32((const unsigned char *)s, len(s)));
+  show32("crc32", crc32((const unsigned char *)s, len(s)));
+  show32("crc32 empty", crc32((const unsigned char *)"", 0));
+  show32("crc32 123456789", crc32((const unsigned char *)"123456789", 9));
+  show32("adler32", adler32((const unsigned char *)s, len(s)));
   unsigned char buf[1000];
   for (int i = 0; i < 1000; i++) buf[i] = (unsigned char)(i * 31 + (i >> 3));
-  show("crc32 buffer", crc32(buf, sizeof buf));
-  show("adler32 buffer", adler32(buf, sizeof buf));
+  show32("crc32 buffer", crc32(buf, sizeof buf));
+  show32("adler32 buffer", adler32(buf, sizeof buf));
   return 0;
 }

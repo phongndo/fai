@@ -1,31 +1,40 @@
 /* Calls to libm (external functions with float arguments and results, some through pointers),
  * the <math.h> classification and comparison macros (Clang's float builtins, which are FIR
- * ops), and the __builtin_ functions and constants with a FIR op. */
-#include "fai_test.h"
+ * ops), and the __builtin_ functions and constants with a FIR op. Printed with printf: each
+ * float's exact bits, then its value with %.17g (a float promoted to double, %.9g). */
 #include <math.h>
+#include <stdio.h>
+
+static void show(const char *label, long v) { printf("%s %ld\n", label, v); }
+
+static void show_d(const char *label, double x) {
+  union {
+    double d;
+    unsigned long u;
+  } b = {x};
+  printf("%s 0x%016lx %.17g\n", label, b.u, x);
+}
+
+static void show_f(const char *label, float x) {
+  union {
+    float f;
+    unsigned u;
+  } b = {x};
+  printf("%s 0x%08x %.9g\n", label, b.u, x);
+}
 
 double in[] = {2.0, -2.5, 0.5, 10.0, 1e-310, -0.0, 3.75, 100.0};
 float fin[] = {2.0f, -2.5f, 0.5f, 7.25f};
 unsigned long snan_bits = 0x7ff0000000000001UL;
 
 void classify(double x) {
-  fai_put_long(isnan(x));
-  fai_put_long(isinf(x) != 0);
-  fai_put_long(isfinite(x) != 0);
-  fai_put_long(isnormal(x) != 0);
-  fai_put_long(signbit(x) != 0);
-  fai_put_long(fpclassify(x) == FP_ZERO);
-  fai_put_long(fpclassify(x) == FP_SUBNORMAL);
-  fai_put_char('\n');
+  printf("%d%d%d%d%d%d%d\n", isnan(x), isinf(x) != 0, isfinite(x) != 0, isnormal(x) != 0,
+         signbit(x) != 0, fpclassify(x) == FP_ZERO, fpclassify(x) == FP_SUBNORMAL);
 }
 
 void fclassify(float x) {
-  fai_put_long(isnan(x));
-  fai_put_long(isinf(x) != 0);
-  fai_put_long(isfinite(x) != 0);
-  fai_put_long(isnormal(x) != 0);
-  fai_put_long(signbit(x) != 0);
-  fai_put_char('\n');
+  printf("%d%d%d%d%d\n", isnan(x), isinf(x) != 0, isfinite(x) != 0, isnormal(x) != 0,
+         signbit(x) != 0);
 }
 
 int main(void) {

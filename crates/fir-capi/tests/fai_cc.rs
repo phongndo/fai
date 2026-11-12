@@ -10,7 +10,8 @@
 //! (`fai-cc --emit hfir`) also runs in the interpreter, under Arm's NaN choice (the NaNs the
 //! hardware gives, as the backend's harness does), whose calls of the output helpers (events)
 //! must spell the same text and whose result the same exit code; a program that calls other
-//! external functions (libm's included) isn't comparable there and is counted.
+//! external functions (libm's, or libc's `printf`) isn't comparable there, since the
+//! interpreter's world answers them with zeros: it is listed with the first such function.
 //!
 //! The programs under `frontends/c/tests/errors/` use what `fai-cc` doesn't support yet: each
 //! says where and what in `// expect: LINE:COL: TEXT` lines, and `fai-cc` must report exactly
@@ -202,10 +203,16 @@ fn run_native(tc: &Toolchain, exe: &Path) -> Result<Behavior, String> {
     }
 }
 
-/// The interpreter's run of `main`, as a native run's behavior: the output helpers' events
-/// spelled out, and the returned value as an exit code. `None` if the program calls other
-/// external functions.
-fn run_fir(hfir: &str) -> Result<Option<Behavior>, String> {
+/// What the interpreter's run of `main` gives.
+enum FirRun {
+    /// The output helpers' events spelled out, and the returned value as an exit code.
+    Ran(Behavior),
+    /// The program calls this other external function, so its run can't be compared.
+    Calls(String),
+}
+
+/// The interpreter's run of `main`, as a native run's behavior.
+fn run_fir(hfir: &str) -> Result<FirRun, String> {
     let m = fir::parse_module(hfir).map_err(|e| format!("the HFIR doesn't parse: {e}"))?;
     fir::verify_module(&m).map_err(|e| format!("the HFIR doesn't verify: {e}"))?;
     let r = fir::interp::run_detail_with(
@@ -232,7 +239,8 @@ fn run_fir(hfir: &str) -> Result<Option<Behavior>, String> {
         } else if let Some(c) = arg("@fai_put_char(i32 ") {
             stdout.push(char::from(c as u8));
         } else {
-            return Ok(None);
+            let callee = call.split_once('(').map_or(call, |c| c.0);
+            return Ok(FirRun::Calls(callee.trim_start_matches('@').to_owned()));
         }
     }
     let outcome = r.line[r.events.len()..]
@@ -243,7 +251,7 @@ fn run_fir(hfir: &str) -> Result<Option<Behavior>, String> {
         Some(v) => v.parse::<i64>().map_err(|e| format!("'{outcome}': {e}"))? & 0xff,
         None => return Err(format!("fir run: {outcome}")),
     };
-    Ok(Some(Behavior {
+    Ok(FirRun::Ran(Behavior {
         stdout,
         code: code as i32,
     }))
@@ -357,13 +365,17 @@ fn one(file: &Path, fai: &Path, tc: &Toolchain, rt: &Path, out: &Path, tally: &M
         false
     } else {
         match run_fir(&String::from_utf8_lossy(&hfir.stdout)) {
-            Ok(Some(got)) if got == want => true,
-            Ok(Some(got)) => {
+            Ok(FirRun::Ran(got)) if got == want => true,
+            Ok(FirRun::Ran(got)) => {
                 fail(format!("fir run gives {got:?}, the reference {want:?}"));
                 false
             }
-            Ok(None) => {
-                tally.lock().unwrap().fir_other_externs.push(name.clone());
+            Ok(FirRun::Calls(callee)) => {
+                tally
+                    .lock()
+                    .unwrap()
+                    .fir_other_externs
+                    .push(format!("{name} ({callee})"));
                 false
             }
             Err(e) => {
@@ -481,13 +493,14 @@ fn fai_cc_corpus() {
     t.fir_other_externs.sort();
     eprintln!(
         "fai-cc corpus: {} programs; native runs matching the reference: {} without -O, {} with \
-         -O; fir run matching: {} ({} call other external functions: {:?}); error tests: {}",
+         -O; fir run matching: {}, not comparable: {} (calling other external functions: {}); \
+         error tests: {}",
         t.programs,
         t.native,
         t.native_opt,
         t.fir_match,
         t.fir_other_externs.len(),
-        t.fir_other_externs,
+        t.fir_other_externs.join(", "),
         errors
     );
     assert!(
