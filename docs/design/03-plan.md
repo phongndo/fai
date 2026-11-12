@@ -59,6 +59,13 @@ addresses become offsets (MFIR computes offsets, per the Layout decision). Each 
 differential testing against the reference interpreter. Matching each Rust pass to its Lean proof
 by construction (certificates or generated matchers) comes after this round.
 
+**Progress:** the pass manager and the four passes are in `crates/fir/src/passes/` (decision:
+Passes): `fir opt FILE [-O | --passes dse,fwd,copyprop,dce] [--remarks] [--stats]`, verifying
+after every pass in development builds. Optimized fixtures and random programs (including
+programs made to exercise the memory passes) refine the originals in `fir run` and still verify
+(the fixtures in `fir-ref check` too). Each pass costs a few nanoseconds per op on functions of a million
+ops; the whole `-O` pipeline costs less than parsing.
+
 ## LFIR for AArch64
 
 - **Dialect:** `aarch64.*` ops for the instructions fai emits, over virtual then physical
