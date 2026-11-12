@@ -73,7 +73,7 @@ Ordered by dependency.
 
 ### AOT phase (now)
 
-0. FIR-1 program-level proofs: the simulation framework and dead store elimination are proved. Next: mem2reg (needs a relation between cores whose memories and environments differ), store-to-load forwarding, dead allocations, and reordering across `noalias`. Also: the angelic choice for ambiguous addresses, replacing the `ambiguous` outcome; type safety (verified programs never get stuck)
+0. FIR-1 program-level proofs: the simulation framework, dead store elimination, and store-to-load forwarding are proved. Next: copy propagation and mem2reg (both need a relation between cores whose environments differ; mem2reg also needs one between memories), dead allocations, and reordering across `noalias`. Also: the angelic choice for ambiguous addresses, replacing the `ambiguous` outcome; type safety (verified programs never get stuck)
 1. Structure details: symbol visibility and linkage, graph (unordered) regions for dataflow hardware
 2. Control flow details: coroutines, async, and generators (an HFIR building block lowered to a state machine; decided in the building-blocks round)
 3. Types details: function and closure types, arrays, tagged unions (building-blocks round)

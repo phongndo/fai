@@ -88,6 +88,16 @@ def StepMatch (R : Machine → Machine → Prop) (mt ms : Machine) : Prop :=
   (∀ ht, step mt = .error ht → Escapes ms ∨
     ∃ j hs, runSteps j ms = .error hs ∧ ht.behavior.Refines hs.behavior)
 
+/-- A step match for one relation is one for a weaker relation, where that holds of the states the
+source reaches. -/
+theorem StepMatch.mono {R1 R2 : Machine → Machine → Prop} {mt ms : Machine} (h : StepMatch R1 mt ms)
+    (hr : ∀ mt' k ms', runSteps (k + 1) ms = .ok ms' → R1 mt' ms' → R2 mt' ms') :
+    StepMatch R2 mt ms := by
+  refine ⟨fun mt' e => ?_, h.2⟩
+  rcases h.1 mt' e with hesc | ⟨k, ms', ek, hR, hsh⟩
+  · exact .inl hesc
+  · exact .inr ⟨k, ms', ek, hr mt' k ms' ek hR, hsh⟩
+
 /-- `R` relates target states to source states, and every related pair matches. -/
 def Simulation (R : Machine → Machine → Prop) : Prop :=
   ∀ mt ms, R mt ms → StepMatch R mt ms
