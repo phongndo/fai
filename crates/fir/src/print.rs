@@ -4,180 +4,8 @@
 use std::fmt::Write;
 
 use crate::body::{Body, Int, OpId, Operand, OperandKind, RegionId, ValueId};
+use crate::decl::{Field, FieldTy, Imm, Item};
 use crate::ir::*;
-
-impl Ovf {
-    pub fn suffix(self) -> &'static str {
-        match self {
-            Ovf::Wrap => "wrap",
-            Ovf::Nsw => "nsw",
-            Ovf::Nuw => "nuw",
-            Ovf::NswNuw => "nsw.nuw",
-            Ovf::Trap(s) => {
-                if s {
-                    "s.trap"
-                } else {
-                    "u.trap"
-                }
-            }
-            Ovf::Sat(s) => {
-                if s {
-                    "s.sat"
-                } else {
-                    "u.sat"
-                }
-            }
-            Ovf::Ub(s) => {
-                if s {
-                    "s.ub"
-                } else {
-                    "u.ub"
-                }
-            }
-        }
-    }
-}
-
-impl Edge {
-    pub fn name(self) -> &'static str {
-        match self {
-            Edge::Ub => "ub",
-            Edge::Trap => "trap",
-            Edge::Total => "total",
-            Edge::Wrap => "wrap",
-        }
-    }
-}
-
-impl ShiftEdge {
-    pub fn name(self) -> &'static str {
-        match self {
-            ShiftEdge::Ub => "ub",
-            ShiftEdge::Trap => "trap",
-            ShiftEdge::Mask => "mask",
-            ShiftEdge::Total => "total",
-        }
-    }
-}
-
-impl Pred {
-    pub fn name(self) -> &'static str {
-        match self {
-            Pred::Eq => "eq",
-            Pred::Ne => "ne",
-            Pred::Slt => "slt",
-            Pred::Sle => "sle",
-            Pred::Sgt => "sgt",
-            Pred::Sge => "sge",
-            Pred::Ult => "ult",
-            Pred::Ule => "ule",
-            Pred::Ugt => "ugt",
-            Pred::Uge => "uge",
-        }
-    }
-}
-
-/// Whether one division modifier covers both edge cases.
-fn div_one_modifier(signed: bool, zero: Edge, ovf: Edge) -> bool {
-    !signed
-        || (zero, ovf) == (Edge::Ub, Edge::Ub)
-        || (zero, ovf) == (Edge::Trap, Edge::Trap)
-        || (zero, ovf) == (Edge::Total, Edge::Wrap)
-}
-
-impl OpKind {
-    /// The op's name with its modifiers, as written in text.
-    pub fn name(&self) -> String {
-        let mut s = String::new();
-        self.write_name(&mut s);
-        s
-    }
-
-    /// Append the op's name with its modifiers.
-    pub fn write_name(&self, out: &mut String) {
-        use OpKind::*;
-        let mut push = |parts: &[&str]| {
-            for p in parts {
-                out.push_str(p);
-            }
-        };
-        match self {
-            Const(_) => push(&["int.const"]),
-            Poison => push(&["poison"]),
-            Freeze => push(&["freeze"]),
-            Copy => push(&["copy"]),
-            Select => push(&["select"]),
-            Arith(op, o) => {
-                let n = match op {
-                    ArithOp::Add => "int.add.",
-                    ArithOp::Sub => "int.sub.",
-                    ArithOp::Mul => "int.mul.",
-                };
-                push(&[n, o.suffix()]);
-            }
-            Bit(op) => push(&[match op {
-                BitOp::And => "int.and",
-                BitOp::Or => "int.or",
-                BitOp::Xor => "int.xor",
-            }]),
-            Div(op, z, o) => {
-                let n = match op {
-                    DivOp::DivS => "int.div.s.",
-                    DivOp::DivU => "int.div.u.",
-                    DivOp::RemS => "int.rem.s.",
-                    DivOp::RemU => "int.rem.u.",
-                };
-                if div_one_modifier(op.signed(), *z, *o) {
-                    push(&[n, z.name()]);
-                } else {
-                    push(&[n, z.name(), ".", o.name()]);
-                }
-            }
-            Shift(op, e) => {
-                let n = match op {
-                    ShiftOp::Shl => "int.shl.",
-                    ShiftOp::ShrU => "int.shr.u.",
-                    ShiftOp::ShrS => "int.shr.s.",
-                };
-                push(&[n, e.name()]);
-            }
-            Cmp(p) => push(&["int.cmp.", p.name()]),
-            Zext => push(&["int.zext"]),
-            Sext => push(&["int.sext"]),
-            Trunc(m) => push(&[match m {
-                TruncMode::Wrap => "int.trunc.wrap",
-                TruncMode::Nsw => "int.trunc.nsw",
-                TruncMode::Nuw => "int.trunc.nuw",
-            }]),
-            If => push(&["cf.if"]),
-            Loop { .. } => push(&["cf.loop"]),
-            Yield => push(&["cf.yield"]),
-            Break => push(&["cf.break"]),
-            Continue => push(&["cf.continue"]),
-            Ret => push(&["func.ret"]),
-            MemStack { .. } => push(&["mem.stack"]),
-            MemAlloc { fail, .. } => push(&[match fail {
-                AllocFail::Null => "mem.alloc.null",
-                AllocFail::Trap => "mem.alloc.trap",
-            }]),
-            MemFree { .. } => push(&["mem.free"]),
-            Load { .. } => push(&["mem.load"]),
-            Store { .. } => push(&["mem.store"]),
-            PtrOffset { inbounds } => push(&[if *inbounds {
-                "ptr.offset.inbounds"
-            } else {
-                "ptr.offset.wrap"
-            }]),
-            PtrAddr => push(&["ptr.addr"]),
-            PtrExpose => push(&["ptr.expose"]),
-            PtrFromExposed => push(&["ptr.from_exposed"]),
-            PtrWithAddr => push(&["ptr.with_addr"]),
-            PtrNull => push(&["ptr.null"]),
-            PtrCmp(p) => push(&["ptr.cmp.", p.name()]),
-            Call { .. } => push(&["func.call"]),
-        }
-    }
-}
 
 /// Append an integer stored in a body.
 fn push_int(out: &mut String, n: Int<'_>) {
@@ -293,8 +121,8 @@ impl Printer<'_> {
         }
     }
 
-    fn operands(&mut self, op: OpId) {
-        for (i, o) in self.body.operands(op).iter().enumerate() {
+    fn operand_list(&mut self, operands: &[Operand]) {
+        for (i, o) in operands.iter().enumerate() {
             if i > 0 {
                 self.out.push_str(", ");
             }
@@ -335,103 +163,162 @@ impl Printer<'_> {
             self.values(b.results(op));
             self.out.push_str(" = ");
         }
-        let kind = b.kind(op);
-        match (kind, b.regions(op)) {
-            (OpKind::Const(n), _) => {
-                self.out.push_str("int.const ");
-                push_int(self.out, b.int(n));
-                self.loc(b.loc(op));
-            }
-            (OpKind::If, &[thn, els]) => {
-                self.out.push_str("cf.if ");
-                self.operands(op);
-                self.loc(b.loc(op));
-                self.out.push(' ');
-                self.region(depth, thn);
-                if !b.is_empty(els) {
-                    self.out.push_str(" else ");
-                    self.region(depth, els);
-                }
-            }
-            (OpKind::Loop { progress }, &[body]) => {
-                self.out.push_str("cf.loop");
-                if progress {
-                    self.out.push_str(" progress");
-                }
-                if b.params(body).len() > 0 {
-                    self.out.push_str(" iter(");
-                    for (i, (p, a)) in b.params(body).zip(b.operands(op)).enumerate() {
-                        if i > 0 {
-                            self.out.push_str(", ");
-                        }
-                        self.value(p);
-                        self.out.push_str(" = ");
-                        self.operand(a);
-                    }
-                    self.out.push(')');
-                }
-                self.loc(b.loc(op));
-                self.out.push(' ');
-                self.region(depth, body);
-            }
-            (OpKind::MemStack { size, align }, _) => {
-                self.out.push_str("mem.stack ");
-                push_u64(self.out, size);
-                self.out.push_str(", align ");
-                push_u64(self.out, align.into());
-                self.loc(b.loc(op));
-            }
-            (OpKind::MemAlloc { family, align, .. }, _) => {
-                kind.write_name(self.out);
-                self.out.push(' ');
-                self.out.push_str(b.str(family));
-                self.out.push(' ');
-                self.operands(op);
-                self.out.push_str(", align ");
-                push_u64(self.out, align.into());
-                self.loc(b.loc(op));
-            }
-            (OpKind::MemFree { family }, _) => {
-                self.out.push_str("mem.free ");
-                self.out.push_str(b.str(family));
-                self.out.push(' ');
-                self.operands(op);
-                self.loc(b.loc(op));
-            }
-            (OpKind::Load { align }, _) => {
-                self.out.push_str("mem.load ");
-                self.operands(op);
-                self.out.push_str(", align ");
-                push_u64(self.out, align.into());
-                self.loc(b.loc(op));
-            }
-            (OpKind::Store { ty, align }, _) => {
-                self.out.push_str("mem.store ");
-                push_ty(self.out, ty);
-                self.out.push(' ');
-                self.operands(op);
-                self.out.push_str(", align ");
-                push_u64(self.out, align.into());
-                self.loc(b.loc(op));
-            }
-            (OpKind::Call { callee }, _) => {
-                self.out.push_str("func.call @");
-                self.out.push_str(b.str(callee));
-                self.out.push('(');
-                self.operands(op);
-                self.out.push(')');
-                self.loc(b.loc(op));
-            }
-            (k, _) => {
-                k.write_name(self.out);
-                if !b.operands(op).is_empty() {
-                    self.out.push(' ');
-                    self.operands(op);
-                }
-                self.loc(b.loc(op));
-            }
+        let params = b.regions(op).iter().map(|&r| b.params(r).len());
+        if b.kind(op).decl().fits(b.operands(op).len(), params) {
+            self.readable(depth, op);
+        } else {
+            self.generic(depth, op);
         }
         self.out.push('\n');
+    }
+
+    /// An immediate's value as text.
+    fn imm(&mut self, f: Field, v: Imm) {
+        match v {
+            Imm::Int(n) => push_int(self.out, self.body.int(n)),
+            Imm::Nat(n) => push_u64(self.out, n),
+            Imm::Align(n) => push_u64(self.out, n.into()),
+            Imm::Str(s) => {
+                if f.ty == FieldTy::Func {
+                    self.out.push('@');
+                }
+                self.out.push_str(self.body.str(s));
+            }
+            Imm::Ty(t) => push_ty(self.out, t),
+            Imm::Flag(b) => self.out.push_str(if b { "true" } else { "false" }),
+        }
+    }
+
+    /// The readable form, from the op's declared format.
+    fn readable(&mut self, depth: usize, op: OpId) {
+        let b = self.body;
+        let kind = b.kind(op);
+        let decl = kind.decl();
+        self.out.push_str(kind.mnemonic());
+        let operands = b.operands(op);
+        let mut next = 0;
+        for &item in decl.head() {
+            match item {
+                Item::Imm(i) => {
+                    let f = decl.imms[usize::from(i)];
+                    match kind.imm(i.into()) {
+                        Some(Imm::Flag(set)) => {
+                            if set {
+                                self.out.push(' ');
+                                self.out.push_str(f.name);
+                            }
+                        }
+                        Some(v) => {
+                            self.out.push(' ');
+                            self.imm(f, v);
+                        }
+                        None => {}
+                    }
+                }
+                Item::Operand => {
+                    if let Some(o) = operands.get(next) {
+                        self.out.push(' ');
+                        self.operand(o);
+                        next += 1;
+                    }
+                }
+                Item::Comma => self.out.push(','),
+                Item::Keyword(kw) => {
+                    self.out.push(' ');
+                    self.out.push_str(kw);
+                }
+                Item::Variadic => {
+                    if next < operands.len() {
+                        self.out.push(' ');
+                        self.operand_list(&operands[next..]);
+                    }
+                    next = operands.len();
+                }
+                Item::Args => {
+                    self.out.push('(');
+                    self.operand_list(&operands[next.min(operands.len())..]);
+                    self.out.push(')');
+                    next = operands.len();
+                }
+                Item::Iter => {
+                    if let Some(&body) = b.regions(op).first()
+                        && b.params(body).len() > 0
+                    {
+                        self.out.push_str(" iter(");
+                        for (i, (p, a)) in b.params(body).zip(&operands[next..]).enumerate() {
+                            if i > 0 {
+                                self.out.push_str(", ");
+                            }
+                            self.value(p);
+                            self.out.push_str(" = ");
+                            self.operand(a);
+                        }
+                        self.out.push(')');
+                    }
+                    next = operands.len();
+                }
+                Item::Region(_) => {}
+            }
+        }
+        self.loc(b.loc(op));
+        for (kw, &r) in decl.regions().zip(b.regions(op)) {
+            match kw {
+                None => {
+                    self.out.push(' ');
+                    self.region(depth, r);
+                }
+                Some(kw) => {
+                    if !b.is_empty(r) {
+                        self.out.push(' ');
+                        self.out.push_str(kw);
+                        self.out.push(' ');
+                        self.region(depth, r);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The generic form: `"name"(operands) {attrs} @loc (regions)`.
+    fn generic(&mut self, depth: usize, op: OpId) {
+        let b = self.body;
+        let kind = b.kind(op);
+        let decl = kind.decl();
+        self.out.push('"');
+        self.out.push_str(kind.mnemonic());
+        self.out.push_str("\"(");
+        self.operand_list(b.operands(op));
+        self.out.push(')');
+        if !decl.imms.is_empty() {
+            self.out.push_str(" {");
+            for (i, &f) in decl.imms.iter().enumerate() {
+                if i > 0 {
+                    self.out.push_str(", ");
+                }
+                self.out.push_str(f.name);
+                self.out.push_str(" = ");
+                if let Some(v) = kind.imm(i) {
+                    self.imm(f, v);
+                }
+            }
+            self.out.push('}');
+        }
+        self.loc(b.loc(op));
+        if !b.regions(op).is_empty() {
+            self.out.push_str(" (");
+            for (i, &r) in b.regions(op).iter().enumerate() {
+                if i > 0 {
+                    self.out.push_str(", ");
+                }
+                if b.params(r).len() > 0 {
+                    self.out.push('(');
+                    self.values(b.params(r));
+                    self.out.push_str(") ");
+                }
+                self.region(depth, r);
+            }
+            self.out.push(')');
+        }
     }
 }
 

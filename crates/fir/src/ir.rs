@@ -7,7 +7,8 @@
 
 use std::fmt;
 
-use crate::body::{IntId, StrId};
+use crate::body::IntId;
+pub use crate::ops::OpKind;
 
 /// A source location, `@line:col`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -180,72 +181,6 @@ pub enum ShiftOp {
 pub enum AllocFail {
     Null,
     Trap,
-}
-
-/// What an op does. Mirrors `Fir.OpKind`. Alignments are 32-bit (Lean's are unbounded).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum OpKind {
-    Const(IntId),
-    Poison,
-    Freeze,
-    Copy,
-    Select,
-    Arith(ArithOp, Ovf),
-    Bit(BitOp),
-    Div(DivOp, Edge, Edge),
-    Shift(ShiftOp, ShiftEdge),
-    Cmp(Pred),
-    Zext,
-    Sext,
-    Trunc(TruncMode),
-    MemStack {
-        size: u64,
-        align: u32,
-    },
-    MemAlloc {
-        fail: AllocFail,
-        family: StrId,
-        align: u32,
-    },
-    MemFree {
-        family: StrId,
-    },
-    Load {
-        align: u32,
-    },
-    Store {
-        ty: Ty,
-        align: u32,
-    },
-    PtrOffset {
-        inbounds: bool,
-    },
-    PtrAddr,
-    PtrExpose,
-    PtrFromExposed,
-    PtrWithAddr,
-    PtrNull,
-    PtrCmp(Pred),
-    Call {
-        callee: StrId,
-    },
-    If,
-    Loop {
-        progress: bool,
-    },
-    Yield,
-    Break,
-    Continue,
-    Ret,
-}
-
-impl OpKind {
-    pub fn is_terminator(&self) -> bool {
-        matches!(
-            self,
-            OpKind::Yield | OpKind::Break | OpKind::Continue | OpKind::Ret
-        )
-    }
 }
 
 /// A module: functions plus the default memory space.

@@ -8,9 +8,11 @@
 use num_bigint::Sign;
 use rustc_hash::FxHashMap;
 
-use crate::body::{Body, IntId, Operand, RegionId, StrId, ValueId, ValueSpec};
+use crate::body::{Body, IntId, OpId, Operand, RegionId, StrId, ValueId, ValueSpec};
+use crate::decl::{Field, FieldTy, Imm, Item};
 use crate::ir::*;
 use crate::lex::{Lexer, Sym, Tok, Token, int_value};
+use crate::ops::op_kind;
 
 pub fn parse_module(input: &str) -> Result<Module, String> {
     let mut p = Parser::new(input, true)?;
@@ -296,19 +298,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Exactly `n` comma-separated operands, into the scratch buffer.
-    fn operands(&mut self, n: usize) -> PResult<()> {
-        for i in 0..n {
-            if i > 0 {
-                self.expect_sym(Sym::Comma)?;
-            }
-            let o = self.operand()?;
-            self.operands.push(o);
-        }
-        Ok(())
-    }
-
-    /// Zero or more comma-separated operands (for terminators), into the scratch buffer.
+    /// Zero or more comma-separated operands, into the scratch buffer.
     fn variadic(&mut self) -> PResult<()> {
         if matches!(self.peek(), Tok::Value(_) | Tok::Hole(_)) {
             loop {
@@ -320,15 +310,6 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(())
-    }
-
-    /// `, align N`
-    fn align_arg(&mut self) -> PResult<u32> {
-        self.expect_sym(Sym::Comma)?;
-        if !self.try_ident("align")? {
-            return self.fail("expected 'align'");
-        }
-        self.nat()
     }
 
     fn opt_loc(&mut self) -> PResult<Option<Loc>> {
@@ -389,124 +370,18 @@ impl<'a> Parser<'a> {
             }
             self.expect_sym(Sym::Eq)?;
         }
-        let name = self.ident()?;
-        let Some(kind) = op_kind(name) else {
-            return self.fail(format!("unknown op '{name}'"));
-        };
         self.operands.clear();
-        let op = match kind {
-            OpKind::Const(_) => {
-                let n = self.int()?;
-                let loc = self.opt_loc()?;
-                self.append(region, OpKind::Const(n), loc)
+        let op = match self.peek() {
+            Tok::Str(name) => {
+                self.bump()?;
+                self.generic_op(region, name)?
             }
-            OpKind::MemStack { .. } => {
-                let size = self.nat()?;
-                let align = self.align_arg()?;
-                let loc = self.opt_loc()?;
-                self.append(region, OpKind::MemStack { size, align }, loc)
-            }
-            OpKind::MemAlloc { fail, .. } => {
-                let family = self.ident()?;
-                let family = self.body.add_str(family);
-                self.operands(1)?;
-                let align = self.align_arg()?;
-                let loc = self.opt_loc()?;
-                let kind = OpKind::MemAlloc {
-                    fail,
-                    family,
-                    align,
+            _ => {
+                let name = self.ident()?;
+                let Some(kind) = op_kind(name) else {
+                    return self.fail(format!("unknown op '{name}'"));
                 };
-                self.append(region, kind, loc)
-            }
-            OpKind::MemFree { .. } => {
-                let family = self.ident()?;
-                let family = self.body.add_str(family);
-                self.operands(1)?;
-                let loc = self.opt_loc()?;
-                self.append(region, OpKind::MemFree { family }, loc)
-            }
-            OpKind::Load { .. } => {
-                self.operands(1)?;
-                let align = self.align_arg()?;
-                let loc = self.opt_loc()?;
-                self.append(region, OpKind::Load { align }, loc)
-            }
-            OpKind::Store { .. } => {
-                let ty = self.ty()?;
-                self.operands(2)?;
-                let align = self.align_arg()?;
-                let loc = self.opt_loc()?;
-                self.append(region, OpKind::Store { ty, align }, loc)
-            }
-            OpKind::Call { .. } => {
-                let callee = match self.peek() {
-                    Tok::Global(s) => {
-                        self.bump()?;
-                        self.body.add_str(s)
-                    }
-                    t => {
-                        return self.fail(format!(
-                            "expected a function name like @f but found {}",
-                            t.describe()
-                        ));
-                    }
-                };
-                self.expect_sym(Sym::LParen)?;
-                if !self.try_sym(Sym::RParen)? {
-                    self.variadic_until_close()?;
-                }
-                let loc = self.opt_loc()?;
-                self.append(region, OpKind::Call { callee }, loc)
-            }
-            OpKind::If => {
-                self.operands(1)?;
-                let loc = self.opt_loc()?;
-                let op = self.body.append_op(
-                    region,
-                    OpKind::If,
-                    self.operands.drain(..),
-                    self.results.drain(..),
-                    [vec![], vec![]],
-                    loc,
-                );
-                let (thn, els) = (self.body.regions(op)[0], self.body.regions(op)[1]);
-                self.region(thn, &[])?;
-                if self.try_ident("else")? {
-                    self.region(els, &[])?;
-                }
-                op
-            }
-            OpKind::Loop { .. } => {
-                let progress = self.try_ident("progress")?;
-                let iter = if self.try_ident("iter")? {
-                    self.expect_sym(Sym::LParen)?;
-                    self.sep_by(Self::iter_arg, Sym::RParen)?
-                } else {
-                    Vec::new()
-                };
-                let loc = self.opt_loc()?;
-                let names: Vec<&'a str> = iter.iter().map(|(p, _)| p.name).collect();
-                let (params, inits): (Vec<_>, Vec<_>) = iter.into_iter().unzip();
-                let op = self.body.append_op(
-                    region,
-                    OpKind::Loop { progress },
-                    inits,
-                    self.results.drain(..),
-                    [params],
-                    loc,
-                );
-                let inner = self.body.regions(op)[0];
-                self.region(inner, &names)?;
-                op
-            }
-            k => {
-                match arity(&k) {
-                    Some(n) => self.operands(n)?,
-                    None => self.variadic()?,
-                }
-                let loc = self.opt_loc()?;
-                self.append(region, k, loc)
+                self.readable_op(region, kind)?
             }
         };
         // Define the results, whose names wait on the `pending` stack.
@@ -536,16 +411,231 @@ impl<'a> Parser<'a> {
         self.expect_sym(Sym::RParen)
     }
 
-    /// Append an op without regions, with the operands and results in the scratch buffers.
-    fn append(&mut self, region: RegionId, kind: OpKind, loc: Option<Loc>) -> crate::OpId {
-        self.body.append_op(
+    /// `@name`
+    fn func_name(&mut self) -> PResult<StrId> {
+        match self.peek() {
+            Tok::Global(s) => {
+                self.bump()?;
+                Ok(self.body.add_str(s))
+            }
+            t => self.fail(format!(
+                "expected a function name like @f but found {}",
+                t.describe()
+            )),
+        }
+    }
+
+    /// An immediate, as the readable form writes it. A flag is a keyword named after its field.
+    fn imm(&mut self, f: Field) -> PResult<Imm> {
+        Ok(match f.ty {
+            FieldTy::Int => Imm::Int(self.int()?),
+            FieldTy::Nat => Imm::Nat(self.nat()?),
+            FieldTy::Align => Imm::Align(self.nat()?),
+            FieldTy::Symbol => {
+                let s = self.ident()?;
+                Imm::Str(self.body.add_str(s))
+            }
+            FieldTy::Func => Imm::Str(self.func_name()?),
+            FieldTy::Ty => Imm::Ty(self.ty()?),
+            FieldTy::Flag => Imm::Flag(self.try_ident(f.name)?),
+        })
+    }
+
+    /// An op in its readable form, after its name, as its declaration's format says. The
+    /// results are in the scratch buffer.
+    fn readable_op(&mut self, region: RegionId, mut kind: OpKind) -> PResult<OpId> {
+        let decl = kind.decl();
+        let mut iter = Vec::new();
+        for &item in decl.head() {
+            match item {
+                Item::Imm(i) => {
+                    let v = self.imm(decl.imms[usize::from(i)])?;
+                    kind.set_imm(i.into(), v);
+                }
+                Item::Operand => {
+                    let o = self.operand()?;
+                    self.operands.push(o);
+                }
+                Item::Comma => self.expect_sym(Sym::Comma)?,
+                Item::Keyword(kw) => {
+                    if !self.try_ident(kw)? {
+                        return self.fail(format!("expected '{kw}'"));
+                    }
+                }
+                Item::Variadic => self.variadic()?,
+                Item::Args => {
+                    self.expect_sym(Sym::LParen)?;
+                    if !self.try_sym(Sym::RParen)? {
+                        self.variadic_until_close()?;
+                    }
+                }
+                Item::Iter => {
+                    if self.try_ident("iter")? {
+                        self.expect_sym(Sym::LParen)?;
+                        iter = self.sep_by(Self::iter_arg, Sym::RParen)?;
+                    }
+                }
+                Item::Region(_) => {}
+            }
+        }
+        let loc = self.opt_loc()?;
+        // `%iter` gives the operands, and the first region's parameters.
+        let names: Vec<&'a str> = iter.iter().map(|(p, _)| p.name).collect();
+        let (params, inits): (Vec<_>, Vec<_>) = iter.into_iter().unzip();
+        self.operands.extend(inits);
+        let mut params = Some(params);
+        let op = self.body.append_op(
             region,
             kind,
             self.operands.drain(..),
             self.results.drain(..),
-            [],
+            decl.regions().map(|_| params.take().unwrap_or_default()),
             loc,
-        )
+        );
+        for (i, kw) in decl.regions().enumerate() {
+            let r = self.body.regions(op)[i];
+            match kw {
+                None => self.region(r, if i == 0 { &names } else { &[] })?,
+                Some(kw) => {
+                    if self.try_ident(kw)? {
+                        self.region(r, &[])?;
+                    }
+                }
+            }
+        }
+        Ok(op)
+    }
+
+    /// A generic-form attribute value: as in the readable form, except that a flag is `true`
+    /// or `false`.
+    fn attr_value(&mut self, f: Field) -> PResult<Imm> {
+        if f.ty != FieldTy::Flag {
+            return self.imm(f);
+        }
+        let b = match self.peek() {
+            Tok::Ident("true") => true,
+            Tok::Ident("false") => false,
+            t => {
+                return self.fail(format!("expected true or false but found {}", t.describe()));
+            }
+        };
+        self.bump()?;
+        Ok(Imm::Flag(b))
+    }
+
+    /// An op in the generic form, after its name `"name"` (see `spec/Fir/Parse.lean`). The
+    /// results are in the scratch buffer.
+    fn generic_op(&mut self, region: RegionId, name: &'a str) -> PResult<OpId> {
+        let Some(mut kind) = op_kind(name) else {
+            return self.fail(format!("unknown op '{name}'"));
+        };
+        let decl = kind.decl();
+        self.expect_sym(Sym::LParen)?;
+        if !self.try_sym(Sym::RParen)? {
+            self.variadic_until_close()?;
+        }
+        // `{key = value, ...}`: every immediate, each once, in any order.
+        let mut seen = vec![false; decl.imms.len()];
+        if self.try_sym(Sym::LBrace)? && !self.try_sym(Sym::RBrace)? {
+            loop {
+                let key = match self.peek() {
+                    Tok::Ident(key) => key,
+                    t => return self.fail(format!("expected a name but found {}", t.describe())),
+                };
+                let Some(i) = decl.imms.iter().position(|f| f.name == key) else {
+                    return self.fail(format!("{name} has no attribute '{key}'"));
+                };
+                if seen[i] {
+                    return self.fail(format!("attribute '{key}' is given twice"));
+                }
+                self.bump()?;
+                self.expect_sym(Sym::Eq)?;
+                let v = self.attr_value(decl.imms[i])?;
+                kind.set_imm(i, v);
+                seen[i] = true;
+                if !self.try_sym(Sym::Comma)? {
+                    break;
+                }
+            }
+            self.expect_sym(Sym::RBrace)?;
+        }
+        if let Some(i) = seen.iter().position(|s| !s) {
+            return self.fail(format!(
+                "{name} needs the attribute '{}'",
+                decl.imms[i].name
+            ));
+        }
+        let loc = self.opt_loc()?;
+        let n = if self.peek() == Tok::Sym(Sym::LParen) {
+            self.count_regions()
+        } else {
+            0
+        };
+        let op = self.body.append_op(
+            region,
+            kind,
+            self.operands.drain(..),
+            self.results.drain(..),
+            (0..n).map(|_| Vec::new()),
+            loc,
+        );
+        // `((%x: T, ...) { ... }, ...)`, the parameters optional.
+        if self.try_sym(Sym::LParen)? && !self.try_sym(Sym::RParen)? {
+            let mut i = 0;
+            loop {
+                let params = if self.try_sym(Sym::LParen)? {
+                    self.sep_by(Self::result, Sym::RParen)?
+                } else {
+                    Vec::new()
+                };
+                // The count covers every region whose `{` follows; for one without it, this
+                // reports the missing `{`.
+                let Some(&r) = self.body.regions(op).get(i) else {
+                    self.expect_sym(Sym::LBrace)?;
+                    return self.fail("expected '{'");
+                };
+                let names: Vec<&'a str> = params.iter().map(|p| p.name).collect();
+                self.body.set_params(r, params);
+                self.region(r, &names)?;
+                i += 1;
+                if !self.try_sym(Sym::Comma)? {
+                    break;
+                }
+            }
+            self.expect_sym(Sym::RParen)?;
+        }
+        Ok(op)
+    }
+
+    /// How many regions a generic op's region list holds, read ahead from its `(`: the `{`s
+    /// at its top level, up to the matching `)`. An op's regions are made with it, before their
+    /// contents are parsed. Every region the parser reaches with its `{` next is counted; if the
+    /// list is malformed otherwise, parsing it fails before the count matters.
+    fn count_regions(&self) -> usize {
+        let mut lexer = self.lexer.clone();
+        let (mut parens, mut braces, mut n) = (0usize, 0usize, 0);
+        while let Ok(t) = lexer.next_token() {
+            match t.tok {
+                Tok::Eof => break,
+                Tok::Sym(Sym::LBrace) => {
+                    if braces == 0 && parens == 0 {
+                        n += 1;
+                    }
+                    braces += 1;
+                }
+                Tok::Sym(Sym::RBrace) => match braces.checked_sub(1) {
+                    Some(b) => braces = b,
+                    None => break,
+                },
+                Tok::Sym(Sym::LParen) if braces == 0 => parens += 1,
+                Tok::Sym(Sym::RParen) if braces == 0 => match parens.checked_sub(1) {
+                    Some(p) => parens = p,
+                    None => break,
+                },
+                _ => {}
+            }
+        }
+        n
     }
 
     /// `%name: type = %init`
@@ -650,172 +740,5 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(m)
-    }
-}
-
-fn ovf(m: &[&str]) -> Option<Ovf> {
-    Some(match m {
-        ["wrap"] => Ovf::Wrap,
-        ["nsw"] => Ovf::Nsw,
-        ["nuw"] => Ovf::Nuw,
-        ["nsw", "nuw"] => Ovf::NswNuw,
-        ["s", "trap"] => Ovf::Trap(true),
-        ["u", "trap"] => Ovf::Trap(false),
-        ["s", "sat"] => Ovf::Sat(true),
-        ["u", "sat"] => Ovf::Sat(false),
-        ["s", "ub"] => Ovf::Ub(true),
-        ["u", "ub"] => Ovf::Ub(false),
-        _ => return None,
-    })
-}
-
-fn zero_edge(s: &str) -> Option<Edge> {
-    Some(match s {
-        "ub" => Edge::Ub,
-        "trap" => Edge::Trap,
-        "total" => Edge::Total,
-        _ => return None,
-    })
-}
-
-fn ovf_edge(s: &str) -> Option<Edge> {
-    Some(match s {
-        "ub" => Edge::Ub,
-        "trap" => Edge::Trap,
-        "wrap" => Edge::Wrap,
-        _ => return None,
-    })
-}
-
-/// `(zero, overflow)` edges. One modifier covers both cases.
-fn div_edges(signed: bool, m: &[&str]) -> Option<(Edge, Edge)> {
-    match m {
-        [z] => {
-            let z = zero_edge(z)?;
-            Some((z, if z == Edge::Total { Edge::Wrap } else { z }))
-        }
-        [z, o] if signed => Some((zero_edge(z)?, ovf_edge(o)?)),
-        _ => None,
-    }
-}
-
-fn shift_edge(m: &[&str]) -> Option<ShiftEdge> {
-    Some(match m {
-        ["ub"] => ShiftEdge::Ub,
-        ["trap"] => ShiftEdge::Trap,
-        ["mask"] => ShiftEdge::Mask,
-        ["total"] => ShiftEdge::Total,
-        _ => return None,
-    })
-}
-
-fn pred(s: &str) -> Option<Pred> {
-    Some(match s {
-        "eq" => Pred::Eq,
-        "ne" => Pred::Ne,
-        "slt" => Pred::Slt,
-        "sle" => Pred::Sle,
-        "sgt" => Pred::Sgt,
-        "sge" => Pred::Sge,
-        "ult" => Pred::Ult,
-        "ule" => Pred::Ule,
-        "ugt" => Pred::Ugt,
-        "uge" => Pred::Uge,
-        _ => return None,
-    })
-}
-
-/// Decode an op name with its modifiers. Ops with immediates get placeholders (such as
-/// `align 1`, or string and integer ids that point nowhere) that the parser fills.
-pub fn op_kind(name: &str) -> Option<OpKind> {
-    use OpKind::*;
-    let mut parts = [""; 6];
-    let mut n = 0;
-    for p in name.split('.') {
-        if n == parts.len() {
-            return None;
-        }
-        parts[n] = p;
-        n += 1;
-    }
-    Some(match &parts[..n] {
-        ["int", "const"] => Const(IntId::PLACEHOLDER),
-        ["poison"] => Poison,
-        ["freeze"] => Freeze,
-        ["copy"] => Copy,
-        ["select"] => Select,
-        ["int", "add", m @ ..] => Arith(ArithOp::Add, ovf(m)?),
-        ["int", "sub", m @ ..] => Arith(ArithOp::Sub, ovf(m)?),
-        ["int", "mul", m @ ..] => Arith(ArithOp::Mul, ovf(m)?),
-        ["int", "and"] => Bit(BitOp::And),
-        ["int", "or"] => Bit(BitOp::Or),
-        ["int", "xor"] => Bit(BitOp::Xor),
-        ["int", "div", "s", m @ ..] => div(DivOp::DivS, m)?,
-        ["int", "div", "u", m @ ..] => div(DivOp::DivU, m)?,
-        ["int", "rem", "s", m @ ..] => div(DivOp::RemS, m)?,
-        ["int", "rem", "u", m @ ..] => div(DivOp::RemU, m)?,
-        ["int", "shl", m @ ..] => Shift(ShiftOp::Shl, shift_edge(m)?),
-        ["int", "shr", "u", m @ ..] => Shift(ShiftOp::ShrU, shift_edge(m)?),
-        ["int", "shr", "s", m @ ..] => Shift(ShiftOp::ShrS, shift_edge(m)?),
-        ["int", "cmp", p] => Cmp(pred(p)?),
-        ["int", "zext"] => Zext,
-        ["int", "sext"] => Sext,
-        ["int", "trunc", "wrap"] => Trunc(TruncMode::Wrap),
-        ["int", "trunc", "nsw"] => Trunc(TruncMode::Nsw),
-        ["int", "trunc", "nuw"] => Trunc(TruncMode::Nuw),
-        ["cf", "if"] => If,
-        ["cf", "loop"] => Loop { progress: false },
-        ["cf", "yield"] => Yield,
-        ["cf", "break"] => Break,
-        ["cf", "continue"] => Continue,
-        ["func", "ret"] => Ret,
-        ["ptr", "offset", "inbounds"] => PtrOffset { inbounds: true },
-        ["ptr", "offset", "wrap"] => PtrOffset { inbounds: false },
-        ["ptr", "addr"] => PtrAddr,
-        ["ptr", "expose"] => PtrExpose,
-        ["ptr", "from_exposed"] => PtrFromExposed,
-        ["ptr", "with_addr"] => PtrWithAddr,
-        ["ptr", "null"] => PtrNull,
-        ["ptr", "cmp", p] => PtrCmp(pred(p)?),
-        ["mem", "stack"] => MemStack { size: 0, align: 1 },
-        ["mem", "alloc", "null"] => MemAlloc {
-            fail: AllocFail::Null,
-            family: StrId::PLACEHOLDER,
-            align: 1,
-        },
-        ["mem", "alloc", "trap"] => MemAlloc {
-            fail: AllocFail::Trap,
-            family: StrId::PLACEHOLDER,
-            align: 1,
-        },
-        ["mem", "free"] => MemFree {
-            family: StrId::PLACEHOLDER,
-        },
-        ["mem", "load"] => Load { align: 1 },
-        ["mem", "store"] => Store {
-            ty: Ty::Ptr,
-            align: 1,
-        },
-        ["func", "call"] => Call {
-            callee: StrId::PLACEHOLDER,
-        },
-        _ => return None,
-    })
-}
-
-fn div(op: DivOp, m: &[&str]) -> Option<OpKind> {
-    let (z, o) = div_edges(op.signed(), m)?;
-    Some(OpKind::Div(op, z, o))
-}
-
-/// How many operands an op without regions takes, or `None` if variadic.
-fn arity(k: &OpKind) -> Option<usize> {
-    use OpKind::*;
-    match k {
-        Const(_) | Poison | PtrNull => Some(0),
-        Freeze | Copy | Zext | Sext | Trunc(_) | PtrAddr | PtrExpose | PtrFromExposed => Some(1),
-        Select => Some(3),
-        Yield | Break | Continue | Ret => None,
-        _ => Some(2),
     }
 }

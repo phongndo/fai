@@ -11,6 +11,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use num_bigint::Sign;
 
 use crate::body::{Body, Int, OpId, Operand, OperandKind, RegionId, ValueId};
+use crate::decl::{Check, Imm, TyE};
 use crate::ir::*;
 
 /// A hole (`?name: T`) found while verifying: the type it must have, and the location of its op.
@@ -280,15 +281,8 @@ fn ints(loc: Option<Loc>, ts: &[Ty]) -> VResult<()> {
     }
 }
 
-/// `msg` unless `xs` has exactly one item.
-fn single<T: Copy>(loc: Option<Loc>, xs: &[T], msg: &str) -> VResult<T> {
-    match xs {
-        [x] => Ok(*x),
-        _ => verr(loc, msg),
-    }
-}
-
-/// Check the operand and result types of an op without regions (Lean's `checkSimple`).
+/// Check the operand and result types of an op without regions by its declared rule (Lean's
+/// `checkSimple`).
 fn check_simple(
     body: &Body,
     loc: Option<Loc>,
@@ -298,164 +292,131 @@ fn check_simple(
     ins: &[Ty],
     outs: &[Ty],
 ) -> VResult<()> {
-    let addr = Ty::Int(space.addr_bits);
-    let one = |t: Ty| expect_tys(loc, "results", outs, &[t]);
-    let align_pow2 = |align: u64| {
-        if is_pow2(align) {
-            Ok(())
-        } else {
-            verr(loc, "alignment must be a power of two")
-        }
+    let Some(rule) = k.decl().rule else {
+        return verr(loc, "unexpected op");
     };
-    let no_results = || {
-        if outs.is_empty() {
-            Ok(())
-        } else {
-            verr(loc, "this op has no results")
-        }
-    };
-    match k {
-        OpKind::Const(n) => {
-            expect_tys(loc, "operands", ins, &[])?;
-            let t = single(loc, outs, "int.const has one result")?;
-            ints(loc, &[t])?;
-            let n = body.int(n);
-            if !(fits_signed(width(t), n) || fits_unsigned(width(t), n)) {
-                return verr(loc, format!("{n} does not fit in {t}"));
+    // The types named so far.
+    let mut vars = [Ty::Ptr; 4];
+    let mut named = 0;
+    let field = |i: u8| k.imm(i.into());
+    for check in rule {
+        let ty = |e: &TyE| match *e {
+            TyE::Ptr => Ty::Ptr,
+            TyE::Addr => Ty::Int(space.addr_bits),
+            TyE::Int(w) => Ty::Int(w),
+            TyE::Var(i) => vars[usize::from(i)],
+            TyE::Field(i) => match field(i) {
+                Some(Imm::Ty(t)) => t,
+                _ => Ty::Ptr,
+            },
+        };
+        let tys_of = |es: &[TyE]| -> Tys {
+            let mut ts = Tys::default();
+            for e in es {
+                ts.push(ty(e));
             }
-            Ok(())
-        }
-        OpKind::Poison => {
-            expect_tys(loc, "operands", ins, &[])?;
-            let t = single(loc, outs, "poison has one result")?;
-            ints(loc, &[t])
-        }
-        OpKind::Freeze => {
-            let t = single(loc, ins, "freeze takes one operand")?;
-            ints(loc, &[t])?;
-            one(t)
-        }
-        OpKind::Copy => {
-            let t = single(loc, ins, "copy takes one operand")?;
-            one(t)
-        }
-        OpKind::Select => {
-            let &[c, a, b] = ins else {
-                return verr(loc, "select takes three operands");
-            };
-            expect_tys(loc, "select", &[c, b], &[Ty::Int(1), a])?;
-            ints(loc, &[a])?;
-            one(a)
-        }
-        OpKind::Arith(..) | OpKind::Bit(_) | OpKind::Div(..) | OpKind::Shift(..) => {
-            let &[a, b] = ins else {
-                return verr(loc, "this op takes two operands");
-            };
-            expect_tys(loc, "operands", &[b], &[a])?;
-            ints(loc, &[a])?;
-            one(a)
-        }
-        OpKind::Cmp(_) => {
-            let &[a, b] = ins else {
-                return verr(loc, "int.cmp takes two operands");
-            };
-            expect_tys(loc, "operands", &[b], &[a])?;
-            ints(loc, &[a])?;
-            one(Ty::Int(1))
-        }
-        OpKind::Zext | OpKind::Sext => {
-            let a = single(loc, ins, "this op takes one operand")?;
-            let t = single(loc, outs, "this op has one result")?;
-            ints(loc, &[a, t])?;
-            if width(t) <= width(a) {
-                return verr(loc, format!("cannot extend {a} to {t}"));
+            ts
+        };
+        // Compare without building the expected list, unless the message needs it.
+        let same = |got: &[Ty], want: &[TyE]| {
+            got.len() == want.len() && got.iter().zip(want).all(|(g, w)| *g == ty(w))
+        };
+        match *check {
+            Check::TakeIns(n, msg) | Check::TakeOuts(n, msg) => {
+                let got = if matches!(check, Check::TakeIns(..)) {
+                    ins
+                } else {
+                    outs
+                };
+                if got.len() != usize::from(n) {
+                    return verr(loc, msg);
+                }
+                vars[named..named + got.len()].copy_from_slice(got);
+                named += got.len();
             }
-            Ok(())
-        }
-        OpKind::Trunc(_) => {
-            let a = single(loc, ins, "int.trunc takes one operand")?;
-            let t = single(loc, outs, "int.trunc has one result")?;
-            ints(loc, &[a, t])?;
-            if width(t) >= width(a) {
-                return verr(loc, format!("cannot truncate {a} to {t}"));
+            Check::Ins(label, want) => {
+                if !same(ins, want) {
+                    expect_tys(loc, label, ins, &tys_of(want))?;
+                }
             }
-            Ok(())
-        }
-        OpKind::MemStack { align, .. } => {
-            align_pow2(align.into())?;
-            expect_tys(loc, "operands", ins, &[])?;
-            one(Ty::Ptr)
-        }
-        OpKind::MemAlloc { align, .. } => {
-            align_pow2(align.into())?;
-            expect_tys(loc, "mem.alloc size", ins, &[addr])?;
-            one(Ty::Ptr)
-        }
-        OpKind::MemFree { .. } => {
-            expect_tys(loc, "operands", ins, &[Ty::Ptr])?;
-            no_results()
-        }
-        OpKind::Load { align } => {
-            align_pow2(align.into())?;
-            expect_tys(loc, "operands", ins, &[Ty::Ptr])?;
-            let t = single(loc, outs, "mem.load has one result")?;
-            if !is_loadable(space, t) {
-                return verr(
-                    loc,
-                    format!("{t} can't be loaded: its size isn't whole bytes"),
-                );
+            Check::Outs(want) => {
+                if !same(outs, want) {
+                    expect_tys(loc, "results", outs, &tys_of(want))?;
+                }
             }
-            Ok(())
-        }
-        OpKind::Store { ty, align } => {
-            align_pow2(align.into())?;
-            expect_tys(loc, "operands", ins, &[ty, Ty::Ptr])?;
-            if !is_loadable(space, ty) {
-                return verr(
-                    loc,
-                    format!("{ty} can't be stored: its size isn't whole bytes"),
-                );
+            Check::NoOuts => {
+                if !outs.is_empty() {
+                    return verr(loc, "this op has no results");
+                }
             }
-            no_results()
-        }
-        OpKind::PtrOffset { .. } | OpKind::PtrWithAddr => {
-            expect_tys(loc, "operands", ins, &[Ty::Ptr, addr])?;
-            one(Ty::Ptr)
-        }
-        OpKind::PtrAddr | OpKind::PtrExpose => {
-            expect_tys(loc, "operands", ins, &[Ty::Ptr])?;
-            one(addr)
-        }
-        OpKind::PtrFromExposed => {
-            expect_tys(loc, "operands", ins, &[addr])?;
-            one(Ty::Ptr)
-        }
-        OpKind::PtrNull => {
-            expect_tys(loc, "operands", ins, &[])?;
-            one(Ty::Ptr)
-        }
-        OpKind::PtrCmp(p) => {
-            if matches!(p, Pred::Slt | Pred::Sle | Pred::Sgt | Pred::Sge) {
-                return verr(loc, "pointer comparisons are unsigned");
+            Check::Same(label, got, want) => {
+                let got = tys_of(got);
+                if !same(&got, want) {
+                    expect_tys(loc, label, &got, &tys_of(want))?;
+                }
             }
-            expect_tys(loc, "operands", ins, &[Ty::Ptr, Ty::Ptr])?;
-            one(Ty::Int(1))
+            Check::Ints(ts) => {
+                if !ts.iter().all(|e| is_int(ty(e))) {
+                    ints(loc, &tys_of(ts))?;
+                }
+            }
+            Check::Pow2(i) => {
+                let Some(Imm::Align(align)) = field(i) else {
+                    return verr(loc, "malformed op");
+                };
+                if !is_pow2(align.into()) {
+                    return verr(loc, "alignment must be a power of two");
+                }
+            }
+            Check::Fits(i, t) => {
+                let Some(Imm::Int(n)) = field(i) else {
+                    return verr(loc, "malformed op");
+                };
+                let (n, t) = (body.int(n), ty(&t));
+                if !(fits_signed(width(t), n) || fits_unsigned(width(t), n)) {
+                    return verr(loc, format!("{n} does not fit in {t}"));
+                }
+            }
+            Check::Widens(a, t) => {
+                let (a, t) = (ty(&a), ty(&t));
+                if width(t) <= width(a) {
+                    return verr(loc, format!("cannot extend {a} to {t}"));
+                }
+            }
+            Check::Narrows(a, t) => {
+                let (a, t) = (ty(&a), ty(&t));
+                if width(t) >= width(a) {
+                    return verr(loc, format!("cannot truncate {a} to {t}"));
+                }
+            }
+            Check::Loadable(t, verb) => {
+                let t = ty(&t);
+                if !is_loadable(space, t) {
+                    return verr(
+                        loc,
+                        format!("{t} can't be {verb}: its size isn't whole bytes"),
+                    );
+                }
+            }
+            Check::Deny(names, msg) => {
+                if names.contains(&k.mnemonic()) {
+                    return verr(loc, msg);
+                }
+            }
+            Check::Call(i) => {
+                let Some(Imm::Str(callee)) = field(i) else {
+                    return verr(loc, "malformed op");
+                };
+                let callee = body.str(callee);
+                let Some((params, rets)) = sigs.get(callee) else {
+                    return verr(loc, format!("no function @{callee}"));
+                };
+                expect_tys(loc, &format!("arguments of @{callee}"), ins, params)?;
+                expect_tys(loc, &format!("results of @{callee}"), outs, rets)?;
+            }
         }
-        OpKind::Call { callee } => {
-            let callee = body.str(callee);
-            let Some((params, rets)) = sigs.get(callee) else {
-                return verr(loc, format!("no function @{callee}"));
-            };
-            expect_tys(loc, &format!("arguments of @{callee}"), ins, params)?;
-            expect_tys(loc, &format!("results of @{callee}"), outs, rets)
-        }
-        OpKind::If
-        | OpKind::Loop { .. }
-        | OpKind::Yield
-        | OpKind::Break
-        | OpKind::Continue
-        | OpKind::Ret => verr(loc, "unexpected op"),
     }
+    Ok(())
 }
 
 /// Verifies one function. Lean threads a name-to-type scope through the ops; here the visible
