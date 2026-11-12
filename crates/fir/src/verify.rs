@@ -12,8 +12,8 @@ use num_bigint::{BigInt, Sign};
 
 use crate::body::{Body, Int, OpId, Operand, OperandKind, RegionId, Succ, ValueId};
 use crate::decl::{Check, Imm, Layer, TyE};
-use crate::ops::TARGETS;
 use crate::ir::*;
+use crate::ops::TARGETS;
 use crate::types::Shape;
 
 /// A hole (`?name: T`) found while verifying: the type it must have, and the location of its op.

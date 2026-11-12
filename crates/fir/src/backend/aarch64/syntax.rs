@@ -56,9 +56,7 @@ impl Reg {
         let n: u64 = digits.parse().ok()?;
         match c {
             "x" if n <= 30 => Some(Reg(n as u32)),
-            "v" if n < u64::from(u32::MAX - Self::FIRST_VIRTUAL) => {
-                Some(Reg::virt(n as u32))
-            }
+            "v" if n < u64::from(u32::MAX - Self::FIRST_VIRTUAL) => Some(Reg::virt(n as u32)),
             _ => None,
         }
     }

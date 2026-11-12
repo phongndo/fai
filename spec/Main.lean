@@ -56,6 +56,7 @@ def runFunc (m : Module) (name : String) (args : List String) (fuel : Nat) :
   if args.length != f.params.length then
     throw s!"@{name} takes {f.params.length} arguments but got {args.length}"
   let vals ← (f.params.zip args).mapM fun (r, a) => parseArg r.ty a
+  if m.layer matches .lfir _ then return AArch64.run m f vals fuel
   match Machine.init (fun _ => 0) World.zero m f vals with
   | .error h => pure (renderHalt h)
   | .ok mach => pure (drive mach 0 fuel)

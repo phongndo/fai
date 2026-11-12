@@ -40,6 +40,10 @@ use crate::sem::{self, Bits, Out};
 pub use crate::sem::{TrapReason, UbKind};
 use crate::types::Shape;
 
+// The machine that runs LFIR modules for AArch64; a child module, so it shares the memory model.
+#[path = "backend/aarch64/machine.rs"]
+mod lfir;
+
 /// The fuel `fir-ref run` uses when `--fuel` isn't given.
 pub const DEFAULT_FUEL: u64 = 1_000_000;
 
@@ -381,6 +385,9 @@ pub fn run(m: &Module, name: &str, args: &[&str], fuel: u64) -> Result<String, S
     let mut vals = Vec::with_capacity(args.len());
     for (&p, &a) in params.iter().zip(args) {
         vals.push(mach.parse_arg(f.body.ty(p), a)?);
+    }
+    if let crate::Layer::Lfir(_) = m.layer {
+        return Ok(lfir::run(mach, fi as u32, &vals, fuel));
     }
     Ok(match mach.init(fi as u32, &vals) {
         Err(h) => h.render(),

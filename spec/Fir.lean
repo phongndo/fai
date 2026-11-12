@@ -20,3 +20,6 @@ import Fir.Space
 import Fir.Fwd
 import Fir.CopyProp
 import Fir.Dce
+import Fir.AArch64Syntax
+import Fir.AArch64
+import Fir.AArch64Machine

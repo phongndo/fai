@@ -149,9 +149,7 @@ impl<'a> Parser<'a> {
                     self.bump()?;
                     Ok(r)
                 }
-                None => self.fail(format!(
-                    "expected a register like x0 or v1 but found '{s}'"
-                )),
+                None => self.fail(format!("expected a register like x0 or v1 but found '{s}'")),
             },
             t => self.fail(format!(
                 "expected a register like x0 or v1 but found {}",
