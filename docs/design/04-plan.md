@@ -490,7 +490,7 @@ Instruction selection, Backend testing, Builder API, API.
   machines) agree. `crates/fir/tests/abi.rs` is the ABI torture test: random signatures (up to
   12 arguments, structs of `i8`…`i64`, `f32`, `f64`, `ptr`, arrays, nested, packed, and 16-byte
   aligned structs, HFAs of 1 to 4 members) compiled by the cross GCC and FIR, each side calling
-  the other directly and through `...`, every leaf reported and compared; 20 seeds of 1,000
+  the other directly and through `...`, every leaf reported and compared; 25 seeds of 1,000
   signatures each (about 14,000 leaves per seed in each of four directions) pass. It found GCC's
   HFA rule: a struct of floats with a zero-length array (even of floats) isn't one.
   `tests/capi/e2e.c` builds a module through the C API that C calls with every class (a large
@@ -498,14 +498,18 @@ Instruction selection, Backend testing, Builder API, API.
   `...`, and reads C's composite variadic arguments, natively with and without `-O`, and checks
   the macOS rejection. The fuzzer gives external functions composite parameters and results and
   passes composites as variadic arguments (not the entry's, whose run lines can't write them);
-  `FIR_FUZZ=3000` on seeds 67 and 71 for `fuzz.rs`, `opt.rs`, `builder.rs`, and `aarch64.rs`:
-  no differences. Per seed 480 to 500 modules pass composites to or from external functions,
-  150 to 170 pass them through `...`, 45 to 48 read them with `va.arg`, and 790 to 850 native
-  runs (each with and without `-O`) pass structs by value. The native harness declares C structs of each
-  composite's layout and class and prints them as `fir run` renders them. Its direct selection
-  of HFIR (main's coverage builds) found that isel took a struct among several results, which
-  only the lowering may scalarize, as one register: it refuses it now, as HFIR only. `cargo
-  xtask verify full` requires the ABI torture test's evidence (240 signatures).
+  `FIR_FUZZ=3000` on seeds 67 and 73 for `fuzz.rs`, `opt.rs`, `builder.rs`, and `aarch64.rs`:
+  no differences. Per seed 470 to 500 modules pass composites to or from external functions,
+  145 to 170 pass them through `...`, 43 to 48 read them with `va.arg`, and 790 to 850 native
+  runs (each with and without `-O`) pass structs by value. Seed 71 is the same except one
+  program (`s71-p534`, no composites in it), whose exposed address of an 8-aligned zero-size
+  stack slot is 16-aligned natively and in LFIR: every interpreter layout keeps bit 3 set, so
+  main's moved-bits rule counts it as a difference; main fails it alike as a fixture (open). The
+  native harness declares C structs of each composite's layout and class and prints them as
+  `fir run` renders them. Its direct selection of HFIR (main's coverage builds) found that isel
+  took a struct among several results, which only the lowering may scalarize, as one register:
+  it refuses it now, as HFIR only. `cargo xtask verify full` requires the ABI torture test's
+  evidence (240 signatures).
 - **API:** version 1.5 (no new functions; external and MFIR functions take composites).
 - **Not yet:** `fai-cc`'s structs by value (track F2); macOS's stack packing (composites on the
   stack are a compile error there); integer leaves wider than 64 bits in a passed composite
