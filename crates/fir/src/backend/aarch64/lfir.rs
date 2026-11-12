@@ -208,5 +208,6 @@ fn func(m: &Module, mm: &MModule, f: &MFunc) -> Func {
         rets: src.rets.clone(),
         file: src.file.clone(),
         body,
+        variadic: src.variadic,
     }
 }

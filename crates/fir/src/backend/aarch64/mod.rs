@@ -79,8 +79,48 @@ pub fn allocate(m: &Module, mm: &mut MModule) {
     });
 }
 
+/// A variadic function, external function, or call through a variadic signature of the module,
+/// if it has one, for the message.
+fn uses_varargs(m: &Module) -> Option<String> {
+    if let Some(name) = m
+        .funcs
+        .iter()
+        .filter(|f| f.variadic)
+        .map(|f| &f.name)
+        .chain(m.externs.iter().filter(|x| x.variadic).map(|x| &x.name))
+        .next()
+    {
+        return Some(format!("@{name}"));
+    }
+    for f in &m.funcs {
+        let b = &f.body;
+        let mut stack = vec![b.entry()];
+        while let Some(r) = stack.pop() {
+            for op in b.ops(r) {
+                if let crate::OpKind::CallIndirect(sig) | crate::OpKind::InvokeIndirect { sig, .. } =
+                    b.kind(op)
+                    && let Some(crate::Shape::Func(_, _, true)) = b.types().shape_of(sig)
+                {
+                    return Some(format!("a call in @{}", f.name));
+                }
+                stack.extend_from_slice(b.regions(op));
+            }
+        }
+    }
+    None
+}
+
 /// Compile a verified module to assembly.
 pub fn compile(m: &Module, o: &Options) -> Result<String, String> {
+    if o.os == Os::Darwin
+        && let Some(what) = uses_varargs(m)
+    {
+        // Apple's AAPCS64 passes every variadic argument on the stack and makes `va_list` a
+        // pointer (open item: macOS varargs).
+        return Err(format!(
+            "{what} is variadic, and variadic functions aren't supported on macOS yet"
+        ));
+    }
     let mut mm = select(m)?;
     allocate(m, &mut mm);
     Ok(emit::emit(m, &mm, o))

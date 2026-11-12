@@ -1403,10 +1403,10 @@ fir_ops
       func callee
       operands []
       noResults
-  /-- `aarch64.blr func<(i32) -> i32> x9`: call the function `x9` points to, with arguments of
-  the signature's parameter types: its own, or, for a variadic function, every argument's at this
-  call (`func<(ptr, i32, f64) -> i32>` for `printf` with an `i32` and an `f64`; decision:
-  Varargs). -/
+  /-- `aarch64.blr func<(i32) -> i32> x9`: call the function `x9` points to, with arguments
+  of the signature's parameter types: its own, or, for a variadic function, every argument's
+  at this call (`func<(ptr, i32, f64) -> i32>` for `printf` with an `i32` and an `f64`;
+  decision: Varargs). -/
   op a64Blr (sig : Ty) (n : Reg)
     name "aarch64.blr"
     format "{sig} {n}"

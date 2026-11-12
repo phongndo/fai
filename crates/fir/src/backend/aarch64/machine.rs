@@ -543,7 +543,7 @@ impl<'m> Lfir<'m> {
                 })
             }
             Ty::Int(_) | Ty::Byte(_) => stuck(loc, format!("{t} is wider than a register")),
-            Ty::Agg(_) | Ty::Slice => stuck(loc, "not a value type"),
+            Ty::Agg(_) | Ty::Slice | Ty::VaList => stuck(loc, "not a value type"),
         }
     }
 
@@ -771,17 +771,14 @@ impl<'m> Lfir<'m> {
         }
     }
 
-    /// Lean's `callExt`: one event, then the results where the convention puts them.
-    fn call_ext(&mut self, loc: Option<Loc>, x: u32) -> R<()> {
+    /// Lean's `callExt`: one event, then the results where the convention puts them. The
+    /// arguments are read by `site`, the call's argument types, when given (`blr`), else by the
+    /// callee's parameters.
+    fn call_ext(&mut self, loc: Option<Loc>, x: u32, site: Option<&[Ty]>) -> R<()> {
         let module: &'m Module = self.m.module;
         let ext = &module.externs[x as usize];
-        let vs = self.arg_vals(loc, &ext.params)?;
-        if vs.len() != ext.params.len()
-            || !vs
-                .iter()
-                .zip(&ext.params)
-                .all(|(&v, &t)| self.m.has_ty(v, t))
-        {
+        let vs = self.arg_vals(loc, site.unwrap_or(&ext.params))?;
+        if !self.m.args_fit(&ext.params, ext.variadic, &vs) {
             return stuck(loc, format!("wrong arguments for @{}", ext.name));
         }
         for (a, t) in self.m.extern_reach(ext, &vs) {
@@ -820,13 +817,14 @@ impl<'m> Lfir<'m> {
         Ok(())
     }
 
-    /// Call function `f` (an index like `Kind::Func`'s).
-    fn call(&mut self, loc: Option<Loc>, f: u32) -> R<()> {
+    /// Call function `f` (an index like `Kind::Func`'s), an external one with arguments of
+    /// types `site` if given (Lean's `callNamed`).
+    fn call(&mut self, loc: Option<Loc>, f: u32, site: Option<&[Ty]>) -> R<()> {
         if f < self.m.nfuncs {
             self.x[30] = Word::Bits(0);
             self.enter(loc, f)
         } else {
-            self.call_ext(loc, f - self.m.nfuncs)
+            self.call_ext(loc, f - self.m.nfuncs, site)
         }
     }
 
@@ -1234,12 +1232,16 @@ impl<'m> Lfir<'m> {
                 let Some(&f) = self.m.funcs.get(name) else {
                     return stuck(loc, format!("no function @{name}"));
                 };
-                self.call(loc, f)?;
+                self.call(loc, f, None)?;
             }
-            OpKind::A64Blr { n, .. } => {
+            OpKind::A64Blr { sig, n } => {
                 let w = self.read(loc, n)?;
                 let f = self.func_at(loc, w)?;
-                self.call(loc, f)?;
+                let site = match body.types().shape_of(sig) {
+                    Some(Shape::Func(ps, ..)) => Some(ps.to_vec()),
+                    _ => None,
+                };
+                self.call(loc, f, site.as_deref())?;
             }
             OpKind::A64BlAlloc { family, align } => {
                 let size = self.read_bits(loc, Reg::x(0))?;
@@ -1289,8 +1291,14 @@ impl<'m> Lfir<'m> {
             self.x[8] = self.sp;
         }
         let module: &'m Module = self.m.module;
-        let body = &module.funcs[f as usize].body;
-        let ps: Vec<Ty> = body.params(body.entry()).map(|v| body.ty(v)).collect();
+        let func = &module.funcs[f as usize];
+        let body = &func.body;
+        // A variadic function's variadic arguments go where fixed ones of their types would.
+        let ps: Vec<Ty> = if func.variadic {
+            args.iter().map(|&v| self.m.scalar_ty(v)).collect()
+        } else {
+            body.params(body.entry()).map(|v| body.ty(v)).collect()
+        };
         let locs = abi::arg_locs(&ps);
         let slots = abi::stack_slots(&ps);
         if slots > 0 {

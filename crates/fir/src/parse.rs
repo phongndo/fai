@@ -16,7 +16,7 @@ use crate::decl::{Field, FieldTy, Imm, Item, Layer};
 use crate::ir::*;
 use crate::lex::{Lexer, Sym, Tok, Token, int_value};
 use crate::ops::{TARGETS, op_kind};
-use crate::types::Types;
+use crate::types::{Shape, Types};
 
 pub fn parse_module(input: &str) -> Result<Module, String> {
     let mut p = Parser::new(input, true)?;
@@ -55,6 +55,10 @@ struct Parser<'a> {
     globals: Globals,
     /// Whether types go to the globals' table (or the current body's).
     in_globals: bool,
+    /// Each direct call written in the readable form: its callee, where its argument list has
+    /// `...` (how many arguments come before it), and the list's position, checked against the
+    /// callee's signature once the module is read (Lean's `PState.calls`).
+    calls: Vec<(String, Option<usize>, (u32, u32))>,
 }
 
 type PResult<T> = Result<T, String>;
@@ -79,6 +83,7 @@ impl<'a> Parser<'a> {
             results: Vec::new(),
             globals: Globals::default(),
             in_globals: false,
+            calls: Vec::new(),
         })
     }
 
@@ -231,6 +236,32 @@ impl<'a> Parser<'a> {
         Ok(items)
     }
 
+    /// Parameters, possibly ending with `...`, ended by `close`: the parameters and whether they
+    /// end with `...` (Lean's `paramsVa`).
+    fn params_va<T>(
+        &mut self,
+        p: impl Fn(&mut Self) -> PResult<T>,
+        close: Sym,
+    ) -> PResult<(Vec<T>, bool)> {
+        let mut items = Vec::new();
+        if self.try_sym(close)? {
+            return Ok((items, false));
+        }
+        loop {
+            if self.try_sym(Sym::Ellipsis)? {
+                if !self.try_sym(close)? {
+                    return self.fail("'...' must come after the parameters");
+                }
+                return Ok((items, true));
+            }
+            items.push(p(self)?);
+            if self.try_sym(close)? {
+                return Ok((items, false));
+            }
+            self.expect_sym(Sym::Comma)?;
+        }
+    }
+
     /// Comma-separated items, possibly none, ended by `close`.
     fn sep_by<T>(&mut self, p: impl Fn(&mut Self) -> PResult<T>, close: Sym) -> PResult<Vec<T>> {
         if self.try_sym(close)? {
@@ -251,7 +282,8 @@ impl<'a> Parser<'a> {
     }
 
     /// A type: `i32`, `ptr`, `b8`, `f32`, `f64`, `struct<C>{i32, ptr}`, `array<4 x i32>`,
-    /// `func<(i32, ptr) -> i32>`, `union<i32, ptr>`, or `slice`.
+    /// `func<(i32, ptr) -> i32>` (`func<(ptr, ...) -> i32>` when variadic), `union<i32, ptr>`,
+    /// `slice`, or `va_list`.
     fn ty(&mut self) -> PResult<Ty> {
         let s = self.ident()?;
         // `iN` and `bN` first: they are most of the types.
@@ -299,10 +331,11 @@ impl<'a> Parser<'a> {
                 let variants = self.sep_by(Self::ty, Sym::Gt)?;
                 Ok(self.types().union(&variants))
             }
+            "va_list" => Ok(Ty::VaList),
             "func" => {
                 self.expect_sym(Sym::Lt)?;
                 self.expect_sym(Sym::LParen)?;
-                let params = self.sep_by(Self::ty, Sym::RParen)?;
+                let (params, variadic) = self.params_va(Self::ty, Sym::RParen)?;
                 let rets = if self.try_sym(Sym::Arrow)? {
                     if self.try_sym(Sym::LParen)? {
                         self.sep_by(Self::ty, Sym::RParen)?
@@ -313,7 +346,7 @@ impl<'a> Parser<'a> {
                     Vec::new()
                 };
                 self.expect_sym(Sym::Gt)?;
-                Ok(self.types().func(&params, &rets))
+                Ok(self.types().func_va(&params, &rets, variadic))
             }
             _ => self.fail(format!("unknown type '{s}'")),
         }
@@ -611,6 +644,54 @@ impl<'a> Parser<'a> {
         self.expect_sym(Sym::RParen)
     }
 
+    /// A call's arguments after `(`, up to `)`, where `...` may stand once before an argument or
+    /// at the end (Lean's `sepByVa`): how many come before it, if it is there.
+    fn args_va(&mut self, start: usize) -> PResult<Option<usize>> {
+        let mut mark = None;
+        loop {
+            if mark.is_none() && self.try_sym(Sym::Ellipsis)? {
+                mark = Some(self.operands.len() - start);
+                if self.try_sym(Sym::RParen)? {
+                    return Ok(mark);
+                }
+            }
+            let o = self.operand()?;
+            self.operands.push(o);
+            if self.try_sym(Sym::RParen)? {
+                return Ok(mark);
+            }
+            self.expect_sym(Sym::Comma)?;
+        }
+    }
+
+    /// Check where a call's `...` is (decision: Varargs): an indirect call's signature says now,
+    /// and a direct call's callee once the module is read.
+    fn va_mark(&mut self, kind: OpKind, mark: Option<usize>, pos: (u32, u32)) -> PResult<()> {
+        match kind {
+            OpKind::CallIndirect(sig) | OpKind::InvokeIndirect { sig, .. } => {
+                if let Some(Shape::Func(ps, _, va)) = self.types().shape_of(sig) {
+                    let n = ps.len();
+                    if mark != va.then_some(n) {
+                        return Err(format!(
+                            "{}:{}: {}",
+                            pos.0,
+                            pos.1,
+                            va_mark_error("the signature", n, va)
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            OpKind::Call { callee } | OpKind::Invoke { callee, .. } => {
+                let callee = self.body.str(callee).to_owned();
+                self.calls.push((callee, mark, pos));
+                Ok(())
+            }
+            _ if mark.is_some() => self.fail("'...' marks a call's variadic arguments"),
+            _ => Ok(()),
+        }
+    }
+
     /// `@name`, for a global.
     fn global_name(&mut self) -> PResult<&'a str> {
         match self.peek() {
@@ -770,10 +851,14 @@ impl<'a> Parser<'a> {
                 }
                 Item::Variadic => self.variadic()?,
                 Item::Args => {
+                    let pos = (self.cur.line, self.cur.col);
                     self.expect_sym(Sym::LParen)?;
+                    let start = self.operands.len();
+                    let mut mark = None;
                     if !self.try_sym(Sym::RParen)? {
-                        self.variadic_until_close()?;
+                        mark = self.args_va(start)?;
                     }
+                    self.va_mark(kind, mark, pos)?;
                 }
                 Item::Iter => {
                     if self.try_ident("iter")? {
@@ -993,7 +1078,7 @@ impl<'a> Parser<'a> {
         };
         self.expect_sym(Sym::LParen)?;
         self.body.clear();
-        let params = self.sep_by(Self::result, Sym::RParen)?;
+        let (params, variadic) = self.params_va(Self::result, Sym::RParen)?;
         let rets = if self.try_sym(Sym::Arrow)? {
             if self.try_sym(Sym::LParen)? {
                 self.sep_by(Self::ty, Sym::RParen)?
@@ -1038,10 +1123,11 @@ impl<'a> Parser<'a> {
             rets,
             file,
             body,
+            variadic,
         })
     }
 
-    /// `memspace default ptr 64 addr 64 [align 8] [int 8:1 16:2 …]`
+    /// `memspace default ptr 64 addr 64 [align 8] [int 8:1 16:2 …] [valist 32:8]`
     fn memspace(&mut self) -> PResult<SpaceCfg> {
         let name = self.ident()?;
         if name != "default" {
@@ -1072,11 +1158,20 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        let (va_size, va_align) = if self.try_ident("valist")? {
+            let size = self.nat()?;
+            self.expect_sym(Sym::Colon)?;
+            (size, self.nat()?)
+        } else {
+            DEFAULT_VA_LIST
+        };
         Ok(SpaceCfg {
             ptr_bits,
             addr_bits,
             ptr_align,
             ints,
+            va_size,
+            va_align,
         })
     }
 
@@ -1233,7 +1328,7 @@ impl<'a> Parser<'a> {
         self.in_globals = true;
         let sig = self.extern_sig();
         self.in_globals = false;
-        let (params, rets) = sig?;
+        let (params, rets, variadic) = sig?;
         if !self.try_ident("effects")? {
             return self.fail("expected 'effects' after an external function's signature");
         }
@@ -1246,13 +1341,14 @@ impl<'a> Parser<'a> {
             rets,
             effects,
             trust,
+            variadic,
         })
     }
 
-    /// `(T, …) [-> T | -> (T, …)]`
-    fn extern_sig(&mut self) -> PResult<(Vec<Ty>, Vec<Ty>)> {
+    /// `(T, …[, ...]) [-> T | -> (T, …)]`
+    fn extern_sig(&mut self) -> PResult<(Vec<Ty>, Vec<Ty>, bool)> {
         self.expect_sym(Sym::LParen)?;
-        let params = self.sep_by(Self::ty, Sym::RParen)?;
+        let (params, variadic) = self.params_va(Self::ty, Sym::RParen)?;
         let rets = if self.try_sym(Sym::Arrow)? {
             if self.try_sym(Sym::LParen)? {
                 self.sep_by(Self::ty, Sym::RParen)?
@@ -1262,7 +1358,7 @@ impl<'a> Parser<'a> {
         } else {
             Vec::new()
         };
-        Ok((params, rets))
+        Ok((params, rets, variadic))
     }
 
     /// `hfir`, `mfir`, or `lfir TARGET`, after `layer`.
@@ -1323,9 +1419,39 @@ impl<'a> Parser<'a> {
                 m.funcs.push(self.func()?);
             }
         }
+        // Each direct call's `...` where its callee's signature says (decision: Varargs). A
+        // callee that isn't declared is the verifier's to report.
+        for (f, mark, (line, col)) in std::mem::take(&mut self.calls) {
+            let sig = match m.funcs.iter().find(|g| g.name == f) {
+                Some(g) => Some((g.body.params(g.body.entry()).count(), g.variadic)),
+                None => m
+                    .externs
+                    .iter()
+                    .find(|x| x.name == f)
+                    .map(|x| (x.params.len(), x.variadic)),
+            };
+            if let Some((n, va)) = sig
+                && mark != va.then_some(n)
+            {
+                return Err(format!(
+                    "{line}:{col}: {}",
+                    va_mark_error(&format!("@{f}"), n, va)
+                ));
+            }
+        }
         m.globals = std::mem::take(&mut self.globals);
         m.layer = layer.unwrap_or_default();
         Ok(m)
+    }
+}
+
+/// What's wrong with a call's `...` against a callee that takes `n` parameters and is variadic
+/// or not (Lean's `vaMarkError`).
+fn va_mark_error(callee: &str, n: usize, variadic: bool) -> String {
+    if variadic {
+        format!("{callee} is variadic: write '...' after its {n} fixed arguments")
+    } else {
+        format!("{callee} is not variadic: '...' marks variadic arguments")
     }
 }
 

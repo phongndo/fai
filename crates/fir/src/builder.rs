@@ -283,6 +283,8 @@ struct Sym {
     params: Vec<Ty>,
     rets: Vec<Ty>,
     kind: SymKind,
+    /// Whether calls may pass variadic arguments after the parameters.
+    variadic: bool,
 }
 
 /// Where the next op goes.
@@ -345,7 +347,7 @@ impl ModuleBuilder {
                 .insert(module.globals.name(i).to_owned(), i as u32);
         }
         for x in &module.externs {
-            mb.add_sym(&x.name, &x.params, &x.rets, SymKind::Extern)?;
+            mb.add_sym(&x.name, &x.params, &x.rets, SymKind::Extern, x.variadic)?;
         }
         // A function's signature is in its body's type table; symbols keep the module's.
         let types = &mut module.globals.types;
@@ -356,7 +358,7 @@ impl ModuleBuilder {
                 .map(|v| types.import(b.types(), b.ty(v)))
                 .collect();
             let rets: Vec<Ty> = f.rets.iter().map(|&t| types.import(b.types(), t)).collect();
-            mb.add_sym(&f.name, &params, &rets, SymKind::Defined)?;
+            mb.add_sym(&f.name, &params, &rets, SymKind::Defined, f.variadic)?;
         }
         mb.module = module;
         Ok(mb)
@@ -416,9 +418,19 @@ impl ModuleBuilder {
 
     /// `func<(params) -> rets>`, for `func.call.indirect`.
     pub fn func_ty(&mut self, params: &[Ty], rets: &[Ty]) -> Result<Ty, BuildError> {
+        self.func_ty_va(params, rets, false)
+    }
+
+    /// `func<(params, ...) -> rets>` when `variadic`, else `func<(params) -> rets>`.
+    pub fn func_ty_va(
+        &mut self,
+        params: &[Ty],
+        rets: &[Ty],
+        variadic: bool,
+    ) -> Result<Ty, BuildError> {
         self.check_tys(params)?;
         self.check_tys(rets)?;
-        Ok(self.module.globals.types.func(params, rets))
+        Ok(self.module.globals.types.func_va(params, rets, variadic))
     }
 
     /// Every type is a type of this builder.
@@ -456,6 +468,7 @@ impl ModuleBuilder {
         params: &[Ty],
         rets: &[Ty],
         kind: SymKind,
+        variadic: bool,
     ) -> Result<FuncRef, BuildError> {
         if self.by_name.contains_key(name) || self.globals_by_name.contains_key(name) {
             return err(format!("@{name} is defined more than once"));
@@ -466,6 +479,7 @@ impl ModuleBuilder {
             params: params.to_vec(),
             rets: rets.to_vec(),
             kind,
+            variadic,
         });
         self.by_name.insert(name.to_owned(), id);
         Ok(FuncRef(id))
@@ -480,10 +494,22 @@ impl ModuleBuilder {
         params: &[Ty],
         rets: &[Ty],
     ) -> Result<FuncRef, BuildError> {
+        self.declare_func_va(name, params, rets, false)
+    }
+
+    /// [`ModuleBuilder::declare_func`] of a function that takes variadic arguments after its
+    /// parameters if `variadic` (`func @f(%fmt: ptr, ...)`).
+    pub fn declare_func_va(
+        &mut self,
+        name: &str,
+        params: &[Ty],
+        rets: &[Ty],
+        variadic: bool,
+    ) -> Result<FuncRef, BuildError> {
         check_name(name)?;
         self.value_tys("func", name, params)?;
         self.value_tys("func", name, rets)?;
-        self.add_sym(name, params, rets, SymKind::Declared)
+        self.add_sym(name, params, rets, SymKind::Declared, variadic)
     }
 
     /// `extern func @name(params) -> rets effects[effects] trust`: a function outside the module.
@@ -495,18 +521,38 @@ impl ModuleBuilder {
         effects: &[ExtEffect],
         trust: Trust,
     ) -> Result<FuncRef, BuildError> {
+        self.extern_func_va(name, params, rets, false, effects, trust)
+    }
+
+    /// [`ModuleBuilder::extern_func`] of a function that takes variadic arguments after its
+    /// parameters if `variadic` (`extern func @printf(ptr, ...) -> i32 …`).
+    pub fn extern_func_va(
+        &mut self,
+        name: &str,
+        params: &[Ty],
+        rets: &[Ty],
+        variadic: bool,
+        effects: &[ExtEffect],
+        trust: Trust,
+    ) -> Result<FuncRef, BuildError> {
         check_name(name)?;
         self.value_tys("extern", name, params)?;
         self.value_tys("extern", name, rets)?;
-        let f = self.add_sym(name, params, rets, SymKind::Extern)?;
+        let f = self.add_sym(name, params, rets, SymKind::Extern, variadic)?;
         self.module.externs.push(Extern {
             name: name.to_owned(),
             params: params.to_vec(),
             rets: rets.to_vec(),
             effects: effects.to_vec(),
             trust,
+            variadic,
         });
         Ok(f)
+    }
+
+    /// Whether a function takes variadic arguments.
+    pub fn func_variadic(&self, f: FuncRef) -> bool {
+        self.syms.get(f.index()).is_some_and(|s| s.variadic)
     }
 
     /// The function or external function with this name.
@@ -777,6 +823,7 @@ impl<'m> FuncBuilder<'m> {
             rets,
             file: st.file.take(),
             body,
+            variadic: sym.variadic,
         });
         Ok(f)
     }
@@ -1320,14 +1367,26 @@ impl<'m> FuncBuilder<'m> {
             }
             Res::Callee(f) => {
                 let sym = self.m.sym(f)?;
-                let (params, rets) = (sym.params.clone(), sym.rets.clone());
+                let (params, rets, va) = (sym.params.clone(), sym.rets.clone(), sym.variadic);
                 let params = self.import_list(&params)?;
-                if ins != params.as_slice() {
+                let n = if va {
+                    params.len().min(ins.len())
+                } else {
+                    ins.len()
+                };
+                if ins[..n] != *params.as_slice() {
                     let name = &self.m.syms[f.index()].name;
                     return err(format!(
                         "arguments of @{name}: expected {} but got {}",
                         self.show_list(&params),
-                        self.show_list(ins)
+                        self.show_list(&ins[..n])
+                    ));
+                }
+                if let Some(&t) = ins[n..].iter().find(|t| !t.is_vararg()) {
+                    let name = &self.m.syms[f.index()].name;
+                    return err(format!(
+                        "arguments of @{name}: {} can't be a variadic argument",
+                        self.show(t)
                     ));
                 }
                 for &t in &rets {
@@ -1341,16 +1400,27 @@ impl<'m> FuncBuilder<'m> {
             }
             Res::Sig(t) => {
                 let types = self.m.st.body.types();
-                let Some(Shape::Func(ps, rs)) = types.shape_of(t) else {
+                let Some(Shape::Func(ps, rs, va)) = types.shape_of(t) else {
                     return err(format!("{} is not a function type", types.show(t)));
                 };
-                if ins.is_empty() || ins[0] != Ty::Ptr || ins[1..] != *ps {
+                let n = if va {
+                    (ps.len() + 1).min(ins.len())
+                } else {
+                    ins.len()
+                };
+                if n == 0 || ins[0] != Ty::Ptr || ins[1..n] != *ps {
                     let mut want = vec![Ty::Ptr];
                     want.extend_from_slice(ps);
                     return err(format!(
                         "operands: expected {} but got {}",
                         self.show_list(&want),
-                        self.show_list(ins)
+                        self.show_list(&ins[..n])
+                    ));
+                }
+                if let Some(&t) = ins[n..].iter().find(|t| !t.is_vararg()) {
+                    return err(format!(
+                        "operands: {} can't be a variadic argument",
+                        types.show(t)
                     ));
                 }
                 outs.extend_from_slice(rs);
@@ -1489,6 +1559,12 @@ impl<'m> FuncBuilder<'m> {
                         return err(msg);
                     }
                 }
+                Check::Vararg(t) => {
+                    let t = ty(&vars, t);
+                    if !t.is_vararg() {
+                        return err(format!("{} can't be a variadic argument", self.show(t)));
+                    }
+                }
                 // Integer ranges, layouts, names, and the shapes of aggregate and union types are
                 // left to the verifier.
                 Check::Fits(..)
@@ -1554,10 +1630,10 @@ fn import(from: &Types, body: &mut Body, map: &mut Vec<u32>, t: Ty) -> Ty {
             let e = import(from, body, map, e);
             body.types_mut().array(n, e)
         }
-        Shape::Func(ps, rs) => {
+        Shape::Func(ps, rs, va) => {
             let ps = list(ps, body, map);
             let rs = list(rs, body, map);
-            body.types_mut().func(&ps, &rs)
+            body.types_mut().func_va(&ps, &rs, va)
         }
         Shape::Union(vs) => {
             let vs = list(vs, body, map);

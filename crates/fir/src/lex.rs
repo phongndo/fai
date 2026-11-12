@@ -23,6 +23,8 @@ pub enum Sym {
     Colon,
     Eq,
     Arrow,
+    /// `...`: variadic parameters or arguments.
+    Ellipsis,
 }
 
 impl Sym {
@@ -40,6 +42,7 @@ impl Sym {
             Sym::Colon => ":",
             Sym::Eq => "=",
             Sym::Arrow => "->",
+            Sym::Ellipsis => "...",
         }
     }
 
@@ -213,6 +216,10 @@ impl<'a> Lexer<'a> {
             self.pos += 2;
             self.col += 2;
             Tok::Sym(Sym::Arrow)
+        } else if c == b'.' && next == Some(b'.') && self.byte(self.pos + 2) == Some(b'.') {
+            self.pos += 3;
+            self.col += 3;
+            Tok::Sym(Sym::Ellipsis)
         } else if let Some(sym) = Sym::of_byte(c) {
             self.pos += 1;
             self.col += 1;

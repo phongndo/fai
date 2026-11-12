@@ -27,10 +27,14 @@ fn copy_ty(from: &Types, t: Ty, mb: &mut ModuleBuilder) -> Ty {
             let e = copy_ty(from, e, mb);
             mb.array_ty(n, e).unwrap()
         }
-        Shape::Func(ps, rs) => {
+        Shape::Func(ps, rs, va) => {
             let ps: Vec<Ty> = ps.iter().map(|&t| copy_ty(from, t, mb)).collect();
             let rs: Vec<Ty> = rs.iter().map(|&t| copy_ty(from, t, mb)).collect();
-            mb.func_ty(&ps, &rs).unwrap()
+            if va {
+                mb.func_ty_va(&ps, &rs, true).unwrap()
+            } else {
+                mb.func_ty(&ps, &rs).unwrap()
+            }
         }
         Shape::Union(vs) => {
             let vs: Vec<Ty> = vs.iter().map(|&t| copy_ty(from, t, mb)).collect();
@@ -80,7 +84,11 @@ fn rebuild(m: &Module) -> Result<Module, BuildError> {
     for x in &m.externs {
         let ps: Vec<Ty> = x.params.iter().map(|&t| copy_ty(gt, t, &mut mb)).collect();
         let rs: Vec<Ty> = x.rets.iter().map(|&t| copy_ty(gt, t, &mut mb)).collect();
-        mb.extern_func(&x.name, &ps, &rs, &x.effects, x.trust)?;
+        if x.variadic {
+            mb.extern_func_va(&x.name, &ps, &rs, true, &x.effects, x.trust)?;
+        } else {
+            mb.extern_func(&x.name, &ps, &rs, &x.effects, x.trust)?;
+        }
     }
     let mut refs = Vec::new();
     for f in &m.funcs {
@@ -94,7 +102,11 @@ fn rebuild(m: &Module) -> Result<Module, BuildError> {
             .iter()
             .map(|&t| copy_ty(b.types(), t, &mut mb))
             .collect();
-        refs.push(mb.declare_func(&f.name, &ps, &rs)?);
+        refs.push(if f.variadic {
+            mb.declare_func_va(&f.name, &ps, &rs, true)?
+        } else {
+            mb.declare_func(&f.name, &ps, &rs)?
+        });
     }
     let g = &m.globals;
     for i in 0..g.len() {
@@ -373,6 +385,15 @@ impl<'a> Replay<'a> {
             OpKind::MemStackOf { ty, align } => {
                 let t = self.ty(f, ty);
                 made = one(f.mem_stack_of(t, align)?);
+            }
+            OpKind::VaStart => {
+                made = None;
+                new_op = Some(f.va_start(ops[0])?);
+            }
+            OpKind::VaArg => made = one(f.va_arg(res[0], ops[0])?),
+            OpKind::VaEnd => {
+                made = None;
+                new_op = Some(f.va_end(ops[0])?);
             }
             OpKind::MemCopy { ty, align } => {
                 made = None;

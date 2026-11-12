@@ -6,7 +6,8 @@ use std::fmt::Write;
 use crate::body::{Body, Int, OpId, Operand, OperandKind, RegionId, Succ, ValueId};
 use crate::decl::{Field, FieldTy, Imm, Item, Layer};
 use crate::ir::*;
-use crate::types::write_rets;
+use crate::types::{Shape, write_rets};
+use rustc_hash::FxHashMap;
 
 /// Append an integer stored in a body.
 fn push_int(out: &mut String, n: Int<'_>) {
@@ -47,6 +48,9 @@ struct Printer<'a> {
     body: &'a Body,
     show_locs: bool,
     out: &'a mut String,
+    /// How many fixed parameters each variadic function of the module has, by name: where a
+    /// direct call's `...` goes (Lean's `OpKind.vaMark`).
+    va: &'a FxHashMap<&'a str, usize>,
 }
 
 /// Append a number's decimal digits.
@@ -77,6 +81,7 @@ fn push_ty(out: &mut String, types: &Types, t: Ty) {
         }
         Ty::Slice => out.push_str("slice"),
         Ty::Float(f) => out.push_str(f.name()),
+        Ty::VaList => out.push_str("va_list"),
         Ty::Agg(_) => types.write(out, t),
     }
 }
@@ -360,8 +365,22 @@ impl Printer<'_> {
                 }
                 Item::Args => {
                     let end = operands.len().saturating_sub(kind.succ_args(b)).max(next);
+                    let args = &operands[next.min(end)..end];
                     self.out.push('(');
-                    self.operand_list(&operands[next.min(end)..end]);
+                    match self.va_mark(kind).filter(|&k| k <= args.len()) {
+                        None => self.operand_list(args),
+                        Some(k) => {
+                            self.operand_list(&args[..k]);
+                            if k > 0 {
+                                self.out.push_str(", ");
+                            }
+                            self.out.push_str("...");
+                            if k < args.len() {
+                                self.out.push(' ');
+                                self.operand_list(&args[k..]);
+                            }
+                        }
+                    }
                     self.out.push(')');
                     next = end;
                 }
@@ -409,6 +428,24 @@ impl Printer<'_> {
         }
         if decl.has_blocks() {
             self.blocks(depth, op);
+        }
+    }
+
+    /// Where a call's `...` goes: after as many arguments as the callee's signature has
+    /// parameters, if it is variadic (Lean's `OpKind.vaMark`).
+    fn va_mark(&self, kind: OpKind) -> Option<usize> {
+        let b = self.body;
+        match kind {
+            OpKind::CallIndirect(sig) | OpKind::InvokeIndirect { sig, .. } => {
+                match b.types().shape_of(sig) {
+                    Some(Shape::Func(ps, _, true)) => Some(ps.len()),
+                    _ => None,
+                }
+            }
+            OpKind::Call { callee } | OpKind::Invoke { callee, .. } => {
+                self.va.get(b.str(callee)).copied()
+            }
+            _ => None,
         }
     }
 
@@ -463,23 +500,30 @@ impl Printer<'_> {
 }
 
 impl Func {
+    /// The function as text. Without its module, calls of variadic functions other than
+    /// through a pointer don't show their `...`.
     pub fn render(&self, show_locs: bool) -> String {
         let mut out = String::new();
-        self.render_into(&mut out, show_locs);
+        self.render_into(&mut out, show_locs, &FxHashMap::default());
         out
     }
 
-    fn render_into(&self, out: &mut String, show_locs: bool) {
+    fn render_into(&self, out: &mut String, show_locs: bool, va: &FxHashMap<&str, usize>) {
         let mut p = Printer {
             body: &self.body,
             show_locs,
             out,
+            va,
         };
         let entry = self.body.entry();
         p.out.push_str("func @");
         p.out.push_str(&self.name);
         p.out.push('(');
         p.values(self.body.params(entry));
+        if self.variadic {
+            let fixed = self.body.params(entry).len() > 0;
+            p.out.push_str(if fixed { ", ..." } else { "..." });
+        }
         p.out.push(')');
         let types = self.body.types();
         write_rets(p.out, &self.rets, |out, t| push_ty(out, types, *t));
@@ -551,6 +595,9 @@ impl Module {
                     write!(out, " {w}:{a}").unwrap();
                 }
             }
+            if (sp.va_size, sp.va_align) != DEFAULT_VA_LIST {
+                write!(out, " valist {}:{}", sp.va_size, sp.va_align).unwrap();
+            }
             out.push('\n');
         }
         if !out.is_empty() {
@@ -586,6 +633,9 @@ impl Module {
                 }
                 push_ty(&mut out, &g.types, t);
             }
+            if x.variadic {
+                out.push_str(if x.params.is_empty() { "..." } else { ", ..." });
+            }
             out.push(')');
             write_rets(&mut out, &x.rets, |out, t| push_ty(out, &g.types, *t));
             out.push_str(" effects[");
@@ -602,11 +652,19 @@ impl Module {
         if !self.externs.is_empty() {
             out.push('\n');
         }
+        // Where each direct call's `...` goes: after a variadic callee's parameters.
+        let mut va = FxHashMap::default();
+        for f in self.funcs.iter().filter(|f| f.variadic) {
+            va.insert(f.name.as_str(), f.body.params(f.body.entry()).len());
+        }
+        for x in self.externs.iter().filter(|x| x.variadic) {
+            va.entry(x.name.as_str()).or_insert(x.params.len());
+        }
         for (i, f) in self.funcs.iter().enumerate() {
             if i > 0 {
                 out.push('\n');
             }
-            f.render_into(&mut out, show_locs);
+            f.render_into(&mut out, show_locs, &va);
         }
         out
     }

@@ -34,6 +34,9 @@ pub enum Ty {
     Byte(u32),
     Slice,
     Float(FloatTy),
+    /// `va_list`: memory for a cursor over a call's variadic arguments, laid out by the memory
+    /// space (Lean's `Ty.vaList`). Not a value type.
+    VaList,
     Agg(TyId),
 }
 
@@ -46,6 +49,16 @@ impl Ty {
 
     pub fn is_float(self) -> bool {
         matches!(self, Ty::Float(_))
+    }
+
+    /// Whether a variadic argument can have this type (Lean's `Ty.isVararg`): `iN` and `bN` of 8
+    /// to 64 bits in whole bytes, `ptr`, `f32`, and `f64`.
+    pub fn is_vararg(self) -> bool {
+        match self {
+            Ty::Int(w) | Ty::Byte(w) => w % 8 == 0 && (8..=64).contains(&w),
+            Ty::Ptr | Ty::Float(_) => true,
+            _ => false,
+        }
     }
 }
 
@@ -83,6 +96,7 @@ impl fmt::Display for Ty {
             Ty::Byte(w) => write!(f, "b{w}"),
             Ty::Slice => f.write_str("slice"),
             Ty::Float(t) => f.write_str(t.name()),
+            Ty::VaList => f.write_str("va_list"),
             Ty::Agg(id) => write!(f, "type#{}", id.index()),
         }
     }
@@ -93,15 +107,21 @@ pub const DEFAULT_INTS: [(u32, u32); 5] = [(8, 1), (16, 2), (32, 4), (64, 8), (1
 
 /// A memory space's data layout (Lean's `SpaceCfg`): how much memory a pointer takes and the
 /// address (index) size used by `ptr.addr`, offsets, and allocation sizes, in bits; the pointer
-/// alignment; and the integer alignments, `(width in bits, alignment in bytes)` by increasing
-/// width.
+/// alignment; the integer alignments, `(width in bits, alignment in bytes)` by increasing
+/// width; and a `va_list`'s size and alignment in bytes (AAPCS64's on Linux by default).
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct SpaceCfg {
     pub ptr_bits: u32,
     pub addr_bits: u32,
     pub ptr_align: u32,
     pub ints: Vec<(u32, u32)>,
+    pub va_size: u32,
+    pub va_align: u32,
 }
+
+/// The default `va_list` layout: AAPCS64's on Linux, `{__stack, __gr_top, __vr_top, __gr_offs,
+/// __vr_offs}` (Lean's `SpaceCfg.vaSize` and `vaAlign` defaults).
+pub const DEFAULT_VA_LIST: (u32, u32) = (32, 8);
 
 impl Default for SpaceCfg {
     fn default() -> Self {
@@ -110,6 +130,8 @@ impl Default for SpaceCfg {
             addr_bits: 64,
             ptr_align: 8,
             ints: DEFAULT_INTS.to_vec(),
+            va_size: DEFAULT_VA_LIST.0,
+            va_align: DEFAULT_VA_LIST.1,
         }
     }
 }
@@ -363,6 +385,8 @@ pub struct Extern {
     pub rets: Vec<Ty>,
     pub effects: Vec<ExtEffect>,
     pub trust: Trust,
+    /// `extern func @printf(ptr, ...)`: takes variadic arguments after its parameters.
+    pub variadic: bool,
 }
 
 impl Extern {
@@ -388,4 +412,6 @@ pub struct Func {
     pub rets: Vec<Ty>,
     pub file: Option<String>,
     pub body: crate::Body,
+    /// `func @f(%fmt: ptr, ...)`: a call may pass variadic arguments after the parameters.
+    pub variadic: bool,
 }

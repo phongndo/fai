@@ -52,6 +52,12 @@ pub fn verify_module(m: &Module) -> Result<Vec<Hole>, String> {
             sp.ptr_align
         ));
     }
+    if !(sp.va_size > 0 && is_pow2(sp.va_align.into())) {
+        return Err(format!(
+            "memspace: va_list size {} must be positive and its alignment {} a power of two",
+            sp.va_size, sp.va_align
+        ));
+    }
     let mut last = 0;
     for &(w, a) in &sp.ints {
         if w <= last {
@@ -81,7 +87,7 @@ pub fn verify_module(m: &Module) -> Result<Vec<Hole>, String> {
         }
         sigs.insert(
             x.name.as_str(),
-            (x.params.clone(), x.rets.clone(), &gs.types),
+            (x.params.clone(), x.rets.clone(), &gs.types, x.variadic),
         );
     }
     for f in &m.funcs {
@@ -92,7 +98,10 @@ pub fn verify_module(m: &Module) -> Result<Vec<Hole>, String> {
         }
         let entry = f.body.entry();
         let params: Vec<Ty> = f.body.params(entry).map(|v| f.body.ty(v)).collect();
-        sigs.insert(f.name.as_str(), (params, f.rets.clone(), f.body.types()));
+        sigs.insert(
+            f.name.as_str(),
+            (params, f.rets.clone(), f.body.types(), f.variadic),
+        );
     }
     for i in 0..gs.len() {
         let name = gs.name(i);
@@ -163,6 +172,7 @@ pub fn verify_module(m: &Module) -> Result<Vec<Hole>, String> {
                 globals: &globals,
             },
             holes: &mut holes,
+            variadic: f.variadic,
             defined: FxHashSet::default(),
             visible: vec![false; f.body.num_values()],
             scope: Vec::new(),
@@ -310,10 +320,10 @@ enum RegionCtx<'a> {
 }
 
 /// Whether values of type `t` can exist in a module of this layer (Lean's `Layer.valueTy`):
-/// in HFIR anything but a function type, elsewhere the scalars.
+/// in HFIR anything but a function type, elsewhere the scalars; never with a `va_list` in it.
 fn value_ty(layer: Layer, types: &Types, t: Ty) -> bool {
     match layer {
-        Layer::Hfir => types.is_hvalue(t),
+        Layer::Hfir => types.is_hvalue(t) && !types.has_va_list(t),
         _ => t.is_value(),
     }
 }
@@ -327,7 +337,7 @@ fn check_ty(types: &Types, sp: &SpaceCfg, layer: Layer, loc: Option<Loc>, t: Ty)
         Ty::Byte(w) if !(w > 0 && w.is_multiple_of(8)) => {
             verr(loc, format!("b{w} is not a valid type"))
         }
-        Ty::Int(_) | Ty::Ptr | Ty::Byte(_) | Ty::Slice | Ty::Float(_) => Ok(()),
+        Ty::Int(_) | Ty::Ptr | Ty::Byte(_) | Ty::Slice | Ty::Float(_) | Ty::VaList => Ok(()),
         Ty::Agg(id) => {
             let part = |x: Ty| -> VResult<()> {
                 check_ty(types, sp, layer, loc, x)?;
@@ -347,7 +357,7 @@ fn check_ty(types: &Types, sp: &SpaceCfg, layer: Layer, loc: Option<Loc>, t: Ty)
                     }
                 }
                 Shape::Array(_, e) => part(e)?,
-                Shape::Func(ps, rs) => {
+                Shape::Func(ps, rs, _) => {
                     for &x in ps.iter().chain(rs) {
                         check_ty(types, sp, layer, loc, x)?;
                         if !value_ty(layer, types, x) {
@@ -369,7 +379,7 @@ fn check_ty(types: &Types, sp: &SpaceCfg, layer: Layer, loc: Option<Loc>, t: Ty)
                     }
                     for &v in vs {
                         check_ty(types, sp, layer, loc, v)?;
-                        if !types.is_hvalue(v) {
+                        if !types.is_hvalue(v) || types.has_va_list(v) {
                             return verr(
                                 loc,
                                 format!(
@@ -622,7 +632,7 @@ fn is_loadable_scalar(space: &SpaceCfg, t: Ty) -> bool {
         Ty::Int(w) => w.is_multiple_of(8),
         Ty::Ptr => space.ptr_bits.is_multiple_of(8),
         Ty::Byte(_) | Ty::Float(_) => true,
-        Ty::Slice | Ty::Agg(_) => false,
+        Ty::Slice | Ty::Agg(_) | Ty::VaList => false,
     }
 }
 
@@ -826,11 +836,17 @@ fn check_simple(
                     return verr(loc, "malformed op");
                 };
                 let callee = body.str(callee);
-                let Some((params, rets, ctypes)) = sigs.get(callee) else {
+                let Some((params, rets, ctypes, va)) = sigs.get(callee) else {
                     return verr(loc, format!("no function @{callee}"));
                 };
                 let what = format!("arguments of @{callee}");
-                expect_tys_in(types, ctypes, loc, &what, ins, params)?;
+                if *va {
+                    let n = params.len().min(ins.len());
+                    expect_tys_in(types, ctypes, loc, &what, &ins[..n], params)?;
+                    check_varargs(types, loc, &what, &ins[n..])?;
+                } else {
+                    expect_tys_in(types, ctypes, loc, &what, ins, params)?;
+                }
                 let what = format!("results of @{callee}");
                 expect_tys_in(types, ctypes, loc, &what, outs, rets)?;
             }
@@ -855,15 +871,21 @@ fn check_simple(
                     return verr(loc, "malformed op");
                 };
                 check_ty(types, space, layer, loc, t)?;
-                let Some(Shape::Func(ps, rs)) = types.shape_of(t) else {
+                let Some(Shape::Func(ps, rs, va)) = types.shape_of(t) else {
                     return verr(loc, format!("{} is not a function type", show(t)));
                 };
-                let ok = ins.len() == ps.len() + 1 && ins[0] == Ty::Ptr && ins[1..] == *ps;
+                let n = if va {
+                    (ps.len() + 1).min(ins.len())
+                } else {
+                    ins.len()
+                };
+                let ok = n == ps.len() + 1 && ins[0] == Ty::Ptr && ins[1..n] == *ps;
                 if !ok {
                     let mut want = vec![Ty::Ptr];
                     want.extend_from_slice(ps);
-                    expect_tys(types, loc, "operands", ins, &want)?;
+                    expect_tys(types, loc, "operands", &ins[..n], &want)?;
                 }
+                check_varargs(types, loc, "operands", &ins[n..])?;
                 expect_tys(types, loc, "results", outs, rs)?;
             }
             Check::Global(i) => {
@@ -995,10 +1017,31 @@ fn check_simple(
                     return verr(loc, format!("{n} is not the bits of a {}", show(t)));
                 }
             }
+            Check::Vararg(t) => {
+                let t = ty(&t);
+                if !t.is_vararg() {
+                    return verr(loc, format!("{} can't be a variadic argument", show(t)));
+                }
+            }
         }
     }
     Ok(())
 }
+
+/// A call's variadic arguments (Lean's `checkArgs`): each of a type `Ty.isVararg` allows.
+fn check_varargs(types: &Types, loc: Option<Loc>, what: &str, ins: &[Ty]) -> VResult<()> {
+    match ins.iter().find(|t| !t.is_vararg()) {
+        Some(&t) => verr(
+            loc,
+            format!("{what}: {} can't be a variadic argument", types.show(t)),
+        ),
+        None => Ok(()),
+    }
+}
+
+/// A function's signature: its parameter and result types (in the table given), and whether it
+/// is variadic.
+type Sig<'a> = (Vec<Ty>, Vec<Ty>, &'a Types, bool);
 
 /// Verifies one function. Lean threads a name-to-type scope through the ops; here the visible
 /// values are a stack (`scope`) that is cut back when a region ends, mirrored in a set
@@ -1008,8 +1051,8 @@ fn check_simple(
 struct Cx<'a> {
     space: &'a SpaceCfg,
     layer: Layer,
-    /// Each function's parameter and result types.
-    sigs: &'a FxHashMap<&'a str, (Vec<Ty>, Vec<Ty>, &'a Types)>,
+    /// Each function's parameter and result types, and whether it is variadic.
+    sigs: &'a FxHashMap<&'a str, Sig<'a>>,
     globals: &'a FxHashSet<&'a str>,
 }
 
@@ -1017,6 +1060,8 @@ struct FuncVerifier<'a> {
     body: &'a Body,
     cx: Cx<'a>,
     holes: &'a mut Vec<Hole>,
+    /// Whether the function is variadic (`va.start` is allowed in it).
+    variadic: bool,
     /// Every name defined so far in the function.
     defined: FxHashSet<&'a str>,
     /// Whether each value is visible here, by id.
@@ -1504,6 +1549,12 @@ impl<'a> FuncVerifier<'a> {
                         }
                     }
                 }
+            }
+            (OpKind::VaStart, []) => {
+                if !self.variadic {
+                    return verr(loc, "va.start is only allowed in a variadic function");
+                }
+                check_simple(&self.cx, body, loc, kind, &ins, &outs)?;
             }
             (k, []) => {
                 if k.is_terminator() || matches!(k, OpKind::If | OpKind::Loop { .. } | OpKind::Try)

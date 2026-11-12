@@ -127,6 +127,7 @@ fn lower_func(sp: &SpaceCfg, ext: &[String], f: &Func) -> Result<Func, String> {
         rets,
         file: f.file.clone(),
         body,
+        variadic: f.variadic,
     })
 }
 
@@ -873,7 +874,7 @@ impl<'a> Lowerer<'a> {
             }
             (_, OpKind::CallIndirect(sig)) => {
                 let flat = match self.dst.types().shape_of(sig) {
-                    Some(Shape::Func(ps, rs)) => {
+                    Some(Shape::Func(ps, rs, va)) => {
                         let (ps, rs) = (ps.to_vec(), rs.to_vec());
                         let mut fps = Vec::new();
                         let mut frs = Vec::new();
@@ -883,7 +884,7 @@ impl<'a> Lowerer<'a> {
                         for t in rs {
                             self.dst.types().scalars(self.aw, t, &mut frs);
                         }
-                        self.dst.types_mut().func(&fps, &frs)
+                        self.dst.types_mut().func_va(&fps, &frs, va)
                     }
                     _ => sig,
                 };

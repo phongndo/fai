@@ -491,6 +491,34 @@ impl FuncBuilder<'_> {
         Ok(self.all_results(made))
     }
 
+    /// `va.start %ap`: start a cursor over the running call's variadic arguments in the
+    /// `va_list` at `%ap`, at the first. Only in a variadic function.
+    pub fn va_start(&mut self, p: impl Into<Operand>) -> Result<OpId, BuildError> {
+        self.begin_op();
+        self.operand(p.into());
+        let kind = OpKind::VaStart;
+        self.simple(kind, Res::None)
+    }
+
+    /// `va.arg %ap`: the next variadic argument of the cursor in the `va_list` at `%ap`, read as
+    /// the result type, which must be of the argument's class (integer and pointer, or float); the
+    /// cursor moves past it. Its bytes are read as a load of the result type reads the argument's.
+    pub fn va_arg(&mut self, result: Ty, p: impl Into<Operand>) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(p.into());
+        let kind = OpKind::VaArg;
+        let made = self.simple(kind, Res::Given(&[result]))?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `va.end %ap`: end the cursor in the `va_list` at `%ap`; its bytes become `poison`.
+    pub fn va_end(&mut self, p: impl Into<Operand>) -> Result<OpId, BuildError> {
+        self.begin_op();
+        self.operand(p.into());
+        let kind = OpKind::VaEnd;
+        self.simple(kind, Res::None)
+    }
+
     /// `float.const 1.5`: the result type's float with these bits, written as the shortest
     /// decimal that reads back to them, `inf`, `-inf`, `nan`, or `nan(0x…)` (see `Fir.FloatText`).
     pub fn float_const(&mut self, result: Ty, value: u64) -> Result<ValueId, BuildError> {
@@ -1063,8 +1091,10 @@ impl FuncBuilder<'_> {
         self.simple(kind, Res::None)
     }
 
-    /// `aarch64.blr func<(i32) -> i32> x9`: call the function `x9` points to, which has that
-    /// signature.
+    /// `aarch64.blr func<(i32) -> i32> x9`: call the function `x9` points to, with arguments
+    /// of the signature's parameter types: its own, or, for a variadic function, every argument's
+    /// at this call (`func<(ptr, i32, f64) -> i32>` for `printf` with an `i32` and an `f64`;
+    /// decision: Varargs).
     pub fn aarch64_blr(&mut self, sig: Ty, n: Reg) -> Result<OpId, BuildError> {
         self.begin_op();
         let sig_id = self.ty_imm(sig)?;

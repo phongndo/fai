@@ -67,6 +67,9 @@ pub enum UbKind {
     Bounds,
     Tag,
     Convert,
+    /// `va.arg` of a `va_list` without a cursor, past the last variadic argument, or of the
+    /// other class than the argument's.
+    VaArg,
 }
 
 impl UbKind {
@@ -94,6 +97,7 @@ impl UbKind {
             UbKind::Bounds => "bounds",
             UbKind::Tag => "tag",
             UbKind::Convert => "convert",
+            UbKind::VaArg => "va-arg",
         }
     }
 }

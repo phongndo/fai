@@ -63,8 +63,9 @@ pub enum Shape<'a> {
     Struct(Policy, &'a [Ty]),
     /// `array<4 x i32>`
     Array(u64, Ty),
-    /// `func<(i32, ptr) -> i32>`: parameters and results.
-    Func(&'a [Ty], &'a [Ty]),
+    /// `func<(i32, ptr) -> i32>`: parameters, results, and whether it is variadic
+    /// (`func<(ptr, ...) -> i32>`).
+    Func(&'a [Ty], &'a [Ty], bool),
     /// `union<i32, ptr>`: the variants.
     Union(&'a [Ty]),
 }
@@ -78,10 +79,22 @@ struct Run {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Entry {
-    Struct { policy: Policy, fields: Run },
-    Array { n: u64, elem: Ty },
-    Func { params: Run, rets: Run },
-    Union { variants: Run },
+    Struct {
+        policy: Policy,
+        fields: Run,
+    },
+    Array {
+        n: u64,
+        elem: Ty,
+    },
+    Func {
+        params: Run,
+        rets: Run,
+        variadic: bool,
+    },
+    Union {
+        variants: Run,
+    },
 }
 
 /// A table of struct, array, and function types.
@@ -132,7 +145,11 @@ impl Types {
         match self.entries[id.index()] {
             Entry::Struct { policy, fields } => Shape::Struct(policy, self.run(fields)),
             Entry::Array { n, elem } => Shape::Array(n, elem),
-            Entry::Func { params, rets } => Shape::Func(self.run(params), self.run(rets)),
+            Entry::Func {
+                params,
+                rets,
+                variadic,
+            } => Shape::Func(self.run(params), self.run(rets), variadic),
             Entry::Union { variants } => Shape::Union(self.run(variants)),
         }
     }
@@ -150,7 +167,7 @@ impl Types {
         match shape {
             Shape::Struct(p, fs) => (0u8, p, fs).hash(&mut h),
             Shape::Array(n, t) => (1u8, n, t).hash(&mut h),
-            Shape::Func(ps, rs) => (2u8, ps, rs).hash(&mut h),
+            Shape::Func(ps, rs, v) => (2u8, ps, rs, v).hash(&mut h),
             Shape::Union(vs) => (3u8, vs).hash(&mut h),
         }
         let hash = h.finish();
@@ -175,9 +192,10 @@ impl Types {
                 fields: push(fs),
             },
             Shape::Array(n, elem) => Entry::Array { n, elem },
-            Shape::Func(ps, rs) => Entry::Func {
+            Shape::Func(ps, rs, variadic) => Entry::Func {
                 params: push(ps),
                 rets: push(rs),
+                variadic,
             },
             Shape::Union(vs) => Entry::Union { variants: push(vs) },
         };
@@ -200,7 +218,12 @@ impl Types {
 
     /// `func<(params) -> rets>`
     pub fn func(&mut self, params: &[Ty], rets: &[Ty]) -> Ty {
-        self.intern(Shape::Func(params, rets))
+        self.intern(Shape::Func(params, rets, false))
+    }
+
+    /// `func<(params, ...) -> rets>` when `variadic`, else `func<(params) -> rets>`.
+    pub fn func_va(&mut self, params: &[Ty], rets: &[Ty], variadic: bool) -> Ty {
+        self.intern(Shape::Func(params, rets, variadic))
     }
 
     /// `union<variants>`
@@ -223,9 +246,9 @@ impl Types {
                 let e = self.import(from, e);
                 self.array(n, e)
             }
-            Shape::Func(ps, rs) => {
+            Shape::Func(ps, rs, v) => {
                 let (ps, rs) = (list(self, ps), list(self, rs));
-                self.func(&ps, &rs)
+                self.func_va(&ps, &rs, v)
             }
             Shape::Union(vs) => {
                 let vs = list(self, vs);
@@ -243,7 +266,9 @@ impl Types {
             (Ty::Agg(x), Ty::Agg(y)) => match (self.shape(x), other.shape(y)) {
                 (Shape::Struct(p, fs), Shape::Struct(q, gs)) => p == q && list(fs, gs),
                 (Shape::Array(n, e), Shape::Array(m, f)) => n == m && self.same(e, other, f),
-                (Shape::Func(ps, rs), Shape::Func(qs, ss)) => list(ps, qs) && list(rs, ss),
+                (Shape::Func(ps, rs, v), Shape::Func(qs, ss, w)) => {
+                    v == w && list(ps, qs) && list(rs, ss)
+                }
                 (Shape::Union(vs), Shape::Union(ws)) => list(vs, ws),
                 _ => false,
             },
@@ -251,10 +276,23 @@ impl Types {
         }
     }
 
-    /// Whether values of this type can exist in HFIR: anything but a function type (Lean's
-    /// `Ty.isHValue`).
+    /// Whether values of this type can exist in HFIR: anything but a function type or a
+    /// `va_list` (Lean's `Ty.isHValue`).
     pub fn is_hvalue(&self, t: Ty) -> bool {
-        !matches!(self.shape_of(t), Some(Shape::Func(..)))
+        t != Ty::VaList && !matches!(self.shape_of(t), Some(Shape::Func(..)))
+    }
+
+    /// Whether a type has a `va_list` in it, which values can't (Lean's `Ty.hasVaList`).
+    pub fn has_va_list(&self, t: Ty) -> bool {
+        match t {
+            Ty::VaList => true,
+            Ty::Agg(id) => match self.shape(id) {
+                Shape::Struct(_, fs) | Shape::Union(fs) => fs.iter().any(|&f| self.has_va_list(f)),
+                Shape::Array(_, e) => self.has_va_list(e),
+                Shape::Func(..) => false,
+            },
+            _ => false,
+        }
     }
 
     /// The scalar types a value of type `t` becomes when lowered (Lean's `Lower.scalars`).
@@ -351,9 +389,12 @@ impl Types {
                     self.write(out, e);
                     out.push('>');
                 }
-                Shape::Func(ps, rs) => {
+                Shape::Func(ps, rs, v) => {
                     out.push_str("func<(");
                     list(out, ps);
+                    if v {
+                        out.push_str(if ps.is_empty() { "..." } else { ", ..." });
+                    }
                     out.push(')');
                     write_rets(out, rs, |out, t| self.write(out, *t));
                     out.push('>');
@@ -365,6 +406,7 @@ impl Types {
                 }
             },
             Ty::Slice => out.push_str("slice"),
+            Ty::VaList => out.push_str("va_list"),
         }
     }
 
@@ -405,6 +447,7 @@ impl Types {
                 let (_, size, align) = slice_layout(sp);
                 (size, align)
             }
+            Ty::VaList => (u128::from(sp.va_size), u64::from(sp.va_align)),
             Ty::Agg(id) => match self.shape(id) {
                 Shape::Struct(p, fs) => {
                     let (_, size, align) = self.place(sp, p, fs);

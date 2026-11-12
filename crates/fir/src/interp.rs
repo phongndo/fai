@@ -115,6 +115,11 @@ enum Byte {
         ptr: u32,
         i: u32,
     },
+    /// Byte `i` of a `va_list` cursor (an index into `cursors`; Lean's `Byte.va`).
+    Va {
+        cursor: u32,
+        i: u32,
+    },
 }
 
 /// A run of entries in a pool.
@@ -249,6 +254,12 @@ enum Kind {
     /// A function: its index in the module's functions, or, from the number of functions on, in
     /// its external functions.
     Func(u32),
+    /// The variadic arguments of a call (Lean's `AllocKind.va`): its first tag, and the
+    /// arguments' types, a run in `Machine::va_tys`.
+    Va {
+        tag: u32,
+        args: Span,
+    },
 }
 
 /// Allocations, as columns by allocation id.
@@ -456,10 +467,17 @@ pub fn run_detail_with(
     };
     let f = &m.funcs[fi];
     let params: Vec<ValueId> = f.body.params(f.body.entry()).collect();
-    if args.len() != params.len() {
+    let n = params.len();
+    if f.variadic {
+        if args.len() < n {
+            return Err(format!(
+                "@{name} takes at least {n} arguments but got {}",
+                args.len()
+            ));
+        }
+    } else if args.len() != n {
         return Err(format!(
-            "@{name} takes {} arguments but got {}",
-            params.len(),
+            "@{name} takes {n} arguments but got {}",
             args.len()
         ));
     }
@@ -467,6 +485,31 @@ pub fn run_detail_with(
     let mut vals = Vec::with_capacity(args.len());
     for (&p, &a) in params.iter().zip(args) {
         vals.push(mach.parse_arg(f.body.ty(p), a)?);
+    }
+    // A variadic argument carries its type: `i32 5`, `f64 1.5` (Lean's `parseVarArg`).
+    for &a in &args[n..] {
+        let words: Vec<&str> = a.split(' ').filter(|w| !w.is_empty()).collect();
+        let [t, v] = words[..] else {
+            return Err(format!(
+                "bad argument '{a}': a variadic argument needs its type, like i32 5"
+            ));
+        };
+        let ty = match t {
+            "ptr" => Ty::Ptr,
+            "f32" => Ty::Float(FloatTy::F32),
+            "f64" => Ty::Float(FloatTy::F64),
+            _ => match (t.as_bytes()[0], t[1..].parse::<u32>()) {
+                (b'i', Ok(w)) if t[1..].bytes().all(|b| b.is_ascii_digit()) => Ty::Int(w),
+                (b'b', Ok(w)) if t[1..].bytes().all(|b| b.is_ascii_digit()) => Ty::Byte(w),
+                _ => return Err(format!("1:1: unknown type '{t}'")),
+            },
+        };
+        if !ty.is_vararg() {
+            return Err(format!(
+                "bad argument '{a}': {ty} can't be a variadic argument"
+            ));
+        }
+        vals.push(mach.parse_arg(ty, v)?);
     }
     if let crate::Layer::Lfir(_) = m.layer {
         return Ok(RunOutput {
@@ -521,6 +564,11 @@ struct Machine<'m> {
     /// Each scope's marks, by byte offset.
     marks: Vec<FxHashMap<u64, u8>>,
     families: Vec<&'m str>,
+    /// The types of every call's variadic arguments, in runs (`Kind::Va`).
+    va_tys: Vec<Ty>,
+    /// `va_list` cursors: the variadic arguments' allocation, its first tag, and the position
+    /// (`Byte::Va`).
+    cursors: Vec<(u32, u32, u32)>,
     // Control
     stack_allocs: Vec<u32>,
     frames: Vec<Frame>,
@@ -579,6 +627,8 @@ impl<'m> Machine<'m> {
             scopes: Vec::new(),
             marks: Vec::new(),
             families: Vec::new(),
+            va_tys: Vec::new(),
+            cursors: Vec::new(),
             stack_allocs: Vec::new(),
             frames: Vec::new(),
             func: 0,
@@ -975,6 +1025,10 @@ impl<'m> Machine<'m> {
                             self.render_ptr(ptr, out);
                             write!(out, "[{i}]").unwrap();
                         }
+                        Byte::Va { cursor, i } => {
+                            let (a, _, k) = self.cursors[cursor as usize];
+                            write!(out, "va(#{a}, {k})[{i}]").unwrap();
+                        }
                     }
                 }
                 out.push(')');
@@ -1194,6 +1248,11 @@ impl<'m> Machine<'m> {
                 "stack memory from {}, whose region has ended",
                 render_loc(site)
             )
+        } else if let Kind::Va { .. } = self.allocs.kind[a as usize] {
+            format!(
+                "the variadic arguments of a call from {}, which has returned",
+                render_loc(site)
+            )
         } else {
             format!(
                 "allocated at {}, freed at {}",
@@ -1404,6 +1463,9 @@ impl<'m> Machine<'m> {
             let f = self.fn_name(f);
             return ub(UbKind::FuncAccess, loc, format!("@{f} is a function"));
         }
+        if let Kind::Va { .. } = self.allocs.kind[ai] {
+            return ub(UbKind::VaArg, loc, "only va.arg reads variadic arguments");
+        }
         let asize = self.allocs.size[ai];
         if !(0 <= off && off + i128::from(size) <= i128::from(asize)) {
             return ub(
@@ -1572,6 +1634,11 @@ impl<'m> Machine<'m> {
                     for b in bs.iter_mut() {
                         *b = self.frag_to_bits(loc, *b)?;
                     }
+                    if bs.iter().any(|b| matches!(b, Byte::Va { .. })) {
+                        // A cursor's bytes read as `poison` (Lean's `Byte.opaque`).
+                        self.bytes_buf = bs;
+                        return Ok(Value::PtrPoison);
+                    }
                     // The address is the low address-size bits of the pointer-size integer.
                     let n = (self.space.addr_bits / 8) as usize;
                     let addr = bs
@@ -1585,7 +1652,7 @@ impl<'m> Machine<'m> {
                     Value::Ptr(self.exposed_ptr(addr))
                 }
             }
-            Ty::Agg(_) | Ty::Slice => {
+            Ty::Agg(_) | Ty::Slice | Ty::VaList => {
                 self.bytes_buf = bs;
                 let t = self.body().types().show(ty);
                 return stuck(loc, format!("{t} is not a value type"));
@@ -1595,7 +1662,8 @@ impl<'m> Machine<'m> {
         Ok(v)
     }
 
-    /// Bytes without fragments as an integer; any `poison` byte makes it `poison`.
+    /// Bytes without fragments as an integer; any `poison` byte, or byte of a `va_list`
+    /// cursor, makes it `poison`.
     fn decode_int(&self, w: u32, bs: &[Byte]) -> Option<Bits> {
         let mut raw = Vec::with_capacity(bs.len());
         for b in bs {
@@ -1623,6 +1691,7 @@ impl<'m> Machine<'m> {
             Ty::Int(w) | Ty::Byte(w) => u64::from(w / 8),
             Ty::Float(f) => u64::from(f.width() / 8),
             Ty::Ptr => u64::from(self.space.ptr_bits / 8),
+            Ty::VaList => u64::from(self.space.va_size),
             Ty::Agg(_) | Ty::Slice => self.body().types().size(self.space, t) as u64,
         }
     }
@@ -1746,6 +1815,7 @@ impl<'m> Machine<'m> {
                     format!("@{} is a global", self.module.globals.name(g as usize))
                 }
                 Kind::Func(f) => format!("@{} is a function", self.fn_name(f)),
+                Kind::Va { .. } => "variadic arguments".to_owned(),
             };
             return ub(UbKind::BadFree, loc, note);
         }
@@ -2325,6 +2395,17 @@ impl<'m> Machine<'m> {
                 Some(b) if b.to_u64() == Some(1) => return Ok(None),
                 Some(_) => return halt(Behavior::Trap(reason), loc, ""),
             },
+            (OpKind::VaArg, _) => match rty {
+                Some(t) => self.va_arg(loc, t, vs)?,
+                None => return stuck(loc, "malformed op"),
+            },
+            (OpKind::VaEnd, &[Value::Ptr(p)]) => {
+                self.write_va_list(loc, p, None)?;
+                return Ok(None);
+            }
+            (OpKind::VaEnd, &[Value::PtrPoison]) => {
+                return ub(UbKind::Poison, loc, "va.end through a poison pointer");
+            }
             _ => return stuck(loc, "malformed op"),
         };
         Ok(Some(v))
@@ -2464,6 +2545,196 @@ impl<'m> Machine<'m> {
         Ok(())
     }
 
+    /// Enter the running function with arguments `vs` (Lean's `enterFunc`): bind its parameters
+    /// and open their scopes, and if it is variadic, put the arguments after them in a new
+    /// variadic-arguments allocation, the call's first stack allocation.
+    fn enter_func(&mut self, loc: Option<Loc>, vs: &[Value]) -> R<()> {
+        let module: &'m Module = self.module;
+        if !module.funcs[self.func as usize].variadic {
+            return self.enter_call(loc, vs);
+        }
+        let n = self.body().params(self.body().entry()).len();
+        self.enter_call(loc, &vs[..n.min(vs.len())])?;
+        let rest = vs.get(n..).unwrap_or(&[]);
+        let a = self.new_va_area(loc, rest)?;
+        self.stack_allocs.push(a);
+        Ok(())
+    }
+
+    /// The type of a scalar value (Lean's `RVal.scalarTy`).
+    fn scalar_ty(&self, v: Value) -> Ty {
+        match v {
+            Value::Int { w, .. } | Value::Wide { w, .. } | Value::Poison { w } => Ty::Int(w),
+            Value::Ptr(_) | Value::PtrPoison => Ty::Ptr,
+            Value::Bytes { len, .. } => Ty::Byte(len * 8),
+            Value::Float { f, .. } | Value::FloatPoison(f) => Ty::Float(f),
+            Value::Agg { .. } | Value::Unset => Ty::Slice,
+        }
+    }
+
+    /// Whether values fit parameters of types `ps`, then variadic arguments if `variadic` (Lean's
+    /// `argsFit`).
+    fn args_fit(&self, ps: &[Ty], variadic: bool, vs: &[Value]) -> bool {
+        let n = ps.len();
+        (if variadic {
+            n <= vs.len()
+        } else {
+            n == vs.len()
+        }) && vs.iter().zip(ps).all(|(&v, &t)| self.has_ty(v, t))
+            && vs[n.min(vs.len())..]
+                .iter()
+                .all(|&v| self.scalar_ty(v).is_vararg())
+    }
+
+    /// The allocation holding a call's variadic arguments, one 8-byte slot each (Lean's
+    /// `newVaArea`).
+    fn new_va_area(&mut self, loc: Option<Loc>, vs: &[Value]) -> R<u32> {
+        if !vs.iter().all(|&v| self.scalar_ty(v).is_vararg()) {
+            return stuck(
+                loc,
+                "a variadic argument must be an iN or bN of 8 to 64 bits, a ptr, or a float",
+            );
+        }
+        let p = self.new_alloc(loc, 8 * vs.len() as u64, 8, Kind::Stack);
+        let Ptr::Rel { alloc, tag, .. } = self.ptrs[p as usize] else {
+            unreachable!()
+        };
+        let start = self.va_tys.len() as u32;
+        for &v in vs {
+            let t = self.scalar_ty(v);
+            self.va_tys.push(t);
+        }
+        self.allocs.kind[alloc as usize] = Kind::Va {
+            tag,
+            args: Span {
+                start,
+                len: vs.len() as u32,
+            },
+        };
+        for (i, &v) in vs.iter().enumerate() {
+            self.encode(v);
+            let mem = &mut self.allocs.bytes[alloc as usize];
+            for (k, b) in self.bytes_buf.iter().enumerate() {
+                mem.set(8 * i as u64 + k as u64, *b);
+            }
+        }
+        Ok(alloc)
+    }
+
+    /// Write a `va_list`'s bytes at `p`, as a store would (Lean's `writeVaList`): a cursor at
+    /// position `pos` of the arguments `area` (first tag `tag`), or `poison` (`None`).
+    fn write_va_list(
+        &mut self,
+        loc: Option<Loc>,
+        p: u32,
+        cursor: Option<(u32, u32, u32)>,
+    ) -> R<()> {
+        let size = self.space.va_size;
+        let (a, off) = self.access(loc, p, u64::from(size), self.space.va_align, true)?;
+        let byte = match cursor {
+            Some(c) => {
+                self.cursors.push(c);
+                let cursor = (self.cursors.len() - 1) as u32;
+                Some(cursor)
+            }
+            None => None,
+        };
+        let mem = &mut self.allocs.bytes[a as usize];
+        for i in 0..size {
+            let b = match byte {
+                Some(cursor) => Byte::Va { cursor, i },
+                None => Byte::Poison,
+            };
+            mem.set(off + u64::from(i), b);
+        }
+        Ok(())
+    }
+
+    /// `va.start` (Lean's `vaStartC`): a cursor at the first variadic argument of the running
+    /// call, whose first stack allocation holds them.
+    fn va_start(&mut self, loc: Option<Loc>, vs: &[Value]) -> R<()> {
+        let p = match vs {
+            [Value::Ptr(p)] => *p,
+            [Value::PtrPoison] => {
+                return ub(UbKind::Poison, loc, "va.start through a poison pointer");
+            }
+            _ => return stuck(loc, "malformed op"),
+        };
+        let first = self.frames.iter().rev().find_map(|f| match *f {
+            Frame::Call { allocs, .. } => Some(allocs),
+            _ => None,
+        });
+        let area = first
+            .and_then(|i| self.stack_allocs.get(i as usize))
+            .and_then(|&a| match self.allocs.kind[a as usize] {
+                Kind::Va { tag, .. } => Some((a, tag)),
+                _ => None,
+            });
+        let Some((a, tag)) = area else {
+            return stuck(loc, "va.start in a function that isn't variadic");
+        };
+        self.write_va_list(loc, p, Some((a, tag, 0)))
+    }
+
+    /// `va.arg` (Lean's `vaArgC`): the variadic argument at the cursor in the `va_list` at `p`,
+    /// read as a `ty` of its class; the cursor moves to the next.
+    fn va_arg(&mut self, loc: Option<Loc>, ty: Ty, vs: &[Value]) -> R<Value> {
+        let p = match vs {
+            [Value::Ptr(p)] => *p,
+            [Value::PtrPoison] => {
+                return ub(UbKind::Poison, loc, "va.arg through a poison pointer");
+            }
+            _ => return stuck(loc, "malformed op"),
+        };
+        let size = self.space.va_size;
+        let (x, off) = self.access(loc, p, u64::from(size), self.space.va_align, false)?;
+        let no_cursor = "the va_list holds no cursor from va.start";
+        let mem = &self.allocs.bytes[x as usize];
+        let cursor = match mem.get(off) {
+            Byte::Va { cursor, i: 0 } => {
+                let c = self.cursors[cursor as usize];
+                (0..u64::from(size))
+                    .all(|i| {
+                        matches!(mem.get(off + i), Byte::Va { cursor: d, i: j }
+                            if u64::from(j) == i && self.cursors[d as usize] == c)
+                    })
+                    .then_some(c)
+            }
+            _ => None,
+        };
+        let Some((a, tag, k)) = cursor else {
+            return ub(UbKind::VaArg, loc, no_cursor);
+        };
+        let Kind::Va { args, .. } = self.allocs.kind[a as usize] else {
+            return ub(UbKind::VaArg, loc, no_cursor);
+        };
+        if !self.allocs.live[a as usize] {
+            return ub(UbKind::UseAfterFree, loc, self.dead_note(a));
+        }
+        let Some(&u) = self.va_tys[args.range()].get(k as usize) else {
+            return ub(
+                UbKind::VaArg,
+                loc,
+                format!("no variadic argument is left: the call passed {}", args.len),
+            );
+        };
+        if u.is_float() != ty.is_float() {
+            return ub(
+                UbKind::VaArg,
+                loc,
+                format!("variadic argument {k} has type {u}, of the other class than {ty}"),
+            );
+        }
+        let n = self.ty_size(ty);
+        let mem = &self.allocs.bytes[a as usize];
+        self.bytes_buf.clear();
+        self.bytes_buf
+            .extend((0..n).map(|i| mem.get(8 * u64::from(k) + i)));
+        let v = self.decode(loc, ty)?;
+        self.write_va_list(loc, p, Some((a, tag, k + 1)))?;
+        Ok(v)
+    }
+
     /// The function an indirect call runs: the one its pointer, `vs[0]`, points at the start of,
     /// which must have the call's signature (Lean's `callTarget`).
     fn call_target(&mut self, loc: Option<Loc>, sig: Ty, vs: &[Value]) -> R<u32> {
@@ -2504,8 +2775,12 @@ impl<'m> Machine<'m> {
         let same = |xs: &[Ty], ys: &[Ty]| {
             xs.len() == ys.len() && xs.iter().zip(ys).all(|(&x, &y)| ctypes.same(x, types, y))
         };
+        let variadic = match module.funcs.get(f as usize) {
+            Some(callee) => callee.variadic,
+            None => module.externs[(f - self.nfuncs) as usize].variadic,
+        };
         let ok = match types.shape_of(sig) {
-            Some(Shape::Func(ps, rs)) => same(&params, ps) && same(rets, rs),
+            Some(Shape::Func(ps, rs, va)) => va == variadic && same(&params, ps) && same(rets, rs),
             _ => false,
         };
         if !ok {
@@ -2515,6 +2790,9 @@ impl<'m> Machine<'m> {
                     t.push_str(", ");
                 }
                 ctypes.write(&mut t, p);
+            }
+            if variadic {
+                t.push_str(if params.is_empty() { "..." } else { ", ..." });
             }
             t.push(')');
             crate::types::write_rets(&mut t, rets, |out, &r| ctypes.write(out, r));
@@ -2546,7 +2824,7 @@ impl<'m> Machine<'m> {
                     .extend(std::iter::repeat_n(Byte::Bits(0), n as usize));
                 Value::Bytes { start, len: n }
             }
-            Ty::Agg(_) | Ty::Slice => Value::Bytes { start: 0, len: 0 },
+            Ty::Agg(_) | Ty::Slice | Ty::VaList => Value::Bytes { start: 0, len: 0 },
         }
     }
 
@@ -2622,10 +2900,13 @@ impl<'m> Machine<'m> {
                     continue;
                 }
                 let size = self.allocs.size[a as usize];
-                let frag = |b: Byte, found: &mut Vec<(u32, u32)>| {
-                    if let Byte::Frag { ptr, .. } = b {
-                        self.push_pairs(ptr, found);
+                let frag = |b: Byte, found: &mut Vec<(u32, u32)>| match b {
+                    Byte::Frag { ptr, .. } => self.push_pairs(ptr, found),
+                    Byte::Va { cursor, .. } => {
+                        let (area, tag, _) = self.cursors[cursor as usize];
+                        found.push((area, tag));
                     }
+                    _ => {}
                 };
                 match &self.allocs.bytes[a as usize] {
                     Mem::Dense(v) => {
@@ -2660,9 +2941,7 @@ impl<'m> Machine<'m> {
     fn call_extern(&mut self, op: OpId, loc: Option<Loc>, x: u32, vs: &[Value]) -> R<()> {
         let module: &'m Module = self.module;
         let ext = &module.externs[x as usize];
-        if vs.len() != ext.params.len()
-            || !vs.iter().zip(&ext.params).all(|(&v, &t)| self.has_ty(v, t))
-        {
+        if !self.args_fit(&ext.params, ext.variadic, vs) {
             return stuck(loc, format!("wrong arguments for @{}", ext.name));
         }
         for (a, t) in self.extern_reach(ext, vs) {
@@ -3070,7 +3349,6 @@ impl<'m> Machine<'m> {
                 self.base = self.slots.len() as u32;
                 let n = self.body().num_values();
                 self.slots.resize(self.slots.len() + n, Value::Unset);
-                self.enter_call(loc, &vs[args..])?;
                 self.frames.push(Frame::Call {
                     op: Some(op),
                     func: caller,
@@ -3078,8 +3356,13 @@ impl<'m> Machine<'m> {
                     scopes,
                     allocs: self.stack_allocs.len() as u32,
                 });
+                self.enter_func(loc, &vs[args..])?;
                 let entry = self.body().entry();
                 self.push_block(entry);
+            }
+            OpKind::VaStart => {
+                self.operands(op, loc, &mut vs)?;
+                self.va_start(loc, &vs)?;
             }
             OpKind::MemStack { .. } | OpKind::MemStackOf { .. } => {
                 let (size, align) = match kind {
@@ -3197,7 +3480,6 @@ impl<'m> Machine<'m> {
         self.func = f;
         self.base = 0;
         self.slots = vec![Value::Unset; self.body().num_values()];
-        self.enter_call(None, args)?;
         self.frames.push(Frame::Call {
             op: None,
             func: f,
@@ -3205,6 +3487,7 @@ impl<'m> Machine<'m> {
             scopes: 0,
             allocs: 0,
         });
+        self.enter_func(None, args)?;
         let entry = self.body().entry();
         self.push_block(entry);
         Ok(())

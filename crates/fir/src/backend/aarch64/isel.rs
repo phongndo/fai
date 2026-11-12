@@ -163,6 +163,15 @@ impl<'a> ModuleCx<'a> {
         }
     }
 
+    /// Whether callee `f` takes variadic arguments.
+    pub fn variadic(&self, f: u32) -> bool {
+        let m = self.m;
+        match m.funcs.get(f as usize) {
+            Some(func) => func.variadic,
+            None => m.externs[f as usize - m.funcs.len()].variadic,
+        }
+    }
+
     /// The parameter and result types of callee `f`.
     pub fn sig(&self, f: u32) -> (Vec<Ty>, &'a [Ty]) {
         let m = self.m;
@@ -400,8 +409,50 @@ struct Sel<'a, 'c> {
     exit: u32,
     /// The register that keeps the results area's address (`x8` on entry), if any.
     res_ptr: Option<Reg>,
+    /// A variadic function's register save areas, for `va.start` (none if it has none).
+    va: Option<VaFrame>,
+    /// Whether the function is variadic.
+    variadic: bool,
     rets: &'a [Ty],
     loc: Option<Loc>,
+}
+
+/// Where a variadic function keeps what `va.start` needs (AAPCS64's `va_list`, decision:
+/// Varargs): the general-purpose and FP register save areas, as frame slots above `sp` with
+/// their sizes, and where the stacked variadic arguments start above `x29`.
+#[derive(Clone, Copy, Debug)]
+struct VaFrame {
+    gr_off: i64,
+    gr_size: i64,
+    vr_off: i64,
+    vr_size: i64,
+    stack: i64,
+}
+
+/// The types of a call's arguments: its operands' after the first `skip` (the pointer of an
+/// indirect call).
+fn arg_tys(body: &Body, op: OpId, skip: usize) -> Vec<Ty> {
+    body.operands(op)[skip..]
+        .iter()
+        .map(|o| match o.get() {
+            OperandKind::Value(v) => body.ty(v),
+            OperandKind::Hole(h) => body.hole_ty(h),
+        })
+        .collect()
+}
+
+/// Whether a function body has a `va.start`.
+fn uses_va_start(body: &Body) -> bool {
+    let mut stack = vec![body.entry()];
+    while let Some(r) = stack.pop() {
+        for op in body.ops(r) {
+            if body.kind(op) == OpKind::VaStart {
+                return true;
+            }
+            stack.extend_from_slice(body.regions(op));
+        }
+    }
+    false
 }
 
 /// Select one function.
@@ -431,6 +482,8 @@ pub fn select_func(cx: &ModuleCx<'_>, index: u32, families: &mut Vec<String>) ->
         locals_end: 0,
         exit: 0,
         res_ptr: None,
+        va: None,
+        variadic: f.variadic,
         rets: &f.rets,
         loc: None,
     };
@@ -869,14 +922,14 @@ impl Sel<'_, '_> {
         while let Some(r) = stack.pop() {
             for op in body.ops(r) {
                 match body.kind(op) {
-                    OpKind::Call { callee } | OpKind::Invoke { callee, .. } => {
-                        let (ps, _) = self.cx.sig(self.cx.funcs[body.str(callee)]);
+                    // A variadic call passes every argument by its type, as fixed ones.
+                    OpKind::Call { .. } | OpKind::Invoke { .. } => {
+                        let ps = arg_tys(body, op, 0);
                         outgoing = outgoing.max(8 * u64::from(abi::stack_slots(&ps)));
                     }
-                    OpKind::CallIndirect(sig) | OpKind::InvokeIndirect { sig, .. } => {
-                        if let Some(Shape::Func(ps, _)) = body.types().shape_of(sig) {
-                            outgoing = outgoing.max(8 * u64::from(abi::stack_slots(ps)));
-                        }
+                    OpKind::CallIndirect(_) | OpKind::InvokeIndirect { .. } => {
+                        let ps = arg_tys(body, op, 1);
+                        outgoing = outgoing.max(8 * u64::from(abi::stack_slots(&ps)));
                     }
                     OpKind::MemStack { align: a, .. } => align = align.max(u64::from(a)),
                     OpKind::MemStackOf { ty, align: a } => {
@@ -941,6 +994,9 @@ impl Sel<'_, '_> {
             let r = self.fresh();
             self.mov(r, Reg::x(8));
             self.res_ptr = Some(r);
+        }
+        if self.variadic && uses_va_start(body) {
+            self.save_va_regs(&ps);
         }
         self.region(body.entry())?;
         // The epilogue.
@@ -1320,6 +1376,19 @@ impl Sel<'_, '_> {
                     self.store(v, p, 0, size);
                 }
             }
+            OpKind::VaStart => {
+                let ap = self.operand(op, 0)?;
+                self.va_start(ap)?;
+            }
+            OpKind::VaArg => {
+                let ap = self.operand(op, 0)?;
+                let v = body.results(op).next().unwrap();
+                let t = body.ty(v);
+                let d = self.val(v);
+                self.va_arg(ap, t, d);
+            }
+            // The cursor needs no cleanup on AAPCS64.
+            OpKind::VaEnd => {}
             OpKind::MemCopy { ty, .. } => {
                 let (d, s) = (self.operand(op, 0)?, self.operand(op, 1)?);
                 let size = self.type_size(ty);
@@ -1385,18 +1454,37 @@ impl Sel<'_, '_> {
                 let func = self.cx.funcs[body.str(callee)];
                 let args = self.operands(op)?;
                 let (ps, rs) = self.cx.sig(func);
-                self.call(op, &args, &ps, rs, |s| {
-                    s.emit(Inst::Bl { func });
-                });
+                if self.cx.variadic(func) {
+                    // A variadic callee is called through its address, with every argument's
+                    // type in the call's signature: on Linux, variadic arguments go where fixed
+                    // ones of their types would (decision: Varargs).
+                    let ps = arg_tys(body, op, 0);
+                    self.sigs.push((ps.clone(), rs.to_vec()));
+                    let sig = (self.sigs.len() - 1) as u32;
+                    let target = self.fresh();
+                    self.emit(Inst::AdrlFunc { d: target, func });
+                    self.call(op, &args, &ps, rs, |s| {
+                        s.emit(Inst::Blr { n: target, sig });
+                    });
+                } else {
+                    self.call(op, &args, &ps, rs, |s| {
+                        s.emit(Inst::Bl { func });
+                    });
+                }
                 let throws = self.cx.throws.get(func as usize).copied().unwrap_or(false);
                 self.after_call(kind, throws);
             }
             OpKind::CallIndirect(sig) | OpKind::InvokeIndirect { sig, .. } => {
                 let args = self.operands(op)?;
-                let Some(Shape::Func(ps, rs)) = body.types().shape_of(sig) else {
+                let Some(Shape::Func(ps, rs, va)) = body.types().shape_of(sig) else {
                     return Err(format!("{}not a function type", at(self.loc)));
                 };
-                let (ps, rs) = (ps.to_vec(), rs.to_vec());
+                // A variadic call's signature lists every argument's type.
+                let (ps, rs) = if va {
+                    (arg_tys(body, op, 1), rs.to_vec())
+                } else {
+                    (ps.to_vec(), rs.to_vec())
+                };
                 self.sigs.push((ps.clone(), rs.clone()));
                 let sig = (self.sigs.len() - 1) as u32;
                 let target = args[0];
@@ -1875,6 +1963,129 @@ impl Sel<'_, '_> {
                 }
             }
             (None, None) => unreachable!(),
+        }
+    }
+
+    /// Save the argument registers a variadic function's named parameters leave over, as
+    /// AAPCS64 lays them out for `va_list` (decision: Varargs): `x[n]`…`x7` in 8-byte slots
+    /// ending at `__gr_top`, and `d[m]`…`d7` (the low 64 bits FIR uses of `q[m]`…`q7`) in 16-byte
+    /// slots ending at `__vr_top`.
+    fn save_va_regs(&mut self, ps: &[Ty]) {
+        let locs = abi::arg_locs(ps);
+        let gp = locs
+            .iter()
+            .filter(|l| matches!(l, ArgLoc::Reg(r) if !r.is_fp()))
+            .count() as u32;
+        let fp = locs
+            .iter()
+            .filter(|l| matches!(l, ArgLoc::Reg(r) if r.is_fp()))
+            .count() as u32;
+        let stack = abi::stack_slots(ps);
+        let (gr_size, vr_size) = (8 * i64::from(8 - gp), 16 * i64::from(8 - fp));
+        let gr_off = self.local(gr_size as u64, 8);
+        let vr_off = self.local(vr_size as u64, 16);
+        for i in gp..8 {
+            let off = gr_off + 8 * i64::from(i - gp);
+            self.str_(MemSize::X, Reg::x(i), Reg::SP, off);
+        }
+        for i in fp..8 {
+            let off = vr_off + 16 * i64::from(i - fp);
+            self.str_(MemSize::X, Reg::d(i), Reg::SP, off);
+        }
+        self.va = Some(VaFrame {
+            gr_off,
+            gr_size,
+            vr_off,
+            vr_size,
+            stack: 16 + 8 * i64::from(stack),
+        });
+    }
+
+    /// `va.start`: fill the `va_list` at `ap` (AAPCS64: `__stack`, `__gr_top`, `__vr_top`,
+    /// `__gr_offs`, `__vr_offs`).
+    fn va_start(&mut self, ap: Reg) -> Result<()> {
+        let Some(va) = self.va else {
+            return Err(format!(
+                "{}va.start in a function that isn't variadic",
+                at(self.loc)
+            ));
+        };
+        let words = [
+            (Reg::FP, va.stack),
+            (Reg::SP, va.gr_off + va.gr_size),
+            (Reg::SP, va.vr_off + va.vr_size),
+        ];
+        for (i, (base, off)) in words.into_iter().enumerate() {
+            let t = self.fresh();
+            self.add_imm(t, base, off);
+            self.str_(MemSize::X, t, ap, 8 * i as i64);
+        }
+        for (i, size) in [va.gr_size, va.vr_size].into_iter().enumerate() {
+            let t = self.konst(-size as u64);
+            self.str_(MemSize::W, t, ap, 24 + 4 * i as i64);
+        }
+        Ok(())
+    }
+
+    /// `va.arg T`: AAPCS64's algorithm (decision: Varargs). While the class's offset
+    /// (`__gr_offs` or `__vr_offs`) is negative, the argument is in the register save area at
+    /// the top (`__gr_top`, `__vr_top`) plus the offset, and the offset moves on by a register's
+    /// slot (8 or 16 bytes); after that, it is at `__stack`, which moves on by 8 bytes.
+    fn va_arg(&mut self, ap: Reg, t: Ty, d: Reg) {
+        let size = self.type_size(t);
+        let (offs_at, top_at, step) = if t.is_float() {
+            (28, 16, 16)
+        } else {
+            (24, 8, 8)
+        };
+        let (reg, stack, join) = (
+            self.new_block(false),
+            self.new_block(false),
+            self.new_block(false),
+        );
+        let w = self.fresh();
+        self.ldr(MemSize::W, w, ap, offs_at);
+        let offs = self.sx(w, 32);
+        self.cmp_imm(offs, 0);
+        let check = self.new_block(false);
+        self.emit(Inst::BCond {
+            c: Cond::Ge,
+            t: stack,
+            f: check,
+        });
+        self.switch_to(check);
+        let next = self.fresh();
+        self.add_imm(next, offs, step);
+        self.str_(MemSize::W, next, ap, offs_at);
+        self.cmp_imm(next, 0);
+        self.emit(Inst::BCond {
+            c: Cond::Gt,
+            t: stack,
+            f: reg,
+        });
+        self.switch_to(reg);
+        let top = self.fresh();
+        self.ldr(MemSize::X, top, ap, top_at);
+        let at = self.alu_new(AluOp::Add, top, offs);
+        self.load_into(d, at, size);
+        self.emit(Inst::B { t: join });
+        self.switch_to(stack);
+        let sp = self.fresh();
+        self.ldr(MemSize::X, sp, ap, 0);
+        self.load_into(d, sp, size);
+        let sp2 = self.fresh();
+        self.add_imm(sp2, sp, 8);
+        self.str_(MemSize::X, sp2, ap, 0);
+        self.emit(Inst::B { t: join });
+        self.switch_to(join);
+    }
+
+    /// Load `size` bytes at `base` into `d`, of either class.
+    fn load_into(&mut self, d: Reg, base: Reg, size: u64) {
+        if d.is_fp() {
+            self.ldr(MemSize::of_bytes(size).unwrap(), d, base, 0);
+        } else {
+            self.load(d, base, 0, size);
         }
     }
 
