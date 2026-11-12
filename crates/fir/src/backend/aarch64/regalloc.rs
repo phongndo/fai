@@ -157,7 +157,39 @@ fn union(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     out.extend_from_slice(&b[j..]);
 }
 
-/// Live-in and live-out sets per block (sorted keys).
+/// The blocks in postorder from the entry (unreachable ones last).
+fn postorder(succ: &[Vec<u32>]) -> Vec<usize> {
+    let n = succ.len();
+    let mut post = Vec::with_capacity(n);
+    let mut seen = vec![false; n];
+    for root in 0..n {
+        if seen[root] {
+            continue;
+        }
+        seen[root] = true;
+        let mut stack = vec![(root, 0usize)];
+        while let Some((b, k)) = stack.last_mut() {
+            let b = *b;
+            match succ[b].get(*k) {
+                Some(&s) => {
+                    *k += 1;
+                    if !seen[s as usize] {
+                        seen[s as usize] = true;
+                        stack.push((s as usize, 0));
+                    }
+                }
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+    }
+    post
+}
+
+/// Live-in and live-out sets per block (sorted keys): a backward dataflow, iterated in
+/// postorder so that it settles in a few rounds.
 fn liveness(f: &MFunc, shapes: &[(u32, u32)], nrets: usize) -> (Vec<Vec<u32>>, Vec<Vec<u32>>) {
     let nb = f.blocks.len();
     let succ = successors(f);
@@ -167,40 +199,47 @@ fn liveness(f: &MFunc, shapes: &[(u32, u32)], nrets: usize) -> (Vec<Vec<u32>>, V
         defs: Vec::new(),
         uses: Vec::new(),
     };
+    // Per key, the last block (plus one) that wrote it, and that read it before writing it.
+    let nkeys = NPHYS + f.nvregs as usize;
+    let mut wrote = vec![0u32; nkeys];
+    let mut read = vec![0u32; nkeys];
     for b in 0..nb {
-        let mut g: Vec<u32> = Vec::new();
-        let mut k: Vec<u32> = Vec::new();
-        for i in f.block_range(b).rev() {
+        let stamp = b as u32 + 1;
+        let (g, k) = (&mut gen_[b], &mut kill[b]);
+        for i in f.block_range(b) {
             effects(f, shapes, f.insts[i], &mut fx);
             if f.insts[i] == Inst::Ret {
                 fx.uses.extend((0..nrets.min(2) as u32).map(Reg::x));
             }
-            for &d in &fx.defs {
-                if let Some(x) = key(d) {
-                    g.retain(|&y| y != x);
-                    k.push(x);
+            for &u in &fx.uses {
+                if let Some(x) = key(u)
+                    && wrote[x as usize] != stamp
+                    && read[x as usize] != stamp
+                {
+                    read[x as usize] = stamp;
+                    g.push(x);
                 }
             }
-            for &u in &fx.uses {
-                if let Some(x) = key(u) {
-                    g.push(x);
+            for &d in &fx.defs {
+                if let Some(x) = key(d)
+                    && wrote[x as usize] != stamp
+                {
+                    wrote[x as usize] = stamp;
+                    k.push(x);
                 }
             }
         }
         g.sort_unstable();
-        g.dedup();
         k.sort_unstable();
-        k.dedup();
-        gen_[b] = g;
-        kill[b] = k;
     }
+    let order = postorder(&succ);
     let mut live_in: Vec<Vec<u32>> = gen_.clone();
     let mut live_out: Vec<Vec<u32>> = vec![Vec::new(); nb];
     let mut tmp = Vec::new();
     let mut changed = true;
     while changed {
         changed = false;
-        for b in (0..nb).rev() {
+        for &b in &order {
             let mut out: Vec<u32> = Vec::new();
             for &s in &succ[b] {
                 union(&out, &live_in[s as usize], &mut tmp);
@@ -641,7 +680,11 @@ fn lower_frame(f: &mut MFunc) {
     let size = u64::from(fr.outgoing + fr.locals + fr.spills + csr);
     let mut out = Out::new(f);
     let alloc_at = fr.alloc_at as usize;
-    let exit_start = f.blocks[fr.exit as usize] as usize;
+    // The exit block, if a return is reachable.
+    let exit_start = f
+        .blocks
+        .get(fr.exit as usize)
+        .map_or(usize::MAX, |&s| s as usize);
     let mut b = 0;
     for i in 0..f.insts.len() {
         while b < f.blocks.len() && f.blocks[b] as usize == i {

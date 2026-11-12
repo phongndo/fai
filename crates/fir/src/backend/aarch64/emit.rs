@@ -86,20 +86,46 @@ fn quote(s: &str) -> String {
     }
 }
 
-fn reg(r: Reg, sf: Sf) -> String {
+const XREGS: [&str; 31] = [
+    "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14",
+    "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27",
+    "x28", "x29", "x30",
+];
+const WREGS: [&str; 31] = [
+    "w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8", "w9", "w10", "w11", "w12", "w13", "w14",
+    "w15", "w16", "w17", "w18", "w19", "w20", "w21", "w22", "w23", "w24", "w25", "w26", "w27",
+    "w28", "w29", "w30",
+];
+
+fn reg(r: Reg, sf: Sf) -> &'static str {
     match (r, sf) {
-        (Reg::SP, Sf::X) => "sp".to_owned(),
-        (Reg::SP, Sf::W) => "wsp".to_owned(),
-        (Reg::XZR, Sf::X) => "xzr".to_owned(),
-        (Reg::XZR, Sf::W) => "wzr".to_owned(),
+        (Reg::SP, Sf::X) => "sp",
+        (Reg::SP, Sf::W) => "wsp",
+        (Reg::XZR, Sf::X) => "xzr",
+        (Reg::XZR, Sf::W) => "wzr",
         (r, _) if r.is_virtual() => panic!("virtual register {r} after allocation"),
-        (Reg(n), Sf::X) => format!("x{n}"),
-        (Reg(n), Sf::W) => format!("w{n}"),
+        (Reg(n), Sf::X) => XREGS[n as usize],
+        (Reg(n), Sf::W) => WREGS[n as usize],
     }
 }
 
-fn x(r: Reg) -> String {
+fn x(r: Reg) -> &'static str {
     reg(r, Sf::X)
+}
+
+/// A block's label: `.LBB<f>_<b>` (ELF) or `LBB<f>_<b>` (Mach-O).
+struct Label(bool, u32, u32);
+
+impl std::fmt::Display for Label {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}LBB{}_{}",
+            if self.0 { "." } else { "" },
+            self.1,
+            self.2
+        )
+    }
 }
 
 fn alu_name(op: AluOp) -> &'static str {
@@ -128,6 +154,13 @@ impl Emitter<'_> {
     fn line(&mut self, s: &str) {
         self.out.push('\t');
         self.out.push_str(s);
+        self.out.push('\n');
+    }
+
+    /// A line written straight into the output.
+    fn linef(&mut self, a: std::fmt::Arguments<'_>) {
+        self.out.push('\t');
+        let _ = self.out.write_fmt(a);
         self.out.push('\n');
     }
 
@@ -160,11 +193,8 @@ impl Emitter<'_> {
         }
     }
 
-    fn label(&self, f: u32, b: u32) -> String {
-        match self.o.os {
-            Os::Linux => format!(".LBB{f}_{b}"),
-            Os::Darwin => format!("LBB{f}_{b}"),
-        }
+    fn label(&self, f: u32, b: u32) -> Label {
+        Label(self.o.os == Os::Linux, f, b)
     }
 
     /// `adrp` and `add` of a symbol's address.
@@ -172,20 +202,20 @@ impl Emitter<'_> {
         let d = x(d);
         match (self.o.os, got) {
             (Os::Linux, false) => {
-                self.line(&format!("adrp {d}, {s}"));
-                self.line(&format!("add {d}, {d}, :lo12:{s}"));
+                self.linef(format_args!("adrp {d}, {s}"));
+                self.linef(format_args!("add {d}, {d}, :lo12:{s}"));
             }
             (Os::Linux, true) => {
-                self.line(&format!("adrp {d}, :got:{s}"));
-                self.line(&format!("ldr {d}, [{d}, :got_lo12:{s}]"));
+                self.linef(format_args!("adrp {d}, :got:{s}"));
+                self.linef(format_args!("ldr {d}, [{d}, :got_lo12:{s}]"));
             }
             (Os::Darwin, false) => {
-                self.line(&format!("adrp {d}, {s}@PAGE"));
-                self.line(&format!("add {d}, {d}, {s}@PAGEOFF"));
+                self.linef(format_args!("adrp {d}, {s}@PAGE"));
+                self.linef(format_args!("add {d}, {d}, {s}@PAGEOFF"));
             }
             (Os::Darwin, true) => {
-                self.line(&format!("adrp {d}, {s}@GOTPAGE"));
-                self.line(&format!("ldr {d}, [{d}, {s}@GOTPAGEOFF]"));
+                self.linef(format_args!("adrp {d}, {s}@GOTPAGE"));
+                self.linef(format_args!("ldr {d}, [{d}, {s}@GOTPAGEOFF]"));
             }
         }
     }
@@ -193,12 +223,12 @@ impl Emitter<'_> {
     /// Put a 32-bit constant in `wN`.
     fn mov32(&mut self, r: u32, v: u32) {
         if v == u32::MAX {
-            self.line(&format!("movn w{r}, #0"));
+            self.linef(format_args!("movn w{r}, #0"));
             return;
         }
-        self.line(&format!("movz w{r}, #{}", v & 0xffff));
+        self.linef(format_args!("movz w{r}, #{}", v & 0xffff));
         if v >> 16 != 0 {
-            self.line(&format!("movk w{r}, #{}, lsl #16", v >> 16));
+            self.linef(format_args!("movk w{r}, #{}, lsl #16", v >> 16));
         }
     }
 
@@ -221,14 +251,14 @@ impl Emitter<'_> {
         } else {
             format!("[{}, #{off}]", x(base))
         };
-        self.line(&format!("{op}{stem} {}, {addr}", reg(r, sf)));
+        self.linef(format_args!("{op}{stem} {}, {addr}", reg(r, sf)));
     }
 
     fn inst(&mut self, f: &MFunc, i: usize, next: Option<u32>) {
         let fi = f.index;
         match f.insts[i] {
             Inst::Alu { op, sf, d, n, m } => {
-                self.line(&format!(
+                self.linef(format_args!(
                     "{} {}, {}, {}",
                     alu_name(op),
                     reg(d, sf),
@@ -256,7 +286,7 @@ impl Emitter<'_> {
                 } else {
                     format!("#{imm}")
                 };
-                self.line(&format!("{name} {}, {}, {imm}", reg(d, sf), reg(n, sf)));
+                self.linef(format_args!("{name} {}, {}, {imm}", reg(d, sf), reg(n, sf)));
             }
             Inst::ShiftImm {
                 op,
@@ -270,7 +300,11 @@ impl Emitter<'_> {
                     ShiftImmOp::Lsr => "lsr",
                     ShiftImmOp::Asr => "asr",
                 };
-                self.line(&format!("{name} {}, {}, #{amount}", reg(d, sf), reg(n, sf)));
+                self.linef(format_args!(
+                    "{name} {}, {}, #{amount}",
+                    reg(d, sf),
+                    reg(n, sf)
+                ));
             }
             Inst::Ext {
                 signed,
@@ -280,7 +314,7 @@ impl Emitter<'_> {
                 width,
             } => {
                 let name = if signed { "sbfx" } else { "ubfx" };
-                self.line(&format!(
+                self.linef(format_args!(
                     "{name} {}, {}, #0, #{width}",
                     reg(d, sf),
                     reg(n, sf)
@@ -288,7 +322,7 @@ impl Emitter<'_> {
             }
             Inst::Mov { sf, d, n } => {
                 if d != n {
-                    self.line(&format!("mov {}, {}", reg(d, sf), reg(n, sf)));
+                    self.linef(format_args!("mov {}, {}", reg(d, sf), reg(n, sf)));
                 }
             }
             Inst::MovWide { op, sf, d, imm, hw } => {
@@ -297,7 +331,7 @@ impl Emitter<'_> {
                     MovOp::Movn => "movn",
                     MovOp::Movk => "movk",
                 };
-                self.line(&format!("{name} {}, #{imm}, lsl #{hw}", reg(d, sf)));
+                self.linef(format_args!("{name} {}, #{imm}, lsl #{hw}", reg(d, sf)));
             }
             Inst::Csel { op, c, sf, d, n, m } => {
                 let name = match op {
@@ -306,7 +340,7 @@ impl Emitter<'_> {
                     CselOp::Csinv => "csinv",
                     CselOp::Csneg => "csneg",
                 };
-                self.line(&format!(
+                self.linef(format_args!(
                     "{name} {}, {}, {}, {}",
                     reg(d, sf),
                     reg(n, sf),
@@ -326,17 +360,21 @@ impl Emitter<'_> {
             }
             Inst::B { t } => {
                 if Some(t) != next {
-                    self.line(&format!("b {}", self.label(fi, t)));
+                    self.linef(format_args!("b {}", self.label(fi, t)));
                 }
             }
             Inst::BCond { c, t, f: e } => {
                 if Some(e) == next {
-                    self.line(&format!("b.{} {}", c.name(), self.label(fi, t)));
+                    self.linef(format_args!("b.{} {}", c.name(), self.label(fi, t)));
                 } else if Some(t) == next {
-                    self.line(&format!("b.{} {}", c.invert().name(), self.label(fi, e)));
+                    self.linef(format_args!(
+                        "b.{} {}",
+                        c.invert().name(),
+                        self.label(fi, e)
+                    ));
                 } else {
-                    self.line(&format!("b.{} {}", c.name(), self.label(fi, t)));
-                    self.line(&format!("b {}", self.label(fi, e)));
+                    self.linef(format_args!("b.{} {}", c.name(), self.label(fi, t)));
+                    self.linef(format_args!("b {}", self.label(fi, e)));
                 }
             }
             Inst::Ret => self.line("ret"),
@@ -346,39 +384,42 @@ impl Emitter<'_> {
                 self.mov32(1, line);
                 self.mov32(2, col);
                 let s = self.sym("__fir_trap", false);
-                self.line(&format!("bl {s}"));
+                self.linef(format_args!("bl {s}"));
             }
             Inst::Bl { func } => {
                 let (s, _) = self.func_sym(func);
-                self.line(&format!("bl {s}"));
+                self.linef(format_args!("bl {s}"));
             }
-            Inst::Blr { n, .. } => self.line(&format!("blr {}", x(n))),
+            Inst::Blr { n, .. } => self.linef(format_args!("blr {}", x(n))),
             Inst::BlAlloc { align, .. } => {
                 if align <= 16 {
                     let s = self.sym("malloc", false);
-                    self.line(&format!("bl {s}"));
+                    self.linef(format_args!("bl {s}"));
                 } else {
                     // aligned_alloc(align, size rounded up to a multiple of align)
                     let a = u64::from(align);
                     if a - 1 < 4096 {
-                        self.line(&format!("add x0, x0, #{}", a - 1));
+                        self.linef(format_args!("add x0, x0, #{}", a - 1));
                     } else {
-                        self.line(&format!("movz x1, #{}, lsl #{}", (a - 1) & 0xffff, 0));
+                        self.linef(format_args!("movz x1, #{}, lsl #{}", (a - 1) & 0xffff, 0));
                         if (a - 1) >> 16 != 0 {
-                            self.line(&format!("movk x1, #{}, lsl #16", ((a - 1) >> 16) & 0xffff));
+                            self.linef(format_args!(
+                                "movk x1, #{}, lsl #16",
+                                ((a - 1) >> 16) & 0xffff
+                            ));
                         }
                         self.line("add x0, x0, x1");
                     }
-                    self.line(&format!("and x0, x0, #{:#x}", (!(a - 1))));
+                    self.linef(format_args!("and x0, x0, #{:#x}", (!(a - 1))));
                     self.line("mov x1, x0");
                     self.mov32(0, align);
                     let s = self.sym("aligned_alloc", false);
-                    self.line(&format!("bl {s}"));
+                    self.linef(format_args!("bl {s}"));
                 }
             }
             Inst::BlFree { .. } => {
                 let s = self.sym("free", false);
-                self.line(&format!("bl {s}"));
+                self.linef(format_args!("bl {s}"));
             }
         }
     }
@@ -387,10 +428,10 @@ impl Emitter<'_> {
         let func = &self.m.funcs[f.index as usize];
         let s = self.sym(&func.name, true);
         self.out.push('\n');
-        self.line(&format!(".globl {s}"));
+        self.linef(format_args!(".globl {s}"));
         self.line(".p2align 2");
         if self.o.os == Os::Linux {
-            self.line(&format!(".type {s}, %function"));
+            self.linef(format_args!(".type {s}, %function"));
         }
         let _ = writeln!(self.out, "{s}:");
         for b in 0..f.blocks.len() {
@@ -405,7 +446,7 @@ impl Emitter<'_> {
             }
         }
         if self.o.os == Os::Linux {
-            self.line(&format!(".size {s}, .-{s}"));
+            self.linef(format_args!(".size {s}, .-{s}"));
         }
     }
 
@@ -495,11 +536,11 @@ impl Emitter<'_> {
             let s = self.sym(gs.name(g), true);
             self.out.push('\n');
             self.line(section);
-            self.line(&format!(".globl {s}"));
-            self.line(&format!(".p2align {}", align.trailing_zeros()));
+            self.linef(format_args!(".globl {s}"));
+            self.linef(format_args!(".p2align {}", align.trailing_zeros()));
             if self.o.os == Os::Linux {
-                self.line(&format!(".type {s}, %object"));
-                self.line(&format!(".size {s}, {}", bytes.len()));
+                self.linef(format_args!(".type {s}, %object"));
+                self.linef(format_args!(".size {s}, {}", bytes.len()));
             }
             let _ = writeln!(self.out, "{s}:");
             let mut i = 0;
@@ -508,7 +549,7 @@ impl Emitter<'_> {
                 if let Some((o, sym)) = ri.peek()
                     && *o == i
                 {
-                    self.line(&format!(".quad {sym}"));
+                    self.linef(format_args!(".quad {sym}"));
                     i += 8;
                     ri.next();
                     continue;
@@ -520,7 +561,7 @@ impl Emitter<'_> {
                     .unwrap_or(bytes.len())
                     .min(i + 16);
                 let items: Vec<String> = bytes[i..end].iter().map(|b| b.to_string()).collect();
-                self.line(&format!(".byte {}", items.join(", ")));
+                self.linef(format_args!(".byte {}", items.join(", ")));
                 i = end;
             }
         }

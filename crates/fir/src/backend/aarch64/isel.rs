@@ -245,6 +245,9 @@ struct Sel<'a, 'c> {
     blocks: Vec<Vec<(Inst, Option<Loc>)>>,
     /// Blocks laid out after the others: the exit block and trap blocks.
     cold: Vec<bool>,
+    /// The blocks in the order selection first switched to them, and which those are.
+    layout: Vec<u32>,
+    placed: Vec<bool>,
     cur: u32,
     /// Whether the current block has ended.
     done: bool,
@@ -278,6 +281,8 @@ pub fn select_func(cx: &ModuleCx<'_>, index: u32, families: &mut Vec<String>) ->
         families,
         blocks: Vec::new(),
         cold: Vec::new(),
+        layout: Vec::new(),
+        placed: Vec::new(),
         cur: 0,
         done: false,
         vreg: vec![NONE; body.num_values()],
@@ -302,12 +307,17 @@ impl Sel<'_, '_> {
     fn new_block(&mut self, cold: bool) -> u32 {
         self.blocks.push(Vec::new());
         self.cold.push(cold);
+        self.placed.push(false);
         (self.blocks.len() - 1) as u32
     }
 
     fn switch_to(&mut self, b: u32) {
         self.cur = b;
         self.done = false;
+        if !self.placed[b as usize] {
+            self.placed[b as usize] = true;
+            self.layout.push(b);
+        }
     }
 
     fn emit(&mut self, i: Inst) {
@@ -760,14 +770,31 @@ impl Sel<'_, '_> {
         Ok(())
     }
 
-    /// Lay the blocks out (hot ones in order, then the exit block and trap blocks) and flatten
-    /// them.
-    fn finish(self, index: u32) -> MFunc {
+    /// Lay the blocks out and flatten them: in the order selection first filled them (source
+    /// order), then the exit block and the trap blocks.
+    fn finish(mut self, index: u32) -> MFunc {
         let n = self.blocks.len();
-        let mut order: Vec<u32> = (0..n as u32).filter(|&b| !self.cold[b as usize]).collect();
+        for b in 0..n {
+            // A block that nothing reaches may lack a terminator; it loops on itself.
+            if !self.blocks[b]
+                .last()
+                .is_some_and(|(i, _)| i.is_terminator())
+            {
+                self.blocks[b].push((Inst::B { t: b as u32 }, None));
+            }
+        }
+        let mut order: Vec<u32> = std::mem::take(&mut self.layout)
+            .into_iter()
+            .filter(|&b| !self.cold[b as usize])
+            .collect();
+        let mut placed = vec![false; n];
+        for &b in &order {
+            placed[b as usize] = true;
+        }
+        order.extend((0..n as u32).filter(|&b| !placed[b as usize] && !self.cold[b as usize]));
         order.push(self.exit);
         order.extend((0..n as u32).filter(|&b| self.cold[b as usize] && b != self.exit));
-        let mut new_index = vec![0u32; n];
+        let mut new_index = vec![u32::MAX; n];
         for (i, &b) in order.iter().enumerate() {
             new_index[b as usize] = i as u32;
         }
@@ -797,13 +824,6 @@ impl Sel<'_, '_> {
                 };
                 out.insts.push(i);
                 out.locs.push(loc);
-            }
-            // A block that nothing reaches may lack a terminator; it loops on itself.
-            if !code.last().is_some_and(|(i, _)| i.is_terminator()) {
-                out.insts.push(Inst::B {
-                    t: new_index[b as usize],
-                });
-                out.locs.push(None);
             }
         }
         // The prologue's `sub sp, sp, N` is its fifth instruction. Before allocation it makes
