@@ -99,7 +99,9 @@ def ty : P Ty := do
   match s.toList with
   | ['p', 't', 'r'] => pure .ptr
   | c :: digits =>
-    match c, (String.ofList digits).toNat? with
+    -- Plain digits only: `toNat?` would also accept `_` separators.
+    let width := if !digits.isEmpty && digits.all Char.isDigit then (String.ofList digits).toNat? else none
+    match c, width with
     | 'i', some w => pure (.int w)
     | 'b', some w => pure (.byte w)
     | _, _ => fail s!"unknown type '{s}'"
@@ -326,8 +328,8 @@ mutual
       let align ← alignArg
       pure (.mk (.store t align) results [v, p] [] (← optLoc))
     | .call _ =>
-      let callee ← match ← next with
-        | .global s => pure s
+      let callee ← match ← peek with
+        | .global s => discard next; pure s
         | t => fail s!"expected a function name like @f but found {t.describe}"
       expectSym "("
       let args ← sepBy operand ")"
@@ -362,8 +364,8 @@ end
 
 def func : P Func := do
   unless ← tryIdent "func" do fail "expected 'func'"
-  let name ← match ← next with
-    | .global s => pure s
+  let name ← match ← peek with
+    | .global s => discard next; pure s
     | t => fail s!"expected a function name like @main but found {t.describe}"
   expectSym "("
   let params ← sepBy result ")"
@@ -371,8 +373,8 @@ def func : P Func := do
       if ← trySym "(" then sepBy ty ")" else pure [← ty]
     else pure []
   let file ← if ← tryIdent "loc" then do
-      match ← next with
-      | .str s => pure (some s)
+      match ← peek with
+      | .str s => discard next; pure (some s)
       | t => fail s!"expected a file name string but found {t.describe}"
     else pure none
   let body ← region params

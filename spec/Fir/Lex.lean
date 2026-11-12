@@ -82,7 +82,8 @@ where
           if s2.chars.head? != some ':' then fail "expected ':' in a location"
           else
             let (c', s3) := s2.advance.takeWhile Char.isDigit
-            emit (.loc l.toNat! c'.toNat!) s3
+            if c'.isEmpty then fail "expected a column number in a location"
+            else emit (.loc l.toNat! c'.toNat!) s3
         else
           let (name, s') := s1.takeWhile isNameChar
           if name.isEmpty then fail "expected a name after '@'"

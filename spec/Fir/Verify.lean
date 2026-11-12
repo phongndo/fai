@@ -165,7 +165,7 @@ def checkSimple (loc : Option Loc) (k : OpKind) (ins outs : List Ty) : VM Unit :
     one .ptr
   | .memFree _ =>
     expectTys loc "operands" ins [.ptr]
-    one' outs
+    one' loc outs
   | .load align =>
     unless isPow2 align do verr loc "alignment must be a power of two"
     expectTys loc "operands" ins [.ptr]
@@ -175,7 +175,7 @@ def checkSimple (loc : Option Loc) (k : OpKind) (ins outs : List Ty) : VM Unit :
     unless isPow2 align do verr loc "alignment must be a power of two"
     expectTys loc "operands" ins [t, .ptr]
     unless isLoadable st.space t do verr loc s!"{t} can't be stored: its size isn't whole bytes"
-    one' outs
+    one' loc outs
   | .ptrOffset _ => expectTys loc "operands" ins [.ptr, addr]; one .ptr
   | .ptrAddr | .ptrExpose => expectTys loc "operands" ins [.ptr]; one addr
   | .ptrFromExposed => expectTys loc "operands" ins [addr]; one .ptr
@@ -191,8 +191,8 @@ def checkSimple (loc : Option Loc) (k : OpKind) (ins outs : List Ty) : VM Unit :
     expectTys loc s!"results of @{callee}" outs rets
   | _ => verr loc "unexpected op"
 where
-  one' (outs : List Ty) : VM Unit :=
-    unless outs.isEmpty do verr none "this op has no results"
+  one' (loc : Option Loc) (outs : List Ty) : VM Unit :=
+    unless outs.isEmpty do verr loc "this op has no results"
 
 def nearestLoop : List RegionCtx → Option (List Ty × List Ty)
   | [] => none
