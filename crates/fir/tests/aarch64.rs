@@ -13,6 +13,9 @@
 //!   does. Traps reach the test runtime's `__fir_trap`, which prints the reason and location.
 //! * Runs that end in UB, get stuck, reach a hole, are ambiguous, or run out of fuel are not
 //!   comparable (UB allows anything) and are only counted.
+//! * Where a module observes addresses (the interpreter's and the hardware's differ), a run
+//!   that differs only in integers, or in ending with an arithmetic trap where the other
+//!   doesn't, is counted, not failed.
 //! * Where `fir run` prints `poison`, any value matches; a non-null pointer prints as `ptr ?`
 //!   (allocation numbers are the interpreter's); leak notes are dropped (counted).
 //!
@@ -451,8 +454,10 @@ fn observes_addresses(m: &Module) -> bool {
     int_loads && ptr_bytes
 }
 
-/// Whether `got` differs from `want` only in integer values, as runs that observe addresses
-/// may.
+/// Whether `got` differs from `want` only where runs that observe addresses may: in integer
+/// values, or in ending with a trap that integer arithmetic raises (`overflow`, `div0`, `shift`)
+/// where the other run doesn't, since the integers may come from addresses (`ptr.addr` of a
+/// stack slot squared overflows at qemu's addresses, not at the interpreter's).
 fn differs_in_integers(want: &str, got: &str) -> bool {
     let toks = |s: &str| -> Vec<String> {
         s.split([' ', ',', ';', '(', ')'])
@@ -461,11 +466,24 @@ fn differs_in_integers(want: &str, got: &str) -> bool {
             .collect()
     };
     let num = |t: &str| t.parse::<i128>().is_ok() || t.starts_with("0x") || t == "?" || t == "null";
-    let (w, g) = (toks(want), toks(got));
-    w.len() == g.len()
-        && w.iter()
-            .zip(&g)
-            .all(|(a, b)| a == b || a == "poison" || (num(a) && num(b)))
+    let ints = |want: &str, got: &str| {
+        let (w, g) = (toks(want), toks(got));
+        w.len() == g.len()
+            && w.iter()
+                .zip(&g)
+                .all(|(a, b)| a == b || a == "poison" || (num(a) && num(b)))
+    };
+    if ints(want, got) {
+        return true;
+    }
+    let (wp, we) = want.rsplit_once("; ").unwrap_or(("", want));
+    let (gp, ge) = got.rsplit_once("; ").unwrap_or(("", got));
+    let arith = |e: &str| {
+        ["trap overflow", "trap div0", "trap shift"]
+            .iter()
+            .any(|t| e.starts_with(t))
+    };
+    ints(wp, gp) && (arith(we) || arith(ge))
 }
 
 /// Whether `got` matches the normalized reference, where `poison` matches anything.
