@@ -1,0 +1,335 @@
+//! The backend's working form of LFIR: one function's machine code as flat arrays.
+//!
+//! Each [`Inst`] is one `aarch64.*` op with its immediates inline (block indices instead of
+//! labels, symbol indices instead of names), so instruction selection, register allocation,
+//! and the emitter work on `Copy` values in a `Vec` without a [`crate::Body`]'s side tables.
+//! [`super::lfir`] turns it into an LFIR module (text, the interpreters), and
+//! [`super::emit`] into assembly. A function's blocks are runs of `insts`, in layout order.
+
+use crate::ir::{
+    AluImmOp, AluOp, Cond, CselOp, Loc, MemSize, MovOp, Reg, Sf, ShiftImmOp, TrapReason, Ty,
+};
+
+/// One instruction: an `aarch64.*` op of LFIR. Blocks are indices into [`MFunc::blocks`];
+/// functions are indices like the interpreter's (the module's functions, then its external
+/// functions); globals are indices into the module's globals.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Inst {
+    Alu {
+        op: AluOp,
+        sf: Sf,
+        d: Reg,
+        n: Reg,
+        m: Reg,
+    },
+    AluImm {
+        op: AluImmOp,
+        sf: Sf,
+        d: Reg,
+        n: Reg,
+        imm: i64,
+    },
+    ShiftImm {
+        op: ShiftImmOp,
+        sf: Sf,
+        d: Reg,
+        n: Reg,
+        amount: u8,
+    },
+    Ext {
+        signed: bool,
+        sf: Sf,
+        d: Reg,
+        n: Reg,
+        width: u8,
+    },
+    Mov {
+        sf: Sf,
+        d: Reg,
+        n: Reg,
+    },
+    MovWide {
+        op: MovOp,
+        sf: Sf,
+        d: Reg,
+        imm: u16,
+        hw: u8,
+    },
+    Csel {
+        op: CselOp,
+        c: Cond,
+        sf: Sf,
+        d: Reg,
+        n: Reg,
+        m: Reg,
+    },
+    Ldr {
+        size: MemSize,
+        d: Reg,
+        base: Reg,
+        off: i64,
+    },
+    Str {
+        size: MemSize,
+        s: Reg,
+        base: Reg,
+        off: i64,
+    },
+    Adrl {
+        d: Reg,
+        global: u32,
+    },
+    AdrlFunc {
+        d: Reg,
+        func: u32,
+    },
+    B {
+        t: u32,
+    },
+    BCond {
+        c: Cond,
+        t: u32,
+        f: u32,
+    },
+    Ret,
+    Trap(TrapReason),
+    Bl {
+        func: u32,
+    },
+    /// A call through `n`; `sig` indexes [`MFunc::sigs`].
+    Blr {
+        n: Reg,
+        sig: u32,
+    },
+    /// `family` indexes [`MModule::families`].
+    BlAlloc {
+        family: u32,
+        align: u32,
+    },
+    BlFree {
+        family: u32,
+    },
+}
+
+impl Inst {
+    /// Whether the instruction ends a block.
+    pub fn is_terminator(self) -> bool {
+        matches!(
+            self,
+            Inst::B { .. } | Inst::BCond { .. } | Inst::Ret | Inst::Trap(_)
+        )
+    }
+
+    /// Whether the instruction is a call, which clobbers the caller-saved registers.
+    pub fn is_call(self) -> bool {
+        matches!(
+            self,
+            Inst::Bl { .. } | Inst::Blr { .. } | Inst::BlAlloc { .. } | Inst::BlFree { .. }
+        )
+    }
+
+    /// The registers the instruction writes and reads, apart from what a call does under the
+    /// calling convention (see [`MFunc::call_regs`]).
+    pub fn regs(self, defs: &mut Vec<Reg>, uses: &mut Vec<Reg>) {
+        defs.clear();
+        uses.clear();
+        match self {
+            Inst::Alu { d, n, m, .. } | Inst::Csel { d, n, m, .. } => {
+                defs.push(d);
+                uses.extend([n, m]);
+            }
+            Inst::AluImm { d, n, .. }
+            | Inst::ShiftImm { d, n, .. }
+            | Inst::Ext { d, n, .. }
+            | Inst::Mov { d, n, .. } => {
+                defs.push(d);
+                uses.push(n);
+            }
+            Inst::MovWide { op, d, .. } => {
+                defs.push(d);
+                if op == MovOp::Movk {
+                    uses.push(d);
+                }
+            }
+            Inst::Ldr { d, base, .. } => {
+                defs.push(d);
+                uses.push(base);
+            }
+            Inst::Str { s, base, .. } => uses.extend([s, base]),
+            Inst::Adrl { d, .. } | Inst::AdrlFunc { d, .. } => defs.push(d),
+            Inst::Blr { n, .. } => uses.push(n),
+            Inst::B { .. }
+            | Inst::BCond { .. }
+            | Inst::Ret
+            | Inst::Trap(_)
+            | Inst::Bl { .. }
+            | Inst::BlAlloc { .. }
+            | Inst::BlFree { .. } => {}
+        }
+    }
+
+    /// The instruction with every register renamed by `f`.
+    pub fn map_regs(self, mut f: impl FnMut(Reg, bool) -> Reg) -> Inst {
+        // `f(r, is_def)`; a `movk`'s destination is both, and is renamed once, as a def.
+        match self {
+            Inst::Alu { op, sf, d, n, m } => Inst::Alu {
+                op,
+                sf,
+                n: f(n, false),
+                m: f(m, false),
+                d: f(d, true),
+            },
+            Inst::Csel { op, c, sf, d, n, m } => Inst::Csel {
+                op,
+                c,
+                sf,
+                n: f(n, false),
+                m: f(m, false),
+                d: f(d, true),
+            },
+            Inst::AluImm { op, sf, d, n, imm } => Inst::AluImm {
+                op,
+                sf,
+                n: f(n, false),
+                d: f(d, true),
+                imm,
+            },
+            Inst::ShiftImm {
+                op,
+                sf,
+                d,
+                n,
+                amount,
+            } => Inst::ShiftImm {
+                op,
+                sf,
+                n: f(n, false),
+                d: f(d, true),
+                amount,
+            },
+            Inst::Ext {
+                signed,
+                sf,
+                d,
+                n,
+                width,
+            } => Inst::Ext {
+                signed,
+                sf,
+                n: f(n, false),
+                d: f(d, true),
+                width,
+            },
+            Inst::Mov { sf, d, n } => Inst::Mov {
+                sf,
+                n: f(n, false),
+                d: f(d, true),
+            },
+            Inst::MovWide { op, sf, d, imm, hw } => Inst::MovWide {
+                op,
+                sf,
+                d: f(d, true),
+                imm,
+                hw,
+            },
+            Inst::Ldr { size, d, base, off } => Inst::Ldr {
+                size,
+                base: f(base, false),
+                d: f(d, true),
+                off,
+            },
+            Inst::Str { size, s, base, off } => Inst::Str {
+                size,
+                s: f(s, false),
+                base: f(base, false),
+                off,
+            },
+            Inst::Adrl { d, global } => Inst::Adrl {
+                d: f(d, true),
+                global,
+            },
+            Inst::AdrlFunc { d, func } => Inst::AdrlFunc {
+                d: f(d, true),
+                func,
+            },
+            Inst::Blr { n, sig } => Inst::Blr {
+                n: f(n, false),
+                sig,
+            },
+            i => i,
+        }
+    }
+}
+
+/// One function's machine code.
+#[derive(Clone, Debug, Default)]
+pub struct MFunc {
+    /// The function's index in the module.
+    pub index: u32,
+    /// The instructions, block after block.
+    pub insts: Vec<Inst>,
+    /// Each instruction's source location (a column parallel to `insts`).
+    pub locs: Vec<Option<Loc>>,
+    /// Where each block starts in `insts`; a block ends where the next starts.
+    pub blocks: Vec<u32>,
+    /// How many virtual registers the code names (`v0` to `vN-1`).
+    pub nvregs: u32,
+    /// The signatures of calls through pointers: parameter and result types.
+    pub sigs: Vec<(Vec<Ty>, Vec<Ty>)>,
+    /// How many parameters and results each callee has (by function index), for `bl`.
+    pub frame: Frame,
+}
+
+/// What the frame lowering needs to know about a function's stack frame.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Frame {
+    /// The size of the outgoing-argument area at the bottom of the frame.
+    pub outgoing: u32,
+    /// The size of the locals (`mem.stack` slots and results areas), right above it.
+    pub locals: u32,
+    /// The largest alignment a local needs.
+    pub align: u32,
+    /// The spill slots' size, right above the locals (set by the register allocator).
+    pub spills: u32,
+    /// The callee-saved registers the code uses (set by the register allocator).
+    pub saved: u32,
+    /// Where the prologue's `sub sp, sp, N` is (an index into `insts`): the instruction the
+    /// frame lowering replaces.
+    pub alloc_at: u32,
+    /// The exit block, which restores the frame and returns.
+    pub exit: u32,
+}
+
+impl MFunc {
+    pub fn block_range(&self, b: usize) -> std::ops::Range<usize> {
+        let start = self.blocks[b] as usize;
+        let end = self
+            .blocks
+            .get(b + 1)
+            .map_or(self.insts.len(), |&e| e as usize);
+        start..end
+    }
+}
+
+/// A module's machine code, with what the emitter needs besides the functions.
+#[derive(Clone, Debug, Default)]
+pub struct MModule {
+    pub funcs: Vec<MFunc>,
+    /// The allocator families named by `mem.alloc` and `mem.free`.
+    pub families: Vec<String>,
+}
+
+/// Which registers a call reads and writes under AAPCS64: it reads the argument registers its
+/// arguments use (and `x8` for more than two results) and writes every caller-saved register.
+pub fn call_uses(nargs: usize, nrets: usize, uses: &mut Vec<Reg>) {
+    uses.clear();
+    uses.extend((0..nargs.min(8) as u32).map(Reg::x));
+    if nrets > 2 {
+        uses.push(Reg::x(8));
+    }
+}
+
+/// The registers a call may change: `x0`…`x18` and `x30`.
+pub const CALLER_SAVED: [u32; 20] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 30,
+];
