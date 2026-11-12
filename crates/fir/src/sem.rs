@@ -55,6 +55,9 @@ pub enum UbKind {
     ReadOnly,
     PtrCompare,
     AddressSpace,
+    ConstWrite,
+    FuncAccess,
+    BadCall,
 }
 
 impl UbKind {
@@ -76,6 +79,9 @@ impl UbKind {
             UbKind::ReadOnly => "readonly",
             UbKind::PtrCompare => "ptr-compare",
             UbKind::AddressSpace => "address-space",
+            UbKind::ConstWrite => "const-write",
+            UbKind::FuncAccess => "func-access",
+            UbKind::BadCall => "bad-call",
         }
     }
 }
@@ -102,6 +108,13 @@ fn pow2(w: u32) -> BigInt {
 pub(crate) fn sext64(w: u32, x: u64) -> i64 {
     let s = 64 - w;
     ((x << s) as i64) >> s
+}
+
+/// `n` wrapped to a signed `w`-bit integer (`0 < w ≤ 64`).
+pub(crate) fn wrap_signed(w: u32, n: i128) -> i128 {
+    let m = 1i128 << w;
+    let r = n.rem_euclid(m);
+    if r >= m / 2 { r - m } else { r }
 }
 
 impl Bits {

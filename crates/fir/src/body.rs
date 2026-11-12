@@ -28,6 +28,7 @@ use std::fmt;
 use num_bigint::BigInt;
 
 use crate::ir::{Loc, OpKind, TrustedFact, Ty};
+use crate::types::Types;
 
 macro_rules! id {
     ($(#[$m:meta])* $name:ident) => {
@@ -370,6 +371,8 @@ pub struct Body {
     holes: Vec<(StrId, Ty)>,
     succs: Vec<Succ>,
     cases: Vec<Case>,
+    /// The struct, array, and function types the body's values and ops name.
+    types: Types,
     entry: RegionId,
 }
 
@@ -404,6 +407,7 @@ impl Body {
             holes: Vec::new(),
             succs: Vec::new(),
             cases: Vec::new(),
+            types: Types::new(),
             entry: RegionId(0),
         };
         body.entry = body.new_region(None, []);
@@ -436,6 +440,7 @@ impl Body {
         self.holes.shrink_to_fit();
         self.succs.shrink_to_fit();
         self.cases.shrink_to_fit();
+        self.types.shrink_to_fit();
     }
 
     /// Empty the body, keeping its arrays' capacity, so it can be reused to build another
@@ -463,11 +468,21 @@ impl Body {
         self.holes.clear();
         self.succs.clear();
         self.cases.clear();
+        self.types.clear();
         self.entry = self.new_region(None, []);
     }
 
     pub fn entry(&self) -> RegionId {
         self.entry
+    }
+
+    /// The table of the struct, array, and function types the body names.
+    pub fn types(&self) -> &Types {
+        &self.types
+    }
+
+    pub fn types_mut(&mut self) -> &mut Types {
+        &mut self.types
     }
 
     fn push_text(&mut self, s: &str) -> Span {
@@ -1512,6 +1527,7 @@ mod tests {
         assert!(b.cases(CasesId::EMPTY).is_empty());
         assert_eq!(std::mem::size_of::<Operand>(), 4);
         assert_eq!(std::mem::size_of::<OpKind>(), 16);
+        assert_eq!(std::mem::size_of::<Ty>(), 8);
     }
 
     /// A `cf.blocks` op gets its blocks after they are made, one by one, with ops nested in

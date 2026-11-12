@@ -57,12 +57,15 @@ inductive Frame where
   /-- A running `cf.blocks`. Its current block runs in the frames above it. -/
   | blocks (progress : Bool) (blocks : List Region) (results : List Result) (loc : Option Loc)
 
-/-- An active `noalias` or `readonly` scope: one function parameter during one call. -/
+/-- An active `noalias` or `readonly` scope: one function parameter during one call, or a
+`const` global for the whole run (a `readonly` scope on its first tag, which every pointer to it
+is derived from). -/
 structure Scope where
   alloc : Nat
   tag : Nat
   noalias : Bool
   readonly : Bool
+  const : Bool := false
 
 /-- What a `noalias` scope records per byte: accessed through a pointer derived from the
 parameter, accessed through another pointer, written. All three is UB. -/
@@ -86,6 +89,8 @@ structure Core where
   /-- Each `noalias` scope's marks, by byte offset. -/
   marks : Std.ExtTreeMap Nat Marks := ∅
   nextScope : Nat := 0
+  /-- Pointers to the globals, and to the functions whose address has been taken. -/
+  addrs : Std.ExtTreeMap String Ptr := ∅
 
 structure Machine where
   core : Core
@@ -193,8 +198,6 @@ def setAlloc (a : Nat) (al : Alloc) : CM Unit :=
 
 /-! ## Addresses -/
 
-def alignUp (x a : Nat) : Nat := if a ≤ 1 then x else (x + a - 1) / a * a
-
 /-- Give an allocation its address, if it doesn't have one yet: the oracle's answer if it fits,
 otherwise the lowest free address from `0x1000`. -/
 def realize (loc : Option Loc) (a : Nat) : CM Nat := do
@@ -299,6 +302,8 @@ def deadNote (al : Alloc) : String :=
   match al.kind with
   | .stack => s!"stack memory from {renderLoc al.site}, whose region has ended"
   | .heap _ => s!"allocated at {renderLoc al.site}, freed at {renderLoc al.freedAt}"
+  | .global g _ => s!"@{g} is a global"
+  | .func f => s!"@{f} is a function"
 
 /-- Where an access goes (allocation, tag, offset), after checking lifetime, bounds, and
 alignment. Changes nothing. -/
@@ -307,6 +312,7 @@ def checkAccess (c : Core) (loc : Option Loc) (p : Ptr) (size align : Nat) :
   let (a, t, off) ← resolveIn c loc p size
   let al ← allocIn c loc a
   unless al.live do ub .useAfterFree loc (deadNote al)
+  if let .func f := al.kind then ub .funcAccess loc s!"@{f} is a function"
   unless 0 ≤ off && off + size ≤ al.size do
     ub .outOfBounds loc s!"offset {off}, {size} bytes, allocation size {al.size}"
   unless al.alignedAt off align do
@@ -341,7 +347,8 @@ def markAll (tags : Std.ExtTreeMap Nat (Option Nat)) (loc : Option Loc) (a t off
     else
       let derived := isDerived tags s.tag t
       if s.readonly && write && derived then
-        ub .readonly loc "write through a pointer derived from a readonly parameter"
+        ub (if s.const then .constWrite else .readonly) loc (if s.const then
+          "write to a const global" else "write through a pointer derived from a readonly parameter")
       else if !s.noalias then markAll tags loc a t off size write rest mm
       else
         let ms := mm.getD id ∅
@@ -382,6 +389,7 @@ def decodeAs (loc : Option Loc) (ty : Ty) (bs : List Byte) : CM RVal := do
       match decodeInt? c.space.ptrBits bs with
       | some (.bits b) => pure (.ptr (some (← fromExposed (b.toNat % 2 ^ c.space.addrBits))))
       | _ => pure (.ptr none)
+  | _ => halt (.stuck s!"{ty} is not a value type") loc
 
 def loadC (loc : Option Loc) (ty : Ty) (align : Nat) : Option Ptr → CM RVal
   | none => ub .poison loc "load through a poison pointer"
@@ -422,7 +430,11 @@ def freePtr (loc : Option Loc) (family : String) : Option Ptr → CM Unit
     unless al.live do
       if al.kind == .stack then ub .badFree loc (deadNote al) else ub .doubleFree loc (deadNote al)
     unless al.kind == .heap family do
-      ub .badFree loc s!"allocated at {renderLoc al.site} by {match al.kind with | .heap f => f | .stack => "mem.stack"}"
+      ub .badFree loc <| match al.kind with
+        | .heap f => s!"allocated at {renderLoc al.site} by {f}"
+        | .stack => s!"allocated at {renderLoc al.site} by mem.stack"
+        | .global g _ => s!"@{g} is a global"
+        | .func f => s!"@{f} is a function"
     unless off == 0 do ub .badFree loc s!"offset {off} is not the start of the allocation"
     let c ← get
     let marks ← markAll c.tags loc a t 0 al.size true c.scopes.toList c.marks
@@ -512,6 +524,28 @@ def intWidth : RVal → Nat
 
 def addrInt (c : Core) (n : Nat) : RVal := .int c.space.addrBits (.bits (BitVec.ofNat _ n))
 
+/-- `p` moved by `n` bytes (`ptr.offset`). In bounds, it is `none` (`poison`) when `p` or the
+result is outside `[0, size]` of a live allocation; an offset of 0 always gives `p`. -/
+def offsetBy (loc : Option Loc) (inbounds : Bool) (p : Ptr) (n : Int) : CM (Option Ptr) := do
+  let c ← get
+  if n == 0 then return some p
+  match p with
+  | .rel a t off =>
+    let al ← getAlloc loc a
+    let ok := al.live && 0 ≤ off && off ≤ al.size && 0 ≤ off + n && off + n ≤ al.size
+    pure (if inbounds && !ok then none else some (.rel a t (off + n)))
+  | .abs addr cands =>
+    let addr' := addrMod c (addr + n)
+    if !inbounds then return some (.abs addr' cands)
+    let keep := cands.filter fun (a, _) =>
+      match c.allocs[a]? with
+      | some al => match al.base with
+        | some b => al.live && b ≤ addr && addr ≤ b + al.size && (b : Int) ≤ addr + n &&
+            addr + n ≤ (b + al.size : Int)
+        | none => false
+      | none => false
+    pure (if keep.isEmpty then none else some (.abs addr' keep))
+
 /-- Evaluate an op without regions that doesn't touch the stack. -/
 def evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVal) :
     CM (List RVal) := do
@@ -553,24 +587,7 @@ def evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVa
   | .ptrOffset inbounds, [_], [p, n] => do
     let some p ← asPtr loc p | return [.ptr none]
     let .bits n ← asInt loc aw n | return [.ptr none]
-    let n := n.toInt
-    if n == 0 then return [.ptr (some p)]
-    match p with
-    | .rel a t off =>
-      let al ← getAlloc loc a
-      let ok := al.live && 0 ≤ off && off ≤ al.size && 0 ≤ off + n && off + n ≤ al.size
-      pure [.ptr (if inbounds && !ok then none else some (.rel a t (off + n)))]
-    | .abs addr cands =>
-      let addr' := addrMod c (addr + n)
-      if !inbounds then return [.ptr (some (.abs addr' cands))]
-      let keep := cands.filter fun (a, _) =>
-        match c.allocs[a]? with
-        | some al => match al.base with
-          | some b => al.live && b ≤ addr && addr ≤ b + al.size && (b : Int) ≤ addr + n &&
-              addr + n ≤ (b + al.size : Int)
-          | none => false
-        | none => false
-      pure [.ptr (if keep.isEmpty then none else some (.abs addr' keep))]
+    pure [.ptr (← offsetBy loc inbounds p n.toInt)]
   | .ptrAddr, [_], [p] => do
     let some p ← asPtr loc p | return [.int aw .poison]
     pure [addrInt c (← ptrAddr loc p)]
@@ -589,6 +606,36 @@ def evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVa
   | .ptrCmp pred, [_], [p, q] => do
     let (some p, some q) := (← asPtr loc p, ← asPtr loc q) | return [.int 1 .poison]
     pure [.int 1 (.bits (BitVec.ofBool (← cmpPtrs loc pred p q)))]
+  -- Layout
+  | .tySize ty, [_], [] => pure [addrInt c (ty.size c.space)]
+  | .tyAlign ty, [_], [] => pure [addrInt c (ty.align c.space)]
+  | .tyOffset ty i, [_], [] => pure [addrInt c ((ty.fieldOffset? c.space i).getD 0)]
+  | .ptrField inbounds ty i, [_], [p] => do
+    let some p ← asPtr loc p | return [.ptr none]
+    pure [.ptr (← offsetBy loc inbounds p ((ty.fieldOffset? c.space i).getD 0))]
+  | .ptrIndex inbounds ty, [_], [p, i] => do
+    let some p ← asPtr loc p | return [.ptr none]
+    let .bits i ← asInt loc aw i | return [.ptr none]
+    let n := i.toInt * ty.stride c.space
+    let wrapped := (BitVec.ofInt aw n).toInt
+    if inbounds && wrapped != n then return [.ptr none]
+    pure [.ptr (← offsetBy loc inbounds p wrapped)]
+  | .memCopy ty align, [], [d, s] => do
+    let w := 8 * ty.size c.space
+    let v ← loadC loc (.byte w) align (← asPtr loc s)
+    storeC loc (.byte w) align v (← asPtr loc d)
+    pure []
+  -- Globals and functions
+  | .memGlobal g, [_], [] =>
+    match c.addrs[g]? with
+    | some p => pure [.ptr (some p)]
+    | none => halt (.stuck s!"no global @{g}") loc
+  | .funcAddr f, [_], [] => do
+    if let some p := c.addrs[f]? then return [.ptr (some p)]
+    unless c.funcs.contains f do halt (.stuck s!"no function @{f}") loc
+    let p ← newAlloc loc 0 1 (.func f)
+    modify fun c => { c with addrs := c.addrs.insert f p }
+    pure [.ptr (some p)]
   | _, _, _ => halt (.stuck "malformed op") loc
 
 /-- Compute an op without regions that doesn't touch the stack, from its operands' values, and
@@ -632,8 +679,10 @@ def closeScopes (ids : List Nat) : CM Unit :=
 
 /-- The heap allocations still live, for the leak report. -/
 def leaks (c : Core) : List String :=
-  (c.allocs.toList.filter fun (_, al) => al.live && al.kind != .stack).map fun (_, al) =>
-    s!"leak: {al.size} bytes from {match al.kind with | .heap f => f | .stack => "stack"} at {renderLoc al.site}"
+  c.allocs.toList.filterMap fun (_, al) =>
+    match al.live, al.kind with
+    | true, .heap f => some s!"leak: {al.size} bytes from {f} at {renderLoc al.site}"
+    | _, _ => none
 
 /-! ## Control flow
 
@@ -769,12 +818,40 @@ def terminate (m : Machine) (loc : Option Loc) (k : OpKind) (vs : List RVal) :
     | none => halt (.stuck "func.ret outside a function") loc
   | _ => halt (.stuck "not a terminator") loc
 
-def OpKind.callee? : OpKind → Option String
-  | .call callee => some callee
+/-- What a call op calls: a function by name, or the function its first operand points at,
+which must have the given type. -/
+inductive Callee where
+  | direct (name : String)
+  | indirect (sig : Ty)
+
+def OpKind.callee? : OpKind → Option Callee
+  | .call callee => some (.direct callee)
+  | .callIndirect sig => some (.indirect sig)
   | _ => none
 
-def OpKind.stackAlloc? : OpKind → Option (Nat × Nat)
-  | .memStack size align => some (size, align)
+/-- The function a call runs, and the arguments it passes. An indirect call's pointer must
+resolve to the start of a function whose parameter and result types are the signature's. -/
+def callTarget (loc : Option Loc) : Callee → List RVal → CM (Func × List RVal)
+  | .direct name, vs => do
+    match (← get).funcs[name]? with
+    | some f => pure (f, vs)
+    | none => halt (.stuck s!"no function @{name}") loc
+  | .indirect sig, v :: vs => do
+    let some p ← asPtr loc v | ub .poison loc "call through a poison pointer"
+    let (a, _, off) ← resolve loc p 0
+    let al ← getAlloc loc a
+    let .func name := al.kind | ub .badCall loc s!"#{a} is not a function"
+    unless off == 0 do ub .badCall loc s!"offset {off} is not the start of @{name}"
+    let some f := (← get).funcs[name]? | halt (.stuck s!"no function @{name}") loc
+    let t := Ty.func (f.params.map (·.ty)) f.rets
+    unless t == sig do ub .badCall loc s!"@{name} has type {t}"
+    pure (f, vs)
+  | .indirect _, [] => halt (.stuck "malformed op") loc
+
+/-- A stack allocation's size and alignment, in a memory space. -/
+def OpKind.stackAlloc? : OpKind → Option (SpaceCfg → Nat × Nat)
+  | .memStack size align => some fun _ => (size, align)
+  | .memStackOf ty align => some fun sp => (ty.size sp, max align (ty.align sp))
   | _ => none
 
 def OpKind.loopProgress? : OpKind → Option Bool
@@ -795,14 +872,15 @@ def execFlat (m : Machine) (kind : OpKind) (results : List Result) (args : List 
   match kind.callee? with
   | some callee => do
     let vs ← operands m.stack loc args
-    let some f := m.core.funcs[callee]? | halt (.stuck s!"no function @{callee}") loc
+    let ((f, vs), m) ← m.exec (callTarget loc callee vs)
     let ((vs, scopes), m) ← m.exec (enterCall loc f.params vs)
     pure { m with
       stack := .block f.body.ops [] (Env.bindAll {} f.params vs) ::
         .call results f.rets scopes loc :: m.stack }
   | none =>
   match kind.stackAlloc? with
-  | some (size, align) => do
+  | some dims => do
+    let (size, align) := dims m.core.space
     let (p, m) ← m.exec (do
       let p ← newAlloc loc size align .stack
       checkResults loc results [.ptr (some p)]
@@ -857,10 +935,73 @@ def step (m : Machine) : Except Halt Machine :=
   | .block (op :: ops) ids env :: rest => execOp { m with stack := .block ops ids env :: rest } op
   | _ => halt (.stuck "no block to run") none
 
-/-- The core before a call from outside the module. -/
+/-! ## Globals -/
+
+mutual
+  /-- The names an initializer takes the address of, in order. -/
+  def Init.syms : Init → List String
+    | .sym s => [s]
+    | .list items => Init.symsList items
+    | _ => []
+  def Init.symsList : List Init → List String
+    | [] => []
+    | i :: is => i.syms ++ Init.symsList is
+end
+
+/-- `bs` written over `base` from offset `off`. -/
+def overlay (base : List Byte) : List (Nat × List Byte) → List Byte
+  | [] => base
+  | (off, bs) :: rest => overlay (base.take off ++ bs ++ base.drop (off + bs.length)) rest
+
+mutual
+  /-- The bytes an object of type `t` starts with. Padding is zero; an initializer that doesn't
+  fit the type (which the verifier rejects) gives `poison`. -/
+  def initBytes (sp : SpaceCfg) (addrs : Std.ExtTreeMap String Ptr) : Ty → Init → List Byte
+    | t, .zero => List.replicate (t.size sp) (.bits 0)
+    | .int w, .int n | .byte w, .int n => encodeInt w (Sem.const w n)
+    | .ptr, .null => encodePtr sp (some .null)
+    | .ptr, .sym s => encodePtr sp addrs[s]?
+    | _, .bytes bs => bs.map fun b => .bits (BitVec.ofNat 8 b)
+    | t@(.struct p fs), .list items =>
+      overlay (List.replicate (t.size sp) (.bits 0))
+        ((placeFields p (Ty.strides sp fs)).1.zip (initList sp addrs fs items))
+    | t@(.array n e), .list items =>
+      overlay (List.replicate (t.size sp) (.bits 0))
+        (((List.range n).map (· * e.stride sp)).zip (initList sp addrs (List.replicate n e) items))
+    | t, _ => List.replicate (t.size sp) .poison
+  def initList (sp : SpaceCfg) (addrs : Std.ExtTreeMap String Ptr) :
+      List Ty → List Init → List (List Byte)
+    | t :: ts, i :: is => initBytes sp addrs t i :: initList sp addrs ts is
+    | _, _ => []
+end
+
+/-- The core before a call from outside the module. Globals are allocations `1, 2, …`, in order,
+each with its first tag numbered like it; next come the functions that initializers take the
+address of, in the order they are first named (other functions get an allocation when `func.addr`
+first names them). A `const` global gets a `readonly` scope for the whole run. -/
 def Core.initial (oracle : Nat → Int) (mod : Module) : Core :=
-  { oracle, space := mod.space,
-    funcs := mod.funcs.foldl (fun acc g => acc.insert g.name g) {} }
+  let sp := mod.space
+  let gs : List (Global × Nat) := mod.globals.zipIdx.map fun (g, i) => (g, i + 1)
+  let fs : List (String × Nat) :=
+    ((mod.globals.flatMap (·.init.syms)).eraseDups.filter fun n =>
+      !mod.globals.any (·.name == n)).zipIdx.map fun (f, i) => (f, gs.length + i + 1)
+  let globalAlloc (g : Global) : Alloc :=
+    { size := g.ty.size sp, align := max g.align (g.ty.align sp), kind := .global g.name g.const }
+  let funcAlloc (f : String) : Alloc := { size := 0, align := 1, kind := .func f }
+  let allocs : List (Nat × Alloc) :=
+    gs.map (fun x => (x.2, globalAlloc x.1)) ++ fs.map fun x => (x.2, funcAlloc x.1)
+  let names : List (String × Nat) := gs.map (fun x => (x.1.name, x.2)) ++ fs
+  let addrs : Std.ExtTreeMap String Ptr := names.foldl (fun m x => m.insert x.1 (.rel x.2 x.2 0)) ∅
+  let consts : List (Nat × Scope) := ((gs.filter (·.1.const)).map (·.2)).zipIdx.map fun (a, id) =>
+    (id, { alloc := a, tag := a, noalias := false, readonly := true, const := true })
+  { oracle, space := sp,
+    funcs := mod.funcs.foldl (fun acc g => acc.insert g.name g) {},
+    allocs := allocs.foldl (fun m x => m.insert x.1 x.2) ∅,
+    mem := gs.foldl (fun m x => m.insert x.2 (writeBytes ∅ 0 (initBytes sp addrs x.1.ty x.1.init))) ∅,
+    tags := allocs.foldl (fun m x => m.insert x.1 none) ∅,
+    scopes := consts.foldl (fun m x => m.insert x.1 x.2) ∅,
+    nextScope := consts.length,
+    addrs }
 
 /-- The machine at the start of a call to `f`. -/
 def Machine.init (oracle : Nat → Int) (mod : Module) (f : Func) (args : List RVal) :

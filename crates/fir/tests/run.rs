@@ -23,8 +23,8 @@ fn run_lines(text: &str) -> Vec<(String, Vec<String>, String)> {
         let Some(body) = line.trim().strip_prefix("// run:") else {
             continue;
         };
-        let parts: Vec<&str> = body.split(" -> ").collect();
-        let [call, want] = parts[..] else {
+        // The outcome may contain ` -> ` itself (a function type), so split at the first.
+        let Some((call, want)) = body.split_once(" -> ") else {
             panic!("bad run line: {line}");
         };
         let call = call.trim();

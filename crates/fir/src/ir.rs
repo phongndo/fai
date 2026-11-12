@@ -8,7 +8,9 @@
 use std::fmt;
 
 use crate::body::IntId;
+pub use crate::globals::{Globals, Init};
 pub use crate::ops::OpKind;
+pub use crate::types::{Policy, Shape, TyId, Types};
 
 /// A source location, `@line:col`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -17,30 +19,49 @@ pub struct Loc {
     pub col: u32,
 }
 
-/// A type: signless integers `iN`, pointers, and byte types `bN`.
+/// A type. The value types are signless integers `iN`, pointers, and byte types `bN`; structs,
+/// arrays, and function types are ids into a [`Types`] table (see `types.rs`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Ty {
     Int(u32),
     Ptr,
     Byte(u32),
+    Agg(TyId),
 }
 
+impl Ty {
+    /// Whether values can have this type.
+    pub fn is_value(self) -> bool {
+        !matches!(self, Ty::Agg(_))
+    }
+}
+
+/// Value types as text. A [`Ty::Agg`] needs its table to print ([`Types::write`]); here it shows
+/// only its id.
 impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Ty::Int(w) => write!(f, "i{w}"),
             Ty::Ptr => f.write_str("ptr"),
             Ty::Byte(w) => write!(f, "b{w}"),
+            Ty::Agg(id) => write!(f, "type#{}", id.index()),
         }
     }
 }
 
-/// A memory space's sizes, in bits: how much memory a pointer takes, and the address (index)
-/// size used by `ptr.addr`, offsets, and allocation sizes.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// The default integer alignments, `(width in bits, alignment in bytes)`: x86-64 System V.
+pub const DEFAULT_INTS: [(u32, u32); 5] = [(8, 1), (16, 2), (32, 4), (64, 8), (128, 16)];
+
+/// A memory space's data layout (Lean's `SpaceCfg`): how much memory a pointer takes and the
+/// address (index) size used by `ptr.addr`, offsets, and allocation sizes, in bits; the pointer
+/// alignment; and the integer alignments, `(width in bits, alignment in bytes)` by increasing
+/// width.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct SpaceCfg {
     pub ptr_bits: u32,
     pub addr_bits: u32,
+    pub ptr_align: u32,
+    pub ints: Vec<(u32, u32)>,
 }
 
 impl Default for SpaceCfg {
@@ -48,6 +69,26 @@ impl Default for SpaceCfg {
         SpaceCfg {
             ptr_bits: 64,
             addr_bits: 64,
+            ptr_align: 8,
+            ints: DEFAULT_INTS.to_vec(),
+        }
+    }
+}
+
+impl SpaceCfg {
+    /// A pointer's alignment when the `memspace` line doesn't give one: the largest power of two
+    /// at most the pointer size in bytes, and at least 1.
+    pub fn natural_align(ptr_bits: u32) -> u32 {
+        let bytes = ptr_bits / 8;
+        if bytes == 0 { 1 } else { 1 << bytes.ilog2() }
+    }
+
+    /// The alignment of `iN` and `bN`: the entry for the smallest width at least `w`, or else the
+    /// largest's.
+    pub fn int_align(&self, w: u32) -> u32 {
+        match self.ints.iter().find(|e| e.0 >= w) {
+            Some(e) => e.1,
+            None => self.ints.last().map_or(1, |e| e.1),
         }
     }
 }
@@ -183,10 +224,11 @@ pub enum AllocFail {
     Trap,
 }
 
-/// A module: functions plus the default memory space.
+/// A module: the default memory space, globals, and functions.
 #[derive(Clone, Debug, Default)]
 pub struct Module {
     pub space: SpaceCfg,
+    pub globals: Globals,
     pub funcs: Vec<Func>,
 }
 

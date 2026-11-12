@@ -7,8 +7,9 @@ The shape of a FIR-0 program. Following the structure decision, everything is an
 kind, typed results, operands, nested regions, and a source location. A region has typed
 parameters (block arguments) and a list of ops.
 
-FIR-1 covers integers, structured control flow, memory, and calls between FIR functions. Floats,
-external calls, and threads come later.
+FIR-1 covers integers, structured control flow, memory, and calls between FIR functions, with
+structs and arrays in memory, globals, and calls through function pointers. Floats, external
+calls, and threads come later.
 -/
 
 namespace Fir
@@ -19,33 +20,147 @@ structure Loc where
   col : Nat
   deriving DecidableEq, Repr, Inhabited
 
-/-- A type: signless integers `iN`, pointers, and byte types `bN` (raw memory, copied exactly). -/
+/-- How a struct's fields are laid out (decision: Layout). -/
+inductive Policy where
+  /-- `struct<C>`: the platform C layout. -/
+  | c
+  /-- `struct<packed>`: no padding, alignment 1. -/
+  | packed
+  /-- `struct<auto>`: FIR picks the order (now: by decreasing alignment). -/
+  | auto
+  deriving DecidableEq, Repr, Inhabited
+
+def Policy.name : Policy → String
+  | .c => "C"
+  | .packed => "packed"
+  | .auto => "auto"
+
+/-- A type. Values have the *value types*: signless integers `iN`, pointers, and byte types
+`bN` (raw memory, copied exactly). Structs and arrays describe memory, and function types
+describe calls; neither is a value type (decision: Aggregates). -/
 inductive Ty where
   | int (w : Nat)
   | ptr
   | byte (w : Nat)
-  deriving DecidableEq, Repr, Inhabited
+  /-- `struct<C>{i32, ptr}` -/
+  | struct (policy : Policy) (fields : List Ty)
+  /-- `array<4 x i32>` -/
+  | array (n : Nat) (elem : Ty)
+  /-- `func<(i32, ptr) -> i32>` -/
+  | func (params rets : List Ty)
+  deriving Repr, Inhabited
+
+mutual
+  /-- Equality of types, by structure. (`deriving` doesn't handle the nested lists.) -/
+  def Ty.decEq : (a b : Ty) → Decidable (a = b)
+    | .int w, .int w' =>
+      if h : w = w' then isTrue (h ▸ rfl) else isFalse (by intro e; cases e; exact h rfl)
+    | .ptr, .ptr => isTrue rfl
+    | .byte w, .byte w' =>
+      if h : w = w' then isTrue (h ▸ rfl) else isFalse (by intro e; cases e; exact h rfl)
+    | .struct p fs, .struct p' fs' =>
+      if hp : p = p' then
+        match Ty.decEqList fs fs' with
+        | isTrue h => isTrue (by rw [hp, h])
+        | isFalse h => isFalse (by intro e; cases e; exact h rfl)
+      else isFalse (by intro e; cases e; exact hp rfl)
+    | .array n t, .array n' t' =>
+      if hn : n = n' then
+        match Ty.decEq t t' with
+        | isTrue h => isTrue (by rw [hn, h])
+        | isFalse h => isFalse (by intro e; cases e; exact h rfl)
+      else isFalse (by intro e; cases e; exact hn rfl)
+    | .func ps rs, .func ps' rs' =>
+      match Ty.decEqList ps ps', Ty.decEqList rs rs' with
+      | isTrue h1, isTrue h2 => isTrue (by rw [h1, h2])
+      | isFalse h, _ => isFalse (by intro e; cases e; exact h rfl)
+      | _, isFalse h => isFalse (by intro e; cases e; exact h rfl)
+    | .int _, .ptr | .int _, .byte _ | .int _, .struct .. | .int _, .array .. | .int _, .func ..
+    | .ptr, .int _ | .ptr, .byte _ | .ptr, .struct .. | .ptr, .array .. | .ptr, .func ..
+    | .byte _, .int _ | .byte _, .ptr | .byte _, .struct .. | .byte _, .array .. | .byte _, .func ..
+    | .struct .., .int _ | .struct .., .ptr | .struct .., .byte _ | .struct .., .array ..
+    | .struct .., .func .. | .array .., .int _ | .array .., .ptr | .array .., .byte _
+    | .array .., .struct .. | .array .., .func .. | .func .., .int _ | .func .., .ptr
+    | .func .., .byte _ | .func .., .struct .. | .func .., .array .. =>
+      isFalse (by intro e; cases e)
+  def Ty.decEqList : (a b : List Ty) → Decidable (a = b)
+    | [], [] => isTrue rfl
+    | t :: ts, t' :: ts' =>
+      match Ty.decEq t t', Ty.decEqList ts ts' with
+      | isTrue h1, isTrue h2 => isTrue (by rw [h1, h2])
+      | isFalse h, _ => isFalse (by intro e; cases e; exact h rfl)
+      | _, isFalse h => isFalse (by intro e; cases e; exact h rfl)
+    | [], _ :: _ | _ :: _, [] => isFalse (by intro e; cases e)
+end
+
+instance : DecidableEq Ty := Ty.decEq
 
 /-- The bit width of an integer or byte type. -/
 def Ty.width : Ty → Nat
   | .int w | .byte w => w
-  | .ptr => 0
+  | _ => 0
 
 def Ty.isInt : Ty → Bool
   | .int _ => true
   | _ => false
 
-instance : ToString Ty := ⟨fun
-  | .int w => s!"i{w}"
-  | .ptr => "ptr"
-  | .byte w => s!"b{w}"⟩
+/-- The types SSA values can have. -/
+def Ty.isValue : Ty → Bool
+  | .int _ | .ptr | .byte _ => true
+  | _ => false
 
-/-- A memory space's sizes, in bits. The pointer size is how much memory a pointer takes; the
-address (index) size is what `ptr.addr`, offsets, and allocation sizes use. -/
+/-- `-> T` or `-> (T, U)`, or nothing, as function headers and types write results. -/
+def retsText (rs : List String) : String :=
+  match rs with
+  | [] => ""
+  | [t] => s!" -> {t}"
+  | ts => s!" -> ({", ".intercalate ts})"
+
+mutual
+  def Ty.render : Ty → String
+    | .int w => s!"i{w}"
+    | .ptr => "ptr"
+    | .byte w => s!"b{w}"
+    | .struct p fs => s!"struct<{p.name}>\{{", ".intercalate (Ty.renderList fs)}}"
+    | .array n t => s!"array<{n} x {t.render}>"
+    | .func ps rs => s!"func<({", ".intercalate (Ty.renderList ps)}){retsText (Ty.renderList rs)}>"
+  def Ty.renderList : List Ty → List String
+    | [] => []
+    | t :: ts => t.render :: Ty.renderList ts
+end
+
+instance : ToString Ty := ⟨Ty.render⟩
+
+/-- The default integer alignments, `(width in bits, alignment in bytes)`: x86-64 System V. -/
+def defaultInts : List (Nat × Nat) := [(8, 1), (16, 2), (32, 4), (64, 8), (128, 16)]
+
+/-- The largest power of two that is at most `n`, and at least 1. -/
+def floorPow2 (n : Nat) : Nat := go n 1
+where
+  go : Nat → Nat → Nat
+    | 0, p => p
+    | k + 1, p => if p * 2 ≤ n then go k (p * 2) else p
+
+/-- A memory space's data layout. The pointer size is how much memory a pointer takes, and the
+address (index) size is what `ptr.addr`, offsets, and allocation sizes use, both in bits. Pointers
+align to `ptrAlign` bytes; `iN` and `bN` to the alignment `ints` lists for the smallest width at
+least `N`, or else for the largest (decision: Data layout). -/
 structure SpaceCfg where
   ptrBits : Nat := 64
   addrBits : Nat := 64
+  ptrAlign : Nat := 8
+  /-- `(width in bits, alignment in bytes)`, by increasing width. -/
+  ints : List (Nat × Nat) := defaultInts
   deriving DecidableEq, Repr, Inhabited
+
+/-- A pointer's alignment when the `memspace` line doesn't give one. -/
+def SpaceCfg.naturalAlign (ptrBits : Nat) : Nat := floorPow2 (ptrBits / 8)
+
+/-- The alignment of `iN` and `bN`. -/
+def SpaceCfg.intAlign (sp : SpaceCfg) (w : Nat) : Nat :=
+  match sp.ints.find? (·.1 ≥ w) with
+  | some (_, a) => a
+  | none => (sp.ints.getLast?.map (·.2)).getD 1
 
 /-- How much a fact is trusted. All three mean the same thing (a violation is UB); they differ in
 how the compiler treats the fact: relied on, checked at runtime, or proved. -/
@@ -517,6 +632,95 @@ fir_ops
     name "cf.switch"
     format "%, default {dflt}, {cases}"
     terminator
+  /-- `ty.size T`: how many bytes a `T` takes, in the memory space's data layout. -/
+  op tySize (ty : Ty)
+    name "ty.size"
+    format "{ty}"
+    rule
+      sized ty
+      operands []
+      results [addr]
+  /-- `ty.align T`: a `T`'s alignment in bytes. -/
+  op tyAlign (ty : Ty)
+    name "ty.align"
+    format "{ty}"
+    rule
+      sized ty
+      operands []
+      results [addr]
+  /-- `ty.offset T, i`: the offset of field `i` in the struct `T`. -/
+  op tyOffset (ty : Ty) (index : Index)
+    name "ty.offset"
+    format "{ty}, {index}"
+    rule
+      field ty index
+      operands []
+      results [addr]
+  /-- `ptr.field.inbounds T %p, i`: field `i` of the struct `T` at `%p`, as `ptr.offset` by the
+  field's offset (`.inbounds` or `.wrap`). -/
+  op ptrField (inbounds : Bool) (ty : Ty) (index : Index)
+    name "ptr.field.{inbounds : offsetModes}"
+    format "{ty} %, {index}"
+    rule
+      field ty index
+      operands [ptr]
+      results [ptr]
+  /-- `ptr.index.inbounds T %p, %i`: element `%i` (signed) of an array of `T` at `%p`. The
+  in-bounds form also gives `poison` when `%i` times `T`'s stride overflows a signed address;
+  the `.wrap` form wraps it. -/
+  op ptrIndex (inbounds : Bool) (ty : Ty)
+    name "ptr.index.{inbounds : offsetModes}"
+    format "{ty} %, %"
+    rule
+      sized ty
+      operands [ptr, addr]
+      results [ptr]
+  /-- `mem.stack.of T, align 1`: stack memory for a `T`, aligned to `align` or `T`'s alignment,
+  whichever is larger; freed when its region ends. -/
+  op memStackOf (ty : Ty) (align : Align)
+    name "mem.stack.of"
+    format "{ty}, align {align}"
+    effects alloc
+    rule
+      pow2 align
+      sized ty
+      operands []
+      results [ptr]
+  /-- `mem.copy T %dst, %src, align 4`: copy a `T`'s bytes exactly, as loading and storing them
+  as one byte value would: padding and pointers included, overlap allowed. -/
+  op memCopy (ty : Ty) (align : Align)
+    name "mem.copy"
+    format "{ty} %, %, align {align}"
+    effects read write
+    rule
+      pow2 align
+      sized ty
+      operands [ptr, ptr]
+      noResults
+  /-- `mem.global @g`: a pointer to the global `@g`. -/
+  op memGlobal (global : Global)
+    name "mem.global"
+    format "{global}"
+    rule
+      global global
+      operands []
+      results [ptr]
+  /-- `func.addr @f`: a pointer to the function `@f`, which only calls may use. -/
+  op funcAddr (callee : Func)
+    name "func.addr"
+    format "{callee}"
+    rule
+      func callee
+      operands []
+      results [ptr]
+  /-- `func.call.indirect func<(i32) -> i32> %p(%a)`: a call through a pointer, which must point
+  at a function of this signature. -/
+  op callIndirect (sig : Ty)
+    name "func.call.indirect"
+    format "{sig} %(%*)"
+    effects read write alloc free trap diverge
+    rule
+      sig sig
 
 /-- The op's name with its modifiers, as printed. -/
 def OpKind.name (k : OpKind) : String :=
@@ -570,9 +774,36 @@ structure Func where
 
 def Func.params (f : Func) : List Result := f.body.params
 
+/-- A global's initial contents. -/
+inductive Init where
+  /-- `zero`: every byte zero. -/
+  | zero
+  /-- An integer, for an `iN` or `bN`. -/
+  | int (n : Int)
+  /-- `null` -/
+  | null
+  /-- `@g`: the address of a global or a function. -/
+  | sym (name : String)
+  /-- `bytes "0aff"`: the whole object's bytes. -/
+  | bytes (bs : List Nat)
+  /-- `{a, b}`: one initializer per struct field or array element; padding is zero. -/
+  | list (items : List Init)
+  deriving Repr, Inhabited
+
+/-- `global [const] @name: T [align N] = INIT`: memory allocated before the program starts and
+never freed. Its alignment is the larger of `align` and `T`'s. -/
+structure Global where
+  name : String
+  ty : Ty
+  const : Bool := false
+  align : Nat := 1
+  init : Init
+  deriving Inhabited
+
 structure Module where
   /-- The default memory space. -/
   space : SpaceCfg := {}
+  globals : List Global := []
   funcs : List Func
 
 def Module.find? (m : Module) (name : String) : Option Func :=

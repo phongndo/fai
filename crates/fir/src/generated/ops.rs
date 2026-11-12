@@ -88,6 +88,32 @@ pub enum OpKind {
     /// `cf.switch %v, default ^d(…), [k: ^b(…), …]`: jump to the case whose key is `%v` (keys are
     /// taken modulo `2^N`), or to the default. Branching on `poison` is UB.
     Switch { dflt: SuccId, cases: CasesId },
+    /// `ty.size T`: how many bytes a `T` takes, in the memory space's data layout.
+    TySize(Ty),
+    /// `ty.align T`: a `T`'s alignment in bytes.
+    TyAlign(Ty),
+    /// `ty.offset T, i`: the offset of field `i` in the struct `T`.
+    TyOffset { ty: Ty, index: u32 },
+    /// `ptr.field.inbounds T %p, i`: field `i` of the struct `T` at `%p`, as `ptr.offset` by the
+    /// field's offset (`.inbounds` or `.wrap`).
+    PtrField { inbounds: bool, ty: Ty, index: u32 },
+    /// `ptr.index.inbounds T %p, %i`: element `%i` (signed) of an array of `T` at `%p`. The
+    /// in-bounds form also gives `poison` when `%i` times `T`'s stride overflows a signed address;
+    /// the `.wrap` form wraps it.
+    PtrIndex { inbounds: bool, ty: Ty },
+    /// `mem.stack.of T, align 1`: stack memory for a `T`, aligned to `align` or `T`'s alignment,
+    /// whichever is larger; freed when its region ends.
+    MemStackOf { ty: Ty, align: u32 },
+    /// `mem.copy T %dst, %src, align 4`: copy a `T`'s bytes exactly, as loading and storing them
+    /// as one byte value would: padding and pointers included, overlap allowed.
+    MemCopy { ty: Ty, align: u32 },
+    /// `mem.global @g`: a pointer to the global `@g`.
+    MemGlobal { global: StrId },
+    /// `func.addr @f`: a pointer to the function `@f`, which only calls may use.
+    FuncAddr { callee: StrId },
+    /// `func.call.indirect func<(i32) -> i32> %p(%a)`: a call through a pointer, which must point
+    /// at a function of this signature.
+    CallIndirect(Ty),
 }
 
 impl OpKind {
@@ -261,6 +287,18 @@ impl OpKind {
             OpKind::Br { .. } => "cf.br",
             OpKind::CondBr { .. } => "cf.cond_br",
             OpKind::Switch { .. } => "cf.switch",
+            OpKind::TySize(_) => "ty.size",
+            OpKind::TyAlign(_) => "ty.align",
+            OpKind::TyOffset { .. } => "ty.offset",
+            OpKind::PtrField { inbounds: true, .. } => "ptr.field.inbounds",
+            OpKind::PtrField { inbounds: false, .. } => "ptr.field.wrap",
+            OpKind::PtrIndex { inbounds: true, .. } => "ptr.index.inbounds",
+            OpKind::PtrIndex { inbounds: false, .. } => "ptr.index.wrap",
+            OpKind::MemStackOf { .. } => "mem.stack.of",
+            OpKind::MemCopy { .. } => "mem.copy",
+            OpKind::MemGlobal { .. } => "mem.global",
+            OpKind::FuncAddr { .. } => "func.addr",
+            OpKind::CallIndirect(_) => "func.call.indirect",
         }
     }
 
@@ -303,6 +341,16 @@ impl OpKind {
             OpKind::Br { .. } => &DECLS[33],
             OpKind::CondBr { .. } => &DECLS[34],
             OpKind::Switch { .. } => &DECLS[35],
+            OpKind::TySize(_) => &DECLS[36],
+            OpKind::TyAlign(_) => &DECLS[37],
+            OpKind::TyOffset { .. } => &DECLS[38],
+            OpKind::PtrField { .. } => &DECLS[39],
+            OpKind::PtrIndex { .. } => &DECLS[40],
+            OpKind::MemStackOf { .. } => &DECLS[41],
+            OpKind::MemCopy { .. } => &DECLS[42],
+            OpKind::MemGlobal { .. } => &DECLS[43],
+            OpKind::FuncAddr { .. } => &DECLS[44],
+            OpKind::CallIndirect(_) => &DECLS[45],
         }
     }
 
@@ -326,6 +374,20 @@ impl OpKind {
             (OpKind::CondBr { f: x, .. }, 1) => Imm::Succ(*x),
             (OpKind::Switch { dflt: x, .. }, 0) => Imm::Succ(*x),
             (OpKind::Switch { cases: x, .. }, 1) => Imm::Cases(*x),
+            (OpKind::TySize(x), 0) => Imm::Ty(*x),
+            (OpKind::TyAlign(x), 0) => Imm::Ty(*x),
+            (OpKind::TyOffset { ty: x, .. }, 0) => Imm::Ty(*x),
+            (OpKind::TyOffset { index: x, .. }, 1) => Imm::Index(*x),
+            (OpKind::PtrField { ty: x, .. }, 0) => Imm::Ty(*x),
+            (OpKind::PtrField { index: x, .. }, 1) => Imm::Index(*x),
+            (OpKind::PtrIndex { ty: x, .. }, 0) => Imm::Ty(*x),
+            (OpKind::MemStackOf { ty: x, .. }, 0) => Imm::Ty(*x),
+            (OpKind::MemStackOf { align: x, .. }, 1) => Imm::Align(*x),
+            (OpKind::MemCopy { ty: x, .. }, 0) => Imm::Ty(*x),
+            (OpKind::MemCopy { align: x, .. }, 1) => Imm::Align(*x),
+            (OpKind::MemGlobal { global: x }, 0) => Imm::Str(*x),
+            (OpKind::FuncAddr { callee: x }, 0) => Imm::Str(*x),
+            (OpKind::CallIndirect(x), 0) => Imm::Ty(*x),
             _ => return None,
         })
     }
@@ -350,6 +412,20 @@ impl OpKind {
             (OpKind::CondBr { f: x, .. }, 1, Imm::Succ(v)) => *x = v,
             (OpKind::Switch { dflt: x, .. }, 0, Imm::Succ(v)) => *x = v,
             (OpKind::Switch { cases: x, .. }, 1, Imm::Cases(v)) => *x = v,
+            (OpKind::TySize(x), 0, Imm::Ty(v)) => *x = v,
+            (OpKind::TyAlign(x), 0, Imm::Ty(v)) => *x = v,
+            (OpKind::TyOffset { ty: x, .. }, 0, Imm::Ty(v)) => *x = v,
+            (OpKind::TyOffset { index: x, .. }, 1, Imm::Index(v)) => *x = v,
+            (OpKind::PtrField { ty: x, .. }, 0, Imm::Ty(v)) => *x = v,
+            (OpKind::PtrField { index: x, .. }, 1, Imm::Index(v)) => *x = v,
+            (OpKind::PtrIndex { ty: x, .. }, 0, Imm::Ty(v)) => *x = v,
+            (OpKind::MemStackOf { ty: x, .. }, 0, Imm::Ty(v)) => *x = v,
+            (OpKind::MemStackOf { align: x, .. }, 1, Imm::Align(v)) => *x = v,
+            (OpKind::MemCopy { ty: x, .. }, 0, Imm::Ty(v)) => *x = v,
+            (OpKind::MemCopy { align: x, .. }, 1, Imm::Align(v)) => *x = v,
+            (OpKind::MemGlobal { global: x }, 0, Imm::Str(v)) => *x = v,
+            (OpKind::FuncAddr { callee: x }, 0, Imm::Str(v)) => *x = v,
+            (OpKind::CallIndirect(x), 0, Imm::Ty(v)) => *x = v,
             _ => {}
         }
     }
@@ -488,11 +564,23 @@ pub fn op_kind(name: &str) -> Option<OpKind> {
         "cf.br" => OpKind::Br { dest: SuccId::PLACEHOLDER },
         "cf.cond_br" => OpKind::CondBr { t: SuccId::PLACEHOLDER, f: SuccId::PLACEHOLDER },
         "cf.switch" => OpKind::Switch { dflt: SuccId::PLACEHOLDER, cases: CasesId::EMPTY },
+        "ty.size" => OpKind::TySize(Ty::Ptr),
+        "ty.align" => OpKind::TyAlign(Ty::Ptr),
+        "ty.offset" => OpKind::TyOffset { ty: Ty::Ptr, index: 0 },
+        "ptr.field.inbounds" => OpKind::PtrField { inbounds: true, ty: Ty::Ptr, index: 0 },
+        "ptr.field.wrap" => OpKind::PtrField { inbounds: false, ty: Ty::Ptr, index: 0 },
+        "ptr.index.inbounds" => OpKind::PtrIndex { inbounds: true, ty: Ty::Ptr },
+        "ptr.index.wrap" => OpKind::PtrIndex { inbounds: false, ty: Ty::Ptr },
+        "mem.stack.of" => OpKind::MemStackOf { ty: Ty::Ptr, align: 1 },
+        "mem.copy" => OpKind::MemCopy { ty: Ty::Ptr, align: 1 },
+        "mem.global" => OpKind::MemGlobal { global: StrId::PLACEHOLDER },
+        "func.addr" => OpKind::FuncAddr { callee: StrId::PLACEHOLDER },
+        "func.call.indirect" => OpKind::CallIndirect(Ty::Ptr),
         _ => return None,
     })
 }
 
-static DECLS: [OpDecl; 36] = [
+static DECLS: [OpDecl; 46] = [
     OpDecl {
         ctor: "const",
         imms: &[Field { name: "n", ty: FieldTy::Int }],
@@ -921,6 +1009,136 @@ static DECLS: [OpDecl; 36] = [
         terminator: true,
         rule: None,
         effects: &[],
+        tier: Tier::Verified,
+    },
+    OpDecl {
+        ctor: "tySize",
+        imms: &[Field { name: "ty", ty: FieldTy::Ty }],
+        items: &[Item::Imm(0)],
+        terminator: false,
+        rule: Some(&[
+            Check::Sized(TyE::Field(0)),
+            Check::Ins("operands", &[]),
+            Check::Outs(&[TyE::Addr]),
+        ]),
+        effects: &[],
+        tier: Tier::Verified,
+    },
+    OpDecl {
+        ctor: "tyAlign",
+        imms: &[Field { name: "ty", ty: FieldTy::Ty }],
+        items: &[Item::Imm(0)],
+        terminator: false,
+        rule: Some(&[
+            Check::Sized(TyE::Field(0)),
+            Check::Ins("operands", &[]),
+            Check::Outs(&[TyE::Addr]),
+        ]),
+        effects: &[],
+        tier: Tier::Verified,
+    },
+    OpDecl {
+        ctor: "tyOffset",
+        imms: &[Field { name: "ty", ty: FieldTy::Ty }, Field { name: "index", ty: FieldTy::Index }],
+        items: &[Item::Imm(0), Item::Comma, Item::Imm(1)],
+        terminator: false,
+        rule: Some(&[
+            Check::Field(TyE::Field(0), 1),
+            Check::Ins("operands", &[]),
+            Check::Outs(&[TyE::Addr]),
+        ]),
+        effects: &[],
+        tier: Tier::Verified,
+    },
+    OpDecl {
+        ctor: "ptrField",
+        imms: &[Field { name: "ty", ty: FieldTy::Ty }, Field { name: "index", ty: FieldTy::Index }],
+        items: &[Item::Imm(0), Item::Operand, Item::Comma, Item::Imm(1)],
+        terminator: false,
+        rule: Some(&[
+            Check::Field(TyE::Field(0), 1),
+            Check::Ins("operands", &[TyE::Ptr]),
+            Check::Outs(&[TyE::Ptr]),
+        ]),
+        effects: &[],
+        tier: Tier::Verified,
+    },
+    OpDecl {
+        ctor: "ptrIndex",
+        imms: &[Field { name: "ty", ty: FieldTy::Ty }],
+        items: &[Item::Imm(0), Item::Operand, Item::Comma, Item::Operand],
+        terminator: false,
+        rule: Some(&[
+            Check::Sized(TyE::Field(0)),
+            Check::Ins("operands", &[TyE::Ptr, TyE::Addr]),
+            Check::Outs(&[TyE::Ptr]),
+        ]),
+        effects: &[],
+        tier: Tier::Verified,
+    },
+    OpDecl {
+        ctor: "memStackOf",
+        imms: &[Field { name: "ty", ty: FieldTy::Ty }, Field { name: "align", ty: FieldTy::Align }],
+        items: &[Item::Imm(0), Item::Comma, Item::Keyword("align"), Item::Imm(1)],
+        terminator: false,
+        rule: Some(&[
+            Check::Pow2(1),
+            Check::Sized(TyE::Field(0)),
+            Check::Ins("operands", &[]),
+            Check::Outs(&[TyE::Ptr]),
+        ]),
+        effects: &[Effect::Alloc],
+        tier: Tier::Verified,
+    },
+    OpDecl {
+        ctor: "memCopy",
+        imms: &[Field { name: "ty", ty: FieldTy::Ty }, Field { name: "align", ty: FieldTy::Align }],
+        items: &[Item::Imm(0), Item::Operand, Item::Comma, Item::Operand, Item::Comma, Item::Keyword("align"), Item::Imm(1)],
+        terminator: false,
+        rule: Some(&[
+            Check::Pow2(1),
+            Check::Sized(TyE::Field(0)),
+            Check::Ins("operands", &[TyE::Ptr, TyE::Ptr]),
+            Check::NoOuts,
+        ]),
+        effects: &[Effect::Read, Effect::Write],
+        tier: Tier::Verified,
+    },
+    OpDecl {
+        ctor: "memGlobal",
+        imms: &[Field { name: "global", ty: FieldTy::Global }],
+        items: &[Item::Imm(0)],
+        terminator: false,
+        rule: Some(&[
+            Check::Global(0),
+            Check::Ins("operands", &[]),
+            Check::Outs(&[TyE::Ptr]),
+        ]),
+        effects: &[],
+        tier: Tier::Verified,
+    },
+    OpDecl {
+        ctor: "funcAddr",
+        imms: &[Field { name: "callee", ty: FieldTy::Func }],
+        items: &[Item::Imm(0)],
+        terminator: false,
+        rule: Some(&[
+            Check::Func(0),
+            Check::Ins("operands", &[]),
+            Check::Outs(&[TyE::Ptr]),
+        ]),
+        effects: &[],
+        tier: Tier::Verified,
+    },
+    OpDecl {
+        ctor: "callIndirect",
+        imms: &[Field { name: "sig", ty: FieldTy::Ty }],
+        items: &[Item::Imm(0), Item::Operand, Item::Args],
+        terminator: false,
+        rule: Some(&[
+            Check::Sig(0),
+        ]),
+        effects: &[Effect::Read, Effect::Write, Effect::Alloc, Effect::Free, Effect::Trap, Effect::Diverge],
         tier: Tier::Verified,
     },
 ];

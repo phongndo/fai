@@ -277,6 +277,16 @@ theorem keeps_fromOut (loc : Option Loc) (o : OpOut w) : KeepsSpace sp (fromOut 
   unfold fromOut; keeps
 macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_fromOut)
 
+theorem keeps_offsetBy (loc : Option Loc) (inbounds : Bool) (p : Ptr) (n : Int) :
+    KeepsSpace sp (offsetBy loc inbounds p n) := by
+  unfold offsetBy; keeps
+macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_offsetBy)
+
+theorem keeps_callTarget (loc : Option Loc) (callee : Callee) (vs : List RVal) :
+    KeepsSpace sp (callTarget loc callee vs) := by
+  unfold callTarget; keeps
+macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_callTarget)
+
 theorem keeps_evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVal) :
     KeepsSpace sp (evalSimple loc k rs vs) := by
   unfold evalSimple; keeps

@@ -15,7 +15,11 @@
 //! * **Frames** are a `Vec` of `Copy` frames. Stack allocations and `noalias` scopes are LIFO, so
 //!   each is one shared stack, and a frame records where its part starts.
 //! * **Allocations** are columns indexed by allocation id (size, alignment, kind, liveness,
-//!   address, exposed tags, sites, bytes). Ids start at 1; index 0 is unused.
+//!   address, exposed tags, sites, bytes). Ids start at 1; index 0 is unused. The globals are
+//!   allocations `1..=G`, made before the call; a function gets a size-0 allocation when its
+//!   address is first needed (functions that initializers name, right after the globals). A
+//!   `const` global's whole-run `readonly` scope in Lean is a check of the allocation's kind
+//!   here, done before the other scopes, as Lean's scope comes first.
 //!
 //! Addresses are 64-bit here: modules whose address size is above 64 bits are rejected. Pointer
 //! offsets, which Lean leaves unbounded, are 128-bit, which a run can't overflow without more
@@ -30,6 +34,7 @@ use crate::body::{Body, Int, OpId, Operand, OperandKind, RegionId, Succ, ValueId
 use crate::ir::*;
 use crate::sem::{self, Bits, Out};
 pub use crate::sem::{TrapReason, UbKind};
+use crate::types::Shape;
 
 /// The fuel `fir-ref run` uses when `--fuel` isn't given.
 pub const DEFAULT_FUEL: u64 = 1_000_000;
@@ -191,16 +196,24 @@ impl Mem {
     }
 }
 
-/// What an allocation is: stack memory, or heap memory of an allocator family.
-const STACK: u32 = u32::MAX;
+/// What an allocation is (Lean's `AllocKind`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Stack,
+    /// Heap memory of an allocator family: its index in `Machine::families`.
+    Heap(u32),
+    /// A global, by index in the module.
+    Global(u32),
+    /// A function, by index in the module.
+    Func(u32),
+}
 
 /// Allocations, as columns by allocation id.
 #[derive(Default)]
 struct Allocs {
     size: Vec<u64>,
     align: Vec<u32>,
-    /// `STACK`, or the heap family's index in `Machine::families`.
-    kind: Vec<u32>,
+    kind: Vec<Kind>,
     live: Vec<bool>,
     /// The address, or 0 before one is observed (addresses are positive).
     base: Vec<u64>,
@@ -370,7 +383,11 @@ pub fn run(m: &Module, name: &str, args: &[&str], fuel: u64) -> Result<String, S
 struct Machine<'m> {
     module: &'m Module,
     funcs: FxHashMap<&'m str, u32>,
-    space: SpaceCfg,
+    space: &'m SpaceCfg,
+    /// Pointers (indices into `ptrs`) to the globals, by name.
+    globals: FxHashMap<&'m str, u32>,
+    /// A pointer to each function whose address has been taken (`NONE` until then).
+    fn_ptrs: Vec<u32>,
     // Values
     slots: Vec<Value>,
     wides: Vec<BigUint>,
@@ -409,16 +426,18 @@ impl<'m> Machine<'m> {
         let mut allocs = Allocs::default();
         allocs.size.push(0);
         allocs.align.push(1);
-        allocs.kind.push(STACK);
+        allocs.kind.push(Kind::Stack);
         allocs.live.push(false);
         allocs.base.push(0);
         allocs.exposed.push(NONE);
         allocs.sites.push((None, None));
         allocs.bytes.push(Mem::Dense(Vec::new()));
-        Machine {
+        let mut m = Machine {
             module,
             funcs,
-            space: module.space,
+            space: &module.space,
+            globals: FxHashMap::default(),
+            fn_ptrs: vec![NONE; module.funcs.len()],
             slots: Vec::new(),
             wides: Vec::new(),
             byte_vals: Vec::new(),
@@ -440,6 +459,118 @@ impl<'m> Machine<'m> {
             base: 0,
             scratch: Vec::new(),
             bytes_buf: Vec::new(),
+        };
+        m.init_globals();
+        m
+    }
+
+    /// Allocate the globals, `1, 2, …` in order, then the functions their initializers take
+    /// the address of, in the order they are first named, and write the initial bytes (Lean's
+    /// `Core.initial`).
+    fn init_globals(&mut self) {
+        let module: &'m Module = self.module;
+        let gs = &module.globals;
+        let sp: &'m SpaceCfg = self.space;
+        for g in 0..gs.len() {
+            let t = gs.ty(g);
+            let size = gs.types.size(sp, t) as u64;
+            let align = gs.types.align(sp, t).max(u64::from(gs.align(g))) as u32;
+            let p = self.new_alloc(None, size, align, Kind::Global(g as u32));
+            self.globals.insert(gs.name(g), p);
+        }
+        let mut syms = Vec::new();
+        for g in 0..gs.len() {
+            gs.syms(gs.init(g), &mut syms);
+        }
+        for name in syms {
+            if self.globals.contains_key(name) {
+                continue;
+            }
+            if let Some(&f) = self.funcs.get(name)
+                && self.fn_ptrs[f as usize] == NONE
+            {
+                self.fn_ptrs[f as usize] = self.new_alloc(None, 0, 1, Kind::Func(f));
+            }
+        }
+        let mut bytes = Vec::new();
+        for g in 0..gs.len() {
+            bytes.clear();
+            self.init_bytes(gs.ty(g), gs.init(g), &mut bytes);
+            let a = g + 1;
+            for (i, &b) in bytes.iter().enumerate() {
+                self.allocs.bytes[a].set(i as u64, b);
+            }
+        }
+    }
+
+    /// The pointer `@name` denotes in an initializer.
+    fn sym_ptr(&self, name: &str) -> Option<u32> {
+        match self.globals.get(name) {
+            Some(&p) => Some(p),
+            None => {
+                let f = *self.funcs.get(name)?;
+                Some(self.fn_ptrs[f as usize]).filter(|&p| p != NONE)
+            }
+        }
+    }
+
+    /// The bytes an object of type `t` starts with (Lean's `initBytes`), appended to `out`.
+    fn init_bytes(&mut self, t: Ty, init: Init, out: &mut Vec<Byte>) {
+        let module: &'m Module = self.module;
+        let gs = &module.globals;
+        let sp: &'m SpaceCfg = self.space;
+        let size = gs.types.size(sp, t) as usize;
+        let start = out.len();
+        match (init, t) {
+            (Init::Zero, _) => out.resize(start + size, Byte::Bits(0)),
+            (Init::Int(i), Ty::Int(w) | Ty::Byte(w)) => {
+                let mut raw = Vec::new();
+                sem::to_le_bytes(w, &sem::konst(w, gs.int(i)), &mut raw);
+                out.extend(raw.into_iter().map(Byte::Bits));
+            }
+            (Init::Null, Ty::Ptr) => self.push_ptr_bytes(Some(NULL), out),
+            (Init::Sym(r), Ty::Ptr) => {
+                let p = self.sym_ptr(gs.text(r));
+                self.push_ptr_bytes(p, out);
+            }
+            (Init::Bytes(r), _) => out.extend(gs.bytes(r).iter().map(|&b| Byte::Bits(b))),
+            (Init::List(r), Ty::Agg(id)) => {
+                let items = gs.items(r);
+                out.resize(start + size, Byte::Bits(0));
+                let mut part = Vec::new();
+                let mut put = |m: &mut Self, off: u128, ty: Ty, item: Init, out: &mut Vec<Byte>| {
+                    part.clear();
+                    m.init_bytes(ty, item, &mut part);
+                    let off = start + off as usize;
+                    // As Lean's `overlay`: what runs past the end is dropped.
+                    let n = part.len().min(out.len().saturating_sub(off));
+                    out[off..off + n].copy_from_slice(&part[..n]);
+                };
+                match gs.types.shape(id) {
+                    Shape::Struct(p, fs) => {
+                        let (offs, _, _) = gs.types.place(sp, p, fs);
+                        for ((&f, &item), off) in fs.iter().zip(items).zip(offs) {
+                            put(self, off, f, item, out);
+                        }
+                    }
+                    Shape::Array(n, e) => {
+                        let stride = gs.types.stride(sp, e);
+                        for (i, &item) in items.iter().take(n as usize).enumerate() {
+                            put(self, i as u128 * stride, e, item, out);
+                        }
+                    }
+                    Shape::Func(..) => {}
+                }
+            }
+            _ => out.resize(start + size, Byte::Poison),
+        }
+    }
+
+    fn push_ptr_bytes(&self, p: Option<u32>, out: &mut Vec<Byte>) {
+        let pb = self.space.ptr_bits / 8;
+        match p {
+            Some(ptr) => out.extend((0..pb).map(|i| Byte::Frag { ptr, i })),
+            None => out.extend((0..pb).map(|_| Byte::Poison)),
         }
     }
 
@@ -731,7 +862,7 @@ impl<'m> Machine<'m> {
     }
 
     /// Lean's `newAlloc`: a fresh allocation and its first tag.
-    fn new_alloc(&mut self, loc: Option<Loc>, size: u64, align: u32, kind: u32) -> u32 {
+    fn new_alloc(&mut self, loc: Option<Loc>, size: u64, align: u32, kind: Kind) -> u32 {
         let a = &mut self.allocs;
         let id = a.size.len() as u32;
         a.size.push(size);
@@ -773,7 +904,7 @@ impl<'m> Machine<'m> {
 
     fn dead_note(&self, a: u32) -> String {
         let (site, freed) = self.allocs.sites[a as usize];
-        if self.allocs.kind[a as usize] == STACK {
+        if self.allocs.kind[a as usize] == Kind::Stack {
             format!(
                 "stack memory from {}, whose region has ended",
                 render_loc(site)
@@ -980,6 +1111,10 @@ impl<'m> Machine<'m> {
         if !self.allocs.live[ai] {
             return ub(UbKind::UseAfterFree, loc, self.dead_note(a));
         }
+        if let Kind::Func(f) = self.allocs.kind[ai] {
+            let f = &self.module.funcs[f as usize].name;
+            return ub(UbKind::FuncAccess, loc, format!("@{f} is a function"));
+        }
         let asize = self.allocs.size[ai];
         if !(0 <= off && off + i128::from(size) <= i128::from(asize)) {
             return ub(
@@ -1021,6 +1156,13 @@ impl<'m> Machine<'m> {
     ) -> R<()> {
         let write = how != How::Read;
         let free = how == How::Free;
+        // A `const` global's whole-run `readonly` scope comes before every other scope.
+        if write
+            && let Kind::Global(g) = self.allocs.kind[a as usize]
+            && self.module.globals.is_const(g as usize)
+        {
+            return ub(UbKind::ConstWrite, loc, "write to a const global");
+        }
         for i in 0..self.scopes.len() {
             let s = &self.scopes[i];
             if s.alloc != a {
@@ -1146,6 +1288,11 @@ impl<'m> Machine<'m> {
                     Value::Ptr(self.exposed_ptr(addr))
                 }
             }
+            Ty::Agg(_) => {
+                self.bytes_buf = bs;
+                let t = self.body().types().show(ty);
+                return stuck(loc, format!("{t} is not a value type"));
+            }
         };
         self.bytes_buf = bs;
         Ok(v)
@@ -1178,6 +1325,7 @@ impl<'m> Machine<'m> {
         match t {
             Ty::Int(w) | Ty::Byte(w) => u64::from(w / 8),
             Ty::Ptr => u64::from(self.space.ptr_bits / 8),
+            Ty::Agg(_) => self.body().types().size(self.space, t) as u64,
         }
     }
 
@@ -1249,7 +1397,7 @@ impl<'m> Machine<'m> {
         let ai = a as usize;
         let kind = self.allocs.kind[ai];
         if !self.allocs.live[ai] {
-            let k = if kind == STACK {
+            let k = if kind == Kind::Stack {
                 UbKind::BadFree
             } else {
                 UbKind::DoubleFree
@@ -1257,20 +1405,17 @@ impl<'m> Machine<'m> {
             return ub(k, loc, self.dead_note(a));
         }
         let fam = self.family(family);
-        if kind != fam {
-            let by = if kind == STACK {
-                "mem.stack"
-            } else {
-                self.families[kind as usize]
+        if kind != Kind::Heap(fam) {
+            let site = render_loc(self.allocs.sites[ai].0);
+            let note = match kind {
+                Kind::Stack => format!("allocated at {site} by mem.stack"),
+                Kind::Heap(f) => format!("allocated at {site} by {}", self.families[f as usize]),
+                Kind::Global(g) => {
+                    format!("@{} is a global", self.module.globals.name(g as usize))
+                }
+                Kind::Func(f) => format!("@{} is a function", self.module.funcs[f as usize].name),
             };
-            return ub(
-                UbKind::BadFree,
-                loc,
-                format!(
-                    "allocated at {} by {by}",
-                    render_loc(self.allocs.sites[ai].0)
-                ),
-            );
+            return ub(UbKind::BadFree, loc, note);
         }
         if off != 0 {
             return ub(
@@ -1351,6 +1496,76 @@ impl<'m> Machine<'m> {
             Out::Trap(r) => halt(Behavior::Trap(r), loc, ""),
             Out::Ub(k) => ub(k, loc, ""),
         }
+    }
+
+    /// `n` modulo the address size, as an address-size integer.
+    fn addr_masked(&self, n: u128) -> Value {
+        self.addr_value((n % self.limit()) as u64)
+    }
+
+    /// `p` moved by `n` bytes (Lean's `offsetBy`). In bounds, it is `poison` when `p` or the
+    /// result is outside `[0, size]` of a live allocation; an offset of 0 always gives `p`.
+    fn offset_by(&mut self, inbounds: bool, p: u32, n: i128) -> R<Option<Value>> {
+        if n == 0 {
+            return Ok(Some(Value::Ptr(p)));
+        }
+        Ok(Some(match self.ptrs[p as usize] {
+            Ptr::Rel { alloc, tag, off } => {
+                let ai = alloc as usize;
+                let size = i128::from(self.allocs.size[ai]);
+                let ok = self.allocs.live[ai]
+                    && 0 <= off
+                    && off <= size
+                    && 0 <= off + n
+                    && off + n <= size;
+                if inbounds && !ok {
+                    Value::PtrPoison
+                } else {
+                    Value::Ptr(self.new_ptr(Ptr::Rel {
+                        alloc,
+                        tag,
+                        off: off + n,
+                    }))
+                }
+            }
+            Ptr::Abs { addr, cands } => {
+                let addr2 = self.addr_mod(i128::from(addr) + n);
+                if !inbounds {
+                    return Ok(Some(Value::Ptr(
+                        self.new_ptr(Ptr::Abs { addr: addr2, cands }),
+                    )));
+                }
+                let start = self.cands.len();
+                for i in cands.range() {
+                    let (a, t) = self.cands[i];
+                    let ai = a as usize;
+                    let b = i128::from(self.allocs.base[ai]);
+                    let end = b + i128::from(self.allocs.size[ai]);
+                    let x = i128::from(addr);
+                    if self.allocs.live[ai]
+                        && b != 0
+                        && b <= x
+                        && x <= end
+                        && b <= x + n
+                        && x + n <= end
+                    {
+                        self.cands.push((a, t));
+                    }
+                }
+                let keep = Span {
+                    start: start as u32,
+                    len: (self.cands.len() - start) as u32,
+                };
+                if keep.len == 0 {
+                    Value::PtrPoison
+                } else {
+                    Value::Ptr(self.new_ptr(Ptr::Abs {
+                        addr: addr2,
+                        cands: keep,
+                    }))
+                }
+            }
+        }))
     }
 
     fn addr_value(&self, n: u64) -> Value {
@@ -1447,7 +1662,7 @@ impl<'m> Machine<'m> {
                     return ub(UbKind::Poison, loc, "allocation size is poison");
                 };
                 let fam = self.family(body.str(family));
-                Value::Ptr(self.new_alloc(loc, size, align, fam))
+                Value::Ptr(self.new_alloc(loc, size, align, Kind::Heap(fam)))
             }
             (OpKind::MemFree { family }, &[p]) => {
                 let p = self.ptr_of(loc, p)?;
@@ -1471,67 +1686,86 @@ impl<'m> Machine<'m> {
                 let Some(n) = self.addr_operand(loc, n)? else {
                     return Ok(Some(Value::PtrPoison));
                 };
-                let n = i128::from(sem::sext64(aw, n));
-                if n == 0 {
+                return self.offset_by(inbounds, p, i128::from(sem::sext64(aw, n)));
+            }
+            // Layout
+            (OpKind::TySize(ty), []) => {
+                let n = body.types().size(self.space, ty);
+                self.addr_masked(n)
+            }
+            (OpKind::TyAlign(ty), []) => {
+                let n = body.types().align(self.space, ty);
+                self.addr_masked(n.into())
+            }
+            (OpKind::TyOffset { ty, index }, []) => {
+                let n = body
+                    .types()
+                    .field_offset(self.space, ty, index)
+                    .unwrap_or(0);
+                self.addr_masked(n)
+            }
+            (
+                OpKind::PtrField {
+                    inbounds,
+                    ty,
+                    index,
+                },
+                &[p],
+            ) => {
+                let Some(p) = self.ptr_of(loc, p)? else {
+                    return Ok(Some(Value::PtrPoison));
+                };
+                let off = body
+                    .types()
+                    .field_offset(self.space, ty, index)
+                    .unwrap_or(0);
+                return self.offset_by(inbounds, p, off as i128);
+            }
+            (OpKind::PtrIndex { inbounds, ty }, &[p, i]) => {
+                let Some(p) = self.ptr_of(loc, p)? else {
+                    return Ok(Some(Value::PtrPoison));
+                };
+                let Some(i) = self.addr_operand(loc, i)? else {
+                    return Ok(Some(Value::PtrPoison));
+                };
+                let stride = body.types().stride(self.space, ty);
+                // `|i| < 2^63` and the stride is below the address-space size, so this fits.
+                let n = i128::from(sem::sext64(aw, i)) * stride as i128;
+                let wrapped = sem::wrap_signed(aw, n);
+                if inbounds && wrapped != n {
+                    return Ok(Some(Value::PtrPoison));
+                }
+                return self.offset_by(inbounds, p, wrapped);
+            }
+            (OpKind::MemCopy { ty, align }, &[d, s]) => {
+                let w = body.types().size(self.space, ty) as u64 * 8;
+                let w = u32::try_from(w).unwrap_or(u32::MAX);
+                let s = self.ptr_of(loc, s)?;
+                let v = self.load(loc, Ty::Byte(w), align, s)?;
+                let d = self.ptr_of(loc, d)?;
+                self.store(loc, Ty::Byte(w), align, v, d)?;
+                return Ok(None);
+            }
+            // Globals and functions
+            (OpKind::MemGlobal { global }, []) => {
+                let name = body.str(global);
+                match self.globals.get(name) {
+                    Some(&p) => Value::Ptr(p),
+                    None => return stuck(loc, format!("no global @{name}")),
+                }
+            }
+            (OpKind::FuncAddr { callee }, []) => {
+                let name = body.str(callee);
+                if let Some(&p) = self.globals.get(name) {
                     return Ok(Some(Value::Ptr(p)));
                 }
-                match self.ptrs[p as usize] {
-                    Ptr::Rel { alloc, tag, off } => {
-                        let ai = alloc as usize;
-                        let size = i128::from(self.allocs.size[ai]);
-                        let ok = self.allocs.live[ai]
-                            && 0 <= off
-                            && off <= size
-                            && 0 <= off + n
-                            && off + n <= size;
-                        if inbounds && !ok {
-                            Value::PtrPoison
-                        } else {
-                            Value::Ptr(self.new_ptr(Ptr::Rel {
-                                alloc,
-                                tag,
-                                off: off + n,
-                            }))
-                        }
-                    }
-                    Ptr::Abs { addr, cands } => {
-                        let addr2 = self.addr_mod(i128::from(addr) + n);
-                        if !inbounds {
-                            return Ok(Some(Value::Ptr(
-                                self.new_ptr(Ptr::Abs { addr: addr2, cands }),
-                            )));
-                        }
-                        let start = self.cands.len();
-                        for i in cands.range() {
-                            let (a, t) = self.cands[i];
-                            let ai = a as usize;
-                            let b = i128::from(self.allocs.base[ai]);
-                            let end = b + i128::from(self.allocs.size[ai]);
-                            let x = i128::from(addr);
-                            if self.allocs.live[ai]
-                                && b != 0
-                                && b <= x
-                                && x <= end
-                                && b <= x + n
-                                && x + n <= end
-                            {
-                                self.cands.push((a, t));
-                            }
-                        }
-                        let keep = Span {
-                            start: start as u32,
-                            len: (self.cands.len() - start) as u32,
-                        };
-                        if keep.len == 0 {
-                            Value::PtrPoison
-                        } else {
-                            Value::Ptr(self.new_ptr(Ptr::Abs {
-                                addr: addr2,
-                                cands: keep,
-                            }))
-                        }
-                    }
+                let Some(&f) = self.funcs.get(name) else {
+                    return stuck(loc, format!("no function @{name}"));
+                };
+                if self.fn_ptrs[f as usize] == NONE {
+                    self.fn_ptrs[f as usize] = self.new_alloc(loc, 0, 1, Kind::Func(f));
                 }
+                Value::Ptr(self.fn_ptrs[f as usize])
             }
             (OpKind::PtrAddr | OpKind::PtrExpose, &[p]) => {
                 let Some(p) = self.ptr_of(loc, p)? else {
@@ -1622,17 +1856,68 @@ impl<'m> Machine<'m> {
         Ok(())
     }
 
+    /// The function an indirect call runs: the one its pointer, `vs[0]`, points at the start of,
+    /// which must have the call's signature (Lean's `callTarget`).
+    fn call_target(&mut self, loc: Option<Loc>, sig: Ty, vs: &[Value]) -> R<u32> {
+        let Some(&v) = vs.first() else {
+            return stuck(loc, "malformed op");
+        };
+        let Some(p) = self.ptr_of(loc, v)? else {
+            return ub(UbKind::Poison, loc, "call through a poison pointer");
+        };
+        let (a, _, off) = self.resolve(loc, p, 0)?;
+        let Kind::Func(f) = self.allocs.kind[a as usize] else {
+            return ub(UbKind::BadCall, loc, format!("#{a} is not a function"));
+        };
+        let callee = &self.module.funcs[f as usize];
+        if off != 0 {
+            return ub(
+                UbKind::BadCall,
+                loc,
+                format!("offset {off} is not the start of @{}", callee.name),
+            );
+        }
+        let cb = &callee.body;
+        let params = cb.params(cb.entry()).map(|v| cb.ty(v));
+        let ok = match self.body().types().shape_of(sig) {
+            Some(Shape::Func(ps, rs)) => {
+                params.len() == ps.len()
+                    && params.clone().eq(ps.iter().copied())
+                    && callee.rets == rs
+            }
+            _ => false,
+        };
+        if !ok {
+            let mut t = String::from("func<(");
+            for (i, p) in params.enumerate() {
+                if i > 0 {
+                    t.push_str(", ");
+                }
+                write!(t, "{p}").unwrap();
+            }
+            t.push(')');
+            crate::types::write_rets(&mut t, &callee.rets, |out, r| write!(out, "{r}").unwrap());
+            t.push('>');
+            return ub(
+                UbKind::BadCall,
+                loc,
+                format!("@{} has type {t}", callee.name),
+            );
+        }
+        Ok(f)
+    }
+
     /// The heap allocations still live, for the leak report.
     fn leaks(&self) -> Vec<String> {
         (1..self.allocs.size.len())
-            .filter(|&a| self.allocs.live[a] && self.allocs.kind[a] != STACK)
-            .map(|a| {
-                format!(
+            .filter_map(|a| match self.allocs.kind[a] {
+                Kind::Heap(f) if self.allocs.live[a] => Some(format!(
                     "leak: {} bytes from {} at {}",
                     self.allocs.size[a],
-                    self.families[self.allocs.kind[a] as usize],
+                    self.families[f as usize],
                     render_loc(self.allocs.sites[a].0)
-                )
+                )),
+                _ => None,
             })
             .collect()
     }
@@ -1878,11 +2163,18 @@ impl<'m> Machine<'m> {
                 });
                 self.enter_body(loc, body.regions(op)[0], &vs)?;
             }
-            OpKind::Call { callee } => {
+            OpKind::Call { .. } | OpKind::CallIndirect(_) => {
                 self.operands(op, loc, &mut vs)?;
-                let name = body.str(callee);
-                let Some(&f) = self.funcs.get(name) else {
-                    return stuck(loc, format!("no function @{name}"));
+                let (f, args) = match kind {
+                    OpKind::Call { callee } => {
+                        let name = body.str(callee);
+                        let Some(&f) = self.funcs.get(name) else {
+                            return stuck(loc, format!("no function @{name}"));
+                        };
+                        (f, 0)
+                    }
+                    OpKind::CallIndirect(sig) => (self.call_target(loc, sig, &vs)?, 1),
+                    _ => unreachable!(),
                 };
                 let (caller, caller_base) = (self.func, self.base);
                 let scopes = self.scopes.len() as u32;
@@ -1890,7 +2182,7 @@ impl<'m> Machine<'m> {
                 self.base = self.slots.len() as u32;
                 let n = self.body().num_values();
                 self.slots.resize(self.slots.len() + n, Value::Unset);
-                self.enter_call(loc, &vs)?;
+                self.enter_call(loc, &vs[args..])?;
                 self.frames.push(Frame::Call {
                     op: Some(op),
                     func: caller,
@@ -1901,8 +2193,16 @@ impl<'m> Machine<'m> {
                 let entry = self.body().entry();
                 self.push_block(entry);
             }
-            OpKind::MemStack { size, align } => {
-                let p = self.new_alloc(loc, size, align, STACK);
+            OpKind::MemStack { .. } | OpKind::MemStackOf { .. } => {
+                let (size, align) = match kind {
+                    OpKind::MemStack { size, align } => (size, align),
+                    OpKind::MemStackOf { ty, align } => {
+                        let (size, a) = body.types().dims(self.space, ty);
+                        (size as u64, align.max(a as u32))
+                    }
+                    _ => unreachable!(),
+                };
+                let p = self.new_alloc(loc, size, align, Kind::Stack);
                 self.bind(loc, body.results(op), &[Value::Ptr(p)])?;
                 let Ptr::Rel { alloc, .. } = self.ptrs[p as usize] else {
                     unreachable!()

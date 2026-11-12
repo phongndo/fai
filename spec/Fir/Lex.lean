@@ -20,7 +20,7 @@ inductive Tok where
   | ident (s : String)
   | int (n : Int)
   | str (s : String)
-  /-- One of `( ) { } [ ] , : = ->` -/
+  /-- One of `( ) { } [ ] < > , : = ->` -/
   | sym (s : String)
   | eof
   deriving BEq, Repr, Inhabited
@@ -73,7 +73,7 @@ where
       else if c == '/' && cs.head? == some '/' then
         go (s.takeWhile (· != '\n')).2 acc
       else if c == '-' && cs.head? == some '>' then emit (.sym "->") s.advance.advance
-      else if "(){}[],:=".contains c then emit (.sym c.toString) s.advance
+      else if "(){}[]<>,:=".contains c then emit (.sym c.toString) s.advance
       else if c == '%' || c == '?' || c == '^' then
         let (name, s') := s.advance.takeWhile isNameChar
         if name.isEmpty then fail s!"expected a name after '{c}'"

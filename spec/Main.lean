@@ -82,8 +82,10 @@ def expectations (text : String) : Except String (List Expect) :=
     let line := line.trimAscii.toString
     if line.startsWith "// run:" then
       let body := (line.drop 7).toString
+      -- The outcome may contain ` -> ` itself (a function type), so split at the first.
       match body.splitOn " -> " with
-      | [call, outcome] =>
+      | call :: rest@(_ :: _) =>
+        let outcome := " -> ".intercalate rest
         match parseCall call with
         | some (name, args) => .ok (some (.run name args outcome.trimAscii.toString))
         | none => .error s!"bad run line: {line}"

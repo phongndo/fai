@@ -42,10 +42,14 @@ pub enum FieldTy {
     Nat,
     /// An alignment, [`Imm::Align`].
     Align,
+    /// A field index, [`Imm::Index`].
+    Index,
     /// A dotted name such as `c.malloc`, [`Imm::Str`].
     Symbol,
     /// A function, `@f`, [`Imm::Str`].
     Func,
+    /// A global, `@g`, [`Imm::Str`].
+    Global,
     Ty,
     /// A keyword named after the field (`true` or `false` in the generic form), [`Imm::Flag`].
     Flag,
@@ -62,6 +66,7 @@ pub enum Imm {
     Int(IntId),
     Nat(u64),
     Align(u32),
+    Index(u32),
     Str(StrId),
     Ty(Ty),
     Flag(bool),
@@ -128,6 +133,17 @@ pub enum Check {
     Deny(&'static [&'static str], &'static str),
     /// The operands and results match the function's signature.
     Call(u8),
+    /// The type has a layout.
+    Sized(TyE),
+    /// The type is a struct with the field the immediate names.
+    Field(TyE, u8),
+    /// The immediate is a function type; the operands are a pointer and its parameters, and the
+    /// results its results.
+    Sig(u8),
+    /// The global exists.
+    Global(u8),
+    /// The function exists.
+    Func(u8),
 }
 
 /// Effect categories (decision: Effects); resource tags come later.

@@ -52,7 +52,7 @@ writes them with their operands. -/
 def Imm.render (f : Field) : Imm → String
   | .int n => toString n
   | .nat n => toString n
-  | .str s => if f.ty == .func then "@" ++ s else s
+  | .str s => if f.ty == .func || f.ty == .global then "@" ++ s else s
   | .ty t => toString t
   | .flag b => toString b
   | .succ s => s.renderGeneric
@@ -179,19 +179,41 @@ end
 
 def Func.render (showLocs : Bool) (f : Func) : String :=
   let params := commas (f.params.map Result.render)
-  let rets := match f.rets with
-    | [] => ""
-    | [t] => s!" -> {t}"
-    | ts => s!" -> ({commas (ts.map toString)})"
+  let rets := retsText (f.rets.map toString)
   let file := match f.file with
     | some s => if showLocs then s!" loc \"{s}\"" else ""
     | none => ""
   s!"func @{f.name}({params}){rets}{file} " ++ renderRegion showLocs "" f.body ++ "\n"
 
+def hexByte (b : Nat) : String :=
+  let d (n : Nat) := Nat.digitChar n
+  String.ofList [d (b / 16 % 16), d (b % 16)]
+
+partial def Init.render : Init → String
+  | .zero => "zero"
+  | .int n => toString n
+  | .null => "null"
+  | .sym s => s!"@{s}"
+  | .bytes bs => s!"bytes \"{String.join (bs.map hexByte)}\""
+  | .list items => "{" ++ commas (items.map Init.render) ++ "}"
+
+def Global.render (g : Global) : String :=
+  let const := if g.const then "const " else ""
+  let align := if g.align == 1 then "" else s!" align {g.align}"
+  s!"global {const}@{g.name}: {g.ty}{align} = {g.init.render}\n"
+
+/-- The `memspace` line: the alignments only where they aren't the defaults. -/
+def SpaceCfg.render (sp : SpaceCfg) : String :=
+  let align := if sp.ptrAlign == SpaceCfg.naturalAlign sp.ptrBits then "" else s!" align {sp.ptrAlign}"
+  let ints := if sp.ints == defaultInts then "" else
+    " int " ++ " ".intercalate (sp.ints.map fun (w, a) => s!"{w}:{a}")
+  s!"memspace default ptr {sp.ptrBits} addr {sp.addrBits}{align}{ints}\n"
+
 def Module.render (m : Module) (showLocs := true) : String :=
-  let header := if m.space == {} then "" else
-    s!"memspace default ptr {m.space.ptrBits} addr {m.space.addrBits}\n\n"
-  header ++ "\n".intercalate (m.funcs.map (Func.render showLocs))
+  let header := if m.space == {} then "" else m.space.render ++ "\n"
+  let globals := if m.globals.isEmpty then "" else
+    String.join (m.globals.map Global.render) ++ "\n"
+  header ++ globals ++ "\n".intercalate (m.funcs.map (Func.render showLocs))
 
 def hex (n : Nat) : String := "0x" ++ String.ofList (Nat.toDigits 16 n)
 

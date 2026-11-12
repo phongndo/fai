@@ -6,6 +6,7 @@ use std::fmt::Write;
 use crate::body::{Body, Int, OpId, Operand, OperandKind, RegionId, Succ, ValueId};
 use crate::decl::{Field, FieldTy, Imm, Item};
 use crate::ir::*;
+use crate::types::write_rets;
 
 /// Append an integer stored in a body.
 fn push_int(out: &mut String, n: Int<'_>) {
@@ -63,7 +64,7 @@ fn push_u64(out: &mut String, mut n: u64) {
     out.push_str(std::str::from_utf8(&buf[i..]).expect("ASCII digits"));
 }
 
-fn push_ty(out: &mut String, t: Ty) {
+fn push_ty(out: &mut String, types: &Types, t: Ty) {
     match t {
         Ty::Int(w) => {
             out.push('i');
@@ -74,6 +75,7 @@ fn push_ty(out: &mut String, t: Ty) {
             out.push('b');
             push_u64(out, w.into());
         }
+        Ty::Agg(_) => types.write(out, t),
     }
 }
 
@@ -83,7 +85,7 @@ impl Printer<'_> {
         self.out.push('%');
         self.out.push_str(b.name(v));
         self.out.push_str(": ");
-        push_ty(self.out, b.ty(v));
+        push_ty(self.out, b.types(), b.ty(v));
         let facts = b.facts(v);
         if !facts.is_empty() {
             self.out.push_str(" [");
@@ -116,7 +118,7 @@ impl Printer<'_> {
                 self.out.push('?');
                 self.out.push_str(self.body.hole_name(h));
                 self.out.push_str(": ");
-                push_ty(self.out, self.body.hole_ty(h));
+                push_ty(self.out, self.body.types(), self.body.hole_ty(h));
             }
         }
     }
@@ -189,14 +191,14 @@ impl Printer<'_> {
         match v {
             Imm::Int(n) => push_int(self.out, self.body.int(n)),
             Imm::Nat(n) => push_u64(self.out, n),
-            Imm::Align(n) => push_u64(self.out, n.into()),
+            Imm::Align(n) | Imm::Index(n) => push_u64(self.out, n.into()),
             Imm::Str(s) => {
-                if f.ty == FieldTy::Func {
+                if matches!(f.ty, FieldTy::Func | FieldTy::Global) {
                     self.out.push('@');
                 }
                 self.out.push_str(self.body.str(s));
             }
-            Imm::Ty(t) => push_ty(self.out, t),
+            Imm::Ty(t) => push_ty(self.out, self.body.types(), t),
             Imm::Flag(b) => self.out.push_str(if b { "true" } else { "false" }),
             Imm::Succ(s) => self.generic_succ(self.body.succ(s)),
             Imm::Cases(c) => {
@@ -441,23 +443,8 @@ impl Func {
         p.out.push('(');
         p.values(self.body.params(entry));
         p.out.push(')');
-        match self.rets.as_slice() {
-            [] => {}
-            [t] => {
-                p.out.push_str(" -> ");
-                push_ty(p.out, *t);
-            }
-            ts => {
-                p.out.push_str(" -> (");
-                for (i, t) in ts.iter().enumerate() {
-                    if i > 0 {
-                        p.out.push_str(", ");
-                    }
-                    push_ty(p.out, *t);
-                }
-                p.out.push(')');
-            }
-        }
+        let types = self.body.types();
+        write_rets(p.out, &self.rets, |out, t| push_ty(out, types, *t));
         if let Some(s) = &self.file
             && show_locs
         {
@@ -471,17 +458,78 @@ impl Func {
     }
 }
 
+/// An initializer as text (Lean's `Init.render`).
+fn push_init(out: &mut String, g: &Globals, init: Init) {
+    match init {
+        Init::Zero => out.push_str("zero"),
+        Init::Int(i) => write!(out, "{}", g.int(i)).unwrap(),
+        Init::Null => out.push_str("null"),
+        Init::Sym(r) => {
+            out.push('@');
+            out.push_str(g.text(r));
+        }
+        Init::Bytes(r) => {
+            out.push_str("bytes \"");
+            for b in g.bytes(r) {
+                write!(out, "{b:02x}").unwrap();
+            }
+            out.push('"');
+        }
+        Init::List(r) => {
+            out.push('{');
+            for (i, &item) in g.items(r).iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                push_init(out, g, item);
+            }
+            out.push('}');
+        }
+    }
+}
+
 impl Module {
     /// Canonical text. With `show_locs` off, op locations and function files are left out.
     pub fn render(&self, show_locs: bool) -> String {
         let mut out = String::new();
-        if self.space != SpaceCfg::default() {
+        let sp = &self.space;
+        if *sp != SpaceCfg::default() {
             write!(
                 out,
-                "memspace default ptr {} addr {}\n\n",
-                self.space.ptr_bits, self.space.addr_bits
+                "memspace default ptr {} addr {}",
+                sp.ptr_bits, sp.addr_bits
             )
             .unwrap();
+            if sp.ptr_align != SpaceCfg::natural_align(sp.ptr_bits) {
+                write!(out, " align {}", sp.ptr_align).unwrap();
+            }
+            if sp.ints != DEFAULT_INTS {
+                out.push_str(" int");
+                for (w, a) in &sp.ints {
+                    write!(out, " {w}:{a}").unwrap();
+                }
+            }
+            out.push_str("\n\n");
+        }
+        let g = &self.globals;
+        for i in 0..g.len() {
+            out.push_str("global ");
+            if g.is_const(i) {
+                out.push_str("const ");
+            }
+            out.push('@');
+            out.push_str(g.name(i));
+            out.push_str(": ");
+            push_ty(&mut out, &g.types, g.ty(i));
+            if g.align(i) != 1 {
+                write!(out, " align {}", g.align(i)).unwrap();
+            }
+            out.push_str(" = ");
+            push_init(&mut out, g, g.init(i));
+            out.push('\n');
+        }
+        if !g.is_empty() {
+            out.push('\n');
         }
         for (i, f) in self.funcs.iter().enumerate() {
             if i > 0 {

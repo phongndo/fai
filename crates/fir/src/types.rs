@@ -1,0 +1,375 @@
+//! Struct, array, and function types, and their layout, mirroring the `Ty` constructors of
+//! `spec/Fir/Syntax.lean` and `spec/Fir/Layout.lean`.
+//!
+//! [`Ty`] stays a small `Copy` value: value types (`iN`, `ptr`, `bN`) are inline, and every other
+//! type is [`Ty::Agg`], an id into a [`Types`] table. Each function's [`Body`](crate::Body) owns
+//! the table for the types its values and ops name; the module's globals own another. Tables
+//! intern their entries, so two equal types in one table have the same id and `==` compares
+//! them structurally. Types from different tables are never compared: values only ever have value
+//! types, and the verifier checks every signature before any body (see `verify.rs`).
+
+use std::fmt::Write;
+use std::hash::{Hash, Hasher};
+
+use rustc_hash::{FxHashMap, FxHasher};
+
+use crate::ir::{SpaceCfg, Ty};
+
+/// An entry in a [`Types`] table.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct TyId(u32);
+
+impl TyId {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// How a struct's fields are laid out (Lean's `Policy`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Policy {
+    /// `struct<C>`: the platform C layout.
+    C,
+    /// `struct<packed>`: no padding, alignment 1.
+    Packed,
+    /// `struct<auto>`: by decreasing alignment.
+    Auto,
+}
+
+impl Policy {
+    pub fn name(self) -> &'static str {
+        match self {
+            Policy::C => "C",
+            Policy::Packed => "packed",
+            Policy::Auto => "auto",
+        }
+    }
+}
+
+/// What a [`Ty::Agg`] is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Shape<'a> {
+    /// `struct<C>{i32, ptr}`
+    Struct(Policy, &'a [Ty]),
+    /// `array<4 x i32>`
+    Array(u64, Ty),
+    /// `func<(i32, ptr) -> i32>`: parameters and results.
+    Func(&'a [Ty], &'a [Ty]),
+}
+
+/// A run of entries in `parts`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct Run {
+    start: u32,
+    len: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Entry {
+    Struct { policy: Policy, fields: Run },
+    Array { n: u64, elem: Ty },
+    Func { params: Run, rets: Run },
+}
+
+/// A table of struct, array, and function types.
+#[derive(Clone, Debug, Default)]
+pub struct Types {
+    entries: Vec<Entry>,
+    /// Struct fields and function parameters and results, as runs.
+    parts: Vec<Ty>,
+    /// The first entry with each content hash; `same_hash` links the others.
+    index: FxHashMap<u64, u32>,
+    same_hash: Vec<u32>,
+}
+
+const NONE: u32 = u32::MAX;
+
+impl Types {
+    pub fn new() -> Types {
+        Types::default()
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.parts.clear();
+        self.index.clear();
+        self.same_hash.clear();
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        self.entries.shrink_to_fit();
+        self.parts.shrink_to_fit();
+        self.index.shrink_to_fit();
+        self.same_hash.shrink_to_fit();
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn run(&self, r: Run) -> &[Ty] {
+        &self.parts[r.start as usize..(r.start + r.len) as usize]
+    }
+
+    pub fn shape(&self, id: TyId) -> Shape<'_> {
+        match self.entries[id.index()] {
+            Entry::Struct { policy, fields } => Shape::Struct(policy, self.run(fields)),
+            Entry::Array { n, elem } => Shape::Array(n, elem),
+            Entry::Func { params, rets } => Shape::Func(self.run(params), self.run(rets)),
+        }
+    }
+
+    /// The shape of `t`, if it is in a table.
+    pub fn shape_of(&self, t: Ty) -> Option<Shape<'_>> {
+        match t {
+            Ty::Agg(id) => Some(self.shape(id)),
+            _ => None,
+        }
+    }
+
+    fn intern(&mut self, shape: Shape<'_>) -> Ty {
+        let mut h = FxHasher::default();
+        match shape {
+            Shape::Struct(p, fs) => (0u8, p, fs).hash(&mut h),
+            Shape::Array(n, t) => (1u8, n, t).hash(&mut h),
+            Shape::Func(ps, rs) => (2u8, ps, rs).hash(&mut h),
+        }
+        let hash = h.finish();
+        let mut cur = self.index.get(&hash).copied().unwrap_or(NONE);
+        while cur != NONE {
+            if self.shape(TyId(cur)) == shape {
+                return Ty::Agg(TyId(cur));
+            }
+            cur = self.same_hash[cur as usize];
+        }
+        let mut push = |ts: &[Ty]| {
+            let start = self.parts.len() as u32;
+            self.parts.extend_from_slice(ts);
+            Run {
+                start,
+                len: ts.len() as u32,
+            }
+        };
+        let entry = match shape {
+            Shape::Struct(policy, fs) => Entry::Struct {
+                policy,
+                fields: push(fs),
+            },
+            Shape::Array(n, elem) => Entry::Array { n, elem },
+            Shape::Func(ps, rs) => Entry::Func {
+                params: push(ps),
+                rets: push(rs),
+            },
+        };
+        let id = u32::try_from(self.entries.len()).expect("fewer than 2^32 types");
+        self.entries.push(entry);
+        let prev = self.index.insert(hash, id).unwrap_or(NONE);
+        self.same_hash.push(prev);
+        Ty::Agg(TyId(id))
+    }
+
+    /// `struct<policy>{fields}`; its fields must be types of this table.
+    pub fn structure(&mut self, policy: Policy, fields: &[Ty]) -> Ty {
+        self.intern(Shape::Struct(policy, fields))
+    }
+
+    /// `array<n x elem>`
+    pub fn array(&mut self, n: u64, elem: Ty) -> Ty {
+        self.intern(Shape::Array(n, elem))
+    }
+
+    /// `func<(params) -> rets>`
+    pub fn func(&mut self, params: &[Ty], rets: &[Ty]) -> Ty {
+        self.intern(Shape::Func(params, rets))
+    }
+
+    /// Append a type as text (Lean's `Ty.render`).
+    pub fn write(&self, out: &mut String, t: Ty) {
+        let list = |out: &mut String, ts: &[Ty]| {
+            for (i, &t) in ts.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                self.write(out, t);
+            }
+        };
+        match t {
+            Ty::Int(w) => write!(out, "i{w}").unwrap(),
+            Ty::Ptr => out.push_str("ptr"),
+            Ty::Byte(w) => write!(out, "b{w}").unwrap(),
+            Ty::Agg(id) => match self.shape(id) {
+                Shape::Struct(p, fs) => {
+                    write!(out, "struct<{}>{{", p.name()).unwrap();
+                    list(out, fs);
+                    out.push('}');
+                }
+                Shape::Array(n, e) => {
+                    write!(out, "array<{n} x ").unwrap();
+                    self.write(out, e);
+                    out.push('>');
+                }
+                Shape::Func(ps, rs) => {
+                    out.push_str("func<(");
+                    list(out, ps);
+                    out.push(')');
+                    write_rets(out, rs, |out, t| self.write(out, *t));
+                    out.push('>');
+                }
+            },
+        }
+    }
+
+    /// A type as text.
+    pub fn show(&self, t: Ty) -> String {
+        let mut out = String::new();
+        self.write(&mut out, t);
+        out
+    }
+
+    /// `(t1, t2)`, for messages.
+    pub fn show_list(&self, ts: &[Ty]) -> String {
+        let mut out = String::from("(");
+        for (i, &t) in ts.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            self.write(&mut out, t);
+        }
+        out.push(')');
+        out
+    }
+
+    // Layout (Lean's `Fir.Layout`). Sizes are 128-bit, so that the verifier sees a type that is
+    // too large for the address space instead of an overflow; a verified type's size fits its
+    // address space, which is at most 64 bits here.
+
+    /// A type's size and alignment, in bytes (Lean's `Ty.dims`).
+    pub fn dims(&self, sp: &SpaceCfg, t: Ty) -> (u128, u64) {
+        match t {
+            Ty::Int(w) | Ty::Byte(w) => (u128::from(w / 8), u64::from(sp.int_align(w))),
+            Ty::Ptr => (u128::from(sp.ptr_bits / 8), u64::from(sp.ptr_align)),
+            Ty::Agg(id) => match self.shape(id) {
+                Shape::Struct(p, fs) => {
+                    let (_, size, align) = self.place(sp, p, fs);
+                    (size, align)
+                }
+                Shape::Array(n, e) => {
+                    let (s, a) = self.dims(sp, e);
+                    (u128::from(n).saturating_mul(align_up(s, a)), a)
+                }
+                Shape::Func(..) => (0, 1),
+            },
+        }
+    }
+
+    pub fn size(&self, sp: &SpaceCfg, t: Ty) -> u128 {
+        self.dims(sp, t).0
+    }
+
+    pub fn align(&self, sp: &SpaceCfg, t: Ty) -> u64 {
+        self.dims(sp, t).1
+    }
+
+    /// How far apart array elements of type `t` are.
+    pub fn stride(&self, sp: &SpaceCfg, t: Ty) -> u128 {
+        let (s, a) = self.dims(sp, t);
+        align_up(s, a)
+    }
+
+    /// A struct's fields' offsets in declared order, its size, and its alignment (Lean's
+    /// `placeFields` of `Ty.strides`).
+    pub fn place(&self, sp: &SpaceCfg, p: Policy, fs: &[Ty]) -> (Vec<u128>, u128, u64) {
+        let mut ds: Vec<(usize, u128, u64)> = fs
+            .iter()
+            .enumerate()
+            .map(|(i, &f)| {
+                let (s, a) = self.dims(sp, f);
+                (i, align_up(s, a), a)
+            })
+            .collect();
+        let align = ds.iter().fold(1, |m, d| m.max(d.2));
+        if p == Policy::Auto {
+            // Stable, like Lean's `mergeSort`.
+            ds.sort_by_key(|d| std::cmp::Reverse(d.2));
+        }
+        let mut offs = vec![0; fs.len()];
+        let mut o: u128 = 0;
+        for &(i, s, a) in &ds {
+            if p != Policy::Packed {
+                o = align_up(o, a);
+            }
+            offs[i] = o;
+            o = o.saturating_add(s);
+        }
+        match p {
+            Policy::Packed => (offs, o, 1),
+            _ => (offs, align_up(o, align), align),
+        }
+    }
+
+    /// The offset of field `i` of a struct.
+    pub fn field_offset(&self, sp: &SpaceCfg, t: Ty, i: u32) -> Option<u128> {
+        match self.shape_of(t)? {
+            Shape::Struct(p, fs) => self.place(sp, p, fs).0.get(i as usize).copied(),
+            _ => None,
+        }
+    }
+}
+
+/// `x` rounded up to a multiple of `a` (Lean's `alignUp`).
+pub fn align_up(x: u128, a: u64) -> u128 {
+    let a = u128::from(a);
+    if a <= 1 {
+        x
+    } else {
+        x.saturating_add(a - 1) / a * a
+    }
+}
+
+/// ` -> T`, ` -> (T, U)`, or nothing: how function headers and types write results (Lean's
+/// `retsText`).
+pub fn write_rets<T>(out: &mut String, rs: &[T], mut write: impl FnMut(&mut String, &T)) {
+    match rs {
+        [] => {}
+        [t] => {
+            out.push_str(" -> ");
+            write(out, t);
+        }
+        ts => {
+            out.push_str(" -> (");
+            for (i, t) in ts.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write(out, t);
+            }
+            out.push(')');
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn equal_types_share_an_entry() {
+        let mut t = Types::new();
+        let a = t.array(4, Ty::Int(32));
+        let s = t.structure(Policy::C, &[Ty::Int(8), a, Ty::Ptr]);
+        let a2 = t.array(4, Ty::Int(32));
+        let s2 = t.structure(Policy::C, &[Ty::Int(8), a2, Ty::Ptr]);
+        assert_eq!((a, s), (a2, s2));
+        assert_ne!(s, t.structure(Policy::Packed, &[Ty::Int(8), a, Ty::Ptr]));
+        assert_ne!(t.func(&[Ty::Ptr], &[]), t.func(&[], &[Ty::Ptr]));
+        assert_eq!(t.len(), 5);
+        assert_eq!(t.show(s), "struct<C>{i8, array<4 x i32>, ptr}");
+        let sp = SpaceCfg::default();
+        assert_eq!(t.dims(&sp, s), (32, 8));
+        assert_eq!(t.field_offset(&sp, s, 2), Some(24));
+    }
+}

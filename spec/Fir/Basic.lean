@@ -87,6 +87,13 @@ inductive UBKind where
   | ptrCompare
   /-- No free address range was left when an allocation needed an address. -/
   | addressSpace
+  /-- A write to a `const` global. -/
+  | constWrite
+  /-- A load or store through a pointer to a function. -/
+  | funcAccess
+  /-- An indirect call through a pointer that isn't the start of a function of the call's
+  signature. -/
+  | badCall
   deriving DecidableEq, Repr
 
 /-- The outcome of evaluating one op with result width `w`. -/
@@ -143,5 +150,8 @@ def UBKind.name : UBKind → String
   | .readonly => "readonly"
   | .ptrCompare => "ptr-compare"
   | .addressSpace => "address-space"
+  | .constWrite => "const-write"
+  | .funcAccess => "func-access"
+  | .badCall => "bad-call"
 
 end Fir

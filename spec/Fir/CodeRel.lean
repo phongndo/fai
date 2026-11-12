@@ -540,11 +540,9 @@ theorem execFlat_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : S
   | some callee =>
     simp only [h.operands loc hargs]
     refine lockstep_bind fun vs => ?_
-    cases c.funcs[callee]? with
-    | none => exact .halt
-    | some f =>
-      refine lockstep_exec rfl fun _ core => ?_
-      exact Lockstep.ok ((StackRel.call (D := fun _ => False) h).push (.refl _) (fun _ x => x.elim) _ _)
+    refine lockstep_exec rfl fun _ core => ?_
+    refine lockstep_exec rfl fun _ core => ?_
+    exact Lockstep.ok ((StackRel.call (D := fun _ => False) h).push (.refl _) (fun _ x => x.elim) _ _)
   | none =>
   cases kind.stackAlloc? with
   | some sa =>

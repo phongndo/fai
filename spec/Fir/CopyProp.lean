@@ -229,7 +229,8 @@ theorem step_mid {cm : Core} {x y : String} {o : Op} {ss t s : List Op} {ids : L
       execFlat ⟨cm, S0⟩ k res args loc := rfl
   cases hsa : k.stackAlloc? with
   | some sa =>
-    obtain ⟨size, align⟩ := sa
+    generalize hd : sa cm.space = dims
+    obtain ⟨size, align⟩ := dims
     let idOf (p : Ptr) : Nat := match p with | .rel a .. => a | _ => 0
     refine step_same (x := (newAlloc loc size align .stack >>= fun p =>
         checkResults loc res [.ptr (some p)] >>= fun _ => pure p) cm)
@@ -237,11 +238,11 @@ theorem step_mid {cm : Core} {x y : String} {o : Op} {ss t s : List Op} {ids : L
       (fs := fun p core => ⟨core, bindTop res [.ptr (some p)] (addAllocId (idOf p) S0)⟩)
       ?_ ?_ hshape ?_
     · rw [stepT]
-      simp only [execFlat, hcallee, hsa, Machine.exec, StateT.run]
+      simp only [execFlat, hcallee, hsa, hd, Machine.exec, StateT.run]
       cases (newAlloc loc size align .stack >>= fun p =>
         checkResults loc res [.ptr (some p)] >>= fun _ => pure p) cm <;> rfl
     · rw [stepS]
-      simp only [execFlat, hcallee, hsa, Machine.exec, StateT.run]
+      simp only [execFlat, hcallee, hsa, hd, Machine.exec, StateT.run]
       cases (newAlloc loc size align .stack >>= fun p =>
         checkResults loc res [.ptr (some p)] >>= fun _ => pure p) cm <;> rfl
     · intro p core _

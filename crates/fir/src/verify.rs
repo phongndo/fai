@@ -13,6 +13,7 @@ use num_bigint::{BigInt, Sign};
 use crate::body::{Body, Int, OpId, Operand, OperandKind, RegionId, Succ, ValueId};
 use crate::decl::{Check, Imm, TyE};
 use crate::ir::*;
+use crate::types::Shape;
 
 /// A hole (`?name: T`) found while verifying: the type it must have, and the location of its op.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -32,7 +33,7 @@ pub fn render_loc(loc: Option<Loc>) -> String {
 
 /// Verify a module. On success, returns the holes it contains, in order.
 pub fn verify_module(m: &Module) -> Result<Vec<Hole>, String> {
-    let sp = m.space;
+    let sp = &m.space;
     if !(sp.ptr_bits > 0
         && sp.ptr_bits.is_multiple_of(8)
         && sp.addr_bits > 0
@@ -44,21 +45,81 @@ pub fn verify_module(m: &Module) -> Result<Vec<Hole>, String> {
             sp.ptr_bits, sp.addr_bits
         ));
     }
+    if !is_pow2(sp.ptr_align.into()) {
+        return Err(format!(
+            "memspace: pointer alignment {} must be a power of two",
+            sp.ptr_align
+        ));
+    }
+    let mut last = 0;
+    for &(w, a) in &sp.ints {
+        if w <= last {
+            return Err("memspace: integer alignments must be listed by increasing width".into());
+        }
+        if !is_pow2(a.into()) {
+            return Err(format!(
+                "memspace: alignment {a} of i{w} must be a power of two"
+            ));
+        }
+        last = w;
+    }
+    // Names: globals and functions share them.
+    let gs = &m.globals;
+    let mut globals = FxHashSet::default();
+    for i in 0..gs.len() {
+        if !globals.insert(gs.name(i)) {
+            return Err(format!("global @{} is defined more than once", gs.name(i)));
+        }
+    }
     let mut sigs = FxHashMap::default();
     for f in &m.funcs {
-        if sigs.contains_key(f.name.as_str()) {
+        if sigs.contains_key(f.name.as_str())
+            || (!globals.is_empty() && globals.contains(f.name.as_str()))
+        {
             return Err(format!("function @{} is defined more than once", f.name));
         }
         let entry = f.body.entry();
         let params: Vec<Ty> = f.body.params(entry).map(|v| f.body.ty(v)).collect();
         sigs.insert(f.name.as_str(), (params, f.rets.clone()));
     }
+    for i in 0..gs.len() {
+        let name = gs.name(i);
+        let t = gs.ty(i);
+        check_sized(&gs.types, sp, None, t)
+            .map_err(|e| format!("global @{name}: {}", e.strip_prefix("@?: ").unwrap_or(&e)))?;
+        if !is_pow2(gs.align(i).into()) {
+            return Err(format!("global @{name}: alignment must be a power of two"));
+        }
+        let named = |s: &str| globals.contains(s) || sigs.contains_key(s);
+        check_init(gs, &named, sp, name, t, gs.init(i))?;
+    }
+    // Signatures, so that calls only ever compare value types.
+    for f in &m.funcs {
+        let entry = f.body.entry();
+        for t in f
+            .body
+            .params(entry)
+            .map(|v| f.body.ty(v))
+            .chain(f.rets.iter().copied())
+        {
+            if !t.is_value() {
+                return Err(format!(
+                    "in @{}: @?: {} is not a value type",
+                    f.name,
+                    f.body.types().show(t)
+                ));
+            }
+        }
+    }
     let mut holes = Vec::new();
     for f in &m.funcs {
         let mut v = FuncVerifier {
             body: &f.body,
-            space: sp,
-            sigs: &sigs,
+            cx: Cx {
+                space: sp,
+                sigs: &sigs,
+                globals: &globals,
+            },
             holes: &mut holes,
             defined: FxHashSet::default(),
             visible: vec![false; f.body.num_values()],
@@ -69,6 +130,96 @@ pub fn verify_module(m: &Module) -> Result<Vec<Hole>, String> {
             .map_err(|e| format!("in @{}: {e}", f.name))?;
     }
     Ok(holes)
+}
+
+/// Check a global's initializer against its type (Lean's `checkInit`).
+fn check_init(
+    gs: &Globals,
+    named: &dyn Fn(&str) -> bool,
+    sp: &SpaceCfg,
+    g: &str,
+    t: Ty,
+    init: Init,
+) -> Result<(), String> {
+    let types = &gs.types;
+    let show = |t: Ty| types.show(t);
+    match (init, t) {
+        (Init::Zero, _) => {}
+        (Init::Int(i), Ty::Int(w) | Ty::Byte(w)) => {
+            let n = gs.int(i);
+            if !(fits_signed(w, Int::Big(n)) || fits_unsigned(w, Int::Big(n))) {
+                return Err(format!("global @{g}: {n} does not fit in {}", show(t)));
+            }
+        }
+        (Init::Int(_), _) => {
+            return Err(format!(
+                "global @{g}: an integer can't initialize {}",
+                show(t)
+            ));
+        }
+        (Init::Null, Ty::Ptr) => {}
+        (Init::Null, _) => return Err(format!("global @{g}: null can't initialize {}", show(t))),
+        (Init::Sym(r), Ty::Ptr) => {
+            let s = gs.text(r);
+            if !named(s) {
+                return Err(format!("global @{g}: no global or function @{s}"));
+            }
+        }
+        (Init::Sym(r), _) => {
+            return Err(format!(
+                "global @{g}: @{} can't initialize {}",
+                gs.text(r),
+                show(t)
+            ));
+        }
+        (Init::Bytes(r), _) => {
+            let n = gs.bytes(r).len();
+            let size = types.size(sp, t);
+            if n as u128 != size {
+                return Err(format!(
+                    "global @{g}: {n} bytes can't initialize {}, which takes {size}",
+                    show(t)
+                ));
+            }
+        }
+        (Init::List(r), Ty::Agg(id)) => {
+            let items = gs.items(r);
+            match types.shape(id) {
+                Shape::Struct(_, fs) => {
+                    if items.len() != fs.len() {
+                        return Err(format!(
+                            "global @{g}: {} takes {} initializers but got {}",
+                            show(t),
+                            fs.len(),
+                            items.len()
+                        ));
+                    }
+                    for (&f, &i) in fs.iter().zip(items) {
+                        check_init(gs, named, sp, g, f, i)?;
+                    }
+                }
+                Shape::Array(n, e) => {
+                    if items.len() as u64 != n {
+                        return Err(format!(
+                            "global @{g}: {} takes {n} initializers but got {}",
+                            show(t),
+                            items.len()
+                        ));
+                    }
+                    for &i in items {
+                        check_init(gs, named, sp, g, e, i)?;
+                    }
+                }
+                Shape::Func(..) => {
+                    return Err(format!("global @{g}: a list can't initialize {}", show(t)));
+                }
+            }
+        }
+        (Init::List(_), _) => {
+            return Err(format!("global @{g}: a list can't initialize {}", show(t)));
+        }
+    }
+    Ok(())
 }
 
 type VResult<T> = Result<T, String>;
@@ -93,20 +244,107 @@ enum RegionCtx<'a> {
     },
 }
 
-fn check_ty(loc: Option<Loc>, t: Ty) -> VResult<()> {
+/// Check that a type is well formed: valid widths, parts with a layout, function types of value
+/// types, and sizes that fit the address space (Lean's `checkTy`).
+fn check_ty(types: &Types, sp: &SpaceCfg, loc: Option<Loc>, t: Ty) -> VResult<()> {
     match t {
         Ty::Int(0) => verr(loc, "i0 is not a valid type"),
         Ty::Byte(w) if !(w > 0 && w.is_multiple_of(8)) => {
             verr(loc, format!("b{w} is not a valid type"))
         }
-        _ => Ok(()),
+        Ty::Int(_) | Ty::Ptr | Ty::Byte(_) => Ok(()),
+        Ty::Agg(id) => {
+            let part = |x: Ty| -> VResult<()> {
+                check_ty(types, sp, loc, x)?;
+                if has_layout(types, x) {
+                    Ok(())
+                } else {
+                    verr(
+                        loc,
+                        format!("{} can't be part of {}", types.show(x), types.show(t)),
+                    )
+                }
+            };
+            match types.shape(id) {
+                Shape::Struct(_, fs) => {
+                    for &f in fs {
+                        part(f)?;
+                    }
+                }
+                Shape::Array(_, e) => part(e)?,
+                Shape::Func(ps, rs) => {
+                    for &x in ps.iter().chain(rs) {
+                        check_ty(types, sp, loc, x)?;
+                        if !x.is_value() {
+                            return verr(
+                                loc,
+                                format!(
+                                    "{} can't be a parameter or result of {}",
+                                    types.show(x),
+                                    types.show(t)
+                                ),
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+            let size = types.size(sp, t);
+            if sp.addr_bits < 128 && size >= 1u128 << sp.addr_bits {
+                return verr(
+                    loc,
+                    format!("{} is too large for the address space", types.show(t)),
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Whether values of the type can be part of memory (Lean's `Ty.hasLayout`).
+fn has_layout(types: &Types, t: Ty) -> bool {
+    match t {
+        Ty::Int(w) => w.is_multiple_of(8),
+        Ty::Agg(id) => !matches!(types.shape(id), Shape::Func(..)),
+        _ => true,
+    }
+}
+
+/// Check that a value's type is a well-formed value type.
+#[inline]
+fn check_value_ty(types: &Types, sp: &SpaceCfg, loc: Option<Loc>, t: Ty) -> VResult<()> {
+    match t {
+        Ty::Int(w) if w > 0 => Ok(()),
+        Ty::Ptr => Ok(()),
+        Ty::Byte(w) if w > 0 && w.is_multiple_of(8) => Ok(()),
+        _ => check_value_ty_slow(types, sp, loc, t),
+    }
+}
+
+#[cold]
+fn check_value_ty_slow(types: &Types, sp: &SpaceCfg, loc: Option<Loc>, t: Ty) -> VResult<()> {
+    check_ty(types, sp, loc, t)?;
+    if t.is_value() {
+        Ok(())
+    } else {
+        verr(loc, format!("{} is not a value type", types.show(t)))
+    }
+}
+
+/// Check that a type is well formed and has a layout.
+fn check_sized(types: &Types, sp: &SpaceCfg, loc: Option<Loc>, t: Ty) -> VResult<()> {
+    check_ty(types, sp, loc, t)?;
+    if has_layout(types, t) {
+        Ok(())
+    } else {
+        verr(loc, format!("{} has no size in memory", types.show(t)))
     }
 }
 
 fn width(t: Ty) -> u32 {
     match t {
         Ty::Int(w) | Ty::Byte(w) => w,
-        Ty::Ptr => 0,
+        _ => 0,
     }
 }
 
@@ -257,53 +495,61 @@ impl std::ops::Deref for Tys {
     }
 }
 
-/// `(t1, t2)`
-fn tys(ts: &[Ty]) -> String {
-    let parts: Vec<String> = ts.iter().map(Ty::to_string).collect();
-    format!("({})", parts.join(", "))
-}
-
-fn expect_tys(loc: Option<Loc>, what: &str, got: &[Ty], want: &[Ty]) -> VResult<()> {
+fn expect_tys(types: &Types, loc: Option<Loc>, what: &str, got: &[Ty], want: &[Ty]) -> VResult<()> {
     if got == want {
         Ok(())
     } else {
         verr(
             loc,
-            format!("{what}: expected {} but got {}", tys(want), tys(got)),
+            format!(
+                "{what}: expected {} but got {}",
+                types.show_list(want),
+                types.show_list(got)
+            ),
         )
     }
 }
 
-fn is_loadable(space: SpaceCfg, t: Ty) -> bool {
+fn is_loadable(space: &SpaceCfg, t: Ty) -> bool {
     match t {
         Ty::Int(w) => w.is_multiple_of(8),
         Ty::Ptr => space.ptr_bits.is_multiple_of(8),
         Ty::Byte(_) => true,
+        Ty::Agg(_) => false,
     }
 }
 
-fn ints(loc: Option<Loc>, ts: &[Ty]) -> VResult<()> {
+fn ints(types: &Types, loc: Option<Loc>, ts: &[Ty]) -> VResult<()> {
     if ts.iter().all(|t| is_int(*t)) {
         Ok(())
     } else {
-        verr(loc, format!("expected integers but got {}", tys(ts)))
+        verr(
+            loc,
+            format!("expected integers but got {}", types.show_list(ts)),
+        )
     }
 }
 
 /// Check the operand and result types of an op without regions by its declared rule (Lean's
 /// `checkSimple`).
 fn check_simple(
+    cx: &Cx<'_>,
     body: &Body,
     loc: Option<Loc>,
-    space: SpaceCfg,
-    sigs: &FxHashMap<&str, (Vec<Ty>, Vec<Ty>)>,
     k: OpKind,
     ins: &[Ty],
     outs: &[Ty],
 ) -> VResult<()> {
+    let Cx {
+        space,
+        sigs,
+        globals,
+    } = *cx;
     let Some(rule) = k.decl().rule else {
         return verr(loc, "unexpected op");
     };
+    let types = body.types();
+    let show = |t: Ty| types.show(t);
     // The types named so far.
     let mut vars = [Ty::Ptr; 4];
     let mut named = 0;
@@ -345,12 +591,12 @@ fn check_simple(
             }
             Check::Ins(label, want) => {
                 if !same(ins, want) {
-                    expect_tys(loc, label, ins, &tys_of(want))?;
+                    expect_tys(types, loc, label, ins, &tys_of(want))?;
                 }
             }
             Check::Outs(want) => {
                 if !same(outs, want) {
-                    expect_tys(loc, "results", outs, &tys_of(want))?;
+                    expect_tys(types, loc, "results", outs, &tys_of(want))?;
                 }
             }
             Check::NoOuts => {
@@ -361,12 +607,12 @@ fn check_simple(
             Check::Same(label, got, want) => {
                 let got = tys_of(got);
                 if !same(&got, want) {
-                    expect_tys(loc, label, &got, &tys_of(want))?;
+                    expect_tys(types, loc, label, &got, &tys_of(want))?;
                 }
             }
             Check::Ints(ts) => {
                 if !ts.iter().all(|e| is_int(ty(e))) {
-                    ints(loc, &tys_of(ts))?;
+                    ints(types, loc, &tys_of(ts))?;
                 }
             }
             Check::Pow2(i) => {
@@ -383,27 +629,33 @@ fn check_simple(
                 };
                 let (n, t) = (body.int(n), ty(&t));
                 if !(fits_signed(width(t), n) || fits_unsigned(width(t), n)) {
-                    return verr(loc, format!("{n} does not fit in {t}"));
+                    return verr(loc, format!("{n} does not fit in {}", show(t)));
                 }
             }
             Check::Widens(a, t) => {
                 let (a, t) = (ty(&a), ty(&t));
                 if width(t) <= width(a) {
-                    return verr(loc, format!("cannot extend {a} to {t}"));
+                    return verr(loc, format!("cannot extend {} to {}", show(a), show(t)));
                 }
             }
             Check::Narrows(a, t) => {
                 let (a, t) = (ty(&a), ty(&t));
                 if width(t) >= width(a) {
-                    return verr(loc, format!("cannot truncate {a} to {t}"));
+                    return verr(loc, format!("cannot truncate {} to {}", show(a), show(t)));
                 }
             }
             Check::Loadable(t, verb) => {
                 let t = ty(&t);
+                if !t.is_value() {
+                    return verr(
+                        loc,
+                        format!("{} can't be {verb}: it is not a value type", show(t)),
+                    );
+                }
                 if !is_loadable(space, t) {
                     return verr(
                         loc,
-                        format!("{t} can't be {verb}: its size isn't whole bytes"),
+                        format!("{} can't be {verb}: its size isn't whole bytes", show(t)),
                     );
                 }
             }
@@ -420,8 +672,58 @@ fn check_simple(
                 let Some((params, rets)) = sigs.get(callee) else {
                     return verr(loc, format!("no function @{callee}"));
                 };
-                expect_tys(loc, &format!("arguments of @{callee}"), ins, params)?;
-                expect_tys(loc, &format!("results of @{callee}"), outs, rets)?;
+                expect_tys(types, loc, &format!("arguments of @{callee}"), ins, params)?;
+                expect_tys(types, loc, &format!("results of @{callee}"), outs, rets)?;
+            }
+            Check::Sized(t) => check_sized(types, space, loc, ty(&t))?,
+            Check::Field(t, i) => {
+                let t = ty(&t);
+                check_sized(types, space, loc, t)?;
+                let Some(Imm::Index(i)) = field(i) else {
+                    return verr(loc, "malformed op");
+                };
+                match types.shape_of(t) {
+                    Some(Shape::Struct(_, fs)) => {
+                        if i as usize >= fs.len() {
+                            return verr(loc, format!("{} has no field {i}", show(t)));
+                        }
+                    }
+                    _ => return verr(loc, format!("{} is not a struct", show(t))),
+                }
+            }
+            Check::Sig(i) => {
+                let Some(Imm::Ty(t)) = field(i) else {
+                    return verr(loc, "malformed op");
+                };
+                check_ty(types, space, loc, t)?;
+                let Some(Shape::Func(ps, rs)) = types.shape_of(t) else {
+                    return verr(loc, format!("{} is not a function type", show(t)));
+                };
+                let ok = ins.len() == ps.len() + 1 && ins[0] == Ty::Ptr && ins[1..] == *ps;
+                if !ok {
+                    let mut want = vec![Ty::Ptr];
+                    want.extend_from_slice(ps);
+                    expect_tys(types, loc, "operands", ins, &want)?;
+                }
+                expect_tys(types, loc, "results", outs, rs)?;
+            }
+            Check::Global(i) => {
+                let Some(Imm::Str(g)) = field(i) else {
+                    return verr(loc, "malformed op");
+                };
+                let g = body.str(g);
+                if !globals.contains(g) {
+                    return verr(loc, format!("no global @{g}"));
+                }
+            }
+            Check::Func(i) => {
+                let Some(Imm::Str(f)) = field(i) else {
+                    return verr(loc, "malformed op");
+                };
+                let f = body.str(f);
+                if !sigs.contains_key(f) {
+                    return verr(loc, format!("no function @{f}"));
+                }
             }
         }
     }
@@ -431,10 +733,18 @@ fn check_simple(
 /// Verifies one function. Lean threads a name-to-type scope through the ops; here the visible
 /// values are a stack (`scope`) that is cut back when a region ends, mirrored in a set
 /// (`visible`) for lookups.
+/// What the whole module tells the checks of one function.
+#[derive(Clone, Copy)]
+struct Cx<'a> {
+    space: &'a SpaceCfg,
+    /// Each function's parameter and result types.
+    sigs: &'a FxHashMap<&'a str, (Vec<Ty>, Vec<Ty>)>,
+    globals: &'a FxHashSet<&'a str>,
+}
+
 struct FuncVerifier<'a> {
     body: &'a Body,
-    space: SpaceCfg,
-    sigs: &'a FxHashMap<&'a str, (Vec<Ty>, Vec<Ty>)>,
+    cx: Cx<'a>,
     holes: &'a mut Vec<Hole>,
     /// Every name defined so far in the function.
     defined: FxHashSet<&'a str>,
@@ -448,7 +758,7 @@ struct FuncVerifier<'a> {
 impl<'a> FuncVerifier<'a> {
     fn func(&mut self, rets: &[Ty]) -> VResult<()> {
         for &t in rets {
-            check_ty(None, t)?;
+            check_value_ty(self.body.types(), self.cx.space, None, t)?;
         }
         let entry = self.body.entry();
         for v in self.body.params(entry) {
@@ -461,7 +771,7 @@ impl<'a> FuncVerifier<'a> {
     fn define(&mut self, loc: Option<Loc>, v: ValueId, is_param: bool) -> VResult<()> {
         let body = self.body;
         let (name, ty) = (body.name(v), body.ty(v));
-        check_ty(loc, ty)?;
+        check_value_ty(body.types(), self.cx.space, loc, ty)?;
         for f in body.facts(v) {
             check_fact(body, loc, is_param, name, ty, *f)?;
         }
@@ -491,7 +801,7 @@ impl<'a> FuncVerifier<'a> {
             }
             OperandKind::Hole(h) => {
                 let ty = self.body.hole_ty(h);
-                check_ty(loc, ty)?;
+                check_value_ty(self.body.types(), self.cx.space, loc, ty)?;
                 self.holes.push(Hole {
                     name: self.body.hole_name(h).to_owned(),
                     ty,
@@ -562,7 +872,13 @@ impl<'a> FuncVerifier<'a> {
         let Some((_, ps)) = blocks.iter().find(|(l, _)| *l == label) else {
             return verr(loc, format!("no block ^{label} in the enclosing cf.blocks"));
         };
-        expect_tys(loc, &format!("arguments of ^{label}"), args, ps)
+        expect_tys(
+            self.body.types(),
+            loc,
+            &format!("arguments of ^{label}"),
+            args,
+            ps,
+        )
     }
 
     /// Check jumps to `targets`, whose arguments are `args` in order (Lean's `splitArgs`).
@@ -650,7 +966,7 @@ impl<'a> FuncVerifier<'a> {
         match (kind, body.regions(op)) {
             (OpKind::Yield, []) => match self.ctx.last() {
                 Some(RegionCtx::IfBranch(rs) | RegionCtx::Block { results: rs, .. }) => {
-                    expect_tys(loc, "cf.yield", &ins, rs)?;
+                    expect_tys(body.types(), loc, "cf.yield", &ins, rs)?;
                 }
                 _ => return verr(loc, "cf.yield must end a cf.if region or a block"),
             },
@@ -658,15 +974,15 @@ impl<'a> FuncVerifier<'a> {
                 let Some((_, rs)) = self.nearest_loop() else {
                     return verr(loc, "cf.break outside a loop");
                 };
-                expect_tys(loc, "cf.break", &ins, rs)?;
+                expect_tys(body.types(), loc, "cf.break", &ins, rs)?;
             }
             (OpKind::Continue, []) => {
                 let Some((ps, _)) = self.nearest_loop() else {
                     return verr(loc, "cf.continue outside a loop");
                 };
-                expect_tys(loc, "cf.continue", &ins, ps)?;
+                expect_tys(body.types(), loc, "cf.continue", &ins, ps)?;
             }
-            (OpKind::Ret, []) => expect_tys(loc, "func.ret", &ins, self.func_rets())?,
+            (OpKind::Ret, []) => expect_tys(body.types(), loc, "func.ret", &ins, self.func_rets())?,
             (OpKind::Br { dest }, []) => {
                 if self.nearest_blocks().is_none() {
                     return verr(loc, "cf.br outside cf.blocks");
@@ -685,7 +1001,13 @@ impl<'a> FuncVerifier<'a> {
                 if ins.len() != 1 + t.nargs as usize + f.nargs as usize {
                     return verr(loc, "malformed op");
                 }
-                expect_tys(loc, "cf.cond_br condition", &ins[..1], &[Ty::Int(1)])?;
+                expect_tys(
+                    body.types(),
+                    loc,
+                    "cf.cond_br condition",
+                    &ins[..1],
+                    &[Ty::Int(1)],
+                )?;
                 self.check_succs(loc, [t, f].into_iter(), &ins[1..])?;
             }
             (OpKind::Switch { dflt, cases }, []) => {
@@ -726,7 +1048,7 @@ impl<'a> FuncVerifier<'a> {
             }
             (OpKind::Blocks { .. }, rs) => self.blocks(loc, &ins, &outs, rs)?,
             (OpKind::If, &[thn, els]) => {
-                expect_tys(loc, "cf.if condition", &ins, &[Ty::Int(1)])?;
+                expect_tys(body.types(), loc, "cf.if condition", &ins, &[Ty::Int(1)])?;
                 for r in [thn, els] {
                     if body.params(r).len() != 0 {
                         return verr(loc, "cf.if regions have no parameters");
@@ -744,7 +1066,7 @@ impl<'a> FuncVerifier<'a> {
                     return verr(loc, "only blocks of cf.blocks have labels");
                 }
                 let ps: Vec<Ty> = body.params(inner).map(|v| body.ty(v)).collect();
-                expect_tys(loc, "cf.loop initial values", &ins, &ps)?;
+                expect_tys(body.types(), loc, "cf.loop initial values", &ins, &ps)?;
                 let mark = self.scope.len();
                 for v in body.params(inner) {
                     self.define(loc, v, false)?;
@@ -761,7 +1083,7 @@ impl<'a> FuncVerifier<'a> {
                 if k.is_terminator() || matches!(k, OpKind::If | OpKind::Loop { .. }) {
                     return verr(loc, "malformed op");
                 }
-                check_simple(body, loc, self.space, self.sigs, k, &ins, &outs)?;
+                check_simple(&self.cx, body, loc, k, &ins, &outs)?;
             }
             _ => return verr(loc, "malformed op"),
         }

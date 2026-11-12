@@ -47,8 +47,8 @@ where
 def _root_.Fir.FieldTy.rust : FieldTy → String
   | .int => "IntId"
   | .nat => "u64"
-  | .align => "u32"
-  | .symbol | .func => "StrId"
+  | .align | .index => "u32"
+  | .symbol | .func | .global => "StrId"
   | .ty => "Ty"
   | .succ => "SuccId"
   | .cases => "CasesId"
@@ -58,9 +58,9 @@ def _root_.Fir.FieldTy.rust : FieldTy → String
 /-- What the name table's kinds hold in an immediate. -/
 def _root_.Fir.FieldTy.placeholder : FieldTy → String
   | .int => "IntId::PLACEHOLDER"
-  | .nat => "0"
+  | .nat | .index => "0"
   | .align => "1"
-  | .symbol | .func => "StrId::PLACEHOLDER"
+  | .symbol | .func | .global => "StrId::PLACEHOLDER"
   | .ty => "Ty::Ptr"
   | .succ => "SuccId::PLACEHOLDER"
   | .cases => "CasesId::EMPTY"
@@ -70,7 +70,8 @@ def _root_.Fir.FieldTy.immVariant : FieldTy → String
   | .int => "Int"
   | .nat => "Nat"
   | .align => "Align"
-  | .symbol | .func => "Str"
+  | .index => "Index"
+  | .symbol | .func | .global => "Str"
   | .ty => "Ty"
   | .succ => "Succ"
   | .cases => "Cases"
@@ -80,8 +81,10 @@ def _root_.Fir.FieldTy.rustDecl : FieldTy → String
   | .int => "Int"
   | .nat => "Nat"
   | .align => "Align"
+  | .index => "Index"
   | .symbol => "Symbol"
   | .func => "Func"
+  | .global => "Global"
   | .ty => "Ty"
   | .succ => "Succ"
   | .cases => "Cases"
@@ -90,7 +93,7 @@ def _root_.Fir.FieldTy.rustDecl : FieldTy → String
 /-- A variant names its fields when one is a `bool`, a number, a string, or a branch target. -/
 def _root_.Fir.OpDecl.isStruct (d : OpDecl) : Bool :=
   d.fields.any fun f => match f.ty with
-    | .nat | .align | .symbol | .func | .flag | .mod "Bool" | .succ | .cases => true
+    | .nat | .align | .index | .symbol | .func | .global | .flag | .mod "Bool" | .succ | .cases => true
     | _ => false
 
 /-- `Variant(a, b)` or `Variant { x: a, y: b }` from each field's text; `rest` ends a struct
@@ -171,6 +174,11 @@ def rustRule (d : OpDecl) (checks : List Check) : Except String (List String) :=
       | .deny names msg =>
         pure s!"Check::Deny(&[{", ".intercalate (names.map rustStr)}], {rustStr msg})"
       | .call f => pure s!"Check::Call({immIndex d f})"
+      | .sized x => pure s!"Check::Sized({t x})"
+      | .field x i => pure s!"Check::Field({t x}, {immIndex d i})"
+      | .sig f => pure s!"Check::Sig({immIndex d f})"
+      | .global f => pure s!"Check::Global({immIndex d f})"
+      | .func f => pure s!"Check::Func({immIndex d f})"
     out := out ++ [s]
   if env.length > 4 then throw s!"{d.ctor}: a rule names at most 4 types"
   pure out

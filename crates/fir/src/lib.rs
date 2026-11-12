@@ -17,6 +17,7 @@
 
 mod body;
 mod decl;
+mod globals;
 pub mod interp;
 mod ir;
 mod lex;
@@ -26,6 +27,7 @@ mod ops;
 mod parse;
 mod print;
 mod sem;
+mod types;
 mod verify;
 
 pub use body::{
@@ -33,7 +35,9 @@ pub use body::{
     Succ, SuccId, UseId, Uses, ValueDef, ValueId, ValueSpec,
 };
 pub use decl::{Check, Effect, Field, FieldTy, Imm, Item, OpDecl, Tier, TyE};
+pub use globals::Run;
 pub use ir::*;
 pub use ops::op_kind;
 pub use parse::parse_module;
+pub use types::align_up;
 pub use verify::{Hole, render_loc, verify_module};

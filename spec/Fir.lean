@@ -3,6 +3,7 @@ import Fir.OpDSL
 import Fir.Refinement
 import Fir.Syntax
 import Fir.Sem
+import Fir.Layout
 import Fir.Mem
 import Fir.MemRules
 import Fir.Interp

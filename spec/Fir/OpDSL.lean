@@ -25,7 +25,8 @@ same tables, and the Rust `OpKind`, to `crates/fir/src/generated/ops.rs`.
 
 **Fields.** `(zero ovf : Edge)` declares fields of the constructor. Fields of these types are
 *immediates*, written in the op's format: `Int`, `Nat` (Rust `u64`), `Align` (a `Nat`; Rust
-`u32`), `Symbol` (a dotted name such as `c.malloc`; a `String`), `Func` (a function, `@f`; a
+`u32`), `Index` (a field index, a `Nat`; Rust `u32`), `Symbol` (a dotted name such as
+`c.malloc`; a `String`), `Func` (a function, `@f`; a `String`), `Global` (a global, `@g`; a
 `String`), `Ty`, `Flag` (a `Bool` written as a keyword named after the field), `Succ` (a branch
 target `^b(%x, …)`, whose operands are the op's; Rust: an id into a side table), and `Cases`
 (`cf.switch`'s `[k: ^b(…), …]`). Fields of any other type (`Bool` or an enum) are *modifiers*,
@@ -79,8 +80,10 @@ inductive FieldTy where
   | int
   | nat
   | align
+  | index
   | symbol
   | func
+  | global
   | ty
   | flag
   /-- A branch target, `^b(%x, …)`: its label and argument count (Rust: an id into a side table). -/
@@ -182,6 +185,18 @@ inductive Check where
   | deny (names : List String) (msg : String)
   /-- `call callee`: the operands and results match the function's signature. -/
   | call (field : String)
+  /-- `sized t`: `t` is a type with a layout: a struct, an array, or a value type in whole
+  bytes. -/
+  | sized (t : TyE)
+  /-- `field t i`: `t` is a struct with a field `i`. -/
+  | field (t : TyE) (index : String)
+  /-- `sig t`: `t` is a function type; the operands are a pointer and its parameters, and the
+  results are its results. -/
+  | sig (field : String)
+  /-- `global g`: the global exists. -/
+  | global (field : String)
+  /-- `func f`: the function exists. -/
+  | func (field : String)
   deriving Repr, Inhabited
 
 /-- Effect categories (decision: Effects); resource tags come later. -/
@@ -285,8 +300,10 @@ def fieldTy : String → FieldTy
   | "Int" => .int
   | "Nat" => .nat
   | "Align" => .align
+  | "Index" => .index
   | "Symbol" => .symbol
   | "Func" => .func
+  | "Global" => .global
   | "Ty" => .ty
   | "Flag" => .flag
   | "Succ" => .succ
@@ -295,8 +312,8 @@ def fieldTy : String → FieldTy
 
 /-- The Lean type of a field type. -/
 def leanTy : String → Name
-  | "Align" => `Nat
-  | "Symbol" | "Func" => `String
+  | "Align" | "Index" => `Nat
+  | "Symbol" | "Func" | "Global" => `String
   | "Flag" => `Bool
   | t => .mkSimple t
 
@@ -406,6 +423,11 @@ def checkTerm (stx : TSyntax `firCheck) : MacroM Term := do
     let `(firArg| [$ns,*]) := l | Macro.throwErrorAt l "expected a list of names"
     `(Check.deny $(quote (← ns.getElems.toList.mapM argStr)) $(quote (← argStr msg)))
   | "call", [f] => `(Check.call $(quote (← argIdent f)))
+  | "sized", [t] => `(Check.sized $(← tyE t))
+  | "field", [t, i] => `(Check.field $(← tyE t) $(quote (← argIdent i)))
+  | "sig", [f] => `(Check.sig $(quote (← argIdent f)))
+  | "global", [f] => `(Check.global $(quote (← argIdent f)))
+  | "func", [f] => `(Check.func $(quote (← argIdent f)))
   | _, _ => Macro.throwErrorAt stx "unknown check"
 
 partial def flatArg : TSyntax `firArg → List String
@@ -435,8 +457,10 @@ def fieldTyTerm : FieldTy → MacroM Term
   | .int => `(FieldTy.int)
   | .nat => `(FieldTy.nat)
   | .align => `(FieldTy.align)
+  | .index => `(FieldTy.index)
   | .symbol => `(FieldTy.symbol)
   | .func => `(FieldTy.func)
+  | .global => `(FieldTy.global)
   | .ty => `(FieldTy.ty)
   | .flag => `(FieldTy.flag)
   | .succ => `(FieldTy.succ)
@@ -448,7 +472,8 @@ def defaultTerm : FieldTy → MacroM Term
   | .int => `((0 : Int))
   | .nat => `((0 : Nat))
   | .align => `((1 : Nat))
-  | .symbol | .func => `("")
+  | .index => `((0 : Nat))
+  | .symbol | .func | .global => `("")
   | .ty => `(Ty.ptr)
   | .flag => `(false)
   | .succ => `(({ label := "", nargs := 0 } : Succ))
@@ -458,8 +483,8 @@ def defaultTerm : FieldTy → MacroM Term
 /-- The `Imm` constructor for an immediate field. -/
 def immCtor : FieldTy → Name
   | .int => `Imm.int
-  | .nat | .align => `Imm.nat
-  | .symbol | .func => `Imm.str
+  | .nat | .align | .index => `Imm.nat
+  | .symbol | .func | .global => `Imm.str
   | .ty => `Imm.ty
   | .succ => `Imm.succ
   | .cases => `Imm.cases

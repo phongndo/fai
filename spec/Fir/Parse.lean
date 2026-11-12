@@ -140,10 +140,44 @@ def sepBy (p : P α) (close : String) : P (List α) := do
   expectSym close
   pure items
 
-def ty : P Ty := do
+def nat : P Nat := do
+  let n ← int
+  if n < 0 then fail "expected a non-negative integer" else pure n.toNat
+
+/-- A type: `i32`, `ptr`, `b8`, `struct<C>{i32, ptr}`, `array<4 x i32>`, or
+`func<(i32, ptr) -> i32>`. -/
+partial def ty : P Ty := do
   let s ← ident
+  match s with
+  | "ptr" => pure .ptr
+  | "struct" =>
+    expectSym "<"
+    let p ← match ← ident with
+      | "C" => pure Policy.c
+      | "packed" => pure .packed
+      | "auto" => pure .auto
+      | p => fail s!"unknown struct layout '{p}'"
+    expectSym ">"
+    expectSym "{"
+    pure (.struct p (← sepBy ty "}"))
+  | "array" =>
+    expectSym "<"
+    let n ← nat
+    unless ← tryIdent "x" do fail "expected 'x'"
+    let t ← ty
+    expectSym ">"
+    pure (.array n t)
+  | "func" =>
+    expectSym "<"
+    expectSym "("
+    let ps ← sepBy ty ")"
+    let rs ← if ← trySym "->" then do
+        if ← trySym "(" then sepBy ty ")" else pure [← ty]
+      else pure []
+    expectSym ">"
+    pure (.func ps rs)
+  | _ =>
   match s.toList with
-  | ['p', 't', 'r'] => pure .ptr
   | c :: digits =>
     -- Plain digits only: `toNat?` would also accept `_` separators.
     let width := if !digits.isEmpty && digits.all Char.isDigit then (String.ofList digits).toNat? else none
@@ -159,10 +193,6 @@ def trust : P Trust := do
   | "check" => pure .check
   | "proved" => pure .proved
   | s => fail s!"expected assume, check, or proved but found '{s}'"
-
-def nat : P Nat := do
-  let n ← int
-  if n < 0 then fail "expected a non-negative integer" else pure n.toNat
 
 def range : P (Int × Int) := do
   expectSym "("
@@ -240,15 +270,22 @@ def genericSucc : P (Succ × List Operand) := do
   let nargs ← if ← trySym "(" then do let n ← nat; expectSym ")"; pure n else pure 0
   pure ({ label, nargs }, [])
 
+/-- `@name` -/
+def globalName : P String := do
+  match ← peek with
+  | .global s => discard next; pure s
+  | t => fail s!"expected a global name like @g but found {t.describe}"
+
 /-- An immediate, as the readable form writes it. A flag is a keyword named after its field.
 Branch targets are read here as the generic form writes them; the readable form's go with
 their operands (`head`). -/
 def imm (f : Field) : P Imm :=
   match f.ty with
   | .int => .int <$> int
-  | .nat | .align => .nat <$> nat
+  | .nat | .align | .index => .nat <$> nat
   | .symbol => .str <$> ident
   | .func => .str <$> funcName
+  | .global => .str <$> globalName
   | .ty => .ty <$> ty
   | .succ => (.succ ·.1) <$> genericSucc
   | .cases => (.cases ·.1) <$> cases genericSucc
@@ -420,22 +457,77 @@ def func : P Func := do
   let body ← region params
   pure { name, rets, file, body }
 
-/-- `memspace default ptr 64 addr 64` -/
+/-- `memspace default ptr 64 addr 64 [align 8] [int 8:1 16:2 …]` -/
 def memspace : P SpaceCfg := do
   let name ← ident
   unless name == "default" do fail "only the default memory space can be declared for now"
   unless ← tryIdent "ptr" do fail "expected 'ptr'"
   let ptrBits ← nat
   unless ← tryIdent "addr" do fail "expected 'addr'"
-  pure { ptrBits, addrBits := ← nat }
+  let addrBits ← nat
+  let ptrAlign ← if ← tryIdent "align" then nat else pure (SpaceCfg.naturalAlign ptrBits)
+  let mut ints := defaultInts
+  if ← tryIdent "int" then
+    ints := []
+    repeat
+      let w ← nat
+      expectSym ":"
+      ints := ints ++ [(w, ← nat)]
+      unless (← peek) matches .int _ do break
+  pure { ptrBits, addrBits, ptrAlign, ints }
+
+/-- Hex digits, two per byte. -/
+def hexBytes (s : String) : Option (List Nat) :=
+  let digit (c : Char) : Option Nat :=
+    if c.isDigit then some (c.toNat - '0'.toNat)
+    else if 'a' ≤ c && c ≤ 'f' then some (c.toNat - 'a'.toNat + 10)
+    else none
+  let rec go : List Char → Option (List Nat)
+    | [] => some []
+    | a :: b :: rest => do
+      let x ← digit a
+      let y ← digit b
+      pure ((x * 16 + y) :: (← go rest))
+    | [_] => none
+  go s.toList
+
+/-- `zero`, an integer, `null`, `@name`, `bytes "00ff"`, or `{init, …}`. -/
+partial def init : P Init := do
+  match ← peek with
+  | .ident "zero" => discard next; pure .zero
+  | .ident "null" => discard next; pure .null
+  | .ident "bytes" =>
+    discard next
+    match ← peek with
+    | .str s =>
+      let some bs := hexBytes s | fail "expected two lowercase hex digits per byte"
+      discard next
+      pure (.bytes bs)
+    | t => fail s!"expected a string of hex digits but found {t.describe}"
+  | .int n => discard next; pure (.int n)
+  | .global s => discard next; pure (.sym s)
+  | .sym "{" => discard next; pure (.list (← sepBy init "}"))
+  | t => fail s!"expected an initializer but found {t.describe}"
+
+/-- `global [const] @name: T [align N] = INIT` -/
+def global : P Global := do
+  let const ← tryIdent "const"
+  let name ← globalName
+  expectSym ":"
+  let t ← ty
+  let align ← if ← tryIdent "align" then nat else pure 1
+  expectSym "="
+  pure { name, ty := t, const, align, init := ← init }
 
 def module : P Module := do
   let mut funcs := #[]
+  let mut globals := #[]
   let mut space : SpaceCfg := {}
   while (← peek) != .eof do
     if ← tryIdent "memspace" then space ← memspace
+    else if ← tryIdent "global" then globals := globals.push (← global)
     else funcs := funcs.push (← func)
-  pure { space, funcs := funcs.toList }
+  pure { space, globals := globals.toList, funcs := funcs.toList }
 
 end P
 

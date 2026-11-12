@@ -1,6 +1,7 @@
 import Std.Data.ExtTreeMap
 import Fir.Basic
 import Fir.Syntax
+import Fir.Layout
 
 /-!
 # Memory
@@ -20,6 +21,10 @@ namespace Fir
 inductive AllocKind where
   | stack
   | heap (family : String)
+  /-- A global's memory, allocated before the program starts and never freed. -/
+  | global (name : String) (const : Bool)
+  /-- A function: size 0, so no access can read or write it. -/
+  | func (name : String)
   deriving DecidableEq, Repr
 
 /-- An allocation's bytes, by offset. Unwritten bytes are `poison`. -/
@@ -98,10 +103,5 @@ def RVal.encode (cfg : SpaceCfg) : RVal → List Byte
   | .int w v => encodeInt w v
   | .ptr p => encodePtr cfg p
   | .bytes bs => bs
-
-/-- How many bytes a value of type `t` takes in memory. -/
-def Ty.size (cfg : SpaceCfg) : Ty → Nat
-  | .int w | .byte w => w / 8
-  | .ptr => cfg.ptrBits / 8
 
 end Fir

@@ -16,6 +16,7 @@ use crate::decl::{Field, FieldTy, Imm, Item};
 use crate::ir::*;
 use crate::lex::{Lexer, Sym, Tok, Token, int_value};
 use crate::ops::op_kind;
+use crate::types::Types;
 
 pub fn parse_module(input: &str) -> Result<Module, String> {
     let mut p = Parser::new(input, true)?;
@@ -50,6 +51,10 @@ struct Parser<'a> {
     /// Scratch buffers for the op being parsed.
     operands: Vec<Operand>,
     results: Vec<ValueSpec<'a>>,
+    /// The module's globals so far.
+    globals: Globals,
+    /// Whether types go to the globals' table (or the current body's).
+    in_globals: bool,
 }
 
 type PResult<T> = Result<T, String>;
@@ -72,6 +77,8 @@ impl<'a> Parser<'a> {
             pending: Vec::new(),
             operands: Vec::new(),
             results: Vec::new(),
+            globals: Globals::default(),
+            in_globals: false,
         })
     }
 
@@ -215,11 +222,20 @@ impl<'a> Parser<'a> {
         Ok(items)
     }
 
+    /// The table types are parsed into.
+    fn types(&mut self) -> &mut Types {
+        if self.in_globals {
+            &mut self.globals.types
+        } else {
+            self.body.types_mut()
+        }
+    }
+
+    /// A type: `i32`, `ptr`, `b8`, `struct<C>{i32, ptr}`, `array<4 x i32>`, or
+    /// `func<(i32, ptr) -> i32>`.
     fn ty(&mut self) -> PResult<Ty> {
         let s = self.ident()?;
-        if s == "ptr" {
-            return Ok(Ty::Ptr);
-        }
+        // `iN` and `bN` first: they are most of the types.
         let rest = s.get(1..).unwrap_or("");
         let width = if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
             rest.parse::<u32>().ok()
@@ -227,8 +243,51 @@ impl<'a> Parser<'a> {
             None
         };
         match (s.as_bytes()[0], width) {
-            (b'i', Some(w)) => Ok(Ty::Int(w)),
-            (b'b', Some(w)) => Ok(Ty::Byte(w)),
+            (b'i', Some(w)) => return Ok(Ty::Int(w)),
+            (b'b', Some(w)) => return Ok(Ty::Byte(w)),
+            _ => {}
+        }
+        match s {
+            "ptr" => Ok(Ty::Ptr),
+            "struct" => {
+                self.expect_sym(Sym::Lt)?;
+                let policy = match self.ident()? {
+                    "C" => Policy::C,
+                    "packed" => Policy::Packed,
+                    "auto" => Policy::Auto,
+                    p => return self.fail(format!("unknown struct layout '{p}'")),
+                };
+                self.expect_sym(Sym::Gt)?;
+                self.expect_sym(Sym::LBrace)?;
+                let fields = self.sep_by(Self::ty, Sym::RBrace)?;
+                Ok(self.types().structure(policy, &fields))
+            }
+            "array" => {
+                self.expect_sym(Sym::Lt)?;
+                let n = self.nat()?;
+                if !self.try_ident("x")? {
+                    return self.fail("expected 'x'");
+                }
+                let elem = self.ty()?;
+                self.expect_sym(Sym::Gt)?;
+                Ok(self.types().array(n, elem))
+            }
+            "func" => {
+                self.expect_sym(Sym::Lt)?;
+                self.expect_sym(Sym::LParen)?;
+                let params = self.sep_by(Self::ty, Sym::RParen)?;
+                let rets = if self.try_sym(Sym::Arrow)? {
+                    if self.try_sym(Sym::LParen)? {
+                        self.sep_by(Self::ty, Sym::RParen)?
+                    } else {
+                        vec![self.ty()?]
+                    }
+                } else {
+                    Vec::new()
+                };
+                self.expect_sym(Sym::Gt)?;
+                Ok(self.types().func(&params, &rets))
+            }
             _ => self.fail(format!("unknown type '{s}'")),
         }
     }
@@ -525,6 +584,20 @@ impl<'a> Parser<'a> {
         self.expect_sym(Sym::RParen)
     }
 
+    /// `@name`, for a global.
+    fn global_name(&mut self) -> PResult<&'a str> {
+        match self.peek() {
+            Tok::Global(s) => {
+                self.bump()?;
+                Ok(s)
+            }
+            t => self.fail(format!(
+                "expected a global name like @g but found {}",
+                t.describe()
+            )),
+        }
+    }
+
     /// `@name`
     fn func_name(&mut self) -> PResult<StrId> {
         match self.peek() {
@@ -547,11 +620,16 @@ impl<'a> Parser<'a> {
             FieldTy::Int => Imm::Int(self.int()?),
             FieldTy::Nat => Imm::Nat(self.nat()?),
             FieldTy::Align => Imm::Align(self.nat()?),
+            FieldTy::Index => Imm::Index(self.nat()?),
             FieldTy::Symbol => {
                 let s = self.ident()?;
                 Imm::Str(self.body.add_str(s))
             }
             FieldTy::Func => Imm::Str(self.func_name()?),
+            FieldTy::Global => {
+                let s = self.global_name()?;
+                Imm::Str(self.body.add_str(s))
+            }
             FieldTy::Ty => Imm::Ty(self.ty()?),
             FieldTy::Flag => Imm::Flag(self.try_ident(f.name)?),
             FieldTy::Succ => {
@@ -854,7 +932,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `memspace default ptr 64 addr 64`
+    /// `memspace default ptr 64 addr 64 [align 8] [int 8:1 16:2 …]`
     fn memspace(&mut self) -> PResult<SpaceCfg> {
         let name = self.ident()?;
         if name != "default" {
@@ -867,10 +945,95 @@ impl<'a> Parser<'a> {
         if !self.try_ident("addr")? {
             return self.fail("expected 'addr'");
         }
+        let addr_bits = self.nat()?;
+        let ptr_align = if self.try_ident("align")? {
+            self.nat()?
+        } else {
+            SpaceCfg::natural_align(ptr_bits)
+        };
+        let mut ints = DEFAULT_INTS.to_vec();
+        if self.try_ident("int")? {
+            ints.clear();
+            loop {
+                let w = self.nat()?;
+                self.expect_sym(Sym::Colon)?;
+                ints.push((w, self.nat()?));
+                if !matches!(self.peek(), Tok::Int(_)) {
+                    break;
+                }
+            }
+        }
         Ok(SpaceCfg {
             ptr_bits,
-            addr_bits: self.nat()?,
+            addr_bits,
+            ptr_align,
+            ints,
         })
+    }
+
+    /// `zero`, an integer, `null`, `@name`, `bytes "00ff"`, or `{init, …}`.
+    fn init(&mut self) -> PResult<Init> {
+        Ok(match self.peek() {
+            Tok::Ident("zero") => {
+                self.bump()?;
+                Init::Zero
+            }
+            Tok::Ident("null") => {
+                self.bump()?;
+                Init::Null
+            }
+            Tok::Ident("bytes") => {
+                self.bump()?;
+                let Tok::Str(s) = self.peek() else {
+                    let found = self.peek().describe();
+                    return self.fail(format!("expected a string of hex digits but found {found}"));
+                };
+                let Some(bs) = hex_bytes(s) else {
+                    return self.fail("expected two lowercase hex digits per byte");
+                };
+                self.bump()?;
+                self.globals.bytes_init(bs)
+            }
+            Tok::Int(text) => {
+                self.bump()?;
+                self.globals.int_init(int_value(text))
+            }
+            Tok::Global(name) => {
+                self.bump()?;
+                self.globals.sym_init(name)
+            }
+            Tok::Sym(Sym::LBrace) => {
+                self.bump()?;
+                let items = self.sep_by(Self::init, Sym::RBrace)?;
+                self.globals.list_init(items)
+            }
+            t => {
+                return self.fail(format!(
+                    "expected an initializer but found {}",
+                    t.describe()
+                ));
+            }
+        })
+    }
+
+    /// `global [const] @name: T [align N] = INIT`, after `global`.
+    fn global(&mut self) -> PResult<()> {
+        let constant = self.try_ident("const")?;
+        let name = self.global_name()?;
+        self.expect_sym(Sym::Colon)?;
+        self.in_globals = true;
+        let ty = self.ty();
+        self.in_globals = false;
+        let ty = ty?;
+        let align = if self.try_ident("align")? {
+            self.nat()?
+        } else {
+            1
+        };
+        self.expect_sym(Sym::Eq)?;
+        let init = self.init()?;
+        self.globals.push(name, ty, constant, align, init);
+        Ok(())
     }
 
     fn module(&mut self) -> PResult<Module> {
@@ -878,10 +1041,29 @@ impl<'a> Parser<'a> {
         while self.peek() != Tok::Eof {
             if self.try_ident("memspace")? {
                 m.space = self.memspace()?;
+            } else if self.try_ident("global")? {
+                self.global()?;
             } else {
                 m.funcs.push(self.func()?);
             }
         }
+        m.globals = std::mem::take(&mut self.globals);
         Ok(m)
     }
+}
+
+/// Hex digits, two per byte, lowercase (Lean's `hexBytes`).
+fn hex_bytes(s: &str) -> Option<Vec<u8>> {
+    let digit = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    };
+    let b = s.as_bytes();
+    if !b.len().is_multiple_of(2) {
+        return None;
+    }
+    b.chunks(2)
+        .map(|p| Some(digit(p[0])? * 16 + digit(p[1])?))
+        .collect()
 }
