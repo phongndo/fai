@@ -1,12 +1,15 @@
 //! `fir`: the FIR command-line tool.
 //!
 //! ```text
+//! fir run FILE [@FUNC] [ARG...] [--fuel N]   run a function (default @main)
 //! fir check FILE                             verify; list holes
 //! fir fmt FILE [--no-locs] [--unverified]     print canonical text (--unverified: parse only)
 //! ```
 //!
 //! `check` prints what `fir-ref check` prints: `ok`, or one `hole ?NAME: TYPE @LOC` line per
-//! hole; on failure, `FILE: MESSAGE` on stderr and exit code 1.
+//! hole; on failure, `FILE: MESSAGE` on stderr and exit code 1. `run` prints the one-line
+//! outcome `fir-ref run` prints, for the same oracle (every choice answers `0`); arguments are
+//! integers, `null`, or `poison`, parsed as Lean parses them.
 
 use std::process::ExitCode;
 
@@ -23,6 +26,33 @@ fn run(args: &[&str]) -> Result<(), ExitCode> {
         ExitCode::FAILURE
     };
     match args {
+        ["run", file, rest @ ..] => {
+            let (fuel, rest) = match rest {
+                [r @ .., "--fuel", n] => (
+                    fir::interp::parse_nat(n).map_or(fir::interp::DEFAULT_FUEL, |n| {
+                        u64::try_from(n).unwrap_or(u64::MAX)
+                    }),
+                    r,
+                ),
+                _ => (fir::interp::DEFAULT_FUEL, rest),
+            };
+            let (name, call_args) = match rest {
+                [f, r @ ..] if f.starts_with('@') => (&f[1..], r),
+                _ => ("main", rest),
+            };
+            let m = fir::parse_module(&read(file)?).map_err(|e| fail(file, e))?;
+            fir::verify_module(&m).map_err(|e| fail(file, e))?;
+            match fir::interp::run(&m, name, call_args, fuel) {
+                Ok(s) => {
+                    println!("{s}");
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    Err(ExitCode::FAILURE)
+                }
+            }
+        }
         ["check", file] => {
             let m = fir::parse_module(&read(file)?).map_err(|e| fail(file, e))?;
             let holes = fir::verify_module(&m).map_err(|e| fail(file, e))?;
@@ -43,7 +73,9 @@ fn run(args: &[&str]) -> Result<(), ExitCode> {
             Ok(())
         }
         _ => {
-            eprintln!("usage:\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]");
+            eprintln!(
+                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]"
+            );
             Err(ExitCode::from(2))
         }
     }

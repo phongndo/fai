@@ -10,10 +10,12 @@
 //! values referring to each other by 32-bit index.
 
 mod body;
+pub mod interp;
 mod ir;
 mod lex;
 mod parse;
 mod print;
+mod sem;
 mod verify;
 
 pub use body::{

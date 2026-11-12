@@ -529,7 +529,7 @@ impl Body {
         self.op_kind[op.index()]
     }
 
-    pub fn results(&self, op: OpId) -> impl ExactSizeIterator<Item = ValueId> + use<> {
+    pub fn results(&self, op: OpId) -> impl ExactSizeIterator<Item = ValueId> + Clone + use<> {
         self.op_shape[op.index()]
             .results
             .range()
@@ -565,7 +565,10 @@ impl Body {
 
     // Regions
 
-    pub fn params(&self, region: RegionId) -> impl ExactSizeIterator<Item = ValueId> + use<> {
+    pub fn params(
+        &self,
+        region: RegionId,
+    ) -> impl ExactSizeIterator<Item = ValueId> + Clone + use<> {
         self.regions[region.index()]
             .params
             .range()
