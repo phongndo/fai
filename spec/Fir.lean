@@ -14,6 +14,7 @@ import Fir.Parse
 import Fir.Print
 import Fir.Rules
 import Fir.Sim
+import Fir.SimStutter
 import Fir.CodeRel
 import Fir.Dse
 import Fir.Space
@@ -25,3 +26,4 @@ import Fir.AArch64
 import Fir.AArch64Machine
 import Fir.Lower
 import Fir.LowerBits
+import Fir.LowerProof
