@@ -368,6 +368,11 @@ theorem enterBody_space {sp : SpaceCfg} {m : Machine} (hm : m.core.space = sp) (
   unfold enterBody; ends_in
 macro_rules | `(tactic| ends_lemma) => `(tactic| exact enterBody_space (by assumption) _ _ _)
 
+theorem jump_space {sp : SpaceCfg} {m : Machine} (hm : m.core.space = sp) (loc : Option Loc)
+    (s : Succ) (vs : List RVal) : EndsIn sp (jump m loc s vs) := by
+  unfold jump; ends_in
+macro_rules | `(tactic| ends_lemma) => `(tactic| exact jump_space (by assumption) _ _ _)
+
 theorem terminate_space {sp : SpaceCfg} {m : Machine} (hm : m.core.space = sp) (loc : Option Loc)
     (k : OpKind) (vs : List RVal) : EndsIn sp (terminate m loc k vs) := by
   unfold terminate; ends_in

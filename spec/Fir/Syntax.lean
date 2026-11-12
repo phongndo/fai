@@ -205,14 +205,27 @@ def unsignedEdges : List (Spelling (Edge × Edge)) :=
   [sp "ub" (.ub, .ub), sp "trap" (.trap, .trap), sp "total" (.total, .wrap)] ++
   Edge.all.flatMap fun z => Edge.all.map fun o => sp z.name (z, o) (parses := false)
 
+/-- A branch target: a block of the nearest enclosing `cf.blocks`, by label, and how many of the
+branch's operands are its arguments. A branch's operands are its own (the condition, the switched
+value), then each target's arguments, in the order the targets are written. -/
+structure Succ where
+  label : String
+  nargs : Nat
+  deriving DecidableEq, Repr, Inhabited
+
+/-- `cf.switch`'s cases, in order: a key and its target. -/
+abbrev Cases := List (Int × Succ)
+
 /-- An op's immediate: a value written in its text that isn't an operand (`align 4`,
-`c.malloc`, `@f`). -/
+`c.malloc`, `@f`, a branch target `^b`). -/
 inductive Imm where
   | int (n : Int)
   | nat (n : Nat)
   | str (s : String)
   | ty (t : Ty)
   | flag (b : Bool)
+  | succ (s : Succ)
+  | cases (cs : Cases)
   deriving DecidableEq, Repr
 
 /-! ## Ops
@@ -479,6 +492,31 @@ fir_ops
     name "func.ret"
     format "%*"
     terminator
+  /-- `cf.blocks [progress] { ^entry: … ^b(%x: i32): … }`: labeled blocks, entered at the first
+  (which has no parameters), with jumps between them. Each block ends with a terminator:
+  `cf.yield` leaves with the op's results; `cf.br`, `cf.cond_br`, and `cf.switch` jump. With
+  `progress`, control may be assumed to leave the op (as for `cf.loop progress`). -/
+  op blocks (progress : Flag)
+    name "cf.blocks"
+    format "{progress} blocks"
+    effects diverge
+  /-- `cf.br ^b(%x, …)`: jump to a block of the nearest enclosing `cf.blocks`. -/
+  op br (dest : Succ)
+    name "cf.br"
+    format "{dest}"
+    terminator
+  /-- `cf.cond_br %c, ^t(…), ^f(…)`: jump to `^t` if `%c` is 1, otherwise to `^f`. Branching on
+  `poison` is UB. -/
+  op condBr (t f : Succ)
+    name "cf.cond_br"
+    format "%, {t}, {f}"
+    terminator
+  /-- `cf.switch %v, default ^d(…), [k: ^b(…), …]`: jump to the case whose key is `%v` (keys are
+  taken modulo `2^N`), or to the default. Branching on `poison` is UB. -/
+  op switch (dflt : Succ) (cases : Cases)
+    name "cf.switch"
+    format "%, default {dflt}, {cases}"
+    terminator
 
 /-- The op's name with its modifiers, as printed. -/
 def OpKind.name (k : OpKind) : String :=
@@ -504,21 +542,23 @@ mutual
   inductive Op where
     | mk (kind : OpKind) (results : List Result) (args : List Operand) (regions : List Region)
         (loc : Option Loc)
-  /-- A region's parameters are written like results, and can carry facts. -/
+  /-- A region's parameters are written like results, and can carry facts. A block of
+  `cf.blocks` is a region with a label (`^name`); other regions have none. -/
   inductive Region where
-    | mk (params : List Result) (ops : List Op)
+    | mk (params : List Result) (ops : List Op) (label : Option String)
 end
 
 instance : Inhabited Op := ⟨.mk .poison [] [] [] none⟩
-instance : Inhabited Region := ⟨.mk [] []⟩
+instance : Inhabited Region := ⟨.mk [] [] none⟩
 
 def Op.kind : Op → OpKind | .mk k .. => k
 def Op.results : Op → List Result | .mk _ rs .. => rs
 def Op.args : Op → List Operand | .mk _ _ as .. => as
 def Op.regions : Op → List Region | .mk _ _ _ rs _ => rs
 def Op.loc : Op → Option Loc | .mk _ _ _ _ l => l
-def Region.params : Region → List Result | .mk ps _ => ps
-def Region.ops : Region → List Op | .mk _ ops => ops
+def Region.params : Region → List Result | .mk ps _ _ => ps
+def Region.ops : Region → List Op | .mk _ ops _ => ops
+def Region.label : Region → Option String | .mk _ _ l => l
 
 /-- A function. Its parameters are the parameters of its body region. -/
 structure Func where

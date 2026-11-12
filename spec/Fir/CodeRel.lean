@@ -10,9 +10,9 @@ step gives the same core again, or halts the same way, until the target reaches 
 spot. A proof about such a rewrite only reasons about the rewritten spot itself.
 
 `OpsRel L` relates target code to source code that is the same except that `L` relates some
-target op sequences to source op sequences, at any depth (inside `cf.if` and `cf.loop`
-regions too). `L` also sees the target ops that follow a rewritten sequence in its region, so a
-rewrite can depend on what the rest of the region reads.
+target op sequences to source op sequences, at any depth (inside `cf.if` and `cf.loop` regions
+and the blocks of `cf.blocks` too). `L` also sees the target ops that follow a rewritten
+sequence in its region, so a rewrite can depend on what the rest of the region reads.
 
 ## Environments that differ
 
@@ -50,7 +50,7 @@ def Op.reads (n : String) : Op → Bool
 /-- Whether any op in these regions reads `%n`, at any depth. -/
 def regionsReads (n : String) : List Region → Bool
   | [] => false
-  | .mk _ ops :: rs => opsReads n ops || regionsReads n rs
+  | .mk _ ops _ :: rs => opsReads n ops || regionsReads n rs
 
 /-- Whether any op in `ops` reads `%n`, at any depth. -/
 def opsReads (n : String) : List Op → Bool
@@ -95,8 +95,8 @@ inductive OpRel (L : List Op → List Op → List Op → Prop) : Op → Op → P
 
 inductive RegionsRel (L : List Op → List Op → List Op → Prop) : List Region → List Region → Prop
   | nil : RegionsRel L [] []
-  | cons {ps ot os rt rs} : OpsRel L ot os → RegionsRel L rt rs →
-      RegionsRel L (.mk ps ot :: rt) (.mk ps os :: rs)
+  | cons {ps ot os lbl rt rs} : OpsRel L ot os → RegionsRel L rt rs →
+      RegionsRel L (.mk ps ot lbl :: rt) (.mk ps os lbl :: rs)
 
 /-- Op lists that are the same except where `L` relates a target sequence to a source one. `L`
 also sees the target ops after the sequence, up to the end of the region. -/
@@ -110,7 +110,38 @@ variable {L : List Op → List Op → List Op → Prop}
 
 theorem RegionsRel.refl : (rs : List Region) → RegionsRel L rs rs
   | [] => .nil
-  | .mk _ _ :: rs => .cons (.refl _) (RegionsRel.refl rs)
+  | .mk _ _ _ :: rs => .cons (.refl _) (RegionsRel.refl rs)
+
+/-- Related block lists have related blocks under each label. -/
+theorem RegionsRel.find? (l : String) : ∀ (bt : List Region) {bs : List Region},
+    RegionsRel L bt bs →
+    (bt.find? (·.label == some l) = none ∧ bs.find? (·.label == some l) = none) ∨
+    ∃ b b', bt.find? (·.label == some l) = some b ∧ bs.find? (·.label == some l) = some b' ∧
+      RegionsRel L [b] [b'] ∧ b ∈ bt
+  | [], _, h => by cases h; exact .inl ⟨rfl, rfl⟩
+  | .mk ps ot lbl :: rt, _, h => by
+    cases h with
+    | cons ho hr =>
+    by_cases hl : lbl = some l
+    · subst hl
+      exact .inr ⟨_, _, by simp only [List.find?_cons, Region.label, beq_self_eq_true],
+        by simp only [List.find?_cons, Region.label, beq_self_eq_true], .cons ho .nil,
+        List.mem_cons_self⟩
+    · have hl' : ∀ ops, ((Region.mk ps ops lbl).label == some l) = false := fun _ => by
+        simpa [Region.label] using hl
+      rcases RegionsRel.find? l rt hr with ⟨e1, e2⟩ | ⟨b, b', e1, e2, hb, hm⟩
+      · exact .inl ⟨by rw [List.find?_cons, hl']; exact e1, by rw [List.find?_cons, hl']; exact e2⟩
+      · exact .inr ⟨b, b', by rw [List.find?_cons, hl']; exact e1,
+          by rw [List.find?_cons, hl']; exact e2, hb, List.mem_cons_of_mem _ hm⟩
+
+/-- An op in a region of a list reads only what the list reads. -/
+theorem opsReads_of_mem {n : String} : ∀ {rs : List Region} {b : Region}, b ∈ rs →
+    regionsReads n rs = false → opsReads n b.ops = false
+  | .mk _ _ _ :: rs, b, hb, h => by
+    simp only [regionsReads, Bool.or_eq_false_iff] at h
+    rcases List.mem_cons.mp hb with rfl | hb
+    · exact h.1
+    · exact opsReads_of_mem hb h.2
 
 /-- The cases at the head of related code: both at the end, the same op up to regions, or a
 rewritten sequence. -/
@@ -176,6 +207,9 @@ inductive StackRel (L : List Op → List Op → List Op → Prop) :
       NoReads D bt.ops → StackRel L D (.loop p bt rs loc :: ft) (.loop p bs rs loc :: fs)
   | call {D D' rs rets scopes loc ft fs} : StackRel L D' ft fs →
       StackRel L D (.call rs rets scopes loc :: ft) (.call rs rets scopes loc :: fs)
+  | blocks {D p bt bs rs loc ft fs} : StackRel L D ft fs → RegionsRel L bt bs →
+      (∀ b ∈ bt, NoReads D b.ops) →
+      StackRel L D (.blocks p bt rs loc :: ft) (.blocks p bs rs loc :: fs)
 
 /-- Machines with the same core whose stacks hold related code and related environments. -/
 def MRel (L : List Op → List Op → List Op → Prop) (mt ms : Machine) : Prop :=
@@ -211,6 +245,7 @@ theorem lookup (h : StackRel L D ft fs) {n : String} (hn : ¬ D n) :
   | ifJoin _ ih => exact ih hn
   | loop _ _ _ ih => exact ih hn
   | call => rfl
+  | blocks _ _ _ ih => exact ih hn
 
 theorem operandIn (h : StackRel L D ft fs) (loc : Option Loc) {a : Operand}
     (ha : ∀ n, D n → a.reads n = false) : Fir.operandIn ft loc a = Fir.operandIn fs loc a := by
@@ -239,6 +274,7 @@ theorem tail {f f' : Frame} (h : StackRel L D (f :: ft) (f' :: fs)) : ∃ D', St
   | ifJoin h => exact ⟨_, h⟩
   | loop h => exact ⟨_, h⟩
   | call h => exact ⟨_, h⟩
+  | blocks h => exact ⟨_, h⟩
 
 theorem length_eq (h : StackRel L D ft fs) : ft.length = fs.length := by
   induction h <;> simp_all
@@ -247,6 +283,7 @@ theorem shape (h : StackRel L D ft fs) :
     ft.map Frame.isProgressLoop = fs.map Frame.isProgressLoop := by
   induction h with
   | @loop _ p _ _ _ _ _ _ _ _ _ ih => cases p <;> simp_all [Frame.isProgressLoop]
+  | @blocks _ p _ _ _ _ _ _ _ _ _ ih => cases p <;> simp_all [Frame.isProgressLoop]
   | _ => simp_all [Frame.isProgressLoop]
 
 theorem blockIds (h : StackRel L D ft fs) : Fir.blockIds ft = Fir.blockIds fs := by
@@ -260,6 +297,7 @@ theorem bindTop (h : StackRel L D ft fs) (rs : List Result) (vs : List RVal) :
   | ifJoin h => exact .ifJoin h
   | loop h hb hnr => exact .loop h hb hnr
   | call h => exact .call h
+  | blocks h hb hnr => exact .blocks h hb hnr
 
 theorem addAllocId (h : StackRel L D ft fs) (id : Nat) :
     StackRel L D (Fir.addAllocId id ft) (Fir.addAllocId id fs) := by
@@ -269,6 +307,7 @@ theorem addAllocId (h : StackRel L D ft fs) (id : Nat) :
   | ifJoin h => exact .ifJoin h
   | loop h hb hnr => exact .loop h hb hnr
   | call h => exact .call h
+  | blocks h hb hnr => exact .blocks h hb hnr
 
 /-- A new block on top, holding related code that reads no hidden name, with the same
 environment on both sides. -/
@@ -301,6 +340,12 @@ theorem splitLoop (h : StackRel L D ft fs) :
   | loop h hb hnr _ =>
     exact .inr ⟨[], [], _, _, _, _, _, _, _, _, rfl, rfl, rfl, .loop h hb hnr⟩
   | call => exact .inl ⟨rfl, rfl⟩
+  | blocks _ _ _ ih =>
+    simp only [splitStack, pickLoop, Frame.isCall, Bool.false_eq_true, ite_false]
+    rcases ih with ⟨e1, e2⟩ | ⟨at', as', p, bt, bs, rs, loc, bt', bs', D', e1, e2, hids, hr⟩
+    · exact .inl ⟨by rw [e1]; rfl, by rw [e2]; rfl⟩
+    · exact .inr ⟨_, _, p, bt, bs, rs, loc, bt', bs', D', by rw [e1]; rfl, by rw [e2]; rfl,
+        by simp [Fir.blockIds, hids], hr⟩
 
 /-- Where `func.ret` goes: the same call on both sides, with related frames below it. -/
 theorem splitCall (h : StackRel L D ft fs) :
@@ -329,6 +374,44 @@ theorem splitCall (h : StackRel L D ft fs) :
     · exact .inr ⟨_, _, x, bt', bs', D', by rw [e1]; rfl, by rw [e2]; rfl,
         by simp [Fir.blockIds, hids], hr⟩
   | call h => exact .inr ⟨[], [], _, _, _, _, rfl, rfl, rfl, h⟩
+  | blocks _ _ _ ih =>
+    simp only [splitStack, pickCall, Frame.isCall, Bool.false_eq_true, ite_false]
+    rcases ih with ⟨e1, e2⟩ | ⟨at', as', x, bt', bs', D', e1, e2, hids, hr⟩
+    · exact .inl ⟨by rw [e1]; rfl, by rw [e2]; rfl⟩
+    · exact .inr ⟨_, _, x, bt', bs', D', by rw [e1]; rfl, by rw [e2]; rfl,
+        by simp [Fir.blockIds, hids], hr⟩
+
+/-- Where a jump goes: the same `cf.blocks` on both sides, with related frames below it. -/
+theorem splitBlocks (h : StackRel L D ft fs) :
+    (splitStack pickBlocks ft = none ∧ splitStack pickBlocks fs = none) ∨
+    ∃ at' as' p bt bs rs loc bt' bs' D',
+      splitStack pickBlocks ft = some (at', (p, bt, rs, loc), bt') ∧
+      splitStack pickBlocks fs = some (as', (p, bs, rs, loc), bs') ∧
+      Fir.blockIds at' = Fir.blockIds as' ∧
+      StackRel L D' (.blocks p bt rs loc :: bt') (.blocks p bs rs loc :: bs') := by
+  induction h with
+  | nil => exact .inl ⟨rfl, rfl⟩
+  | block _ _ _ _ _ ih =>
+    simp only [splitStack, pickBlocks, Frame.isCall, Bool.false_eq_true, ite_false]
+    rcases ih with ⟨e1, e2⟩ | ⟨at', as', p, bt, bs, rs, loc, bt', bs', D', e1, e2, hids, hr⟩
+    · exact .inl ⟨by rw [e1]; rfl, by rw [e2]; rfl⟩
+    · exact .inr ⟨_, _, p, bt, bs, rs, loc, bt', bs', D', by rw [e1]; rfl, by rw [e2]; rfl,
+        by simp [Fir.blockIds, hids], hr⟩
+  | ifJoin _ ih =>
+    simp only [splitStack, pickBlocks, Frame.isCall, Bool.false_eq_true, ite_false]
+    rcases ih with ⟨e1, e2⟩ | ⟨at', as', p, bt, bs, rs, loc, bt', bs', D', e1, e2, hids, hr⟩
+    · exact .inl ⟨by rw [e1]; rfl, by rw [e2]; rfl⟩
+    · exact .inr ⟨_, _, p, bt, bs, rs, loc, bt', bs', D', by rw [e1]; rfl, by rw [e2]; rfl,
+        by simp [Fir.blockIds, hids], hr⟩
+  | loop _ _ _ ih =>
+    simp only [splitStack, pickBlocks, Frame.isCall, Bool.false_eq_true, ite_false]
+    rcases ih with ⟨e1, e2⟩ | ⟨at', as', p, bt, bs, rs, loc, bt', bs', D', e1, e2, hids, hr⟩
+    · exact .inl ⟨by rw [e1]; rfl, by rw [e2]; rfl⟩
+    · exact .inr ⟨_, _, p, bt, bs, rs, loc, bt', bs', D', by rw [e1]; rfl, by rw [e2]; rfl,
+        by simp [Fir.blockIds, hids], hr⟩
+  | call => exact .inl ⟨rfl, rfl⟩
+  | blocks h hb hnr _ =>
+    exact .inr ⟨[], [], _, _, _, _, _, _, _, _, rfl, rfl, rfl, .blocks h hb hnr⟩
 
 end StackRel
 
@@ -368,6 +451,23 @@ theorem enterBody_eq {c : Core} {D : String → Prop} {ft fs : List Frame}
     refine lockstep_exec rfl fun _ core => ?_
     exact Lockstep.ok (h.push hops hnr _ _)
 
+/-- A jump from related stacks: to related blocks of the same `cf.blocks`. -/
+theorem jump_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : StackRel L D ft fs)
+    (loc : Option Loc) (s : Succ) (vs : List RVal) :
+    Lockstep L (jump ⟨c, ft⟩ loc s vs) (jump ⟨c, fs⟩ loc s vs) := by
+  unfold jump
+  rcases h.splitBlocks with ⟨e1, e2⟩ |
+    ⟨at', as', p, bt, bs, rs, loc', bt', bs', D', e1, e2, hids, hr⟩
+  · simp only [e1, e2]; exact .halt
+  · simp only [e1, e2, hids]
+    cases hr with
+    | blocks h0 hb hnr =>
+      rcases RegionsRel.find? s.label _ hb with ⟨f1, f2⟩ | ⟨b, b', f1, f2, hbb, hm⟩
+      · simp only [f1, f2]; exact .halt
+      · simp only [f1, f2]
+        refine lockstep_exec rfl fun _ core => ?_
+        exact enterBody_eq (.blocks h0 hb hnr) loc hbb (hnr b hm) vs
+
 /-! ## Control flow -/
 
 theorem terminate_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : StackRel L D ft fs)
@@ -378,6 +478,7 @@ theorem terminate_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : 
     unfold terminate
     cases h with
     | ifJoin h => exact bindResults_eq h _ _ _
+    | blocks h => exact bindResults_eq h _ _ _
     | nil => exact .halt
     | block => exact .halt
     | loop => exact .halt
@@ -411,6 +512,22 @@ theorem terminate_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : 
         split
         · exact .halt
         · exact bindResults_eq hr _ _ _
+  case br => exact jump_eq h loc _ vs
+  case condBr t f =>
+    simp only [terminate]
+    refine lockstep_exec rfl fun x core => ?_
+    cases x with
+    | poison => exact .halt
+    | bits b =>
+      by_cases hb : b = 1
+      · simp only [hb, ite_true]; exact jump_eq h loc _ _
+      · simp only [hb, ite_false]; exact jump_eq h loc _ _
+  case switch d cs =>
+    simp only [terminate]
+    split
+    · exact jump_eq h loc _ _
+    · exact .halt
+    · exact .halt
   all_goals exact .halt
 
 /-- An op without regions, with the current block (the op removed) on top of related stacks. -/
@@ -453,6 +570,9 @@ theorem execFlat_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : S
     | call h' =>
       refine lockstep_exec rfl fun _ core => ?_
       exact terminate_eq h' loc kind vs
+    | blocks h' =>
+      refine lockstep_exec rfl fun _ core => ?_
+      exact terminate_eq h' loc kind vs
   · simp only [h.operands loc hargs]
     refine lockstep_bind fun vs => ?_
     refine lockstep_exec rfl fun _ core => ?_
@@ -469,9 +589,20 @@ theorem execOp_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : Sta
     | refl => cases ot; exact ⟨_, _, _, _, _, _, RegionsRel.refl _, rfl, rfl⟩
     | regions h => exact ⟨_, _, _, _, _, _, h, rfl, rfl⟩
   obtain ⟨hargs, hregs⟩ := Op.reads_mk hr
+  cases hk : k.blocksProgress? with
+  | some p =>
+    cases hreg with
+    | nil => simp only [execOp]; exact execFlat_eq h k res hargs loc
+    | cons hops hrest =>
+      simp only [execOp, hk]
+      have hnr : ∀ b ∈ (Region.mk _ _ _ :: _), NoReads D b.ops :=
+        fun b hb n hn => opsReads_of_mem hb (hregs n hn)
+      exact enterBody_eq (.blocks h (.cons hops hrest) hnr) loc (.cons hops .nil)
+        (hnr _ List.mem_cons_self) []
+  | none =>
   rcases hreg with _ | ⟨hops1, _ | ⟨hops2, _ | ⟨hops3, hrest⟩⟩⟩
   · exact execFlat_eq h k res hargs loc
-  · simp only [execOp]
+  · simp only [execOp, hk]
     cases k.loopProgress? with
     | none => exact .halt
     | some p =>
@@ -479,7 +610,7 @@ theorem execOp_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : Sta
       refine lockstep_bind fun vs => ?_
       refine enterBody_eq (.loop h (.cons hops1 .nil) ?_) loc (.cons hops1 .nil) ?_ vs <;>
       · intro n hn; have := hregs n hn; simp_all [regionsReads, Region.ops]
-  · simp only [execOp]
+  · simp only [execOp, hk]
     split
     · simp only [h.operands loc hargs]
       refine lockstep_bind fun vs => ?_
@@ -496,7 +627,7 @@ theorem execOp_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : Sta
           refine Lockstep.ok (hj.push hops2 (fun n hn => ?_) _ _)
           have := hregs n hn; simp_all [regionsReads]
     · exact .halt
-  · exact .halt
+  · simp only [execOp, hk]; exact .halt
 
 /-- The step from related machines whose top blocks are not at a rewritten sequence. -/
 theorem step_eq {c : Core} {D Db : String → Prop} {t0 s0 : List Op} {ids : List Nat}
@@ -569,6 +700,7 @@ theorem StepMatch.of_mrel {R : Machine → Machine → Prop} {mt ms : Machine} (
   | ifJoin => exact (StepMatch.of_lockstep hshape .halt).mono lift
   | loop => exact (StepMatch.of_lockstep hshape .halt).mono lift
   | call => exact (StepMatch.of_lockstep hshape .halt).mono lift
+  | blocks => exact (StepMatch.of_lockstep hshape .halt).mono lift
 
 /-- A source step that the target doesn't take, before a step match: the source runs one step
 ahead of the target. -/
@@ -653,6 +785,7 @@ theorem bindTop_nil (vs : List RVal) : ∀ fs : List Frame, bindTop [] vs fs = f
   | .ifJoin .. :: _ => rfl
   | .loop .. :: _ => rfl
   | .call .. :: _ => rfl
+  | .blocks .. :: _ => rfl
 
 /-- Lookups don't depend on the code left in a block. -/
 theorem lookup_ops (n : String) (o o' : List Op) (ids : List Nat) (env : Env) (fs : List Frame) :

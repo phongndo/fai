@@ -12,9 +12,10 @@ namespace Fir
 
 /-- From step `N` on, the frame `d` from the bottom of the stack is always a `progress` loop:
 that loop never exits. (Frames below the top change only by being popped, and a loop frame is
-replaced only by itself on `cf.continue`, so this is the same as the frames up to and including
-the loop never changing.) This is exactly a `cf.loop progress` that runs forever, including one
-whose body never returns from a call. -/
+replaced only by itself on `cf.continue`, as a `cf.blocks` frame is on a jump, so this is the
+same as the frames up to and including the loop never changing.) This is exactly a
+`cf.loop progress` that runs forever, including one whose body never returns from a call, and a
+`cf.blocks progress` whose jumps never leave it. -/
 def StuckInProgressLoop (oracle : Nat → Int) (mod : Module) (f : Func) (args : List RVal) :
     Prop :=
   ∃ N d, ∀ n, N ≤ n → ∃ m, stateAt oracle mod f args n = .ok m ∧ m.inProgressLoopAt d

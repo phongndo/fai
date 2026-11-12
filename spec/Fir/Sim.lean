@@ -7,8 +7,8 @@ The tool for proving that one function refines another: relate the target machin
 the source machine's, and show that each target step is matched by source steps.
 
 `Simulation.refines` turns a step-by-step simulation into `Func.Refines`. It handles everything
-about whole runs (halting, divergence, and `progress` loops that never exit), so a proof about a
-rewrite only reasons about single steps.
+about whole runs (halting, divergence through loops or jumps, and `progress` loops and blocks
+that never exit), so a proof about a rewrite only reasons about single steps.
 
 Each target step is matched by one or more source steps (a source may take extra steps, as when
 it runs a store the target deleted), or by the source halting with UB or getting stuck, after

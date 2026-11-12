@@ -11,12 +11,19 @@ interpreter.
 * Types: `iN` has `N ≥ 1`; `bN` has `N` a positive multiple of 8. Memory spaces have positive
   sizes that are multiples of 8, with the address size at most the pointer size.
 * SSA: every value is defined once per function, and used only where it is visible (after its
-  definition, in the same region or a nested one).
+  definition, in the same region or a nested one). The blocks of `cf.blocks` are regions too: a
+  value defined in a block is visible only in that block, and values from outside the
+  `cf.blocks` in all of them; block arguments carry values from one block to another.
 * Ops: operand counts and types match the op; constants and facts fit their type; alignments
   are powers of two; calls match the callee's signature.
-* Control flow: a terminator is the last op of its region. `cf.yield` ends a `cf.if` region;
-  `cf.break` and `cf.continue` appear inside a loop; loop bodies end with a terminator; a
-  function body ends with `func.ret`.
+* Control flow: a terminator is the last op of its region. `cf.yield` ends a `cf.if` region or
+  a block; `cf.break` and `cf.continue` appear inside a loop; loop bodies and blocks end with a
+  terminator; a function body ends with `func.ret`.
+* Blocks: `cf.blocks` has at least one block; every block has a label, unique in its
+  `cf.blocks`, and no other region has one; the first block has no parameters. `cf.br`,
+  `cf.cond_br`, and `cf.switch` appear inside `cf.blocks` (possibly inside `cf.if` and `cf.loop`
+  regions there) and name blocks of the nearest one, with arguments of the blocks' parameter
+  types. A switch is on an integer, with keys that fit its type and differ modulo `2^N`.
 * Facts: ranges apply to integers, `nonnull` and `align` to pointers, and `noalias` and
   `readonly` only to pointer parameters of functions.
 
@@ -30,6 +37,9 @@ inductive RegionCtx where
   | func (rets : List Ty)
   | ifBranch (results : List Ty)
   | loopBody (params : List Ty) (results : List Ty)
+  /-- A block of `cf.blocks`: the labels of its blocks with their parameter types, and the
+  `cf.blocks`'s results. -/
+  | block (blocks : List (String × List Ty)) (results : List Ty)
 
 structure Hole where
   name : String
@@ -164,6 +174,23 @@ def nearestLoop : List RegionCtx → Option (List Ty × List Ty)
   | .loopBody ps rs :: _ => some (ps, rs)
   | _ :: rest => nearestLoop rest
 
+/-- The blocks of the nearest enclosing `cf.blocks`. -/
+def nearestBlocks : List RegionCtx → Option (List (String × List Ty))
+  | [] => none
+  | .block bs _ :: _ => some bs
+  | _ :: rest => nearestBlocks rest
+
+/-- Check a branch to `s` with arguments of types `args`. -/
+def checkSucc (loc : Option Loc) (bs : List (String × List Ty)) (s : Succ) (args : List Ty) :
+    VM Unit := do
+  let some ps := bs.lookup s.label | verr loc s!"no block ^{s.label} in the enclosing cf.blocks"
+  expectTys loc s!"arguments of ^{s.label}" args ps
+
+/-- A branch's operand types after its own, split among its targets in order. -/
+def splitArgs : List Succ → List Ty → List (Succ × List Ty)
+  | [], _ => []
+  | s :: ss, ts => (s, ts.take s.nargs) :: splitArgs ss (ts.drop s.nargs)
+
 def funcRets : List RegionCtx → List Ty
   | [] => []
   | [.func rets] => rets
@@ -178,6 +205,7 @@ mutual
       | .ifBranch [] :: _ => pure ()
       | .ifBranch _ :: _ => verr regionLoc "this cf.if region must end with cf.yield"
       | .loopBody .. :: _ => verr regionLoc "a loop body must end with cf.break or cf.continue"
+      | .block .. :: _ => verr regionLoc "a block must end with a terminator"
       | _ => verr regionLoc "the function body must end with func.ret"
     | op :: rest => do
       let scope ← verifyOp ctx scope op
@@ -191,8 +219,9 @@ mutual
     let outs := op.results.map (·.ty)
     match op.kind, op.regions with
     | .yield, [] =>
-      let .ifBranch rs :: _ := ctx | verr loc "cf.yield must end a cf.if region"
-      expectTys loc "cf.yield" ins rs
+      match ctx with
+      | .ifBranch rs :: _ | .block _ rs :: _ => expectTys loc "cf.yield" ins rs
+      | _ => verr loc "cf.yield must end a cf.if region or a block"
     | .brk, [] =>
       let some (_, rs) := nearestLoop ctx | verr loc "cf.break outside a loop"
       expectTys loc "cf.break" ins rs
@@ -200,12 +229,49 @@ mutual
       let some (ps, _) := nearestLoop ctx | verr loc "cf.continue outside a loop"
       expectTys loc "cf.continue" ins ps
     | .ret, [] => expectTys loc "func.ret" ins (funcRets ctx)
+    | .br dest, [] =>
+      let some bs := nearestBlocks ctx | verr loc "cf.br outside cf.blocks"
+      unless ins.length == dest.nargs do verr loc "malformed op"
+      checkSucc loc bs dest ins
+    | .condBr t f, [] =>
+      let some bs := nearestBlocks ctx | verr loc "cf.cond_br outside cf.blocks"
+      unless ins.length == 1 + t.nargs + f.nargs do verr loc "malformed op"
+      expectTys loc "cf.cond_br condition" (ins.take 1) [.int 1]
+      for (s, ts) in splitArgs [t, f] (ins.drop 1) do checkSucc loc bs s ts
+    | .switch d cs, [] =>
+      let some bs := nearestBlocks ctx | verr loc "cf.switch outside cf.blocks"
+      let targets := d :: cs.map (·.2)
+      unless ins.length == 1 + (targets.map (·.nargs)).sum do verr loc "malformed op"
+      let t := ins.headD (.int 1)
+      unless t.isInt do verr loc s!"cf.switch value: expected an integer but got {t}"
+      let mut seen : List Int := []
+      for (k, _) in cs do
+        unless fitsSigned t.width k || fitsUnsigned t.width k do
+          verr loc s!"{k} does not fit in {t}"
+        if seen.contains (k % 2 ^ t.width) then verr loc s!"cf.switch has more than one case {k}"
+        seen := (k % 2 ^ t.width) :: seen
+      for (s, ts) in splitArgs targets (ins.drop 1) do checkSucc loc bs s ts
+    | .blocks _, rs =>
+      unless ins.isEmpty do verr loc "malformed op"
+      let some entry := rs.head? | verr loc "cf.blocks needs at least one block"
+      let mut bs : List (String × List Ty) := []
+      for r in rs do
+        let some l := r.label | verr loc "every block of cf.blocks needs a label"
+        if (bs.lookup l).isSome then verr loc s!"block ^{l} is defined more than once"
+        bs := bs ++ [(l, r.params.map (·.ty))]
+      unless entry.params.isEmpty do verr loc "the entry block of cf.blocks has no parameters"
+      for r in rs do
+        let mut inner := scope
+        for p in r.params do inner ← define loc inner p
+        verifyOps (.block bs outs :: ctx) inner loc r.ops
     | .if_, [thn, els] =>
       expectTys loc "cf.if condition" ins [.int 1]
       for r in [thn, els] do
         unless r.params.isEmpty do verr loc "cf.if regions have no parameters"
+        unless r.label.isNone do verr loc "only blocks of cf.blocks have labels"
         verifyOps (.ifBranch outs :: ctx) scope loc r.ops
     | .loop _, [body] =>
+      unless body.label.isNone do verr loc "only blocks of cf.blocks have labels"
       let ps := body.params.map (·.ty)
       expectTys loc "cf.loop initial values" ins ps
       let mut inner := scope

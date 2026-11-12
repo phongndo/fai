@@ -43,39 +43,81 @@ def renderOpLoc (showLocs : Bool) : Option Loc → String
 
 def commas (xs : List String) : String := ", ".intercalate xs
 
-/-- An immediate's value as text. -/
+/-- A branch target in the generic form: `^b`, or `^b(n)` for `n` arguments. -/
+def Succ.renderGeneric (s : Succ) : String :=
+  "^" ++ s.label ++ (if s.nargs == 0 then "" else s!"({s.nargs})")
+
+/-- An immediate's value as text. Branch targets are in the generic form; the readable form
+writes them with their operands. -/
 def Imm.render (f : Field) : Imm → String
   | .int n => toString n
   | .nat n => toString n
   | .str s => if f.ty == .func then "@" ++ s else s
   | .ty t => toString t
   | .flag b => toString b
+  | .succ s => s.renderGeneric
+  | .cases cs => "[" ++ commas (cs.map fun (k, s) => s!"{k}: {s.renderGeneric}") ++ "]"
+
+/-- How many of an op's operands are its branch targets' arguments. -/
+def OpKind.succArgs (k : OpKind) : Nat :=
+  k.decl.imms.foldl (init := 0) fun n f =>
+    match k.imm f.name with
+    | some (.succ s) => n + s.nargs
+    | some (.cases cs) => n + (cs.map (·.2.nargs)).sum
+    | _ => n
 
 /-- Whether the readable form can show an op with these operands and regions: as many operands
-as the format holds, and the regions it lists, with parameters only where `%iter` gives them. -/
-def OpDecl.fits (d : OpDecl) (args : List Operand) (regions : List Region) : Bool :=
+as the format holds (with its branch targets' arguments), and the regions it lists, with
+parameters only where `%iter` gives them; or, for `cf.blocks`, regions that all have labels. -/
+def OpDecl.fits (d : OpDecl) (k : OpKind) (args : List Operand) (regions : List Region) : Bool :=
   let iter := d.items.contains .iter
-  regions.length == d.regions.length &&
-  (regions.zipIdx.all fun (r, i) => r.params.isEmpty || (iter && i == 0)) &&
+  (if d.hasBlocks then regions.all (·.label.isSome)
+   else regions.length == d.regions.length && regions.all (·.label.isNone) &&
+    regions.zipIdx.all fun (r, i) => r.params.isEmpty || (iter && i == 0)) &&
   (if d.items.contains .variadic || d.items.contains .args then true
    else if iter then some args.length == regions.head?.map (·.params.length)
-   else args.length == (d.items.filter (· == .operand)).length)
+   else args.length == (d.items.filter (· == .operand)).length + k.succArgs)
 
 mutual
   partial def renderRegion (showLocs : Bool) (indent : String) (r : Region) : String :=
     let body := r.ops.map (renderOp showLocs (indent ++ "  "))
     "{\n" ++ String.join body ++ indent ++ "}"
 
+  /-- `cf.blocks`'s blocks, each label at the op's indentation and its ops one level in. -/
+  partial def renderBlocks (showLocs : Bool) (indent : String) (rs : List Region) : String :=
+    let block (r : Region) :=
+      let params := if r.params.isEmpty then "" else
+        "(" ++ commas (r.params.map Result.render) ++ ")"
+      indent ++ "^" ++ r.label.getD "" ++ params ++ ":\n" ++
+        String.join (r.ops.map (renderOp showLocs (indent ++ "  ")))
+    "{\n" ++ String.join (rs.map block) ++ indent ++ "}"
+
   /-- The readable form, from the op's declared format. -/
   partial def renderReadable (showLocs : Bool) (indent : String) (op : Op) : String := Id.run do
     let d := op.kind.decl
     let mut out := op.kind.name
     let mut args := op.args
+    -- A branch target with its arguments, taken from the operands.
+    let target (s : Succ) (args : List Operand) : String × List Operand :=
+      let mine := args.take s.nargs
+      let text := if mine.isEmpty then "" else "(" ++ commas (mine.map Operand.render) ++ ")"
+      ("^" ++ s.label ++ text, args.drop s.nargs)
     for item in d.head do
       match item with
       | .imm f =>
         match (d.field? f).getD default, op.kind.imm f with
         | { ty := .flag, .. }, some (.flag b) => if b then out := out ++ " " ++ f
+        | _, some (.succ s) =>
+          let (text, rest) := target s args
+          out := out ++ " " ++ text
+          args := rest
+        | _, some (.cases cs) =>
+          let mut items := #[]
+          for (k, s) in cs do
+            let (text, rest) := target s args
+            items := items.push s!"{k}: {text}"
+            args := rest
+          out := out ++ " [" ++ commas items.toList ++ "]"
         | field, some v => out := out ++ " " ++ v.render field
         | _, none => pure ()
       | .operand =>
@@ -96,13 +138,14 @@ mutual
           let items := (params.zip args).map fun (r, a) => s!"{r.render} = {a.render}"
           out := out ++ " iter(" ++ commas items ++ ")"
         args := []
-      | .region _ => pure ()
+      | .region _ | .blocks => pure ()
     out := out ++ renderOpLoc showLocs op.loc
     for kw in d.regions, r in op.regions do
       match kw with
       | none => out := out ++ " " ++ renderRegion showLocs indent r
       | some kw =>
         unless r.ops.isEmpty do out := out ++ " " ++ kw ++ " " ++ renderRegion showLocs indent r
+    if d.hasBlocks then out := out ++ " " ++ renderBlocks showLocs indent op.regions
     pure out
 
   /-- The generic form: `"name"(operands) {attrs} @loc (regions)`. -/
@@ -113,9 +156,13 @@ mutual
         f.name ++ " = " ++ (((op.kind.imm f.name).map (·.render f)).getD "")
       " {" ++ commas items ++ "}"
     let region (r : Region) :=
+      let label := match r.label with
+        | some l => "^" ++ l
+        | none => ""
       let params := if r.params.isEmpty then "" else
-        "(" ++ commas (r.params.map Result.render) ++ ") "
-      params ++ renderRegion showLocs indent r
+        "(" ++ commas (r.params.map Result.render) ++ ")"
+      let head := label ++ params
+      (if head.isEmpty then "" else head ++ " ") ++ renderRegion showLocs indent r
     let regions := if op.regions.isEmpty then "" else
       " (" ++ commas (op.regions.map region) ++ ")"
     "\"" ++ op.kind.name ++ "\"(" ++ commas (op.args.map Operand.render) ++ ")" ++ attrs ++
@@ -124,7 +171,8 @@ mutual
   partial def renderOp (showLocs : Bool) (indent : String) (op : Op) : String :=
     let results := if op.results.isEmpty then "" else
       commas (op.results.map Result.render) ++ " = "
-    let line := if op.kind.decl.fits op.args op.regions then renderReadable showLocs indent op
+    let line := if op.kind.decl.fits op.kind op.args op.regions
+      then renderReadable showLocs indent op
       else renderGeneric showLocs indent op
     indent ++ results ++ line ++ "\n"
 end

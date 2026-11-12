@@ -40,8 +40,32 @@ region   ::= ["(" [result, …] ")"] "{" op* "}"
 `%r: i32 = "cf.loop"(%z) {progress = false} ((%i: i32) { … })`. The string is the op's name with
 its modifiers. The attributes are the op's immediates, named after its fields, each given once in
 any order; their values are written as in the readable form, except that a flag is `true` or
-`false`. Operand and region counts aren't checked here; the verifier checks them. The printer
-uses the readable form whenever the op's shape fits it, and the generic form otherwise.
+`false`, and a branch target is its label and argument count (`^b(2)`, or `^b` for none), its
+arguments being among the operands. Operand and region counts aren't checked here; the verifier
+checks them. The printer uses the readable form whenever the op's shape fits it, and the generic
+form otherwise.
+
+## Blocks
+
+`cf.blocks` holds labeled blocks, and branches name them:
+
+```
+%r: i32 = cf.blocks {
+^entry:
+  cf.br ^loop(%zero)
+^loop(%i: i32):
+  %done: i1 = int.cmp.sge %i, %n
+  cf.cond_br %done, ^exit, ^loop(%i2)
+^exit:
+  cf.yield %i
+}
+```
+
+A block is a label, its parameters in parentheses (left out when there are none), `:`, and its
+ops, up to the next label or the closing `}`. A branch target is a label with its arguments in
+parentheses (left out when there are none); `cf.switch` writes its cases as
+`[1: ^a, -1: ^b(%x)]`. In the generic form, a region may start with a label:
+`"cf.blocks"() {progress = false} (^entry { … }, ^loop(%i: i32) { … })`.
 -/
 
 namespace Fir
@@ -86,6 +110,11 @@ def ident : P String := do
   match ← peek with
   | .ident s => discard next; pure s
   | t => fail s!"expected a name but found {t.describe}"
+
+def labelName : P String := do
+  match ← peek with
+  | .label s => discard next; pure s
+  | t => fail s!"expected a block label like ^b but found {t.describe}"
 
 def value : P String := do
   match ← peek with
@@ -189,7 +218,31 @@ def funcName : P String := do
   | .global s => discard next; pure s
   | t => fail s!"expected a function name like @f but found {t.describe}"
 
-/-- An immediate, as the readable form writes it. A flag is a keyword named after its field. -/
+/-- A branch target in the readable form: `^b` or `^b(%x, …)`, with its arguments. -/
+def succ : P (Succ × List Operand) := do
+  let label ← labelName
+  let args ← if ← trySym "(" then sepBy operand ")" else pure []
+  pure ({ label, nargs := args.length }, args)
+
+/-- `[k: target, …]`, with the targets' arguments in order. -/
+def cases (target : P (Succ × List Operand)) : P (Cases × List Operand) := do
+  expectSym "["
+  let items ← sepBy (do
+    let k ← int
+    expectSym ":"
+    let (s, args) ← target
+    pure ((k, s), args)) "]"
+  pure (items.map (·.1), items.flatMap (·.2))
+
+/-- A branch target in the generic form: `^b` or `^b(n)`, for `n` arguments. -/
+def genericSucc : P (Succ × List Operand) := do
+  let label ← labelName
+  let nargs ← if ← trySym "(" then do let n ← nat; expectSym ")"; pure n else pure 0
+  pure ({ label, nargs }, [])
+
+/-- An immediate, as the readable form writes it. A flag is a keyword named after its field.
+Branch targets are read here as the generic form writes them; the readable form's go with
+their operands (`head`). -/
 def imm (f : Field) : P Imm :=
   match f.ty with
   | .int => .int <$> int
@@ -197,6 +250,8 @@ def imm (f : Field) : P Imm :=
   | .symbol => .str <$> ident
   | .func => .str <$> funcName
   | .ty => .ty <$> ty
+  | .succ => (.succ ·.1) <$> genericSucc
+  | .cases => (.cases ·.1) <$> cases genericSucc
   | .flag | .mod _ => .flag <$> tryIdent f.name
 
 /-- `%name: type = %init` -/
@@ -213,7 +268,18 @@ def head (kind : OpKind) (d : OpDecl) : P (OpKind × List Operand × List Result
   let mut params := []
   for item in d.head do
     match item with
-    | .imm f => kind := kind.setImm f (← imm ((d.field? f).getD default))
+    | .imm f =>
+      let field := (d.field? f).getD default
+      match field.ty with
+      | .succ =>
+        let (s, ops) ← succ
+        kind := kind.setImm f (.succ s)
+        args := args ++ ops
+      | .cases =>
+        let (cs, ops) ← cases succ
+        kind := kind.setImm f (.cases cs)
+        args := args ++ ops
+      | _ => kind := kind.setImm f (← imm field)
     | .operand => args := args ++ [← operand]
     | .comma => expectSym ","
     | .keyword kw => unless ← tryIdent kw do fail s!"expected '{kw}'"
@@ -225,7 +291,7 @@ def head (kind : OpKind) (d : OpDecl) : P (OpKind × List Operand × List Result
         let iter ← sepBy iterArg ")"
         params := iter.map (·.1)
         args := args ++ iter.map (·.2)
-    | .region _ => pure ()
+    | .region _ | .blocks => pure ()
   pure (kind, args, params)
 
 /-- A generic-form attribute value: as in the readable form, except that a flag is `true` or
@@ -268,18 +334,38 @@ def attrs (kind : OpKind) (name : String) : P OpKind := do
   pure kind
 
 mutual
-  partial def region (params : List Result) : P Region := do
+  partial def region (params : List Result) (label : Option String := none) : P Region := do
     expectSym "{"
     let mut ops := #[]
     while !(← trySym "}") do
       if (← peek) == .eof then fail "expected '}'"
       ops := ops.push (← op)
-    pure (.mk params ops.toList)
+    pure (.mk params ops.toList label)
 
-  /-- A region in the generic form: `(%x: T, …) { … }`, the parameters optional. -/
+  /-- A region in the generic form: `^b(%x: T, …) { … }`, the label and parameters optional. -/
   partial def genericRegion : P Region := do
+    let label ← match ← peek with
+      | .label l => discard next; pure (some l)
+      | _ => pure none
     let params ← if ← trySym "(" then sepBy result ")" else pure []
-    region params
+    region params label
+
+  /-- `cf.blocks`'s blocks: `{ ^a: ops ^b(%x: T): ops … }`. -/
+  partial def blocks : P (List Region) := do
+    expectSym "{"
+    let mut bs := #[]
+    while !(← trySym "}") do
+      let label ← labelName
+      let params ← if ← trySym "(" then sepBy result ")" else pure []
+      expectSym ":"
+      let mut ops := #[]
+      repeat
+        match ← peek with
+        | .label _ | .sym "}" => break
+        | .eof => fail "expected '}'"
+        | _ => ops := ops.push (← op)
+      bs := bs.push (.mk params ops.toList (some label))
+    pure bs.toList
 
   partial def op : P Op := do
     let results ←
@@ -310,8 +396,9 @@ mutual
       for kw in d.regions do
         let r ← match kw with
           | none => region (if regions.isEmpty then params else [])
-          | some kw => if ← tryIdent kw then region [] else pure (.mk [] [])
+          | some kw => if ← tryIdent kw then region [] else pure (.mk [] [] none)
         regions := regions.push r
+      if d.hasBlocks then regions := regions ++ (← blocks).toArray
       pure (.mk kind results args regions.toList loc)
 end
 

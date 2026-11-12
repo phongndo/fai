@@ -18,6 +18,11 @@ its parameters. A name is looked up in the current call's block frames, innermos
 value is visible exactly where the verifier allows it to be used, and a use of anything else
 gets stuck.
 
+A `cf.blocks` op runs like a loop whose iterations may start at any of its blocks: its frame
+stays on the stack while its blocks run above it, one at a time. A jump (`cf.br`, `cf.cond_br`,
+`cf.switch`) pops the frames above the nearest `cf.blocks` frame, ending their stack memory, and
+starts the target block with only its parameters bound, as `cf.continue` starts an iteration.
+
 The split is for proofs. Ops on values and memory are computations on the core alone (`CM`):
 they take their operands' values and return their results' values, and never see the stack or
 the environment. Only the control-flow layer (`step`, `execOp`, `terminate`) evaluates operands
@@ -49,6 +54,8 @@ inductive Frame where
   /-- A function call: where the results go, the return types, and the `noalias` scopes the
   call opened. Lookups stop here: a callee sees only its own frames. -/
   | call (results : List Result) (rets : List Ty) (scopes : List Nat) (loc : Option Loc)
+  /-- A running `cf.blocks`. Its current block runs in the frames above it. -/
+  | blocks (progress : Bool) (blocks : List Region) (results : List Result) (loc : Option Loc)
 
 /-- An active `noalias` or `readonly` scope: one function parameter during one call. -/
 structure Scope where
@@ -672,6 +679,10 @@ def pickCall : Frame → Option (List Result × List Ty × List Nat × Option Lo
   | .call rs rets scopes loc => some (rs, rets, scopes, loc)
   | _ => none
 
+def pickBlocks : Frame → Option (Bool × List Region × List Result × Option Loc)
+  | .blocks p bs rs loc => some (p, bs, rs, loc)
+  | _ => none
+
 /-- The stack allocations made by these frames' blocks. -/
 def blockIds : List Frame → List Nat
   | [] => []
@@ -684,6 +695,29 @@ def enterBody (m : Machine) (loc : Option Loc) (body : Region) (vs : List RVal) 
   let ((), m) ← m.exec (checkResults loc body.params vs)
   pure { m with stack := .block body.ops [] (Env.bindAll {} body.params vs) :: m.stack }
 
+/-- Jump to block `s` of the nearest `cf.blocks`, with arguments `vs`: pop the frames above it,
+ending their stack memory, and start the block. -/
+def jump (m : Machine) (loc : Option Loc) (s : Succ) (vs : List RVal) : Except Halt Machine :=
+  match splitStack pickBlocks m.stack with
+  | some (above, (p, bs, rs, loc'), below) =>
+    match bs.find? (·.label == some s.label) with
+    | some b => do
+      let ((), m) ← { m with stack := .blocks p bs rs loc' :: below }.exec
+        (releaseIds (blockIds above))
+      enterBody m loc b vs
+    | none => halt (.stuck s!"no block ^{s.label}") loc
+  | none => halt (.stuck "a jump outside cf.blocks") loc
+
+/-- `cf.switch`'s target for the value `n` of a `w`-bit integer, with its arguments: the first
+case whose key is `n` modulo `2^w`, or the default. `vs` are the targets' arguments in order. -/
+def switchTarget (w n : Nat) (d : Succ) (cs : Cases) (vs : List RVal) : Succ × List RVal :=
+  go cs (vs.drop d.nargs)
+where
+  go : Cases → List RVal → Succ × List RVal
+    | [], _ => (d, vs.take d.nargs)
+    | (k, s) :: cs, rest =>
+      if (k % (2 ^ w : Int)).toNat == n then (s, rest.take s.nargs) else go cs (rest.drop s.nargs)
+
 /-- Run a terminator. The current block has already been popped. -/
 def terminate (m : Machine) (loc : Option Loc) (k : OpKind) (vs : List RVal) :
     Except Halt Machine :=
@@ -691,8 +725,24 @@ def terminate (m : Machine) (loc : Option Loc) (k : OpKind) (vs : List RVal) :
   | .yield =>
     match m.stack with
     | .ifJoin rs loc' :: rest => { m with stack := rest }.bindResults loc' rs vs
+    | .blocks _ _ rs loc' :: rest => { m with stack := rest }.bindResults loc' rs vs
     | .loop .. :: _ => halt (.stuck "a loop body must end with cf.break or cf.continue") loc
     | _ => halt (.stuck "the function ended without func.ret") loc
+  | .br dest => jump m loc dest vs
+  | .condBr t f => do
+    let (c, m) ← m.exec (asInt loc 1 (vs.headD (.int 1 .poison)))
+    match c with
+    | .poison => ub .poison loc "branch on poison"
+    | .bits b =>
+      if b = 1 then jump m loc t ((vs.drop 1).take t.nargs)
+      else jump m loc f ((vs.drop 1).drop t.nargs)
+  | .switch d cs =>
+    match vs with
+    | .int w (.bits b) :: rest =>
+      let (s, args) := switchTarget w b.toNat d cs rest
+      jump m loc s args
+    | .int _ .poison :: _ => ub .poison loc "branch on poison"
+    | _ => halt (.stuck "cf.switch needs an integer") loc
   | .brk =>
     match splitStack pickLoop m.stack with
     | some (above, (_, _, rs, loc'), below) => do
@@ -735,6 +785,10 @@ def OpKind.isIf : OpKind → Bool
   | .if_ => true
   | _ => false
 
+def OpKind.blocksProgress? : OpKind → Option Bool
+  | .blocks p => some p
+  | _ => none
+
 /-- Run an op without regions. The current block, with the op removed, is on top of the stack. -/
 def execFlat (m : Machine) (kind : OpKind) (results : List Result) (args : List Operand)
     (loc : Option Loc) : Except Halt Machine :=
@@ -771,15 +825,17 @@ def execFlat (m : Machine) (kind : OpKind) (results : List Result) (args : List 
 /-- Run one op. The current block, with the op removed, is on top of the stack. -/
 def execOp (m : Machine) : Op → Except Halt Machine
   | .mk kind results args regions loc =>
-    match regions with
-    | [] => execFlat m kind results args loc
-    | [body] =>
+    match regions, kind.blocksProgress? with
+    | [], _ => execFlat m kind results args loc
+    | entry :: rest, some p =>
+      enterBody { m with stack := .blocks p (entry :: rest) results loc :: m.stack } loc entry []
+    | [body], none =>
       match kind.loopProgress? with
       | some p => do
         let vs ← operands m.stack loc args
         enterBody { m with stack := .loop p body results loc :: m.stack } loc body vs
       | none => halt (.stuck "malformed op") loc
-    | [thn, els] =>
+    | [thn, els], none =>
       if kind.isIf then do
         let vs ← operands m.stack loc args
         let (c, m) ← m.exec (asInt loc 1 (vs.headD (.int 1 .poison)))
@@ -789,7 +845,7 @@ def execOp (m : Machine) : Op → Except Halt Machine
           pure { m with
             stack := .block (if b = 1 then thn else els).ops [] {} :: .ifJoin results loc :: m.stack }
       else halt (.stuck "malformed op") loc
-    | _ => halt (.stuck "malformed op") loc
+    | _, _ => halt (.stuck "malformed op") loc
 
 /-- One step of the machine. -/
 def step (m : Machine) : Except Halt Machine :=
@@ -825,11 +881,13 @@ def stateAt (oracle : Nat → Int) (mod : Module) (f : Func) (args : List RVal) 
     Except Halt Machine :=
   (Machine.init oracle mod f args).bind (runSteps n)
 
+/-- A `cf.loop progress` or `cf.blocks progress`: one that control may be assumed to leave. -/
 def Frame.isProgressLoop : Frame → Bool
   | .loop true .. => true
+  | .blocks true .. => true
   | _ => false
 
-/-- Which frames are `progress` loops, from the top of the stack down. -/
+/-- Which frames are `progress` loops (or `progress` blocks), from the top of the stack down. -/
 def Machine.shape (m : Machine) : List Bool := m.stack.map Frame.isProgressLoop
 
 /-- The frame `d` from the bottom of the stack is a `progress` loop. -/

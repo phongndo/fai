@@ -15,6 +15,8 @@ inductive Tok where
   | loc (line col : Nat)
   /-- `?name` -/
   | hole (s : String)
+  /-- `^name`, a block label -/
+  | label (s : String)
   | ident (s : String)
   | int (n : Int)
   | str (s : String)
@@ -28,6 +30,7 @@ def Tok.describe : Tok → String
   | .global s => s!"@{s}"
   | .loc l c => s!"@{l}:{c}"
   | .hole s => s!"?{s}"
+  | .label s => s!"^{s}"
   | .ident s => s!"'{s}'"
   | .int n => s!"{n}"
   | .str s => s!"\"{s}\""
@@ -71,10 +74,12 @@ where
         go (s.takeWhile (· != '\n')).2 acc
       else if c == '-' && cs.head? == some '>' then emit (.sym "->") s.advance.advance
       else if "(){}[],:=".contains c then emit (.sym c.toString) s.advance
-      else if c == '%' || c == '?' then
+      else if c == '%' || c == '?' || c == '^' then
         let (name, s') := s.advance.takeWhile isNameChar
         if name.isEmpty then fail s!"expected a name after '{c}'"
-        else emit (if c == '%' then .value name else .hole name) s'
+        else
+          let t := if c == '%' then .value name else if c == '?' then .hole name else .label name
+          emit t s'
       else if c == '@' then
         let s1 := s.advance
         if s1.chars.head?.any Char.isDigit then

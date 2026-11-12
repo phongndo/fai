@@ -50,6 +50,8 @@ def _root_.Fir.FieldTy.rust : FieldTy → String
   | .align => "u32"
   | .symbol | .func => "StrId"
   | .ty => "Ty"
+  | .succ => "SuccId"
+  | .cases => "CasesId"
   | .flag | .mod "Bool" => "bool"
   | .mod t => t
 
@@ -60,6 +62,8 @@ def _root_.Fir.FieldTy.placeholder : FieldTy → String
   | .align => "1"
   | .symbol | .func => "StrId::PLACEHOLDER"
   | .ty => "Ty::Ptr"
+  | .succ => "SuccId::PLACEHOLDER"
+  | .cases => "CasesId::EMPTY"
   | _ => "false"
 
 def _root_.Fir.FieldTy.immVariant : FieldTy → String
@@ -68,6 +72,8 @@ def _root_.Fir.FieldTy.immVariant : FieldTy → String
   | .align => "Align"
   | .symbol | .func => "Str"
   | .ty => "Ty"
+  | .succ => "Succ"
+  | .cases => "Cases"
   | _ => "Flag"
 
 def _root_.Fir.FieldTy.rustDecl : FieldTy → String
@@ -77,12 +83,14 @@ def _root_.Fir.FieldTy.rustDecl : FieldTy → String
   | .symbol => "Symbol"
   | .func => "Func"
   | .ty => "Ty"
+  | .succ => "Succ"
+  | .cases => "Cases"
   | _ => "Flag"
 
-/-- A variant names its fields when one is a `bool`, a number, or a string. -/
+/-- A variant names its fields when one is a `bool`, a number, a string, or a branch target. -/
 def _root_.Fir.OpDecl.isStruct (d : OpDecl) : Bool :=
   d.fields.any fun f => match f.ty with
-    | .nat | .align | .symbol | .func | .flag | .mod "Bool" => true
+    | .nat | .align | .symbol | .func | .flag | .mod "Bool" | .succ | .cases => true
     | _ => false
 
 /-- `Variant(a, b)` or `Variant { x: a, y: b }` from each field's text; `rest` ends a struct
@@ -127,6 +135,7 @@ def rustItem (d : OpDecl) : Item → String
   | .iter => "Item::Iter"
   | .region none => "Item::Region(None)"
   | .region (some kw) => s!"Item::Region(Some({rustStr kw}))"
+  | .blocks => "Item::Blocks"
 
 def rustTyE (d : OpDecl) (env : List String) : TyE → String
   | .ptr => "TyE::Ptr"
@@ -196,7 +205,7 @@ def generate : Except String String := do
 // spec/Fir/Syntax.lean. Do not edit: change the declarations and regenerate with
 // `cd spec && lake exe gen-rust > ../crates/fir/src/generated/ops.rs`.
 
-use crate::body::{IntId, StrId};
+use crate::body::{CasesId, IntId, StrId, SuccId};
 use crate::decl::{Check, Effect, Field, FieldTy, Imm, Item, OpDecl, Tier, TyE};
 use crate::ir::*;
 
@@ -213,7 +222,7 @@ pub enum OpKind {"
   out := emit out "}\n"
   -- Names and declarations.
   out := emit out "impl OpKind {"
-  let terms := decls.filter (·.terminator) |>.map fun d => s!"OpKind::{d.rust}"
+  let terms := decls.filter (·.terminator) |>.map fun d => d.rustApply (d.fields.map (·, none))
   out := emit out s!"    pub fn is_terminator(&self) -> bool \{
         matches!(self, {" | ".intercalate terms})
     }

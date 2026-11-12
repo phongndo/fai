@@ -26,9 +26,11 @@ same tables, and the Rust `OpKind`, to `crates/fir/src/generated/ops.rs`.
 **Fields.** `(zero ovf : Edge)` declares fields of the constructor. Fields of these types are
 *immediates*, written in the op's format: `Int`, `Nat` (Rust `u64`), `Align` (a `Nat`; Rust
 `u32`), `Symbol` (a dotted name such as `c.malloc`; a `String`), `Func` (a function, `@f`; a
-`String`), `Ty`, and `Flag` (a `Bool` written as a keyword named after the field). Fields of any
-other type (`Bool` or an enum) are *modifiers*, spelled in the op's name. The Rust variant names
-its fields when one is a `Bool`, a number, or a string; otherwise it is a tuple.
+`String`), `Ty`, `Flag` (a `Bool` written as a keyword named after the field), `Succ` (a branch
+target `^b(%x, …)`, whose operands are the op's; Rust: an id into a side table), and `Cases`
+(`cf.switch`'s `[k: ^b(…), …]`). Fields of any other type (`Bool` or an enum) are *modifiers*,
+spelled in the op's name. The Rust variant names its fields when one is a `Bool`, a number, a
+string, or a branch target; otherwise it is a tuple.
 
 **Names.** `name "int.{op}.{ovf}"` spells the op: each `{fields}` slot is filled from a
 vocabulary, the field type's `Spelled` instance or a named list (`{zero ovf : signedEdges}`), and
@@ -40,7 +42,8 @@ the parser accepts.
 `%*` zero or more operands, `(%*)` a parenthesized argument list, `%iter` a loop's optional
 `iter(%x: T = %init, …)` (its operands, and the first region's parameters), `,` a comma, and a
 word a keyword. `region` is a region; `else region` one introduced by a keyword, which may be
-left out when empty. The op's location goes after the format's last item before its regions.
+left out when empty; `blocks` is any number of labeled regions (`cf.blocks`). The op's location
+goes after the format's last item before its regions.
 
 **Rule.** How `checkSimple` types an op without regions, as checks run in order (`Check`).
 Control-flow ops (`cf.*`, `func.ret`) have no rule; the verifier checks them against the regions
@@ -80,6 +83,10 @@ inductive FieldTy where
   | func
   | ty
   | flag
+  /-- A branch target, `^b(%x, …)`: its label and argument count (Rust: an id into a side table). -/
+  | succ
+  /-- `cf.switch`'s cases, `[k: ^b(…), …]`. -/
+  | cases
   /-- A modifier: `Bool` or an enum, named here. -/
   | mod (type : String)
   deriving DecidableEq, Repr, Inhabited
@@ -104,6 +111,8 @@ inductive Item where
   | iter
   /-- A region; one introduced by a keyword is left out when empty. -/
   | region (kw : Option String)
+  /-- `cf.blocks`'s labeled blocks, `{ ^a: … ^b(%x: T): … }`: any number of regions. -/
+  | blocks
   deriving DecidableEq, Repr, Inhabited
 
 /-- Read a format template. -/
@@ -129,6 +138,7 @@ where
       else go (cs.drop w.length) (acc.push (.keyword (String.ofList w)))
   regions : List Item → List Item
     | .keyword "region" :: rest => .region none :: regions rest
+    | .keyword "blocks" :: rest => .blocks :: regions rest
     | .keyword kw :: .keyword "region" :: rest => .region (some kw) :: regions rest
     | i :: rest => i :: regions rest
     | [] => []
@@ -208,9 +218,13 @@ def OpDecl.imms (d : OpDecl) : List Field := d.fields.filter (·.ty.isImm)
 def OpDecl.field? (d : OpDecl) (name : String) : Option Field := d.fields.find? (·.name == name)
 
 /-- The items before the first region, and the regions. -/
-def OpDecl.head (d : OpDecl) : List Item := d.items.takeWhile fun | .region _ => false | _ => true
+def OpDecl.head (d : OpDecl) : List Item :=
+  d.items.takeWhile fun | .region _ | .blocks => false | _ => true
 def OpDecl.regions (d : OpDecl) : List (Option String) :=
   d.items.filterMap fun | .region kw => some kw | _ => none
+/-- Whether the op's regions are labeled blocks (`cf.blocks`). `blocks` is always the last
+item. -/
+def OpDecl.hasBlocks (d : OpDecl) : Bool := d.items.getLast? == some .blocks
 
 namespace OpDSL
 
@@ -275,6 +289,8 @@ def fieldTy : String → FieldTy
   | "Func" => .func
   | "Ty" => .ty
   | "Flag" => .flag
+  | "Succ" => .succ
+  | "Cases" => .cases
   | t => .mod t
 
 /-- The Lean type of a field type. -/
@@ -423,6 +439,8 @@ def fieldTyTerm : FieldTy → MacroM Term
   | .func => `(FieldTy.func)
   | .ty => `(FieldTy.ty)
   | .flag => `(FieldTy.flag)
+  | .succ => `(FieldTy.succ)
+  | .cases => `(FieldTy.cases)
   | .mod t => `(FieldTy.mod $(quote t))
 
 /-- The value a field of the name table's kinds holds when the name doesn't set it. -/
@@ -433,6 +451,8 @@ def defaultTerm : FieldTy → MacroM Term
   | .symbol | .func => `("")
   | .ty => `(Ty.ptr)
   | .flag => `(false)
+  | .succ => `(({ label := "", nargs := 0 } : Succ))
+  | .cases => `(([] : Cases))
   | .mod _ => Macro.throwError "a modifier field must be set by the name"
 
 /-- The `Imm` constructor for an immediate field. -/
@@ -441,6 +461,8 @@ def immCtor : FieldTy → Name
   | .nat | .align => `Imm.nat
   | .symbol | .func => `Imm.str
   | .ty => `Imm.ty
+  | .succ => `Imm.succ
+  | .cases => `Imm.cases
   | _ => `Imm.flag
 
 def validate (d : Decl) : MacroM Unit := do
@@ -460,11 +482,13 @@ def validate (d : Decl) : MacroM Unit := do
     if let .imm n := i then
       unless (fieldNamed n).isSome do Macro.throwErrorAt d.ctor s!"{ctor}: no field '{n}'"
   -- Regions come last; `%iter` feeds the first.
-  let head := items.takeWhile fun | .region _ => false | _ => true
-  unless (items.drop head.length).all (· matches .region _) do
+  let head := items.takeWhile fun | .region _ | .blocks => false | _ => true
+  unless (items.drop head.length).all (· matches .region _ | .blocks) do
     Macro.throwErrorAt d.ctor s!"{ctor}: regions must come last in the format"
   if items.contains .iter && head.length == items.length then
     Macro.throwErrorAt d.ctor s!"{ctor}: %iter needs a region"
+  if items.contains .blocks && items.getLast? != some .blocks then
+    Macro.throwErrorAt d.ctor s!"{ctor}: blocks must be the last item of the format"
   -- Each modifier is set by every name line.
   if d.names.isEmpty then Macro.throwErrorAt d.ctor s!"{ctor}: no name"
   for n in d.names do
