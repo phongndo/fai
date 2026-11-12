@@ -79,7 +79,10 @@ pub fn verify_module(m: &Module) -> Result<Vec<Hole>, String> {
         {
             return Err(format!("function @{} is defined more than once", x.name));
         }
-        sigs.insert(x.name.as_str(), (x.params.clone(), x.rets.clone()));
+        sigs.insert(
+            x.name.as_str(),
+            (x.params.clone(), x.rets.clone(), &gs.types),
+        );
     }
     for f in &m.funcs {
         if sigs.contains_key(f.name.as_str())
@@ -89,12 +92,12 @@ pub fn verify_module(m: &Module) -> Result<Vec<Hole>, String> {
         }
         let entry = f.body.entry();
         let params: Vec<Ty> = f.body.params(entry).map(|v| f.body.ty(v)).collect();
-        sigs.insert(f.name.as_str(), (params, f.rets.clone()));
+        sigs.insert(f.name.as_str(), (params, f.rets.clone(), f.body.types()));
     }
     for i in 0..gs.len() {
         let name = gs.name(i);
         let t = gs.ty(i);
-        check_sized(&gs.types, sp, None, t)
+        check_sized(&gs.types, sp, m.layer, None, t)
             .map_err(|e| format!("global @{name}: {}", e.strip_prefix("@?: ").unwrap_or(&e)))?;
         if !is_pow2(gs.align(i).into()) {
             return Err(format!("global @{name}: alignment must be a power of two"));
@@ -131,7 +134,7 @@ pub fn verify_module(m: &Module) -> Result<Vec<Hole>, String> {
             ));
         }
     }
-    // Signatures, so that calls only ever compare value types.
+    // Signatures.
     for f in &m.funcs {
         let entry = f.body.entry();
         for t in f
@@ -140,7 +143,7 @@ pub fn verify_module(m: &Module) -> Result<Vec<Hole>, String> {
             .map(|v| f.body.ty(v))
             .chain(f.rets.iter().copied())
         {
-            if !t.is_value() {
+            if !value_ty(m.layer, f.body.types(), t) {
                 return Err(format!(
                     "in @{}: @?: {} is not a value type",
                     f.name,
@@ -249,7 +252,7 @@ fn check_init(
                         check_init(gs, named, sp, g, e, i)?;
                     }
                 }
-                Shape::Func(..) => {
+                Shape::Func(..) | Shape::Union(_) => {
                     return Err(format!("global @{g}: a list can't initialize {}", show(t)));
                 }
             }
@@ -288,18 +291,28 @@ enum RegionCtx<'a> {
     },
 }
 
-/// Check that a type is well formed: valid widths, parts with a layout, function types of value
-/// types, and sizes that fit the address space (Lean's `checkTy`).
-fn check_ty(types: &Types, sp: &SpaceCfg, loc: Option<Loc>, t: Ty) -> VResult<()> {
+/// Whether values of type `t` can exist in a module of this layer (Lean's `Layer.valueTy`):
+/// in HFIR anything but a function type, elsewhere the scalars.
+fn value_ty(layer: Layer, types: &Types, t: Ty) -> bool {
+    match layer {
+        Layer::Hfir => types.is_hvalue(t),
+        _ => t.is_value(),
+    }
+}
+
+/// Check that a type is well formed: valid widths, parts with a layout, unions of value types,
+/// function types of the layer's value types, and sizes that fit the address space (Lean's
+/// `checkTy`).
+fn check_ty(types: &Types, sp: &SpaceCfg, layer: Layer, loc: Option<Loc>, t: Ty) -> VResult<()> {
     match t {
         Ty::Int(0) => verr(loc, "i0 is not a valid type"),
         Ty::Byte(w) if !(w > 0 && w.is_multiple_of(8)) => {
             verr(loc, format!("b{w} is not a valid type"))
         }
-        Ty::Int(_) | Ty::Ptr | Ty::Byte(_) => Ok(()),
+        Ty::Int(_) | Ty::Ptr | Ty::Byte(_) | Ty::Slice => Ok(()),
         Ty::Agg(id) => {
             let part = |x: Ty| -> VResult<()> {
-                check_ty(types, sp, loc, x)?;
+                check_ty(types, sp, layer, loc, x)?;
                 if has_layout(types, x) {
                     Ok(())
                 } else {
@@ -318,13 +331,32 @@ fn check_ty(types: &Types, sp: &SpaceCfg, loc: Option<Loc>, t: Ty) -> VResult<()
                 Shape::Array(_, e) => part(e)?,
                 Shape::Func(ps, rs) => {
                     for &x in ps.iter().chain(rs) {
-                        check_ty(types, sp, loc, x)?;
-                        if !x.is_value() {
+                        check_ty(types, sp, layer, loc, x)?;
+                        if !value_ty(layer, types, x) {
                             return verr(
                                 loc,
                                 format!(
                                     "{} can't be a parameter or result of {}",
                                     types.show(x),
+                                    types.show(t)
+                                ),
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                Shape::Union(vs) => {
+                    if vs.is_empty() {
+                        return verr(loc, format!("{} needs at least one variant", types.show(t)));
+                    }
+                    for &v in vs {
+                        check_ty(types, sp, layer, loc, v)?;
+                        if !types.is_hvalue(v) {
+                            return verr(
+                                loc,
+                                format!(
+                                    "{} can't be a variant of {}",
+                                    types.show(v),
                                     types.show(t)
                                 ),
                             );
@@ -349,26 +381,38 @@ fn check_ty(types: &Types, sp: &SpaceCfg, loc: Option<Loc>, t: Ty) -> VResult<()
 fn has_layout(types: &Types, t: Ty) -> bool {
     match t {
         Ty::Int(w) => w.is_multiple_of(8),
-        Ty::Agg(id) => !matches!(types.shape(id), Shape::Func(..)),
+        Ty::Agg(id) => !matches!(types.shape(id), Shape::Func(..) | Shape::Union(_)),
         _ => true,
     }
 }
 
-/// Check that a value's type is a well-formed value type.
+/// Check that a value's type is a well-formed value type of the layer.
 #[inline]
-fn check_value_ty(types: &Types, sp: &SpaceCfg, loc: Option<Loc>, t: Ty) -> VResult<()> {
+fn check_value_ty(
+    types: &Types,
+    sp: &SpaceCfg,
+    layer: Layer,
+    loc: Option<Loc>,
+    t: Ty,
+) -> VResult<()> {
     match t {
         Ty::Int(w) if w > 0 => Ok(()),
         Ty::Ptr => Ok(()),
         Ty::Byte(w) if w > 0 && w.is_multiple_of(8) => Ok(()),
-        _ => check_value_ty_slow(types, sp, loc, t),
+        _ => check_value_ty_slow(types, sp, layer, loc, t),
     }
 }
 
 #[cold]
-fn check_value_ty_slow(types: &Types, sp: &SpaceCfg, loc: Option<Loc>, t: Ty) -> VResult<()> {
-    check_ty(types, sp, loc, t)?;
-    if t.is_value() {
+fn check_value_ty_slow(
+    types: &Types,
+    sp: &SpaceCfg,
+    layer: Layer,
+    loc: Option<Loc>,
+    t: Ty,
+) -> VResult<()> {
+    check_ty(types, sp, layer, loc, t)?;
+    if value_ty(layer, types, t) {
         Ok(())
     } else {
         verr(loc, format!("{} is not a value type", types.show(t)))
@@ -376,8 +420,8 @@ fn check_value_ty_slow(types: &Types, sp: &SpaceCfg, loc: Option<Loc>, t: Ty) ->
 }
 
 /// Check that a type is well formed and has a layout.
-fn check_sized(types: &Types, sp: &SpaceCfg, loc: Option<Loc>, t: Ty) -> VResult<()> {
-    check_ty(types, sp, loc, t)?;
+fn check_sized(types: &Types, sp: &SpaceCfg, layer: Layer, loc: Option<Loc>, t: Ty) -> VResult<()> {
+    check_ty(types, sp, layer, loc, t)?;
     if has_layout(types, t) {
         Ok(())
     } else {
@@ -554,12 +598,54 @@ fn expect_tys(types: &Types, loc: Option<Loc>, what: &str, got: &[Ty], want: &[T
     }
 }
 
-fn is_loadable(space: &SpaceCfg, t: Ty) -> bool {
+fn is_loadable_scalar(space: &SpaceCfg, t: Ty) -> bool {
     match t {
         Ty::Int(w) => w.is_multiple_of(8),
         Ty::Ptr => space.ptr_bits.is_multiple_of(8),
         Ty::Byte(_) => true,
-        Ty::Agg(_) => false,
+        Ty::Slice | Ty::Agg(_) => false,
+    }
+}
+
+/// A scalar in whole bytes, or an aggregate with a layout whose leaves are (Lean's
+/// `isLoadable`).
+fn is_loadable(types: &Types, space: &SpaceCfg, t: Ty) -> bool {
+    if t.is_value() {
+        return is_loadable_scalar(space, t);
+    }
+    if !has_layout(types, t) {
+        return false;
+    }
+    let mut leaves = Vec::new();
+    types.leaves(space, t, 0, &mut leaves);
+    leaves.iter().all(|&(_, l)| is_loadable_scalar(space, l))
+}
+
+/// Compare types from two tables, as `expect_tys` does within one.
+fn expect_tys_in(
+    got_types: &Types,
+    want_types: &Types,
+    loc: Option<Loc>,
+    what: &str,
+    got: &[Ty],
+    want: &[Ty],
+) -> VResult<()> {
+    let same = got.len() == want.len()
+        && got
+            .iter()
+            .zip(want)
+            .all(|(&g, &w)| got_types.same(g, want_types, w));
+    if same {
+        Ok(())
+    } else {
+        verr(
+            loc,
+            format!(
+                "{what}: expected {} but got {}",
+                want_types.show_list(want),
+                got_types.show_list(got)
+            ),
+        )
     }
 }
 
@@ -586,9 +672,9 @@ fn check_simple(
 ) -> VResult<()> {
     let Cx {
         space,
+        layer,
         sigs,
         globals,
-        ..
     } = *cx;
     let Some(rule) = k.decl().rule else {
         return verr(loc, "unexpected op");
@@ -603,6 +689,7 @@ fn check_simple(
         let ty = |e: &TyE| match *e {
             TyE::Ptr => Ty::Ptr,
             TyE::Addr => Ty::Int(space.addr_bits),
+            TyE::Slice => Ty::Slice,
             TyE::Int(w) => Ty::Int(w),
             TyE::Var(i) => vars[usize::from(i)],
             TyE::Field(i) => match field(i) {
@@ -691,13 +778,19 @@ fn check_simple(
             }
             Check::Loadable(t, verb) => {
                 let t = ty(&t);
-                if !t.is_value() {
+                if !value_ty(layer, types, t) {
                     return verr(
                         loc,
                         format!("{} can't be {verb}: it is not a value type", show(t)),
                     );
                 }
-                if !is_loadable(space, t) {
+                if !(t.is_value() || has_layout(types, t)) {
+                    return verr(
+                        loc,
+                        format!("{} can't be {verb}: it has no layout", show(t)),
+                    );
+                }
+                if !is_loadable(types, space, t) {
                     return verr(
                         loc,
                         format!("{} can't be {verb}: its size isn't whole bytes", show(t)),
@@ -714,16 +807,18 @@ fn check_simple(
                     return verr(loc, "malformed op");
                 };
                 let callee = body.str(callee);
-                let Some((params, rets)) = sigs.get(callee) else {
+                let Some((params, rets, ctypes)) = sigs.get(callee) else {
                     return verr(loc, format!("no function @{callee}"));
                 };
-                expect_tys(types, loc, &format!("arguments of @{callee}"), ins, params)?;
-                expect_tys(types, loc, &format!("results of @{callee}"), outs, rets)?;
+                let what = format!("arguments of @{callee}");
+                expect_tys_in(types, ctypes, loc, &what, ins, params)?;
+                let what = format!("results of @{callee}");
+                expect_tys_in(types, ctypes, loc, &what, outs, rets)?;
             }
-            Check::Sized(t) => check_sized(types, space, loc, ty(&t))?,
+            Check::Sized(t) => check_sized(types, space, layer, loc, ty(&t))?,
             Check::Field(t, i) => {
                 let t = ty(&t);
-                check_sized(types, space, loc, t)?;
+                check_sized(types, space, layer, loc, t)?;
                 let Some(Imm::Index(i)) = field(i) else {
                     return verr(loc, "malformed op");
                 };
@@ -740,7 +835,7 @@ fn check_simple(
                 let Some(Imm::Ty(t)) = field(i) else {
                     return verr(loc, "malformed op");
                 };
-                check_ty(types, space, loc, t)?;
+                check_ty(types, space, layer, loc, t)?;
                 let Some(Shape::Func(ps, rs)) = types.shape_of(t) else {
                     return verr(loc, format!("{} is not a function type", show(t)));
                 };
@@ -770,6 +865,77 @@ fn check_simple(
                     return verr(loc, format!("no function @{f}"));
                 }
             }
+            Check::Parts(t) => match ty(&t) {
+                t @ Ty::Agg(id) => match types.shape(id) {
+                    Shape::Struct(_, fs) => expect_tys(types, loc, "operands", ins, fs)?,
+                    Shape::Array(n, e) => {
+                        if !(ins.len() as u64 == n && ins.iter().all(|&x| x == e)) {
+                            return verr(
+                                loc,
+                                format!(
+                                    "operands: expected {n} values of type {} for {} but got {}",
+                                    show(e),
+                                    show(t),
+                                    types.show_list(ins)
+                                ),
+                            );
+                        }
+                    }
+                    _ => return verr(loc, format!("{} is not a struct or an array", show(t))),
+                },
+                t => return verr(loc, format!("{} is not a struct or an array", show(t))),
+            },
+            Check::Part(a, i, t) => {
+                let (a, t) = (ty(&a), ty(&t));
+                let Some(Imm::Index(i)) = field(i) else {
+                    return verr(loc, "malformed op");
+                };
+                let part = match types.shape_of(a) {
+                    Some(Shape::Struct(_, fs)) => Some(fs.get(i as usize).copied()),
+                    Some(Shape::Array(n, e)) => Some((u64::from(i) < n).then_some(e)),
+                    _ => None,
+                };
+                match part {
+                    Some(Some(p)) => {
+                        expect_tys(types, loc, &format!("part {i} of {}", show(a)), &[t], &[p])?
+                    }
+                    Some(None) => return verr(loc, format!("{} has no part {i}", show(a))),
+                    None => {
+                        return verr(loc, format!("{} is not a struct or an array", show(a)));
+                    }
+                }
+            }
+            Check::Variant(u, i, t) => {
+                let (u, t) = (ty(&u), ty(&t));
+                let Some(Imm::Index(i)) = field(i) else {
+                    return verr(loc, "malformed op");
+                };
+                match types.shape_of(u) {
+                    Some(Shape::Union(vs)) => match vs.get(i as usize) {
+                        Some(&v) => expect_tys(
+                            types,
+                            loc,
+                            &format!("variant {i} of {}", show(u)),
+                            &[t],
+                            &[v],
+                        )?,
+                        None => return verr(loc, format!("{} has no variant {i}", show(u))),
+                    },
+                    _ => return verr(loc, format!("{} is not a union", show(u))),
+                }
+            }
+            Check::Union(u) => {
+                let u = ty(&u);
+                if !matches!(types.shape_of(u), Some(Shape::Union(_))) {
+                    return verr(loc, format!("{} is not a union", show(u)));
+                }
+            }
+            Check::Scalar(t) => {
+                let t = ty(&t);
+                if !t.is_value() {
+                    return verr(loc, format!("{} is not a scalar type", show(t)));
+                }
+            }
         }
     }
     Ok(())
@@ -784,7 +950,7 @@ struct Cx<'a> {
     space: &'a SpaceCfg,
     layer: Layer,
     /// Each function's parameter and result types.
-    sigs: &'a FxHashMap<&'a str, (Vec<Ty>, Vec<Ty>)>,
+    sigs: &'a FxHashMap<&'a str, (Vec<Ty>, Vec<Ty>, &'a Types)>,
     globals: &'a FxHashSet<&'a str>,
 }
 
@@ -804,7 +970,7 @@ struct FuncVerifier<'a> {
 impl<'a> FuncVerifier<'a> {
     fn func(&mut self, rets: &[Ty]) -> VResult<()> {
         for &t in rets {
-            check_value_ty(self.body.types(), self.cx.space, None, t)?;
+            check_value_ty(self.body.types(), self.cx.space, self.cx.layer, None, t)?;
         }
         let entry = self.body.entry();
         for v in self.body.params(entry) {
@@ -817,7 +983,7 @@ impl<'a> FuncVerifier<'a> {
     fn define(&mut self, loc: Option<Loc>, v: ValueId, is_param: bool) -> VResult<()> {
         let body = self.body;
         let (name, ty) = (body.name(v), body.ty(v));
-        check_value_ty(body.types(), self.cx.space, loc, ty)?;
+        check_value_ty(body.types(), self.cx.space, self.cx.layer, loc, ty)?;
         for f in body.facts(v) {
             check_fact(body, loc, is_param, name, ty, *f)?;
         }
@@ -847,7 +1013,7 @@ impl<'a> FuncVerifier<'a> {
             }
             OperandKind::Hole(h) => {
                 let ty = self.body.hole_ty(h);
-                check_value_ty(self.body.types(), self.cx.space, loc, ty)?;
+                check_value_ty(self.body.types(), self.cx.space, self.cx.layer, loc, ty)?;
                 self.holes.push(Hole {
                     name: self.body.hole_name(h).to_owned(),
                     ty,

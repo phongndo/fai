@@ -75,6 +75,7 @@ fn push_ty(out: &mut String, types: &Types, t: Ty) {
             out.push('b');
             push_u64(out, w.into());
         }
+        Ty::Slice => out.push_str("slice"),
         Ty::Agg(_) => types.write(out, t),
     }
 }

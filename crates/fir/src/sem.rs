@@ -23,6 +23,8 @@ pub enum TrapReason {
     Overflow,
     Shift,
     Oom,
+    Bounds,
+    Tag,
 }
 
 impl TrapReason {
@@ -32,6 +34,8 @@ impl TrapReason {
             TrapReason::Overflow => "overflow",
             TrapReason::Shift => "shift",
             TrapReason::Oom => "oom",
+            TrapReason::Bounds => "bounds",
+            TrapReason::Tag => "tag",
         }
     }
 }
@@ -58,6 +62,8 @@ pub enum UbKind {
     ConstWrite,
     FuncAccess,
     BadCall,
+    Bounds,
+    Tag,
 }
 
 impl UbKind {
@@ -82,6 +88,8 @@ impl UbKind {
             UbKind::ConstWrite => "const-write",
             UbKind::FuncAccess => "func-access",
             UbKind::BadCall => "bad-call",
+            UbKind::Bounds => "bounds",
+            UbKind::Tag => "tag",
         }
     }
 }
@@ -296,6 +304,13 @@ fn arith_facts(op: ArithOp, w: u32, a: &Bits, b: &Bits) -> ArithFacts {
 
 fn ovf_needs_defined(o: Ovf) -> bool {
     matches!(o, Ovf::Trap(_) | Ovf::Ub(_))
+}
+
+/// `int.add.overflow.s` and friends on defined operands: the wrapped result and whether the
+/// operation overflowed, signed or unsigned.
+pub(crate) fn overflow_pair(op: ArithOp, signed: bool, w: u32, a: &Bits, b: &Bits) -> (Bits, bool) {
+    let f = arith_facts(op, w, a, b);
+    (f.wrapped, if signed { f.ovf_s } else { f.ovf_u })
 }
 
 /// `int.add`, `int.sub`, `int.mul` (Lean's `Sem.arith`).

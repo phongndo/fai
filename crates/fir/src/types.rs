@@ -65,6 +65,8 @@ pub enum Shape<'a> {
     Array(u64, Ty),
     /// `func<(i32, ptr) -> i32>`: parameters and results.
     Func(&'a [Ty], &'a [Ty]),
+    /// `union<i32, ptr>`: the variants.
+    Union(&'a [Ty]),
 }
 
 /// A run of entries in `parts`.
@@ -79,6 +81,7 @@ enum Entry {
     Struct { policy: Policy, fields: Run },
     Array { n: u64, elem: Ty },
     Func { params: Run, rets: Run },
+    Union { variants: Run },
 }
 
 /// A table of struct, array, and function types.
@@ -130,6 +133,7 @@ impl Types {
             Entry::Struct { policy, fields } => Shape::Struct(policy, self.run(fields)),
             Entry::Array { n, elem } => Shape::Array(n, elem),
             Entry::Func { params, rets } => Shape::Func(self.run(params), self.run(rets)),
+            Entry::Union { variants } => Shape::Union(self.run(variants)),
         }
     }
 
@@ -147,6 +151,7 @@ impl Types {
             Shape::Struct(p, fs) => (0u8, p, fs).hash(&mut h),
             Shape::Array(n, t) => (1u8, n, t).hash(&mut h),
             Shape::Func(ps, rs) => (2u8, ps, rs).hash(&mut h),
+            Shape::Union(vs) => (3u8, vs).hash(&mut h),
         }
         let hash = h.finish();
         let mut cur = self.index.get(&hash).copied().unwrap_or(NONE);
@@ -174,6 +179,7 @@ impl Types {
                 params: push(ps),
                 rets: push(rs),
             },
+            Shape::Union(vs) => Entry::Union { variants: push(vs) },
         };
         let id = u32::try_from(self.entries.len()).expect("fewer than 2^32 types");
         self.entries.push(entry);
@@ -195,6 +201,128 @@ impl Types {
     /// `func<(params) -> rets>`
     pub fn func(&mut self, params: &[Ty], rets: &[Ty]) -> Ty {
         self.intern(Shape::Func(params, rets))
+    }
+
+    /// `union<variants>`
+    pub fn union(&mut self, variants: &[Ty]) -> Ty {
+        self.intern(Shape::Union(variants))
+    }
+
+    /// `t` from table `from`, interned in this one.
+    pub fn import(&mut self, from: &Types, t: Ty) -> Ty {
+        let Ty::Agg(id) = t else { return t };
+        let list = |me: &mut Types, ts: &[Ty]| -> Vec<Ty> {
+            ts.iter().map(|&x| me.import(from, x)).collect()
+        };
+        match from.shape(id) {
+            Shape::Struct(p, fs) => {
+                let fs = list(self, fs);
+                self.structure(p, &fs)
+            }
+            Shape::Array(n, e) => {
+                let e = self.import(from, e);
+                self.array(n, e)
+            }
+            Shape::Func(ps, rs) => {
+                let (ps, rs) = (list(self, ps), list(self, rs));
+                self.func(&ps, &rs)
+            }
+            Shape::Union(vs) => {
+                let vs = list(self, vs);
+                self.union(&vs)
+            }
+        }
+    }
+
+    /// Whether `a` in this table is the type `b` in table `other`.
+    pub fn same(&self, a: Ty, other: &Types, b: Ty) -> bool {
+        let list = |xs: &[Ty], ys: &[Ty]| {
+            xs.len() == ys.len() && xs.iter().zip(ys).all(|(&x, &y)| self.same(x, other, y))
+        };
+        match (a, b) {
+            (Ty::Agg(x), Ty::Agg(y)) => match (self.shape(x), other.shape(y)) {
+                (Shape::Struct(p, fs), Shape::Struct(q, gs)) => p == q && list(fs, gs),
+                (Shape::Array(n, e), Shape::Array(m, f)) => n == m && self.same(e, other, f),
+                (Shape::Func(ps, rs), Shape::Func(qs, ss)) => list(ps, qs) && list(rs, ss),
+                (Shape::Union(vs), Shape::Union(ws)) => list(vs, ws),
+                _ => false,
+            },
+            _ => a == b,
+        }
+    }
+
+    /// Whether values of this type can exist in HFIR: anything but a function type (Lean's
+    /// `Ty.isHValue`).
+    pub fn is_hvalue(&self, t: Ty) -> bool {
+        !matches!(self.shape_of(t), Some(Shape::Func(..)))
+    }
+
+    /// The scalar types a value of type `t` becomes when lowered (Lean's `Lower.scalars`).
+    pub fn scalars(&self, aw: u32, t: Ty, out: &mut Vec<Ty>) {
+        match t {
+            Ty::Slice => out.extend([Ty::Ptr, Ty::Int(aw)]),
+            Ty::Agg(id) => match self.shape(id) {
+                Shape::Struct(_, fs) => fs.iter().for_each(|&f| self.scalars(aw, f, out)),
+                Shape::Array(n, e) => {
+                    let start = out.len();
+                    self.scalars(aw, e, out);
+                    let k = out.len() - start;
+                    for _ in 1..n {
+                        out.extend_from_within(start..start + k);
+                    }
+                    if n == 0 {
+                        out.truncate(start);
+                    }
+                }
+                Shape::Union(vs) => {
+                    out.push(Ty::Int(32));
+                    vs.iter().for_each(|&v| self.scalars(aw, v, out));
+                }
+                Shape::Func(..) => out.push(t),
+            },
+            _ => out.push(t),
+        }
+    }
+
+    /// How many scalars `t` becomes.
+    pub fn num_scalars(&self, t: Ty) -> usize {
+        match t {
+            Ty::Slice => 2,
+            Ty::Agg(id) => match self.shape(id) {
+                Shape::Struct(_, fs) => fs.iter().map(|&f| self.num_scalars(f)).sum(),
+                Shape::Array(n, e) => n as usize * self.num_scalars(e),
+                Shape::Union(vs) => 1 + vs.iter().map(|&v| self.num_scalars(v)).sum::<usize>(),
+                Shape::Func(..) => 1,
+            },
+            _ => 1,
+        }
+    }
+
+    /// The scalars a value of type `t` is stored as, with their offsets from `base`, in order
+    /// (Lean's `Ty.leaves`).
+    pub fn leaves(&self, sp: &SpaceCfg, t: Ty, base: u128, out: &mut Vec<(u128, Ty)>) {
+        match t {
+            Ty::Slice => {
+                out.push((base, Ty::Ptr));
+                out.push((base + slice_layout(sp).0, Ty::Int(sp.addr_bits)));
+            }
+            Ty::Agg(id) => match self.shape(id) {
+                Shape::Struct(p, fs) => {
+                    let (offs, _, _) = self.place(sp, p, fs);
+                    for (&f, &o) in fs.iter().zip(&offs) {
+                        self.leaves(sp, f, base + o, out);
+                    }
+                }
+                Shape::Array(n, e) => {
+                    let stride = self.stride(sp, e);
+                    for j in 0..u128::from(n) {
+                        self.leaves(sp, e, base + j * stride, out);
+                    }
+                }
+                _ => out.push((base, t)),
+            },
+            _ => out.push((base, t)),
+        }
     }
 
     /// Append a type as text (Lean's `Ty.render`).
@@ -229,7 +357,13 @@ impl Types {
                     write_rets(out, rs, |out, t| self.write(out, *t));
                     out.push('>');
                 }
+                Shape::Union(vs) => {
+                    out.push_str("union<");
+                    list(out, vs);
+                    out.push('>');
+                }
             },
+            Ty::Slice => out.push_str("slice"),
         }
     }
 
@@ -262,6 +396,10 @@ impl Types {
         match t {
             Ty::Int(w) | Ty::Byte(w) => (u128::from(w / 8), u64::from(sp.int_align(w))),
             Ty::Ptr => (u128::from(sp.ptr_bits / 8), u64::from(sp.ptr_align)),
+            Ty::Slice => {
+                let (_, size, align) = slice_layout(sp);
+                (size, align)
+            }
             Ty::Agg(id) => match self.shape(id) {
                 Shape::Struct(p, fs) => {
                     let (_, size, align) = self.place(sp, p, fs);
@@ -271,7 +409,7 @@ impl Types {
                     let (s, a) = self.dims(sp, e);
                     (u128::from(n).saturating_mul(align_up(s, a)), a)
                 }
-                Shape::Func(..) => (0, 1),
+                Shape::Func(..) | Shape::Union(_) => (0, 1),
             },
         }
     }
@@ -328,6 +466,18 @@ impl Types {
             _ => None,
         }
     }
+}
+
+/// A slice's layout, as `struct<C>{ptr, iA}`: the length's offset, the size, and the alignment
+/// (Lean's `SpaceCfg.sliceLayout`).
+pub fn slice_layout(sp: &SpaceCfg) -> (u128, u128, u64) {
+    let pa = u64::from(sp.ptr_align);
+    let ia = u64::from(sp.int_align(sp.addr_bits));
+    let ps = align_up(u128::from(sp.ptr_bits / 8), pa);
+    let is = align_up(u128::from(sp.addr_bits / 8), ia);
+    let off = align_up(ps, ia);
+    let align = pa.max(ia);
+    (off, align_up(off + is, align), align)
 }
 
 /// `x` rounded up to a multiple of `a` (Lean's `alignUp`).

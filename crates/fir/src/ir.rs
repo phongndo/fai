@@ -23,20 +23,23 @@ pub struct Loc {
     pub col: u32,
 }
 
-/// A type. The value types are signless integers `iN`, pointers, and byte types `bN`; structs,
-/// arrays, and function types are ids into a [`Types`] table (see `types.rs`).
+/// A type. The scalar value types are signless integers `iN`, pointers, and byte types `bN`;
+/// `slice` is HFIR's pointer and length; structs, arrays, unions, and function types are ids into
+/// a [`Types`] table (see `types.rs`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Ty {
     Int(u32),
     Ptr,
     Byte(u32),
+    Slice,
     Agg(TyId),
 }
 
 impl Ty {
-    /// Whether values can have this type.
+    /// Whether this is a scalar value type, the only types values have outside HFIR (Lean's
+    /// `Ty.isValue`).
     pub fn is_value(self) -> bool {
-        !matches!(self, Ty::Agg(_))
+        matches!(self, Ty::Int(_) | Ty::Ptr | Ty::Byte(_))
     }
 }
 
@@ -48,6 +51,7 @@ impl fmt::Display for Ty {
             Ty::Int(w) => write!(f, "i{w}"),
             Ty::Ptr => f.write_str("ptr"),
             Ty::Byte(w) => write!(f, "b{w}"),
+            Ty::Slice => f.write_str("slice"),
             Ty::Agg(id) => write!(f, "type#{}", id.index()),
         }
     }

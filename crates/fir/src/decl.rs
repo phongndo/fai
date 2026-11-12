@@ -157,6 +157,7 @@ pub enum TyE {
     Ptr,
     /// The address-sized integer.
     Addr,
+    Slice,
     Int(u32),
     Var(u8),
     Field(u8),
@@ -199,6 +200,16 @@ pub enum Check {
     Global(u8),
     /// The function exists.
     Func(u8),
+    /// The type is a struct or an array, and the operands are its fields or elements.
+    Parts(TyE),
+    /// The first type is a struct or an array whose part (the immediate) has the second type.
+    Part(TyE, u8, TyE),
+    /// The first type is a union whose variant (the immediate) has the second type.
+    Variant(TyE, u8, TyE),
+    /// The type is a union.
+    Union(TyE),
+    /// The type is a scalar value type.
+    Scalar(TyE),
 }
 
 /// Effect categories (decision: Effects); resource tags come later.

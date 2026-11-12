@@ -248,8 +248,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// A type: `i32`, `ptr`, `b8`, `struct<C>{i32, ptr}`, `array<4 x i32>`, or
-    /// `func<(i32, ptr) -> i32>`.
+    /// A type: `i32`, `ptr`, `b8`, `struct<C>{i32, ptr}`, `array<4 x i32>`,
+    /// `func<(i32, ptr) -> i32>`, `union<i32, ptr>`, or `slice`.
     fn ty(&mut self) -> PResult<Ty> {
         let s = self.ident()?;
         // `iN` and `bN` first: they are most of the types.
@@ -288,6 +288,12 @@ impl<'a> Parser<'a> {
                 let elem = self.ty()?;
                 self.expect_sym(Sym::Gt)?;
                 Ok(self.types().array(n, elem))
+            }
+            "slice" => Ok(Ty::Slice),
+            "union" => {
+                self.expect_sym(Sym::Lt)?;
+                let variants = self.sep_by(Self::ty, Sym::Gt)?;
+                Ok(self.types().union(&variants))
             }
             "func" => {
                 self.expect_sym(Sym::Lt)?;

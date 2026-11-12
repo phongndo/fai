@@ -44,6 +44,16 @@ use crate::types::Shape;
 #[path = "backend/aarch64/machine.rs"]
 mod lfir;
 
+/// The alignment a leaf at offset `off` of an access aligned to `align` keeps (Lean's
+/// `Nat.gcd align off`).
+fn leaf_align(align: u32, off: u128) -> u32 {
+    let (mut a, mut b) = (u128::from(align), off);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a as u32
+}
+
 /// The fuel `fir-ref run` uses when `--fuel` isn't given.
 pub const DEFAULT_FUEL: u64 = 1_000_000;
 
@@ -71,6 +81,12 @@ enum Value {
     PtrPoison,
     /// A `bN` value: a run in `byte_vals`.
     Bytes {
+        start: u32,
+        len: u32,
+    },
+    /// An HFIR aggregate (Lean's `RVal.agg`): a run of parts in `agg_vals`. A union is its tag
+    /// (an `i32`) and its payload; a slice its pointer and length.
+    Agg {
         start: u32,
         len: u32,
     },
@@ -363,6 +379,40 @@ pub fn parse_int(s: &str) -> Option<BigInt> {
 /// what `fir-ref run` prints on stderr: no such function, a wrong argument count, or a bad
 /// argument. `m` must be verified.
 pub fn run(m: &Module, name: &str, args: &[&str], fuel: u64) -> Result<String, String> {
+    run_detail(m, name, args, fuel, false).map(|r| r.line)
+}
+
+/// How a run went (Lean's `RunResult` in `spec/Main.lean`): the outcome line, the events part of
+/// it, and whether the run ended in UB or got stuck, or ran out of fuel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunOutput {
+    pub line: String,
+    /// The events, each followed by `; `.
+    pub events: String,
+    pub absorbing: bool,
+    pub out_of_fuel: bool,
+}
+
+impl RunOutput {
+    /// Whether a run of the lowering, `tgt`, agrees with this HFIR run (Lean's
+    /// `RunResult.lowersTo`): the same line, unless this run ends in UB or gets stuck, where
+    /// `tgt` must have its events first. A run that ran out of fuel is not compared.
+    pub fn lowers_to(&self, tgt: &RunOutput) -> bool {
+        self.out_of_fuel
+            || self.line == tgt.line
+            || (self.absorbing && tgt.events.starts_with(&self.events))
+    }
+}
+
+/// [`run`], with the outcome's parts. With `lower_rets`, returned values are shown as the
+/// scalars the lowering returns instead (Lean's `Lower.lowerValue`).
+pub fn run_detail(
+    m: &Module,
+    name: &str,
+    args: &[&str],
+    fuel: u64,
+    lower_rets: bool,
+) -> Result<RunOutput, String> {
     if m.space.addr_bits > 64 {
         return Err(format!(
             "the interpreter supports address sizes up to 64 bits, not {}",
@@ -387,10 +437,21 @@ pub fn run(m: &Module, name: &str, args: &[&str], fuel: u64) -> Result<String, S
         vals.push(mach.parse_arg(f.body.ty(p), a)?);
     }
     if let crate::Layer::Lfir(_) = m.layer {
-        return Ok(lfir::run(mach, fi as u32, &vals, fuel));
+        return Ok(RunOutput {
+            line: lfir::run(mach, fi as u32, &vals, fuel),
+            events: String::new(),
+            absorbing: false,
+            out_of_fuel: false,
+        });
     }
+    mach.lower_rets = lower_rets;
     Ok(match mach.init(fi as u32, &vals) {
-        Err(h) => h.render(),
+        Err(h) => RunOutput {
+            line: h.render(),
+            events: String::new(),
+            absorbing: matches!(h.behavior, Behavior::Ub(_) | Behavior::Stuck(_)),
+            out_of_fuel: false,
+        },
         Ok(()) => mach.drive(fuel),
     })
 }
@@ -412,6 +473,7 @@ struct Machine<'m> {
     slots: Vec<Value>,
     wides: Vec<BigUint>,
     byte_vals: Vec<Byte>,
+    agg_vals: Vec<Value>,
     ptrs: Vec<Ptr>,
     cands: Vec<(u32, u32)>,
     // Memory
@@ -432,6 +494,8 @@ struct Machine<'m> {
     /// The running function and where its slots start.
     func: u32,
     base: u32,
+    /// Show returned values as the lowering returns them (`run_detail`).
+    lower_rets: bool,
     /// Reused buffers.
     scratch: Vec<Value>,
     bytes_buf: Vec<Byte>,
@@ -467,6 +531,7 @@ impl<'m> Machine<'m> {
             slots: Vec::new(),
             wides: Vec::new(),
             byte_vals: Vec::new(),
+            agg_vals: Vec::new(),
             ptrs: vec![Ptr::Abs {
                 addr: 0,
                 cands: Span { start: 0, len: 0 },
@@ -483,6 +548,7 @@ impl<'m> Machine<'m> {
             frames: Vec::new(),
             func: 0,
             base: 0,
+            lower_rets: false,
             scratch: Vec::new(),
             bytes_buf: Vec::new(),
         };
@@ -585,7 +651,7 @@ impl<'m> Machine<'m> {
                             put(self, i as u128 * stride, e, item, out);
                         }
                     }
-                    Shape::Func(..) => {}
+                    Shape::Func(..) | Shape::Union(_) => {}
                 }
             }
             _ => out.resize(start + size, Byte::Poison),
@@ -688,14 +754,113 @@ impl<'m> Machine<'m> {
         }
     }
 
+    /// Whether a value has a type of the running function's table (Lean's `RVal.hasTy`).
     fn has_ty(&self, v: Value, t: Ty) -> bool {
+        self.has_ty_in(self.body().types(), v, t)
+    }
+
+    fn has_ty_in(&self, types: &Types, v: Value, t: Ty) -> bool {
         match (v, t) {
             (Value::Int { w, .. } | Value::Wide { w, .. } | Value::Poison { w }, Ty::Int(w2)) => {
                 w == w2
             }
             (Value::Ptr(_) | Value::PtrPoison, Ty::Ptr) => true,
             (Value::Bytes { len, .. }, Ty::Byte(w)) => u64::from(len) * 8 == u64::from(w),
+            (Value::Agg { start, len }, Ty::Slice) => {
+                let ps = &self.agg_vals[Span { start, len }.range()];
+                matches!(
+                    ps,
+                    [
+                        Value::Ptr(_) | Value::PtrPoison,
+                        Value::Int { .. } | Value::Wide { .. } | Value::Poison { .. }
+                    ]
+                )
+            }
+            (Value::Agg { start, len }, Ty::Agg(id)) => {
+                let ps = &self.agg_vals[Span { start, len }.range()];
+                match types.shape(id) {
+                    Shape::Struct(_, fs) => {
+                        ps.len() == fs.len()
+                            && ps
+                                .iter()
+                                .zip(fs)
+                                .all(|(&p, &f)| self.has_ty_in(types, p, f))
+                    }
+                    Shape::Array(n, e) => {
+                        ps.len() as u64 == n && ps.iter().all(|&p| self.has_ty_in(types, p, e))
+                    }
+                    Shape::Union(vs) => match ps {
+                        [Value::Int { w: 32, bits }, x] => match vs.get(*bits as usize) {
+                            Some(&u) => self.has_ty_in(types, *x, u),
+                            None => false,
+                        },
+                        _ => false,
+                    },
+                    Shape::Func(..) => false,
+                }
+            }
             _ => false,
+        }
+    }
+
+    /// The parts of an aggregate value.
+    fn parts(&self, v: Value) -> Option<&[Value]> {
+        match v {
+            Value::Agg { start, len } => Some(&self.agg_vals[Span { start, len }.range()]),
+            _ => None,
+        }
+    }
+
+    fn new_agg(&mut self, parts: &[Value]) -> Value {
+        let start = self.agg_vals.len() as u32;
+        self.agg_vals.extend_from_slice(parts);
+        Value::Agg {
+            start,
+            len: parts.len() as u32,
+        }
+    }
+
+    /// An aggregate's scalars, depth first (Lean's `RVal.leaves`), appended to `out`.
+    fn leaf_values(&self, v: Value, out: &mut Vec<Value>) {
+        match self.parts(v) {
+            Some(ps) => ps.iter().for_each(|&p| self.leaf_values(p, out)),
+            None => out.push(v),
+        }
+    }
+
+    /// A value of type `t` from the front of its scalars `vs` (Lean's `Ty.build`), with the
+    /// position after them.
+    fn build(&mut self, types: &Types, t: Ty, vs: &[Value], at: usize) -> Option<(Value, usize)> {
+        match t {
+            Ty::Slice => {
+                let ps = vs.get(at..at + 2)?;
+                let ps = [ps[0], ps[1]];
+                Some((self.new_agg(&ps), at + 2))
+            }
+            Ty::Agg(id) => match types.shape(id) {
+                Shape::Struct(_, fs) => {
+                    let mut parts = Vec::with_capacity(fs.len());
+                    let mut at = at;
+                    for &f in fs {
+                        let (x, next) = self.build(types, f, vs, at)?;
+                        parts.push(x);
+                        at = next;
+                    }
+                    Some((self.new_agg(&parts), at))
+                }
+                Shape::Array(n, e) => {
+                    let mut parts = Vec::with_capacity(n as usize);
+                    let mut at = at;
+                    for _ in 0..n {
+                        let (x, next) = self.build(types, e, vs, at)?;
+                        parts.push(x);
+                        at = next;
+                    }
+                    Some((self.new_agg(&parts), at))
+                }
+                _ => Some((*vs.get(at)?, at + 1)),
+            },
+            _ => Some((*vs.get(at)?, at + 1)),
         }
     }
 
@@ -748,6 +913,19 @@ impl<'m> Machine<'m> {
                     }
                 }
                 out.push(')');
+            }
+            Value::Agg { start, len } => {
+                out.push('{');
+                for (i, &p) in self.agg_vals[Span { start, len }.range()]
+                    .iter()
+                    .enumerate()
+                {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    self.render_value(p, out);
+                }
+                out.push('}');
             }
             Value::Unset => out.push('?'),
         }
@@ -1327,7 +1505,7 @@ impl<'m> Machine<'m> {
                     Value::Ptr(self.exposed_ptr(addr))
                 }
             }
-            Ty::Agg(_) => {
+            Ty::Agg(_) | Ty::Slice => {
                 self.bytes_buf = bs;
                 let t = self.body().types().show(ty);
                 return stuck(loc, format!("{t} is not a value type"));
@@ -1364,7 +1542,7 @@ impl<'m> Machine<'m> {
         match t {
             Ty::Int(w) | Ty::Byte(w) => u64::from(w / 8),
             Ty::Ptr => u64::from(self.space.ptr_bits / 8),
-            Ty::Agg(_) => self.body().types().size(self.space, t) as u64,
+            Ty::Agg(_) | Ty::Slice => self.body().types().size(self.space, t) as u64,
         }
     }
 
@@ -1402,7 +1580,7 @@ impl<'m> Machine<'m> {
             Value::Bytes { start, len } => {
                 bs.extend_from_slice(&self.byte_vals[Span { start, len }.range()])
             }
-            Value::Unset => {}
+            Value::Agg { .. } | Value::Unset => {}
         }
         self.bytes_buf = bs;
     }
@@ -1670,7 +1848,16 @@ impl<'m> Machine<'m> {
                 };
                 self.int_value(rw, Some(b))
             }
-            (OpKind::Poison, []) => Value::Poison { w: rw },
+            (OpKind::Poison, []) => match rty {
+                Some(Ty::Ptr) => Value::PtrPoison,
+                Some(Ty::Byte(w)) => {
+                    let start = self.byte_vals.len() as u32;
+                    self.byte_vals
+                        .extend(std::iter::repeat_n(Byte::Poison, (w / 8) as usize));
+                    Value::Bytes { start, len: w / 8 }
+                }
+                _ => Value::Poison { w: rw },
+            },
             (OpKind::Freeze, &[Value::Poison { w }]) => self.int_value(w, Some(Bits::zero(w))),
             (OpKind::Freeze | OpKind::Copy, &[v]) => v,
             (OpKind::Select, &[c, a, b]) => {
@@ -1738,11 +1925,11 @@ impl<'m> Machine<'m> {
             }
             (OpKind::Load { align }, &[p]) => {
                 let p = self.ptr_of(loc, p)?;
-                self.load(loc, rty.unwrap(), align, p)?
+                self.load_any(loc, rty.unwrap(), align, p)?
             }
             (OpKind::Store { ty, align }, &[v, p]) => {
                 let p = self.ptr_of(loc, p)?;
-                self.store(loc, ty, align, v, p)?;
+                self.store_any(loc, ty, align, v, p)?;
                 return Ok(None);
             }
             (OpKind::PtrNull, []) => Value::Ptr(NULL),
@@ -1789,10 +1976,11 @@ impl<'m> Machine<'m> {
                 return self.offset_by(inbounds, p, off as i128);
             }
             (OpKind::PtrIndex { inbounds, ty }, &[p, i]) => {
+                let i = self.addr_operand(loc, i)?;
                 let Some(p) = self.ptr_of(loc, p)? else {
                     return Ok(Some(Value::PtrPoison));
                 };
-                let Some(i) = self.addr_operand(loc, i)? else {
+                let Some(i) = i else {
                     return Ok(Some(Value::PtrPoison));
                 };
                 let stride = body.types().stride(self.space, ty);
@@ -1875,9 +2063,178 @@ impl<'m> Machine<'m> {
                     bits: u64::from(self.cmp_ptrs(loc, pred, p, q)?),
                 }
             }
+            // Building blocks
+            (OpKind::AggMake, _) => self.new_agg(vs),
+            (OpKind::AggExtract { index }, &[a]) => match self.parts(a) {
+                Some(ps) => match ps.get(index as usize) {
+                    Some(&x) => x,
+                    None => return stuck(loc, format!("no part {index}")),
+                },
+                None => return stuck(loc, "malformed op"),
+            },
+            (OpKind::AggInsert { index }, &[a, x]) => match self.parts(a) {
+                Some(ps) if (index as usize) < ps.len() => {
+                    let mut ps = ps.to_vec();
+                    ps[index as usize] = x;
+                    self.new_agg(&ps)
+                }
+                Some(_) => return stuck(loc, format!("no part {index}")),
+                None => return stuck(loc, "malformed op"),
+            },
+            (OpKind::UnionMake { index }, &[x]) => {
+                let tag = Value::Int {
+                    w: 32,
+                    bits: u64::from(index) & sem::mask(32),
+                };
+                self.new_agg(&[tag, x])
+            }
+            (OpKind::UnionTag, &[u]) => match self.parts(u) {
+                Some(&[t @ (Value::Int { w: 32, .. } | Value::Poison { w: 32 }), _]) => t,
+                _ => return stuck(loc, "malformed op"),
+            },
+            (OpKind::UnionGet { trap, index }, &[u]) => match self.parts(u) {
+                Some(&[Value::Int { w: 32, bits }, x]) => {
+                    if bits == u64::from(index) {
+                        x
+                    } else if trap {
+                        return halt(Behavior::Trap(TrapReason::Tag), loc, "");
+                    } else {
+                        return ub(UbKind::Tag, loc, format!("the union holds variant {bits}"));
+                    }
+                }
+                _ => return stuck(loc, "malformed op"),
+            },
+            (OpKind::SliceMake, &[p, n]) => {
+                self.ptr_of(loc, p)?;
+                self.bits(loc, n)?;
+                self.new_agg(&[p, n])
+            }
+            (OpKind::SlicePtr, &[sv]) => match self.parts(sv) {
+                Some(&[p @ (Value::Ptr(_) | Value::PtrPoison), _]) => p,
+                _ => return stuck(loc, "malformed op"),
+            },
+            (OpKind::SliceLen, &[sv]) => match self.parts(sv) {
+                Some(
+                    &[
+                        _,
+                        n @ (Value::Int { .. } | Value::Wide { .. } | Value::Poison { .. }),
+                    ],
+                ) => n,
+                _ => return stuck(loc, "malformed op"),
+            },
+            (OpKind::SliceGet { trap, align }, &[sv, i]) => {
+                let t = rty.unwrap();
+                let q = self.slice_elem(loc, trap, t, sv, i)?;
+                self.load_any(loc, t, align, q)?
+            }
+            (OpKind::SliceSet { trap, ty, align }, &[v, sv, i]) => {
+                let q = self.slice_elem(loc, trap, ty, sv, i)?;
+                self.store_any(loc, ty, align, v, q)?;
+                return Ok(None);
+            }
+            (OpKind::Check(reason), &[c]) => match self.bits(loc, c)? {
+                None => return ub(UbKind::Poison, loc, "check of poison"),
+                Some(b) if b.to_u64() == Some(1) => return Ok(None),
+                Some(_) => return halt(Behavior::Trap(reason), loc, ""),
+            },
             _ => return stuck(loc, "malformed op"),
         };
         Ok(Some(v))
+    }
+
+    /// Where the leaf at offset `off` of an aggregate at `p` is: `ptr.offset.wrap` by `off`
+    /// (Lean's `leafPtr`).
+    fn leaf_ptr(&mut self, p: Option<u32>, off: u128) -> R<Option<u32>> {
+        let Some(p) = p else { return Ok(None) };
+        let n = sem::wrap_signed(self.space.addr_bits, off as i128);
+        Ok(match self.offset_by(false, p, n)? {
+            Some(Value::Ptr(q)) => Some(q),
+            _ => None,
+        })
+    }
+
+    /// Load a scalar, or an aggregate leaf by leaf (Lean's `loadAny`).
+    fn load_any(&mut self, loc: Option<Loc>, ty: Ty, align: u32, p: Option<u32>) -> R<Value> {
+        if ty.is_value() {
+            return self.load(loc, ty, align, p);
+        }
+        let types: &'m Types = self.body().types();
+        let mut leaves = Vec::new();
+        types.leaves(self.space, ty, 0, &mut leaves);
+        let mut vals = Vec::with_capacity(leaves.len());
+        for &(off, t) in &leaves {
+            let q = self.leaf_ptr(p, off)?;
+            vals.push(self.load(loc, t, leaf_align(align, off), q)?);
+        }
+        match self.build(types, ty, &vals, 0) {
+            Some((v, n)) if n == vals.len() => Ok(v),
+            _ => stuck(loc, format!("{} is not a value type", types.show(ty))),
+        }
+    }
+
+    /// Store a scalar, or an aggregate leaf by leaf (Lean's `storeAny`).
+    fn store_any(
+        &mut self,
+        loc: Option<Loc>,
+        ty: Ty,
+        align: u32,
+        v: Value,
+        p: Option<u32>,
+    ) -> R<()> {
+        if ty.is_value() {
+            return self.store(loc, ty, align, v, p);
+        }
+        let types: &'m Types = self.body().types();
+        if !self.has_ty(v, ty) {
+            return stuck(loc, format!("the stored value isn't a {}", types.show(ty)));
+        }
+        let mut leaves = Vec::new();
+        types.leaves(self.space, ty, 0, &mut leaves);
+        let mut vals = Vec::with_capacity(leaves.len());
+        self.leaf_values(v, &mut vals);
+        for (&(off, t), &w) in leaves.iter().zip(&vals) {
+            let q = self.leaf_ptr(p, off)?;
+            self.store(loc, t, leaf_align(align, off), w, q)?;
+        }
+        Ok(())
+    }
+
+    /// Where element `i` of slice `sv` of `ty`s is, after checking `i` against the length
+    /// (Lean's `sliceElem`).
+    fn slice_elem(
+        &mut self,
+        loc: Option<Loc>,
+        trap: bool,
+        ty: Ty,
+        sv: Value,
+        i: Value,
+    ) -> R<Option<u32>> {
+        let Some(&[pv, nv]) = self.parts(sv) else {
+            return stuck(loc, "expected a slice");
+        };
+        let p = self.ptr_of(loc, pv)?;
+        let n = self.bits(loc, nv)?;
+        let i = self.bits(loc, i)?;
+        let (Some(x), Some(m)) = (i, n) else {
+            return ub(UbKind::Poison, loc, "slice index or length is poison");
+        };
+        let (x, m) = (x.to_u64().unwrap_or(0), m.to_u64().unwrap_or(0));
+        if x >= m {
+            if trap {
+                return halt(Behavior::Trap(TrapReason::Bounds), loc, "");
+            }
+            return ub(UbKind::Bounds, loc, format!("index {x}, length {m}"));
+        }
+        let Some(p) = p else { return Ok(None) };
+        let aw = self.space.addr_bits;
+        let stride = self.body().types().stride(self.space, ty);
+        let off = u128::from(x).wrapping_mul(stride) as u64 & sem::mask(aw);
+        Ok(
+            match self.offset_by(true, p, i128::from(sem::sext64(aw, off)))? {
+                Some(Value::Ptr(q)) => Some(q),
+                _ => None,
+            },
+        )
     }
 
     /// Bind a callee's parameters and open its `noalias` and `readonly` scopes; the callee's
@@ -1940,35 +2297,39 @@ impl<'m> Machine<'m> {
                 format!("offset {off} is not the start of @{name}"),
             );
         }
-        // Parameter and result types; they are value types, which need no table.
+        // Parameter and result types, in the callee's table.
         let module: &'m Module = self.module;
         let mut params = Vec::new();
-        let rets: &[Ty] = match module.funcs.get(f as usize) {
+        let (rets, ctypes): (&[Ty], &Types) = match module.funcs.get(f as usize) {
             Some(callee) => {
                 let cb = &callee.body;
                 params.extend(cb.params(cb.entry()).map(|v| cb.ty(v)));
-                &callee.rets
+                (&callee.rets, cb.types())
             }
             None => {
                 let x = &module.externs[(f - self.nfuncs) as usize];
                 params.extend_from_slice(&x.params);
-                &x.rets
+                (&x.rets, &module.globals.types)
             }
         };
-        let ok = match self.body().types().shape_of(sig) {
-            Some(Shape::Func(ps, rs)) => params == ps && rets == rs,
+        let types = self.body().types();
+        let same = |xs: &[Ty], ys: &[Ty]| {
+            xs.len() == ys.len() && xs.iter().zip(ys).all(|(&x, &y)| ctypes.same(x, types, y))
+        };
+        let ok = match types.shape_of(sig) {
+            Some(Shape::Func(ps, rs)) => same(&params, ps) && same(rets, rs),
             _ => false,
         };
         if !ok {
             let mut t = String::from("func<(");
-            for (i, p) in params.iter().enumerate() {
+            for (i, &p) in params.iter().enumerate() {
                 if i > 0 {
                     t.push_str(", ");
                 }
-                write!(t, "{p}").unwrap();
+                ctypes.write(&mut t, p);
             }
             t.push(')');
-            crate::types::write_rets(&mut t, rets, |out, r| write!(out, "{r}").unwrap());
+            crate::types::write_rets(&mut t, rets, |out, &r| ctypes.write(out, r));
             t.push('>');
             return ub(UbKind::BadCall, loc, format!("@{name} has type {t}"));
         }
@@ -1996,7 +2357,7 @@ impl<'m> Machine<'m> {
                     .extend(std::iter::repeat_n(Byte::Bits(0), n as usize));
                 Value::Bytes { start, len: n }
             }
-            Ty::Agg(_) => Value::Bytes { start: 0, len: 0 },
+            Ty::Agg(_) | Ty::Slice => Value::Bytes { start: 0, len: 0 },
         }
     }
 
@@ -2297,6 +2658,16 @@ impl<'m> Machine<'m> {
                 self.marks.truncate(scopes as usize);
                 let Some(op) = op else {
                     let mut out = String::new();
+                    let mut lowered = Vec::new();
+                    let vs = if self.lower_rets {
+                        let types = self.body().types();
+                        for (&v, &t) in vs.iter().zip(rets) {
+                            self.lower_value(types, t, v, &mut lowered);
+                        }
+                        &lowered[..]
+                    } else {
+                        vs
+                    };
                     for (j, &v) in vs.iter().enumerate() {
                         if j > 0 {
                             out.push_str(", ");
@@ -2476,6 +2847,32 @@ impl<'m> Machine<'m> {
                 self.operands(op, loc, &mut vs)?;
                 let results = body.results(op);
                 let rty = results.clone().next().map(|r| body.ty(r));
+                if let OpKind::Overflow { op: aop, signed } = kind {
+                    let w = match rty {
+                        Some(Ty::Int(w)) => w,
+                        _ => 0,
+                    };
+                    let (a, b) = match vs[..] {
+                        [a, b] => (self.bits(loc, a)?, self.bits(loc, b)?),
+                        _ => return stuck(loc, "malformed op"),
+                    };
+                    let out = match (a, b) {
+                        (Some(a), Some(b)) => {
+                            let (r, o) = sem::overflow_pair(aop, signed, w, &a, &b);
+                            [
+                                self.int_value(w, Some(r)),
+                                Value::Int {
+                                    w: 1,
+                                    bits: u64::from(o),
+                                },
+                            ]
+                        }
+                        _ => [Value::Poison { w }, Value::Poison { w: 1 }],
+                    };
+                    self.bind(loc, results, &out)?;
+                    self.scratch = vs;
+                    return Ok(());
+                }
                 match self.simple(loc, kind, rty, &vs)? {
                     Some(v) => self.bind(loc, results, &[v])?,
                     None => self.bind(loc, results, &[])?,
@@ -2541,8 +2938,70 @@ impl<'m> Machine<'m> {
         Ok(())
     }
 
+    /// The scalars an HFIR value of type `t` is represented by after lowering (Lean's
+    /// `Lower.lowerValue`): its leaves, and for a union `poison` for the variants it doesn't hold.
+    fn lower_value(&mut self, types: &Types, t: Ty, v: Value, out: &mut Vec<Value>) {
+        let parts: Vec<Value> = match self.parts(v) {
+            Some(ps) => ps.to_vec(),
+            None => {
+                out.push(v);
+                return;
+            }
+        };
+        match types.shape_of(t) {
+            Some(Shape::Struct(_, fs)) => {
+                for (&f, &p) in fs.iter().zip(&parts) {
+                    self.lower_value(types, f, p, out);
+                }
+            }
+            Some(Shape::Array(_, e)) => {
+                for &p in &parts {
+                    self.lower_value(types, e, p, out);
+                }
+            }
+            Some(Shape::Union(vs)) => match parts[..] {
+                [tag @ Value::Int { w: 32, bits }, payload] => {
+                    out.push(tag);
+                    for (j, &u) in vs.iter().enumerate() {
+                        if j as u64 == bits {
+                            self.lower_value(types, u, payload, out);
+                        } else {
+                            let mut ts = Vec::new();
+                            types.scalars(self.space.addr_bits, u, &mut ts);
+                            for t in ts {
+                                let p = self.poison_of(t);
+                                out.push(p);
+                            }
+                        }
+                    }
+                }
+                _ => self.leaf_values(v, out),
+            },
+            _ => self.leaf_values(v, out),
+        }
+    }
+
+    /// The `poison` value of a scalar type.
+    fn poison_of(&mut self, t: Ty) -> Value {
+        match t {
+            Ty::Ptr => Value::PtrPoison,
+            Ty::Byte(w) => {
+                let start = self.byte_vals.len() as u32;
+                self.byte_vals
+                    .extend(std::iter::repeat_n(Byte::Poison, (w / 8) as usize));
+                Value::Bytes { start, len: w / 8 }
+            }
+            t => Value::Poison {
+                w: match t {
+                    Ty::Int(w) => w,
+                    _ => 0,
+                },
+            },
+        }
+    }
+
     /// Run at most `fuel` steps and describe the outcome (`fir-ref run`'s `drive`).
-    fn drive(&mut self, fuel: u64) -> String {
+    fn drive(&mut self, fuel: u64) -> RunOutput {
         let mut steps = 0;
         loop {
             if steps >= fuel {
@@ -2553,10 +3012,20 @@ impl<'m> Machine<'m> {
                     )
                 });
                 let tail = if progress { " in a progress loop" } else { "" };
-                return format!("{}out of fuel after {fuel} steps{tail}", self.trace);
+                return RunOutput {
+                    line: format!("{}out of fuel after {fuel} steps{tail}", self.trace),
+                    events: self.trace.clone(),
+                    absorbing: false,
+                    out_of_fuel: true,
+                };
             }
             if let Err(h) = self.step() {
-                return format!("{}{}", self.trace, h.render());
+                return RunOutput {
+                    line: format!("{}{}", self.trace, h.render()),
+                    events: self.trace.clone(),
+                    absorbing: matches!(h.behavior, Behavior::Ub(_) | Behavior::Stuck(_)),
+                    out_of_fuel: false,
+                };
             }
             steps += 1;
         }
