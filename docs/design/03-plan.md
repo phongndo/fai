@@ -41,15 +41,24 @@ run time. Opening it (unknown generic ops, the opaque tier) comes after this rou
 ## HFIR building blocks
 
 Each one is declared in HFIR only, has Lean semantics, and is lowered to MFIR by a lowering proved
-correct in Lean (a refinement between the HFIR program and its MFIR lowering):
+correct in Lean (a refinement between the HFIR program and its MFIR lowering). The checks they
+lower to are `cf.check.REASON %ok`, a core op (decision: Checks):
 
-| Block | Ops (sketch) | Lowered to |
-|---|---|---|
-| Aggregate values | `agg.make`, `agg.extract`, `agg.insert`; aggregates as SSA values, parameters, results | Scalars per field, or memory for large ones |
-| Checked arithmetic | `int.add.checked` → `(result, overflowed)`; language-style ops that trap with a reason | Core arithmetic with `.wrap` plus comparisons, or `.trap` |
-| Tagged unions | `union.make`, `union.tag`, `union.get` (UB or trap on the wrong tag) | A tag field plus payload in memory or aggregates |
-| Slices | `slice.make`, `slice.len`, `slice.get`/`slice.set` (bounds-checked, trap reason `bounds`) | Pointer, length, a check, and `ptr.index` |
-| Exceptions | `cf.try { } catch %e { }`, `exn.throw` | Calls that name their handler in MFIR (the Exceptions decision); LFIR lowers to unwind tables |
+| Block | Ops | Lowered to | Status |
+|---|---|---|---|
+| Aggregate values | `agg.make`, `agg.extract`, `agg.insert`, `copy`; structs and arrays as values, parameters, results, region parameters; `mem.load`/`mem.store` leaf by leaf | One scalar per leaf; copies; one access per leaf at `ptr.offset.wrap` | Built; lowering tested |
+| Checked arithmetic | `int.add.overflow.s` → `(result, overflowed)`, `sub`, `mul`, `.u`; trapping ops are the `.s.trap`/`.u.trap` modifiers | Extension, `.wrap` arithmetic, truncation, `int.cmp.ne` | Built; lowering proved |
+| Tagged unions | `union<…>`; `union.make`, `union.tag`, `union.get.ub`/`.trap` (reason `tag`); SSA only | The tag and every variant's scalars (`poison` where not held); `int.cmp.eq` and `cf.check.tag` | Built; lowering tested |
+| Slices | `slice`; `slice.make`, `slice.ptr`, `slice.len`, `slice.get.ub`/`.trap`, `slice.set.ub`/`.trap` (reason `bounds`) | Pointer and length; `int.cmp.ult` and `cf.check.bounds`; `int.mul.wrap` and `ptr.offset.inbounds` | Built; lowering tested |
+| Field and element addresses | `ptr.field`, `ptr.index` (core HFIR ops) | `ptr.offset` by `int.const` offsets and exact products | Lowering proved |
+| Exceptions | `cf.try { } catch %e { }`, `exn.throw` | Calls that name their handler in MFIR (the Exceptions decision); LFIR lowers to unwind tables | Next |
+
+The lowering (`Fir.Lower`, `crates/fir/src/lower.rs`; `fir lower FILE`) scalarizes each function,
+then expands it (decision: HFIR lowering). Both tools print the same lowering, and the tests run
+every fixture and fuzzed HFIR program before and after lowering: the same outcome, or, where the
+HFIR run is UB, the same events first. `Lower.Proof.Expand.refines` proves the expansion pass, and
+so the whole lowering of functions without aggregate, union, or slice values
+(`lowerFunc_refines`); the scalarizing pass is not proved yet (decision: Lowering proofs).
 
 ## MFIR
 
