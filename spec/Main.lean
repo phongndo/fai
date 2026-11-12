@@ -11,7 +11,9 @@ fir-ref test PATH...                           run the test files (.fir) under P
 ```
 
 Arguments are integers, `null` (for pointers), or `poison`. Every free choice takes the oracle's
-answer `0`: `freeze` gives `0`, allocations succeed, and addresses are assigned first-fit.
+answer `0`: `freeze` gives `0`, allocations succeed, and addresses are assigned first-fit. Every
+external call returns zeros (`0`, `null`) and changes nothing (`World.zero`). The outcome line
+lists the run's events first, each followed by `; `.
 
 A test file is a `.fir` module with expectations in comments:
 
@@ -40,11 +42,12 @@ def parseArg (t : Ty) (s : String) : Except String RVal :=
 
 partial def drive (m : Machine) (steps limit : Nat) : String :=
   if steps ≥ limit then
-    s!"out of fuel after {limit} steps" ++ (if m.inProgressLoop then " in a progress loop" else "")
+    renderRun m.core.trace <|
+      s!"out of fuel after {limit} steps" ++ (if m.inProgressLoop then " in a progress loop" else "")
   else
     match step m with
     | .ok m' => drive m' (steps + 1) limit
-    | .error h => renderHalt h
+    | .error h => renderRun m.core.trace (renderHalt h)
 
 /-- Run a function and describe the outcome in one line. -/
 def runFunc (m : Module) (name : String) (args : List String) (fuel : Nat) :
@@ -53,7 +56,7 @@ def runFunc (m : Module) (name : String) (args : List String) (fuel : Nat) :
   if args.length != f.params.length then
     throw s!"@{name} takes {f.params.length} arguments but got {args.length}"
   let vals ← (f.params.zip args).mapM fun (r, a) => parseArg r.ty a
-  match Machine.init (fun _ => 0) m f vals with
+  match Machine.init (fun _ => 0) World.zero m f vals with
   | .error h => pure (renderHalt h)
   | .ok mach => pure (drive mach 0 fuel)
 

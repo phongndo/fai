@@ -28,10 +28,10 @@ namespace Fir.Dse
 /-! ## How runs halt -/
 
 /-- A halt that lets the target do anything (UB, stuck), or one `Func.Decided` rules out. -/
-def Escape (h : Halt) : Prop := h.behavior.Absorbing ∨ h.behavior = .ambiguous
+def Escape (h : Halt) : Prop := h.outcome.Absorbing ∨ h.outcome = .ambiguous
 
-theorem halt_error {b : Behavior} {loc : Option Loc} {note : String} {h : Halt}
-    (e : (halt b loc note : Except Halt α) = .error h) : h.behavior = b := by
+theorem halt_error {b : Outcome} {loc : Option Loc} {note : String} {h : Halt}
+    (e : (halt b loc note : Except Halt α) = .error h) : h.outcome = b := by
   cases e; rfl
 
 theorem escape_ub {k : UBKind} {loc : Option Loc} {note : String} {h : Halt}
@@ -317,13 +317,13 @@ theorem checkAccess_same {c : Core} {loc loc' : Option Loc} {p : Ptr} {n A A' : 
 
 theorem storeC_none {loc : Option Loc} {T : Ty} {A : Nat} {v : RVal} {c : Core} :
     storeC loc T A v none c =
-      .error { behavior := .ub .poison, loc := loc, note := "store through a poison pointer" } :=
+      .error { outcome := .ub .poison, loc := loc, note := "store through a poison pointer" } :=
   rfl
 
 theorem storeC_ill_typed {loc : Option Loc} {T : Ty} {A : Nat} {v : RVal} {p : Ptr} {c : Core}
     (h : v.hasTy T = false) :
     storeC loc T A v (some p) c =
-      .error { behavior := .stuck s!"the stored value isn't a {T}", loc := loc } := by
+      .error { outcome := .stuck s!"the stored value isn't a {T}", loc := loc } := by
   simp [storeC, h, halt, throw, throwThe, MonadExcept.throw, bind, Except.bind]
   rfl
 
@@ -428,14 +428,14 @@ theorem checkResults_nil (loc : Option Loc) (vs : List RVal) (c : Core) :
     checkResults loc [] vs c =
       match vs with
       | [] => .ok ((), c)
-      | _ => .error { behavior := .stuck "wrong number of values", loc := loc } := by
+      | _ => .error { outcome := .stuck "wrong number of values", loc := loc } := by
   cases vs <;> rfl
 
 theorem simpleOp_store (loc : Option Loc) (T : Ty) (A : Nat) (v pv : RVal) (c : Core) :
     simpleOp loc (.store T A) [] [v, pv] c =
       match pv with
       | .ptr p => (storeC loc T A v p c).bind fun r => .ok ([], r.2)
-      | _ => .error { behavior := .stuck "expected a ptr", loc := loc } := by
+      | _ => .error { outcome := .stuck "expected a ptr", loc := loc } := by
   simp only [simpleOp, evalSimple, get, getThe, MonadStateOf.get, StateT.get, bind, StateT.bind,
     pure, StateT.pure, Except.bind]
   cases pv with
@@ -496,20 +496,23 @@ theorem step_dse {mt ms : Machine} {s1 s2 : Op} {t s : List Op} {ids : List Nat}
   rw [operands_ops _ s] at step1
   cases hx1 : operandIn (.block s ids es :: fs) loc1 (.var x1) with
   | error h =>
-    have esc : Escapes ⟨c, _⟩ := ⟨1, h, by
-      rw [runSteps_one, step1, operands_pair, hx1]; rfl, .inl (operandIn_var_error hx1)⟩
+    have esc : Escapes c.trace ⟨c, _⟩ := Escapes.one (by
+      rw [runSteps_one, step1, operands_pair, hx1]; rfl) (.inl (operandIn_var_error hx1))
+      (Events.Refines.refl _)
     exact ⟨fun _ _ => .inl esc, fun _ _ => .inl esc⟩
   | ok w1 =>
   cases hxp : operandIn (.block s ids es :: fs) loc1 (.var xp) with
   | error h =>
-    have esc : Escapes ⟨c, _⟩ := ⟨1, h, by
-      rw [runSteps_one, step1, operands_pair, hx1, hxp]; rfl, .inl (operandIn_var_error hxp)⟩
+    have esc : Escapes c.trace ⟨c, _⟩ := Escapes.one (by
+      rw [runSteps_one, step1, operands_pair, hx1, hxp]; rfl) (.inl (operandIn_var_error hxp))
+      (Events.Refines.refl _)
     exact ⟨fun _ _ => .inl esc, fun _ _ => .inl esc⟩
   | ok pv =>
   rw [operands_pair, hx1, hxp] at step1
   simp only [Except.bind] at step1
   rcases dse_core (loc2 := loc2) (A2 := A2) hsz w1 pv c with ⟨h, e1, hesc⟩ | ⟨c1, e1, e2⟩
-  · have esc : Escapes ⟨c, _⟩ := ⟨1, h, by rw [runSteps_one, step1, e1], hesc⟩
+  · have esc : Escapes c.trace ⟨c, _⟩ :=
+      Escapes.one (by rw [runSteps_one, step1, e1]) hesc (Events.Refines.refl _)
     exact ⟨fun _ _ => .inl esc, fun _ _ => .inl esc⟩
   rw [e1] at step1
   refine StepMatch.prepend step1 ?_ ?_
@@ -521,7 +524,7 @@ theorem step_dse {mt ms : Machine} {s1 s2 : Op} {t s : List Op} {ids : List Nat}
     (x := (operands (.block s ids es :: fs) loc2 [v2, .var xp]).bind fun vs =>
       simpleOp loc2 (.store T2 A2) [] vs c)
     (ft := fun outs core => ⟨core, bindTop [] outs (.block t ids et :: ft)⟩)
-    (fs := fun outs core => ⟨core, bindTop [] outs (.block s ids es :: fs)⟩) ?_ ?_ ?_ ?_
+    (fs := fun outs core => ⟨core, bindTop [] outs (.block s ids es :: fs)⟩) ?_ ?_ ?_ ?_ ?_
   · rw [step_simple rfl rfl rfl, rel.operands loc2 hargs]
   · rw [step_simple rfl rfl rfl]
     congr 1
@@ -532,6 +535,11 @@ theorem step_dse {mt ms : Machine} {s1 s2 : Op} {t s : List Op} {ids : List Nat}
     | ok w2 => rw [hv] at e; cases e; exact e2 w2
   · simp only [Machine.shape]
     exact (shape_cons rfl hb).symm
+  · -- The deleted store left the trace alone.
+    have hk := keeps_simpleOp (sp := c.fixed) loc1 (.store T1 A1) [] [w1, pv] c _ rfl e1
+    simp only [Core.fixed, Prod.mk.injEq] at hk
+    simp only [hk.2]
+    exact Events.Refines.refl _
   · intro _ core _
     exact ⟨rfl, D, rel.bindTop _ _⟩
 
@@ -548,8 +556,8 @@ refines the original, for every argument and every oracle. -/
 theorem refines {mod : Module} {tgt src : Func} (hparams : tgt.params = src.params)
     (hrets : tgt.rets = src.rets) (hops : OpsRel L tgt.body.ops src.body.ops)
     (dec : src.Decided mod) : tgt.Refines mod src :=
-  Simulation.refines sim
-    (fun oracle args => ⟨oracle, InitMatch.of_lockstep
-      (init_lockstep hparams hrets hops oracle args) fun _ _ h => h⟩) dec
+  Simulation.refines sim (fun _ _ h => by rw [h.1]; exact Events.Refines.refl _)
+    (fun oracle world args => ⟨oracle, InitMatch.of_lockstep
+      (init_lockstep hparams hrets hops oracle world args) fun _ _ h => h⟩) dec
 
 end Fir.Dse

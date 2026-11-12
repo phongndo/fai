@@ -281,7 +281,10 @@ def R (mt ms : Machine) : Prop := (MRel L mt ms ∨ Mid mt ms) ∧ 0 < ms.core.s
 
 theorem simpleOp_ok_space {loc : Option Loc} {k : OpKind} {rs : List Result} {vs : List RVal}
     {c c' : Core} {outs : List RVal} (e : simpleOp loc k rs vs c = .ok (outs, c')) :
-    c'.space = c.space := keeps_simpleOp loc k rs vs c _ rfl e
+    c'.space = c.space := by
+  have := keeps_simpleOp (sp := c.fixed) loc k rs vs c _ rfl e
+  simp only [Core.fixed, Prod.mk.injEq] at this
+  exact this.1
 
 /-- At a rewritten spot, both run the store, and land between it and the load. -/
 theorem step_store {mt ms : Machine} {s l c : Op} {t s' : List Op} {ids : List Nat}
@@ -306,7 +309,7 @@ theorem step_store {mt ms : Machine} {s l c : Op} {t s' : List Op} {ids : List N
     (x := (operands S1 loc1 [v, op]).bind fun vs => simpleOp loc1 (.store T A1) [] vs core)
     (ft := fun outs core => ⟨core, bindTop [] outs
       (.block (.mk .copy [r] [v] [] loc2 :: t) ids et :: ft)⟩)
-    (fs := fun outs core => ⟨core, bindTop [] outs S1⟩) ?_ ?_ ?_ ?_
+    (fs := fun outs core => ⟨core, bindTop [] outs S1⟩) ?_ ?_ ?_ (Events.Refines.refl _) ?_
   · rw [step_simple rfl rfl rfl, operands_ops _ t, rel.operands loc1 hargs, operands_ops s']
   · rw [step_simple rfl rfl rfl]
   · simp only [Machine.shape]
@@ -350,12 +353,14 @@ theorem step_mid {mt ms : Machine} (hmid : Mid mt ms) (hsp : 0 < ms.core.space.p
   have stepS := step_simple (c := core) (k := .load A2) (res := [r]) (args := [op]) (loc := loc)
     (t := s) (ids := ids) (env := es) (fs := fs) rfl rfl rfl
   rcases hready with ⟨h, e, hesc⟩ | heq
-  · have esc : Escapes ⟨core, _⟩ := ⟨1, h, by rw [runSteps_one, stepS, e]; rfl, hesc⟩
+  · have esc : Escapes core.trace ⟨core, _⟩ :=
+      Escapes.one (by rw [runSteps_one, stepS, e]; rfl) hesc (Events.Refines.refl _)
     exact ⟨fun _ _ => .inl esc, fun _ _ => .inl esc⟩
   refine step_same
     (x := (operands (.block s ids es :: fs) loc [v]).bind fun vs => simpleOp loc .copy [r] vs core)
     (ft := fun outs core => ⟨core, bindTop [r] outs (.block t ids et :: ft)⟩)
-    (fs := fun outs core => ⟨core, bindTop [r] outs (.block s ids es :: fs)⟩) ?_ ?_ ?_ ?_
+    (fs := fun outs core => ⟨core, bindTop [r] outs (.block s ids es :: fs)⟩) ?_ ?_ ?_
+    (Events.Refines.refl _) ?_
   · rw [step_simple rfl rfl rfl, rel.operands loc (Op.reads_mk hrc).1]
   · rw [stepS, heq]
   · simp only [Machine.shape]
@@ -379,14 +384,15 @@ theorem sim : Simulation R := by
 
 theorem init_match {mod : Module} {tgt src : Func} (hsp : 0 < mod.space.ptrBits / 8)
     (hparams : tgt.params = src.params) (hrets : tgt.rets = src.rets)
-    (hops : OpsRel L tgt.body.ops src.body.ops) (oracle : Nat → Int) (args : List RVal) :
-    InitMatch R (Machine.init oracle mod tgt args) (Machine.init oracle mod src args) := by
-  rcases init_lockstep (mod := mod) hparams hrets hops oracle args with ⟨h, e1, e2⟩ |
+    (hops : OpsRel L tgt.body.ops src.body.ops) (oracle : Nat → Int) (world : World)
+    (args : List RVal) :
+    InitMatch R (Machine.init oracle world mod tgt args) (Machine.init oracle world mod src args) := by
+  rcases init_lockstep (mod := mod) hparams hrets hops oracle world args with ⟨h, e1, e2⟩ |
     ⟨mt, ms, e1, e2, hR⟩
   · rw [e1, e2]
-    by_cases hamb : h.behavior = .ambiguous
+    by_cases hamb : h.outcome = .ambiguous
     · exact .inl ⟨h, rfl, .inr hamb⟩
-    · exact .inr (.inr ⟨h, h, rfl, rfl, Behavior.Refines.refl _ hamb⟩)
+    · exact .inr (.inr ⟨h, h, rfl, rfl, Outcome.Refines.refl _ hamb⟩)
   · rw [e1, e2]
     exact .inr (.inl ⟨mt, ms, rfl, rfl, .inl hR, by rw [init_space e2]; exact hsp⟩)
 
@@ -397,8 +403,9 @@ and pointers must take at least one byte (the verifier checks both). -/
 theorem refines {mod : Module} {tgt src : Func} (hsp : 8 ≤ mod.space.ptrBits)
     (hparams : tgt.params = src.params) (hrets : tgt.rets = src.rets)
     (hops : OpsRel L tgt.body.ops src.body.ops) (dec : src.Decided mod) : tgt.Refines mod src :=
-  Simulation.refines sim
-    (fun oracle args => ⟨oracle, init_match (by omega) hparams hrets hops oracle args⟩) dec
+  Simulation.refines sim (fun _ _ h => by
+      rcases h.1 with h | h <;> rw [h.1] <;> exact Events.Refines.refl _)
+    (fun oracle world args => ⟨oracle, init_match (by omega) hparams hrets hops oracle world args⟩) dec
 
 
 /-! ## Look-alikes that are wrong -/

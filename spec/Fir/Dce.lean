@@ -38,7 +38,7 @@ namespace Fir.Dce
 /-- A core computation that leaves the core as it was, and fails only by UB or getting stuck. A
 target may skip it. -/
 def ReadOnly (x : CM α) : Prop :=
-  ∀ c, (∃ h, x c = .error h ∧ h.behavior.Absorbing) ∨ ∃ a, x c = .ok (a, c)
+  ∀ c, (∃ h, x c = .error h ∧ h.outcome.Absorbing) ∨ ∃ a, x c = .ok (a, c)
 
 namespace ReadOnly
 
@@ -168,7 +168,7 @@ theorem poison_pure (r : Result) (loc : Option Loc) : Pure (.mk .poison [r] [] [
 /-- Operands that are variables fail only by getting stuck. -/
 theorem operands_vars_error {fs : List Frame} {loc : Option Loc} :
     ∀ {args : List Operand}, (∀ a ∈ args, ∃ n, a = .var n) → ∀ {h : Halt},
-      operands fs loc args = .error h → h.behavior.Absorbing
+      operands fs loc args = .error h → h.outcome.Absorbing
   | [], _, _, e => by cases e
   | a :: args, hv, h, e => by
     obtain ⟨n, rfl⟩ := hv a (by simp)
@@ -198,7 +198,7 @@ theorem step_deleted {mt ms : Machine} {o : Op} {t s : List Op} {ids : List Nat}
     (hb : StackRel L Db ft fs) (hDb : ∀ n, Db n → D n) (hag : EnvAgree D et es)
     (hnr : NoReads D t) (ht : mt.stack = .block t ids et :: ft)
     (hs : ms.stack = .block (o :: s) ids es :: fs) :
-    Escapes ms ∨ ∃ ms1, step ms = .ok ms1 ∧ MRel L mt ms1 ∧ topLen ms1 = s.length := by
+    Escapes mt.core.trace ms ∨ ∃ ms1, step ms = .ok ms1 ∧ MRel L mt ms1 ∧ topLen ms1 = s.length := by
   obtain ⟨k, res, args, loc, rfl, h1, h2, h3, hvars, hro⟩ := hp
   obtain ⟨c, stt⟩ := mt
   obtain ⟨cs, sts⟩ := ms
@@ -208,11 +208,13 @@ theorem step_deleted {mt ms : Machine} {o : Op} {t s : List Op} {ids : List Nat}
     (ids := ids) (env := es) (fs := fs) h1 h2 h3
   cases hv : operands (.block s ids es :: fs) loc args with
   | error h =>
-    exact .inl ⟨1, h, by rw [runSteps_one, e, hv]; rfl, .inl (operands_vars_error hvars hv)⟩
+    exact .inl (Escapes.one (by rw [runSteps_one, e, hv]; rfl) (.inl (operands_vars_error hvars hv))
+      (Events.Refines.refl _))
   | ok vs =>
   rw [hv] at e
   rcases readOnly_simpleOp (hro vs) c with ⟨h, e1, hh⟩ | ⟨outs, e1⟩
-  · exact .inl ⟨1, h, by rw [runSteps_one, e]; simp only [Except.bind, e1], .inl hh⟩
+  · exact .inl (Escapes.one (by rw [runSteps_one, e]; simp only [Except.bind, e1]) (.inl hh)
+      (Events.Refines.refl _))
   · refine .inr ⟨⟨c, bindTop res outs (.block s ids es :: fs)⟩,
       by rw [e]; simp only [Except.bind, e1], ⟨rfl, fun n => D n ∨ ∃ r ∈ res, r.name = n, ?_⟩, rfl⟩
     refine .block hb (fun n h => .inl (hDb n h)) hts (fun n hn => ?_) (fun n hn => ?_)
@@ -252,9 +254,9 @@ a chain of dead copies can go at once. -/
 theorem refines {mod : Module} {tgt src : Func} (hparams : tgt.params = src.params)
     (hrets : tgt.rets = src.rets) (hops : OpsRel L tgt.body.ops src.body.ops)
     (dec : src.Decided mod) : tgt.Refines mod src :=
-  Simulation.refines sim
-    (fun oracle args => ⟨oracle, InitMatch.of_lockstep
-      (init_lockstep hparams hrets hops oracle args) fun _ _ h => h⟩) dec
+  Simulation.refines sim (fun _ _ h => by rw [h.1]; exact Events.Refines.refl _)
+    (fun oracle world args => ⟨oracle, InitMatch.of_lockstep
+      (init_lockstep hparams hrets hops oracle world args) fun _ _ h => h⟩) dec
 
 theorem OpsRel.prefix {L : List Op → List Op → List Op → Prop} {t s : List Op} (h : OpsRel L t s) :
     ∀ pre : List Op, OpsRel L (pre ++ t) (pre ++ s)

@@ -109,12 +109,12 @@ def OpOut.bind : OpOut w → (Val w → OpOut v) → OpOut v
   | .trap r, _ => .trap r
   | .ub k, _ => .ub k
 
-/-- What running a function does, as seen from outside. -/
-inductive Behavior where
+/-- How a run ends, after its events. -/
+inductive Outcome where
   | ret (vs : List RVal)
   | trap (r : TrapReason)
   | ub (k : UBKind)
-  /-- Runs forever. -/
+  /-- Runs forever without another event. -/
   | diverge
   /-- Reached a hole (`?name`) that has no value yet. -/
   | hole (name : String)
@@ -126,6 +126,21 @@ inductive Behavior where
   unknown, so it refines nothing and is refined by nothing but UB. -/
   | ambiguous
   deriving DecidableEq, Repr
+
+/-- An observable event: a call to an external function, with the arguments it was passed and
+the results the environment returned (`none`: the call never returned). -/
+structure Event where
+  callee : String
+  args : List RVal
+  results : Option (List RVal)
+  deriving DecidableEq, Repr
+
+/-- What running a function does, as seen from outside: a trace of events. A finite trace ends
+in an outcome (`diverge` if the run goes on forever without another event); a run with
+infinitely many events has no outcome. -/
+inductive Behavior where
+  | fin (es : List Event) (o : Outcome)
+  | inf (es : Nat → Event)
 
 def TrapReason.name : TrapReason → String
   | .div0 => "div0"

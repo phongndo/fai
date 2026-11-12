@@ -209,11 +209,18 @@ def SpaceCfg.render (sp : SpaceCfg) : String :=
     " int " ++ " ".intercalate (sp.ints.map fun (w, a) => s!"{w}:{a}")
   s!"memspace default ptr {sp.ptrBits} addr {sp.addrBits}{align}{ints}\n"
 
+/-- `extern func @puts(ptr) -> i32 effects[read(args)] assume` -/
+def Extern.render (x : Extern) : String :=
+  let rets := retsText (x.rets.map toString)
+  s!"extern func @{x.name}({commas (x.params.map toString)}){rets} effects[{commas (x.effects.map ExtEffect.render)}] {x.trust.name}\n"
+
 def Module.render (m : Module) (showLocs := true) : String :=
   let header := if m.space == {} then "" else m.space.render ++ "\n"
   let globals := if m.globals.isEmpty then "" else
     String.join (m.globals.map Global.render) ++ "\n"
-  header ++ globals ++ "\n".intercalate (m.funcs.map (Func.render showLocs))
+  let externs := if m.externs.isEmpty then "" else
+    String.join (m.externs.map Extern.render) ++ "\n"
+  header ++ globals ++ externs ++ "\n".intercalate (m.funcs.map (Func.render showLocs))
 
 def hex (n : Nat) : String := "0x" ++ String.ofList (Nat.toDigits 16 n)
 
@@ -240,10 +247,19 @@ def renderHaltLoc : Option Loc → String
   | some l => s!" @{l.line}:{l.col}"
   | none => ""
 
-/-- One line describing how a run ended. Tests compare against this text. -/
+/-- An event: `@puts(ptr #2) -> i32 0`; `-> ()` for a call that returned nothing, `-> never`
+for one that never returned. -/
+def Event.render (e : Event) : String :=
+  let res := match e.results with
+    | none => "never"
+    | some [] => "()"
+    | some vs => commas (vs.map RVal.render)
+  s!"@{e.callee}({commas (e.args.map RVal.render)}) -> {res}"
+
+/-- How a run ended, after its events. -/
 def renderHalt (h : Halt) : String :=
   let l := renderHaltLoc h.loc
-  let main := match h.behavior with
+  let main := match h.outcome with
     | .ret [] => "returned"
     | .ret vs => s!"returned {commas (vs.map RVal.render)}"
     | .trap r => s!"trap {r.name}{l}"
@@ -254,5 +270,9 @@ def renderHalt (h : Halt) : String :=
     | .ambiguous => s!"ambiguous{l}"
   let note := if h.note.isEmpty then "" else s!" ({h.note})"
   "; ".intercalate ((main ++ note) :: h.leaks)
+
+/-- One line describing a run: its events, then how it ended. Tests compare against this text. -/
+def renderRun (events : List Event) (ending : String) : String :=
+  "; ".intercalate (events.map Event.render ++ [ending])
 
 end Fir

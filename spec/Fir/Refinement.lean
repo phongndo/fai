@@ -195,13 +195,13 @@ theorem RVal.RefinesList.trans {as bs cs : List RVal} :
     RVal.RefinesList as bs → RVal.RefinesList bs cs → RVal.RefinesList as cs :=
   Forall2.trans (r := RVal.Refines) (fun _ _ _ => RVal.Refines.trans)
 
-/-! ## Function behaviors -/
+/-! ## Outcomes -/
 
-/-- `t.Refines s` for the observable behavior of a run. A source that is UB or stuck (malformed;
-verified programs never get stuck) allows anything. An `ambiguous` run has an unknown behavior:
-as a target it refines only those, and as a source nothing refines it. So refinement is not
-reflexive on `ambiguous`. -/
-def Behavior.Refines : Behavior → Behavior → Prop
+/-- `t.Refines s` for how a run ends. A source that is UB or stuck (malformed; verified programs
+never get stuck) allows anything. An `ambiguous` run has an unknown behavior: as a target it
+refines only those, and as a source nothing refines it. So refinement is not reflexive on
+`ambiguous`. -/
+def Outcome.Refines : Outcome → Outcome → Prop
   | _, .ub _ => True
   | _, .stuck _ => True
   | .ret vs, .ret vs' => RVal.RefinesList vs vs'
@@ -210,7 +210,7 @@ def Behavior.Refines : Behavior → Behavior → Prop
   | .hole n, .hole n' => n = n'
   | _, _ => False
 
-def Behavior.refines : Behavior → Behavior → Bool
+def Outcome.refines : Outcome → Outcome → Bool
   | _, .ub _ => true
   | _, .stuck _ => true
   | .ret vs, .ret vs' => RVal.refinesList vs vs'
@@ -219,24 +219,153 @@ def Behavior.refines : Behavior → Behavior → Bool
   | .hole n, .hole n' => n == n'
   | _, _ => false
 
-theorem Behavior.refines_iff {t s : Behavior} : t.refines s = true ↔ t.Refines s := by
-  cases t <;> cases s <;> simp [Behavior.refines, Behavior.Refines, RVal.refinesList_iff]
+theorem Outcome.refines_iff {t s : Outcome} : t.refines s = true ↔ t.Refines s := by
+  cases t <;> cases s <;> simp [Outcome.refines, Outcome.Refines, RVal.refinesList_iff]
 
-theorem Behavior.Refines.refl (b : Behavior) (h : b ≠ .ambiguous) : b.Refines b := by
-  cases b <;> simp_all [Behavior.Refines, RVal.RefinesList.refl]
+theorem Outcome.Refines.refl (b : Outcome) (h : b ≠ .ambiguous) : b.Refines b := by
+  cases b <;> simp_all [Outcome.Refines, RVal.RefinesList.refl]
 
-/-- A source behavior that every target behavior refines: UB, or stuck. -/
-def Behavior.Absorbing : Behavior → Prop
+/-- A source outcome that every target outcome refines: UB, or stuck. -/
+def Outcome.Absorbing : Outcome → Prop
   | .ub _ | .stuck _ => True
   | _ => False
 
-theorem Behavior.Refines.of_absorbing {t s : Behavior} (h : s.Absorbing) : t.Refines s := by
-  cases s <;> cases t <;> simp_all [Behavior.Absorbing, Behavior.Refines]
+theorem Outcome.Refines.of_absorbing {t s : Outcome} (h : s.Absorbing) : t.Refines s := by
+  cases s <;> cases t <;> simp_all [Outcome.Absorbing, Outcome.Refines]
+
+theorem Outcome.Refines.trans {a b c : Outcome} :
+    a.Refines b → b.Refines c → a.Refines c := by
+  intro h₁ h₂
+  cases a <;> cases b <;> cases c <;> simp only [Outcome.Refines] at h₁ h₂ ⊢
+  all_goals first | trivial | contradiction | exact RVal.RefinesList.trans h₁ h₂ | exact h₁.trans h₂
+
+theorem Outcome.Absorbing.of_refines {t s : Outcome} (ht : t.Absorbing) (h : t.Refines s) :
+    s.Absorbing := by
+  cases t <;> cases s <;> simp_all [Outcome.Absorbing, Outcome.Refines]
+
+/-! ## Events -/
+
+/-- `t.Refines s` for events: a call to the same function, with arguments that refine the
+source's (any value where the source passed `poison`), and the same results. The results are
+what the environment returned, so they are inputs to the rest of the run, not outputs: the source
+must have seen exactly them. -/
+def Event.Refines (t s : Event) : Prop :=
+  t.callee = s.callee ∧ RVal.RefinesList t.args s.args ∧ t.results = s.results
+
+def Event.refines (t s : Event) : Bool :=
+  t.callee == s.callee && RVal.refinesList t.args s.args && t.results == s.results
+
+theorem Event.refines_iff {t s : Event} : t.refines s = true ↔ t.Refines s := by
+  simp [Event.refines, Event.Refines, RVal.refinesList_iff, and_assoc]
+
+theorem Event.Refines.refl (e : Event) : e.Refines e :=
+  ⟨rfl, RVal.RefinesList.refl _, rfl⟩
+
+theorem Event.Refines.trans {a b c : Event} : a.Refines b → b.Refines c → a.Refines c :=
+  fun ⟨h1, h2, h3⟩ ⟨h1', h2', h3'⟩ => ⟨h1.trans h1', RVal.RefinesList.trans h2 h2', h3.trans h3'⟩
+
+/-- Event-by-event refinement of traces of equal length. -/
+abbrev Events.Refines := Forall2 Event.Refines
+
+def Events.refines : List Event → List Event → Bool := all2 Event.refines
+
+theorem Events.refines_iff {ts ss : List Event} : Events.refines ts ss = true ↔ Events.Refines ts ss :=
+  all2_iff (fun _ _ => Event.refines_iff)
+
+theorem Events.Refines.refl (es : List Event) : Events.Refines es es :=
+  Forall2.refl Event.Refines.refl es
+
+theorem Events.Refines.trans {as bs cs : List Event} :
+    Events.Refines as bs → Events.Refines bs cs → Events.Refines as cs :=
+  Forall2.trans (r := Event.Refines) (fun _ _ _ => Event.Refines.trans)
+
+theorem Forall2.length_eq {r : α → β → Prop} : ∀ {as : List α} {bs : List β},
+    Forall2 r as bs → as.length = bs.length
+  | [], [], _ => rfl
+  | _ :: _, _ :: _, ⟨_, h⟩ => by simp [Forall2.length_eq h]
+
+/-- Lists related to a concatenation split the same way. -/
+theorem Forall2.split {r : α → β → Prop} : ∀ {as : List α} {bs cs : List β},
+    Forall2 r as (bs ++ cs) → ∃ as1 as2, as = as1 ++ as2 ∧ Forall2 r as1 bs ∧ Forall2 r as2 cs
+  | as, [], cs, h => ⟨[], as, rfl, trivial, h⟩
+  | a :: as, b :: bs, cs, ⟨hab, h⟩ => by
+    obtain ⟨as1, as2, rfl, h1, h2⟩ := Forall2.split (bs := bs) h
+    exact ⟨a :: as1, as2, rfl, ⟨hab, h1⟩, h2⟩
+  | [], _ :: _, _, h => h.elim
+
+theorem Forall2.append {r : α → β → Prop} : ∀ {as1 as2 : List α} {bs1 bs2 : List β},
+    Forall2 r as1 bs1 → Forall2 r as2 bs2 → Forall2 r (as1 ++ as2) (bs1 ++ bs2)
+  | [], _, [], _, _, h => h
+  | _ :: _, _, _ :: _, _, ⟨h, t⟩, h2 => ⟨h, Forall2.append t h2⟩
+
+/-- Related lists are related at every index. -/
+theorem Forall2.getElem? {r : α → β → Prop} : ∀ {as : List α} {bs : List β},
+    Forall2 r as bs → ∀ {i : Nat} {b : β}, bs[i]? = some b → ∃ a, as[i]? = some a ∧ r a b
+  | [], [], _, _, _, e => by simp at e
+  | a :: _, _ :: _, ⟨hab, _⟩, 0, _, e => by simp at e; subst e; exact ⟨a, rfl, hab⟩
+  | _ :: _, _ :: _, ⟨_, h⟩, i + 1, _, e => by simpa using Forall2.getElem? h (i := i) (by simpa using e)
+
+theorem getElem?_append_some {l1 l2 : List α} {i : Nat} {x : α} (h : l1[i]? = some x) :
+    (l1 ++ l2)[i]? = some x := by
+  rw [List.getElem?_append_left (List.getElem?_eq_some_iff.mp h).1, h]
+
+/-! ## Behaviors -/
+
+/-- `t.Refines s` for whole runs. The traces match event by event and the outcomes refine, except
+that a source that is UB or stuck after some events lets the target do anything once it has
+matched those events: UB is not time travel past observable events, so the target must still
+perform every event the source performed before its UB. A run with infinitely many events refines
+one with infinitely many events, matching each, or a source that is UB after some of them; it
+never refines a finite run that doesn't end in UB, even one that diverges silently. -/
+def Behavior.Refines : Behavior → Behavior → Prop
+  | .fin et ot, .fin es os =>
+    (Events.Refines et es ∧ ot.Refines os) ∨
+    (os.Absorbing ∧ ∃ pre post, et = pre ++ post ∧ Events.Refines pre es)
+  | .inf et, .fin es os => os.Absorbing ∧ ∀ i e, es[i]? = some e → (et i).Refines e
+  | .fin .., .inf _ => False
+  | .inf et, .inf es => ∀ i, (et i).Refines (es i)
+
+/-- Refinement is reflexive except on runs that end `ambiguous`. -/
+theorem Behavior.Refines.refl : ∀ (b : Behavior), (∀ es, b ≠ .fin es .ambiguous) → b.Refines b
+  | .fin es o, h => .inl ⟨Events.Refines.refl es, Outcome.Refines.refl o fun e => h es (by rw [e])⟩
+  | .inf _, _ => fun _ => Event.Refines.refl _
+
+/-- The target matches the source's events, then the source is UB or stuck. -/
+theorem Behavior.Refines.of_prefix {t : Behavior} {es : List Event} {o : Outcome}
+    (ho : o.Absorbing)
+    (h : match t with
+      | .fin et _ => ∃ pre post, et = pre ++ post ∧ Events.Refines pre es
+      | .inf et => ∀ i e, es[i]? = some e → (et i).Refines e) :
+    t.Refines (.fin es o) := by
+  cases t with
+  | fin et ot => exact .inr ⟨ho, h⟩
+  | inf et => exact ⟨ho, h⟩
 
 theorem Behavior.Refines.trans {a b c : Behavior} :
     a.Refines b → b.Refines c → a.Refines c := by
-  intro h₁ h₂
-  cases a <;> cases b <;> cases c <;> simp only [Behavior.Refines] at h₁ h₂ ⊢
-  all_goals first | trivial | contradiction | exact RVal.RefinesList.trans h₁ h₂ | exact h₁.trans h₂
+  intro hab hbc
+  match a, b, c, hab, hbc with
+  | .fin as ao, .fin bs bo, .fin cs co, hab, hbc =>
+    rcases hab with ⟨h1, h2⟩ | ⟨hbo, p', q', rfl, hp'⟩ <;>
+      rcases hbc with ⟨h3, h4⟩ | ⟨hco, p, q, rfl, hp⟩
+    · exact .inl ⟨Events.Refines.trans h1 h3, Outcome.Refines.trans h2 h4⟩
+    · obtain ⟨as1, as2, rfl, h1', -⟩ := Forall2.split h1
+      exact .inr ⟨hco, as1, as2, rfl, Events.Refines.trans h1' hp⟩
+    · exact .inr ⟨hbo.of_refines h4, p', q', rfl, Events.Refines.trans hp' h3⟩
+    · obtain ⟨x1, x2, rfl, hx1, -⟩ := Forall2.split hp'
+      exact .inr ⟨hco, x1, x2 ++ q', by simp, Events.Refines.trans hx1 hp⟩
+  | .inf ae, .fin bs bo, .fin cs co, ⟨hbo, hab⟩, hbc =>
+    rcases hbc with ⟨h3, h4⟩ | ⟨hco, p, q, rfl, hp⟩
+    · refine ⟨hbo.of_refines h4, fun i e he => ?_⟩
+      obtain ⟨b, hb, hbe⟩ := Forall2.getElem? h3 he
+      exact Event.Refines.trans (hab i b hb) hbe
+    · refine ⟨hco, fun i e he => ?_⟩
+      obtain ⟨b, hb, hbe⟩ := Forall2.getElem? hp he
+      exact Event.Refines.trans (hab i b (getElem?_append_some hb)) hbe
+  | .inf ae, .inf be, .fin cs co, hab, ⟨hco, hbc⟩ =>
+    exact ⟨hco, fun i e he => Event.Refines.trans (hab i) (hbc i e he)⟩
+  | .inf ae, .inf be, .inf ce, hab, hbc => exact fun i => Event.Refines.trans (hab i) (hbc i)
+  | .fin .., .inf _, _, hab, _ => exact hab.elim
+  | _, .fin .., .inf _, _, hbc => exact hbc.elim
 
 end Fir

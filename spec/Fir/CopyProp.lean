@@ -148,7 +148,8 @@ theorem step_copy {mt ms : Machine} {x y : String} {T : Ty} {facts : List Truste
     (x := (operands S loc [.var x]).bind fun vs => simpleOp loc .copy [⟨y, T, facts⟩] vs c)
     (ft := fun outs core => ⟨core, bindTop [⟨y, T, facts⟩] outs
       (.block (ss.map (substOp x y) ++ t) ids et :: ft)⟩)
-    (fs := fun outs core => ⟨core, bindTop [⟨y, T, facts⟩] outs S⟩) ?_ ?_ ?_ ?_
+    (fs := fun outs core => ⟨core, bindTop [⟨y, T, facts⟩] outs S⟩) ?_ ?_ ?_
+    (Events.Refines.refl _) ?_
   · rw [copyOp, step_simple rfl rfl rfl, operands_one, operands_one]
     simp only [operandIn]
     rw [lookup_agree (os := ss ++ s) hb hDb hag hx]
@@ -236,7 +237,7 @@ theorem step_mid {cm : Core} {x y : String} {o : Op} {ss t s : List Op} {ids : L
         checkResults loc res [.ptr (some p)] >>= fun _ => pure p) cm)
       (ft := fun p core => ⟨core, bindTop res [.ptr (some p)] (addAllocId (idOf p) T0)⟩)
       (fs := fun p core => ⟨core, bindTop res [.ptr (some p)] (addAllocId (idOf p) S0)⟩)
-      ?_ ?_ hshape ?_
+      ?_ ?_ hshape (Events.Refines.refl _) ?_
     · rw [stepT]
       simp only [execFlat, hcallee, hsa, hd, Machine.exec, StateT.run]
       cases (newAlloc loc size align .stack >>= fun p =>
@@ -261,12 +262,12 @@ theorem step_mid {cm : Core} {x y : String} {o : Op} {ss t s : List Op} {ids : L
       refine lockstep_exec rfl fun _ core => ?_
       exact terminate_eq hb loc k vs
     rw [← stepT, ← stepS] at lock
-    exact (StepMatch.of_lockstep hshape lock).mono fun _ _ _ _ h => .inl h
+    exact (StepMatch.of_lockstep hshape (Events.Refines.refl _) lock).mono fun _ _ _ _ h => .inl h
   | false =>
     refine step_same
       (x := (operands S0 loc args).bind fun vs => simpleOp loc k res vs cm)
       (ft := fun outs core => ⟨core, bindTop res outs T0⟩)
-      (fs := fun outs core => ⟨core, bindTop res outs S0⟩) ?_ ?_ hshape ?_
+      (fs := fun outs core => ⟨core, bindTop res outs S0⟩) ?_ ?_ hshape (Events.Refines.refl _) ?_
     · rw [show substOp x y (.mk k res args [] loc) = .mk k res (args.map (substOperand x y)) [] loc
         from rfl, step_simple hcallee hsa hterm, hops]
     · rw [step_simple hcallee hsa hterm]
@@ -306,9 +307,10 @@ function, and bind neither `%x` nor `%y`; the run may end with a terminator. -/
 theorem refines {mod : Module} {tgt src : Func} (hparams : tgt.params = src.params)
     (hrets : tgt.rets = src.rets) (hops : OpsRel L tgt.body.ops src.body.ops)
     (dec : src.Decided mod) : tgt.Refines mod src :=
-  Simulation.refines sim
-    (fun oracle args => ⟨oracle, InitMatch.of_lockstep
-      (init_lockstep hparams hrets hops oracle args) fun _ _ h => .inl h⟩) dec
+  Simulation.refines sim (fun _ _ h => by
+      rcases h with h | h <;> rw [h.1] <;> exact Events.Refines.refl _)
+    (fun oracle world args => ⟨oracle, InitMatch.of_lockstep
+      (init_lockstep hparams hrets hops oracle world args) fun _ _ h => .inl h⟩) dec
 
 /-! ## Look-alikes that are wrong -/
 

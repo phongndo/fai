@@ -800,10 +800,57 @@ structure Global where
   init : Init
   deriving Inhabited
 
+/-- Memory an external function's effects can name: the allocations its pointer arguments point
+into (`args`), every exposed allocation (`exposed`), or the module's globals (`globals`). -/
+inductive MemClass where
+  | args | exposed | globals
+  deriving DecidableEq, Repr
+
+def MemClass.name : MemClass → String
+  | .args => "args"
+  | .exposed => "exposed"
+  | .globals => "globals"
+
+/-- What an external function may do (decision: Call effects). Anything not listed, it doesn't. -/
+inductive ExtEffect where
+  | read (m : MemClass)
+  | write (m : MemClass)
+  | alloc
+  | free
+  | trap
+  | diverge
+  | unwind
+  deriving DecidableEq, Repr
+
+def ExtEffect.render : ExtEffect → String
+  | .read m => s!"read({m.name})"
+  | .write m => s!"write({m.name})"
+  | .alloc => "alloc"
+  | .free => "free"
+  | .trap => "trap"
+  | .diverge => "diverge"
+  | .unwind => "unwind"
+
+instance : Inhabited Trust := ⟨.assume⟩
+
+/-- `extern func @puts(ptr) -> i32 effects[read(args)] assume`: a function outside the module.
+Its effects are a trust-tagged fact about it. -/
+structure Extern where
+  name : String
+  params : List Ty
+  rets : List Ty
+  effects : List ExtEffect
+  trust : Trust
+  deriving Inhabited
+
+/-- The function type of an external function. -/
+def Extern.ty (x : Extern) : Ty := .func x.params x.rets
+
 structure Module where
   /-- The default memory space. -/
   space : SpaceCfg := {}
   globals : List Global := []
+  externs : List Extern := []
   funcs : List Func
 
 def Module.find? (m : Module) (name : String) : Option Func :=

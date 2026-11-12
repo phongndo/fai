@@ -404,6 +404,10 @@ def verifyModule (m : Module) : Except String (Array Hole) := do
     names := names.insert g.name
   let globals := names
   let mut sigs : Std.HashMap String (List Ty × List Ty) := {}
+  for x in m.externs do
+    if names.contains x.name then throw s!"function @{x.name} is defined more than once"
+    names := names.insert x.name
+    sigs := sigs.insert x.name (x.params, x.rets)
   for f in m.funcs do
     if names.contains f.name then throw s!"function @{f.name} is defined more than once"
     names := names.insert f.name
@@ -416,6 +420,18 @@ def verifyModule (m : Module) : Except String (Array Hole) := do
       unless isPow2 g.align do verr none "alignment must be a power of two").run st
     if let .error e := r then throw s!"global @{g.name}: {(e.dropPrefix? "@?: ").map (·.toString) |>.getD e}"
     checkInit g.name names sp g.ty g.init
+  -- External functions.
+  for x in m.externs do
+    for t in x.params ++ x.rets do
+      unless t.isValue do throw s!"extern @{x.name}: {t} is not a value type"
+    let mut seen : List ExtEffect := []
+    for e in x.effects do
+      if seen.contains e then throw s!"extern @{x.name}: {e.render} is listed twice"
+      if e == .unwind then
+        throw s!"extern @{x.name}: unwinding out of an external function is not supported yet"
+      seen := seen ++ [e]
+    if x.trust == .proved then
+      throw s!"extern @{x.name}: the effects of an external function can be assumed or checked, not proved"
   -- Signatures, then bodies.
   for f in m.funcs do
     for t in f.params.map (·.ty) ++ f.rets do

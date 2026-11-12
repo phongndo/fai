@@ -540,9 +540,21 @@ theorem execFlat_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : S
   | some callee =>
     simp only [h.operands loc hargs]
     refine lockstep_bind fun vs => ?_
-    refine lockstep_exec rfl fun _ core => ?_
-    refine lockstep_exec rfl fun _ core => ?_
-    exact Lockstep.ok ((StackRel.call (D := fun _ => False) h).push (.refl _) (fun _ x => x.elim) _ _)
+    refine lockstep_exec rfl fun p core => ?_
+    obtain ⟨tgt, vs'⟩ := p
+    cases tgt with
+    | func f =>
+      refine lockstep_exec rfl fun _ core => ?_
+      exact Lockstep.ok ((StackRel.call (D := fun _ => False) h).push (.refl _) (fun _ x => x.elim) _ _)
+    | extern x =>
+      refine lockstep_exec rfl fun e core => ?_
+      simp only [Machine.record]
+      cases e.results with
+      | some rs =>
+        exact Lockstep.ok ((StackRel.call (D := fun _ => False) h).push (.refl _)
+          (fun _ x => x.elim) _ _)
+      | none =>
+        exact Lockstep.ok ((StackRel.nil (D := fun _ => False)).push (.refl _) (fun _ x => x.elim) _ _)
   | none =>
   cases kind.stackAlloc? with
   | some sa =>
@@ -651,6 +663,7 @@ theorem shape_cons {f f' : Frame} {D : String → Prop} {rt rs : List Frame}
 
 /-- A lockstep step is a simulation step, for machines whose stacks agree on `progress` loops. -/
 theorem StepMatch.of_lockstep {mt ms : Machine} (hshape : ms.shape = mt.shape)
+    (htr : Events.Refines mt.core.trace ms.core.trace)
     (h : Lockstep L (step mt) (step ms)) : StepMatch (MRel L) mt ms := by
   constructor
   · intro mt' e
@@ -667,9 +680,9 @@ theorem StepMatch.of_lockstep {mt ms : Machine} (hshape : ms.shape = mt.shape)
     rcases h with ⟨h, e1, e2⟩ | ⟨_, _, e1, _⟩
     · rw [e, Except.error.injEq] at e1
       subst e1
-      by_cases hamb : ht.behavior = .ambiguous
-      · exact .inl ⟨1, ht, by rw [runSteps_one]; exact e2, .inr hamb⟩
-      · exact .inr ⟨1, ht, by rw [runSteps_one]; exact e2, Behavior.Refines.refl _ hamb⟩
+      by_cases hamb : ht.outcome = .ambiguous
+      · exact .inl ⟨0, ms, ht, rfl, e2, .inl hamb⟩
+      · exact .inr ⟨0, ms, ht, rfl, e2, .inl ⟨htr, Outcome.Refines.refl _ hamb⟩⟩
     · rw [e] at e1; cases e1
 
 /-- A step from related machines. The machines step in lockstep, unless the target's top block
@@ -691,14 +704,14 @@ theorem StepMatch.of_mrel {R : Machine → Machine → Prop} {mt ms : Machine} (
   cases h with
   | @block D Db t0 s0 ids et es ft fs hb hDb ho hag hnr =>
     rcases ho.head with hh | hh | ⟨pt, ps, t, s, rfl, rfl, hl, hts⟩
-    · exact (StepMatch.of_lockstep hshape (step_eq hb hDb hag hnr (.inl hh))).mono lift
-    · exact (StepMatch.of_lockstep hshape (step_eq hb hDb hag hnr (.inr hh))).mono lift
+    · exact (StepMatch.of_lockstep hshape (Events.Refines.refl _) (step_eq hb hDb hag hnr (.inl hh))).mono lift
+    · exact (StepMatch.of_lockstep hshape (Events.Refines.refl _) (step_eq hb hDb hag hnr (.inr hh))).mono lift
     · exact site D Db pt ps t s ids et es ft fs hl hts hb hDb hag hnr rfl rfl
-  | nil => exact (StepMatch.of_lockstep hshape .halt).mono lift
-  | ifJoin => exact (StepMatch.of_lockstep hshape .halt).mono lift
-  | loop => exact (StepMatch.of_lockstep hshape .halt).mono lift
-  | call => exact (StepMatch.of_lockstep hshape .halt).mono lift
-  | blocks => exact (StepMatch.of_lockstep hshape .halt).mono lift
+  | nil => exact (StepMatch.of_lockstep hshape (Events.Refines.refl _) .halt).mono lift
+  | ifJoin => exact (StepMatch.of_lockstep hshape (Events.Refines.refl _) .halt).mono lift
+  | loop => exact (StepMatch.of_lockstep hshape (Events.Refines.refl _) .halt).mono lift
+  | call => exact (StepMatch.of_lockstep hshape (Events.Refines.refl _) .halt).mono lift
+  | blocks => exact (StepMatch.of_lockstep hshape (Events.Refines.refl _) .halt).mono lift
 
 /-- A source step that the target doesn't take, before a step match: the source runs one step
 ahead of the target. -/
@@ -718,9 +731,9 @@ theorem StepMatch.prepend {R : Machine → Machine → Prop} {mt ms ms1 : Machin
         rw [show j + 1 = 1 + j by omega, runSteps_add, run1, Except.ok_bind] at ej
         exact hsh j mj (by omega) ej
   · intro ht et
-    rcases h.2 ht et with hesc | ⟨j, hs, ej, href⟩
+    rcases h.2 ht et with hesc | ⟨j, mj, hs, ej, sj, href⟩
     · exact .inl (hesc.back run1)
-    · exact .inr ⟨1 + j, hs, by rw [runSteps_add, run1, Except.ok_bind]; exact ej, href⟩
+    · exact .inr ⟨1 + j, mj, hs, by rw [runSteps_add, run1, Except.ok_bind]; exact ej, sj, href⟩
 
 /-- One target step matched by one source step that runs the same core computation, from tops of
 the stack that differ only in code. -/
@@ -728,6 +741,7 @@ theorem step_same {R : Machine → Machine → Prop} {mt ms : Machine} {x : Exce
     {ft fs : α → Core → Machine}
     (ht : step mt = x.bind fun p => .ok (ft p.1 p.2))
     (hs : step ms = x.bind fun p => .ok (fs p.1 p.2)) (hshape : ms.shape = mt.shape)
+    (htr : Events.Refines mt.core.trace ms.core.trace)
     (hR : ∀ a core, x = .ok (a, core) → R (ft a core) (fs a core)) : StepMatch R mt ms := by
   cases x with
   | ok p =>
@@ -746,9 +760,9 @@ theorem step_same {R : Machine → Machine → Prop} {mt ms : Machine} {x : Exce
     · rw [ht] at e; cases e
     · rw [ht] at e
       cases e
-      by_cases hamb : h'.behavior = .ambiguous
-      · exact .inl ⟨1, h', by rw [runSteps_one, hs]; rfl, .inr hamb⟩
-      · exact .inr ⟨1, h', by rw [runSteps_one, hs]; rfl, Behavior.Refines.refl _ hamb⟩
+      by_cases hamb : h'.outcome = .ambiguous
+      · exact .inl ⟨0, ms, h', rfl, by rw [hs]; rfl, .inl hamb⟩
+      · exact .inr ⟨0, ms, h', rfl, by rw [hs]; rfl, .inl ⟨htr, Outcome.Refines.refl _ hamb⟩⟩
 
 /-- An op without regions that is not a call, stack allocation, or terminator: evaluate its
 operands, compute on the core, bind its results in the current block. -/
@@ -813,7 +827,7 @@ theorem operandIn_loc {fs : List Frame} {loc loc' : Option Loc} {a : Operand} {v
 
 /-- Reading an undefined variable gets stuck. -/
 theorem operandIn_var_error {fs : List Frame} {loc : Option Loc} {x : String} {h : Halt}
-    (e : operandIn fs loc (.var x) = .error h) : h.behavior.Absorbing := by
+    (e : operandIn fs loc (.var x) = .error h) : h.outcome.Absorbing := by
   simp only [operandIn] at e
   split at e
   · cases e
@@ -847,10 +861,10 @@ theorem step_simple {c : Core} {k : OpKind} {res : List Result} {args : List Ope
 lockstep. -/
 theorem init_lockstep {mod : Module} {tgt src : Func} (hparams : tgt.params = src.params)
     (hrets : tgt.rets = src.rets) (hops : OpsRel L tgt.body.ops src.body.ops)
-    (oracle : Nat → Int) (args : List RVal) :
-    Lockstep L (Machine.init oracle mod tgt args) (Machine.init oracle mod src args) := by
+    (oracle : Nat → Int) (world : World) (args : List RVal) :
+    Lockstep L (Machine.init oracle world mod tgt args) (Machine.init oracle world mod src args) := by
   simp only [Machine.init, hparams, hrets, bind, Except.bind]
-  cases (enterCall none src.params args).run (Core.initial oracle mod) with
+  cases (enterCall none src.params args).run (Core.initial oracle world mod) with
   | error h => exact .halt
   | ok r =>
     exact Lockstep.ok ((StackRel.call (D := fun _ => False) (D' := fun _ => False) .nil).push hops
@@ -860,9 +874,9 @@ theorem init_lockstep {mod : Module} {tgt src : Func} (hparams : tgt.params = sr
 theorem InitMatch.of_lockstep {R : Machine → Machine → Prop} {it is : Except Halt Machine}
     (h : Lockstep L it is) (lift : ∀ mt ms, MRel L mt ms → R mt ms) : InitMatch R it is := by
   rcases h with ⟨h, rfl, rfl⟩ | ⟨mt, ms, rfl, rfl, hR⟩
-  · by_cases hamb : h.behavior = .ambiguous
+  · by_cases hamb : h.outcome = .ambiguous
     · exact .inl ⟨h, rfl, .inr hamb⟩
-    · exact .inr (.inr ⟨h, h, rfl, rfl, Behavior.Refines.refl _ hamb⟩)
+    · exact .inr (.inr ⟨h, h, rfl, rfl, Outcome.Refines.refl _ hamb⟩)
   · exact .inr (.inl ⟨mt, ms, rfl, rfl, lift mt ms hR⟩)
 
 end Fir

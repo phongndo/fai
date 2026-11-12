@@ -519,15 +519,53 @@ def global : P Global := do
   expectSym "="
   pure { name, ty := t, const, align, init := ← init }
 
+/-- `args`, `exposed`, or `globals`. -/
+def memClass : P MemClass := do
+  match ← ident with
+  | "args" => pure .args
+  | "exposed" => pure .exposed
+  | "globals" => pure .globals
+  | s => fail s!"expected args, exposed, or globals but found '{s}'"
+
+/-- `read(args)`, `write(exposed)`, `alloc`, `free`, `trap`, `diverge`, or `unwind`. -/
+def extEffect : P ExtEffect := do
+  match ← ident with
+  | "read" => do expectSym "("; let m ← memClass; expectSym ")"; pure (.read m)
+  | "write" => do expectSym "("; let m ← memClass; expectSym ")"; pure (.write m)
+  | "alloc" => pure .alloc
+  | "free" => pure .free
+  | "trap" => pure .trap
+  | "diverge" => pure .diverge
+  | "unwind" => pure .unwind
+  | s => fail s!"unknown effect '{s}'"
+
+/-- `extern func @name(T, …) [-> T | -> (T, …)] effects[E, …] TRUST`, after `extern`. -/
+def extern : P Extern := do
+  unless ← tryIdent "func" do fail "expected 'func' after 'extern'"
+  let name ← match ← peek with
+    | .global s => discard next; pure s
+    | t => fail s!"expected a function name like @main but found {t.describe}"
+  expectSym "("
+  let params ← sepBy ty ")"
+  let rets ← if ← trySym "->" then do
+      if ← trySym "(" then sepBy ty ")" else pure [← ty]
+    else pure []
+  unless ← tryIdent "effects" do fail "expected 'effects' after an external function's signature"
+  expectSym "["
+  let effects ← sepBy extEffect "]"
+  pure { name, params, rets, effects, trust := ← trust }
+
 def module : P Module := do
   let mut funcs := #[]
   let mut globals := #[]
+  let mut externs := #[]
   let mut space : SpaceCfg := {}
   while (← peek) != .eof do
     if ← tryIdent "memspace" then space ← memspace
     else if ← tryIdent "global" then globals := globals.push (← global)
+    else if ← tryIdent "extern" then externs := externs.push (← extern)
     else funcs := funcs.push (← func)
-  pure { space, globals := globals.toList, funcs := funcs.toList }
+  pure { space, globals := globals.toList, externs := externs.toList, funcs := funcs.toList }
 
 end P
 
