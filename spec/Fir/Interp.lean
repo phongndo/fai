@@ -446,6 +446,7 @@ def deadNote (al : Alloc) : String :=
   | .heap _ => s!"allocated at {renderLoc al.site}, freed at {renderLoc al.freedAt}"
   | .global g _ => s!"@{g} is a global"
   | .func f => s!"@{f} is a function"
+  | .va .. => s!"the variadic arguments of a call from {renderLoc al.site}, which has returned"
 
 /-- Where an access goes (allocation, tag, offset), after checking lifetime, bounds, and
 alignment. Changes nothing. -/
@@ -455,6 +456,7 @@ def checkAccess (c : Core) (loc : Option Loc) (p : Ptr) (size align : Nat) :
   let al ← allocIn c loc a
   unless al.live do ub .useAfterFree loc (deadNote al)
   if let .func f := al.kind then ub .funcAccess loc s!"@{f} is a function"
+  if let .va .. := al.kind then ub .vaArg loc "only va.arg reads variadic arguments"
   unless 0 ≤ off && off + size ≤ al.size do
     ub .outOfBounds loc s!"offset {off}, {size} bytes, allocation size {al.size}"
   unless al.alignedAt off align do
@@ -581,11 +583,102 @@ def freePtr (loc : Option Loc) (family : String) : Option Ptr → CM Unit
         | .stack => s!"allocated at {renderLoc al.site} by mem.stack"
         | .global g _ => s!"@{g} is a global"
         | .func f => s!"@{f} is a function"
+        | .va .. => "variadic arguments"
     unless off == 0 do ub .badFree loc s!"offset {off} is not the start of the allocation"
     let c ← get
     let marks ← markAll c.tags loc a t 0 al.size true c.scopes.toList c.marks
     set { c with marks }
     setAlloc a { al with live := false, freedAt := loc }
+
+/-! ## Variadic arguments
+
+A call of a variadic function puts its variadic arguments in an allocation of their own
+(`AllocKind.va`), each in an 8-byte slot as a store of its type writes it. The allocation is one of
+the call's stack allocations, so it ends when the call returns (decision: Varargs). A `va_list`
+holds a *cursor* over it: `va.start` fills the object with `Byte.va` bytes naming the allocation
+and position 0, `va.arg` reads the argument at the cursor's position and moves it on, and
+`mem.copy` copies a cursor (C's `va_copy`). Read as anything but bytes, a cursor is `poison`, so no
+program sees how a target lays out its `va_list`; any other write leaves bytes that aren't a cursor
+(decision: va_list). -/
+
+/-- The type of a scalar value. -/
+def RVal.scalarTy : RVal → Ty
+  | .int w _ => .int w
+  | .ptr _ => .ptr
+  | .bytes bs => .byte (bs.length * 8)
+  | .float f _ => .float f
+  | .agg _ => .slice
+
+/-- Whether values fit parameters of types `ps`: one of each type, then, if `variadic`, any
+number of variadic arguments of the types `Ty.isVararg` allows. -/
+def argsFit (ps : List Ty) (variadic : Bool) (vs : List RVal) : Bool :=
+  (if variadic then ps.length ≤ vs.length else ps.length == vs.length) &&
+    ((vs.take ps.length).zip ps).all (fun (v, t) => v.hasTy t) &&
+    (vs.drop ps.length).all (·.scalarTy.isVararg)
+
+/-- Make the allocation that holds a call's variadic arguments: 8-byte slots, aligned to 8. -/
+def newVaArea (loc : Option Loc) (vs : List RVal) : CM Nat := do
+  unless vs.all (·.scalarTy.isVararg) do
+    halt (.stuck "a variadic argument must be an iN or bN of 8 to 64 bits, a ptr, or a float") loc
+  let p ← newAlloc loc (8 * vs.length) 8 (.va 0 [])
+  let .rel a t _ := p | halt (.stuck "malformed allocation") loc
+  let al ← getAlloc loc a
+  setAlloc a { al with kind := .va t (vs.map RVal.scalarTy) }
+  let sp := (← get).space
+  let bytes := vs.zipIdx.foldl (fun m (v, i) => writeBytes m (8 * i) (v.encode sp)) ∅
+  modify fun c => { c with mem := c.mem.insert a bytes }
+  pure a
+
+/-- A `va_list` cursor's bytes: at argument `k` of the variadic arguments `a`, whose first tag is
+`t`. -/
+def cursorBytes (sp : SpaceCfg) (a t k : Nat) : List Byte := (List.range sp.vaSize).map (.va a t k)
+
+/-- The cursor these bytes hold, if they hold one: the variadic arguments' allocation, its first
+tag, and the position. -/
+def cursorOf? (bs : List Byte) : Option (Nat × Nat × Nat) :=
+  match bs with
+  | .va a t k _ :: _ =>
+    if bs == (List.range bs.length).map (.va a t k) then some (a, t, k) else none
+  | _ => none
+
+/-- Write bytes into the `va_list` at `p`, as a store of them would. -/
+def writeVaList (loc : Option Loc) (p : Ptr) (bs : List Byte) : CM Unit := fun c => do
+  let ((a, off), c) ← access loc p bs.length c.space.vaAlign true c
+  pure ((), { c with mem := c.mem.insert a (writeBytes (c.mem.getD a ∅) off bs) })
+
+/-- `va.start`: a cursor at the first variadic argument of the running call, among whose stack
+allocations `ids` the variadic arguments are. -/
+def vaStartC (loc : Option Loc) (ids : List Nat) : List RVal → CM Unit
+  | [.ptr (some p)] => do
+    let c ← get
+    let area := ids.findSome? fun a => match (c.allocs[a]?.map (·.kind) : Option AllocKind) with
+      | some (.va t _) => some (a, t)
+      | _ => none
+    let some (a, t) := area | halt (.stuck "va.start in a function that isn't variadic") loc
+    writeVaList loc p (cursorBytes c.space a t 0)
+  | [.ptr none] => ub .poison loc "va.start through a poison pointer"
+  | _ => halt (.stuck "malformed op") loc
+
+/-- `va.arg`: the variadic argument at the cursor in the `va_list` at `p`, read as a `ty` (which
+must be of its class: integer and pointer, or float), as a load of `ty` reads the argument's
+bytes; the cursor moves to the next. -/
+def vaArgC (loc : Option Loc) (ty : Ty) : List RVal → CM RVal
+  | [.ptr (some p)] => do
+    let sp := (← get).space
+    let (x, off) ← access loc p sp.vaSize sp.vaAlign false
+    let some (a, t, k) := cursorOf? (readBytes ((← get).mem.getD x ∅) off sp.vaSize)
+      | ub .vaArg loc "the va_list holds no cursor from va.start"
+    let some al := (← get).allocs[a]? | ub .vaArg loc "the va_list holds no cursor from va.start"
+    let .va _ tys := al.kind | ub .vaArg loc "the va_list holds no cursor from va.start"
+    unless al.live do ub .useAfterFree loc (deadNote al)
+    let some u := tys[k]? | ub .vaArg loc s!"no variadic argument is left: the call passed {tys.length}"
+    unless u.isFpClass == ty.isFpClass do
+      ub .vaArg loc s!"variadic argument {k} has type {u}, of the other class than {ty}"
+    let v ← decodeAs loc ty (readBytes ((← get).mem.getD a ∅) (8 * k) (ty.size sp))
+    writeVaList loc p (cursorBytes sp a t (k + 1))
+    pure v
+  | [.ptr none] => ub .poison loc "va.arg through a poison pointer"
+  | _ => halt (.stuck "malformed op") loc
 
 /-! ## Pointer comparison -/
 
@@ -931,6 +1024,11 @@ def evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVa
     match ← asInt loc 1 x with
     | .poison => ub .poison loc "check of poison"
     | .bits b => if b = 1 then pure [] else halt (.trap reason) loc
+  | .vaArg, [r], vs => do pure [← vaArgC loc r.ty vs]
+  | .vaEnd, [], [.ptr (some p)] => do
+    writeVaList loc p (List.replicate c.space.vaSize .poison)
+    pure []
+  | .vaEnd, [], [.ptr none] => ub .poison loc "va.end through a poison pointer"
   | _, _, _ => evalFloat loc k rs vs
 
 /-- Compute an op without regions that doesn't touch the stack, from its operands' values, and
@@ -967,6 +1065,20 @@ def enterCall (loc : Option Loc) (params : List Result) (vs : List RVal) :
   let opened ← (params.zip vs).mapM fun (r, v) => openScope loc r v
   pure (opened.map (·.1), (opened.filterMap (·.2)).reverse)
 
+/-- Enter a call of `f` with arguments `vs`: check its parameters and open their scopes
+(`enterCall`), and if `f` is variadic, put the arguments after them in a new variadic-arguments
+allocation. Gives the parameters' values, the scopes opened, and the call's first stack
+allocations. -/
+def enterFunc (loc : Option Loc) (f : Func) (vs : List RVal) :
+    CM (List RVal × List Nat × List Nat) := do
+  if f.variadic then
+    let (ps, scopes) ← enterCall loc f.params (vs.take f.params.length)
+    let a ← newVaArea loc (vs.drop f.params.length)
+    pure (ps, scopes, [a])
+  else
+    let (ps, scopes) ← enterCall loc f.params vs
+    pure (ps, scopes, [])
+
 /-- Close the scopes a call opened. -/
 def closeScopes (ids : List Nat) : CM Unit :=
   modify fun c => { c with
@@ -992,6 +1104,7 @@ def RVal.pairs : RVal → List (Nat × Nat)
 
 def Byte.pairs : Byte → List (Nat × Nat)
   | .frag p _ => p.pairs
+  | .va a t _ _ => [(a, t)]
   | _ => []
 
 /-- `xs`, then the elements of `ys` it doesn't have yet, in order. -/
@@ -1048,6 +1161,7 @@ def Ptr.okIn (reach : List (Nat × Nat)) : Ptr → Bool
 
 def Byte.okIn (reach : List (Nat × Nat)) : Byte → Bool
   | .frag p _ => p.okIn reach
+  | .va a t _ _ => reach.contains (a, t)
   | _ => true
 
 /-- A value the environment may hand back: its pointers are ones it can reach, or addresses with
@@ -1097,8 +1211,7 @@ def applyAnswer (loc : Option Loc) (writes : List (Nat × Nat × List Byte)) (fr
 may turn any pointer it holds into an integer), show it what it may read, and carry out its answer.
 Gives the call's event; the control layer records it. -/
 def callExtern (loc : Option Loc) (x : Extern) (vs : List RVal) : CM Event := do
-  unless vs.length == x.params.length && (vs.zip x.params).all (fun (v, t) => v.hasTy t) do
-    halt (.stuck s!"wrong arguments for @{x.name}") loc
+  unless argsFit x.params x.variadic vs do halt (.stuck s!"wrong arguments for @{x.name}") loc
   let c ← get
   let argAllocs := (vs.flatMap RVal.pairs).map (·.1)
   let reach := externReach c x.effects vs
@@ -1348,12 +1461,24 @@ def callTarget (loc : Option Loc) : Callee → List RVal → CM (Target × List 
     unless off == 0 do ub .badCall loc s!"offset {off} is not the start of @{name}"
     let c ← get
     let (tgt, t) ← match c.funcs[name]?, c.externs[name]? with
-      | some f, _ => pure (Target.func f, Ty.func (f.params.map (·.ty)) f.rets)
+      | some f, _ => pure (Target.func f, f.ty)
       | none, some x => pure (.extern x, x.ty)
       | none, none => halt (.stuck s!"no function @{name}") loc
     unless t == sig do ub .badCall loc s!"@{name} has type {t}"
     pure (tgt, vs)
   | .indirect _, [] => halt (.stuck "malformed op") loc
+
+def OpKind.isVaStart : OpKind → Bool
+  | .vaStart => true
+  | _ => false
+
+/-- The stack allocations of the running call's body: those of the block frame nearest the call
+frame (`acc` holds the latest seen). A variadic call's arguments are among them (`enterFunc`). -/
+def callIds (acc : List Nat) : List Frame → List Nat
+  | [] => []
+  | .block _ ids _ :: fs => callIds ids fs
+  | .call .. :: _ => acc
+  | _ :: fs => callIds acc fs
 
 /-- A stack allocation's size and alignment, in a memory space. -/
 def OpKind.stackAlloc? : OpKind → Option (SpaceCfg → Nat × Nat)
@@ -1386,9 +1511,9 @@ def execFlat (m : Machine) (kind : OpKind) (results : List Result) (args : List 
     let ((tgt, vs), m) ← m.exec (callTarget loc callee vs)
     match tgt with
     | .func f => do
-      let ((vs, scopes), m) ← m.exec (enterCall loc f.params vs)
+      let ((vs, scopes, ids), m) ← m.exec (enterFunc loc f vs)
       pure { m with
-        stack := .block f.body.ops [] (Env.bindAll {} f.params vs) ::
+        stack := .block f.body.ops ids (Env.bindAll {} f.params vs) ::
           .call results f.rets scopes loc kind.unwind? :: m.stack }
     | .extern x => do
       -- The call is an event: the environment answers it, and it is recorded at once.
@@ -1399,6 +1524,12 @@ def execFlat (m : Machine) (kind : OpKind) (results : List Result) (args : List 
           stack := externRet loc rs :: .call results x.rets [] loc kind.unwind? :: m.stack }
       | none => pure { m with stack := [hang] }
   | none =>
+  if kind.isVaStart then do
+    -- `va.start` finds the running call's variadic arguments among its stack allocations.
+    let vs ← operands m.stack loc args
+    let ((), m) ← m.exec (vaStartC loc (callIds [] m.stack) vs)
+    pure m
+  else
   match kind.stackAlloc? with
   | some dims => do
     let (size, align) := dims m.core.space
@@ -1533,8 +1664,8 @@ def Core.initial (oracle : Oracle) (world : World) (mod : Module) : Core :=
 /-- The machine at the start of a call to `f`. -/
 def Machine.init (oracle : Oracle) (world : World) (mod : Module) (f : Func) (args : List RVal) :
     Except Halt Machine := do
-  let ((vs, scopes), core) ← (enterCall none f.params args).run (Core.initial oracle world mod)
-  let top := Frame.block f.body.ops [] (Env.bindAll {} f.params vs)
+  let ((vs, scopes, ids), core) ← (enterFunc none f args).run (Core.initial oracle world mod)
+  let top := Frame.block f.body.ops ids (Env.bindAll {} f.params vs)
   pure { core, stack := [top, .call [] f.rets scopes none none] }
 
 /-- Run `n` steps. An `error` is a halted run. -/

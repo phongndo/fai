@@ -340,6 +340,29 @@ theorem keeps_evalFloat (loc : Option Loc) (k : OpKind) (rs : List Result) (vs :
   unfold evalFloat; keeps
 macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_evalFloat)
 
+theorem keeps_writeVaList (loc : Option Loc) (p : Ptr) (bs : List Byte) :
+    KeepsFixed sp (writeVaList loc p bs) := by
+  intro c r hc e
+  simp only [writeVaList, bind, Except.bind, pure, Except.pure] at e
+  cases ha : access loc p bs.length c.space.vaAlign true c with
+  | error => rw [ha] at e; cases e
+  | ok q => rw [ha] at e; cases e; exact keeps_access loc p _ _ true c q hc ha
+macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_writeVaList)
+
+theorem keeps_vaArgC (loc : Option Loc) (T : Ty) (vs : List RVal) :
+    KeepsFixed sp (vaArgC loc T vs) := by
+  unfold vaArgC; keeps
+macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_vaArgC)
+
+theorem keeps_vaStartC (loc : Option Loc) (ids : List Nat) (vs : List RVal) :
+    KeepsFixed sp (vaStartC loc ids vs) := by
+  unfold vaStartC; keeps
+macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_vaStartC)
+
+theorem keeps_newVaArea (loc : Option Loc) (vs : List RVal) : KeepsFixed sp (newVaArea loc vs) := by
+  unfold newVaArea; keeps
+macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_newVaArea)
+
 theorem keeps_evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVal) :
     KeepsFixed sp (evalSimple loc k rs vs) := by
   unfold evalSimple; keeps
@@ -359,6 +382,11 @@ theorem keeps_enterCall (loc : Option Loc) (params : List Result) (vs : List RVa
     KeepsFixed sp (enterCall loc params vs) := by
   unfold enterCall; keeps
 macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_enterCall)
+
+theorem keeps_enterFunc (loc : Option Loc) (f : Func) (vs : List RVal) :
+    KeepsFixed sp (enterFunc loc f vs) := by
+  unfold enterFunc; keeps
+macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_enterFunc)
 
 theorem keeps_closeScopes (ids : List Nat) : KeepsFixed sp (closeScopes ids) := by
   unfold closeScopes; keeps
@@ -542,12 +570,12 @@ theorem init_fixed {oracle : Oracle} {world : World} {mod : Module} {f : Func}
     {args : List RVal} {m : Machine} (e : Machine.init oracle world mod f args = .ok m) :
     m.core.space = mod.space ∧ m.core.trace = [] := by
   simp only [Machine.init, bind, Except.bind] at e
-  cases ec : (enterCall none f.params args).run (Core.initial oracle world mod) with
+  cases ec : (enterFunc none f args).run (Core.initial oracle world mod) with
   | error h => rw [ec] at e; cases e
   | ok p =>
     rw [ec] at e
     cases e
-    have := keeps_enterCall (sp := (Core.initial oracle world mod).fixed) none f.params args _ _ rfl ec
+    have := keeps_enterFunc (sp := (Core.initial oracle world mod).fixed) none f args _ _ rfl ec
     simp only [Core.fixed, Prod.mk.injEq] at this
     exact ⟨this.1, this.2⟩
 

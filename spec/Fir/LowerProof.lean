@@ -54,7 +54,7 @@ computes on core `c` without changing it: the block's environment goes from `env
 inductive RunsPure (c : Core) (ids : List Nat) (fs : List Frame) : List Op → Env → Env → Prop
   | nil {env} : RunsPure c ids fs [] env env
   | cons {k res args loc E env env' vs v} :
-      k.callee? = none → k.stackAlloc? = none → k.isTerminator = false →
+      k.callee? = none → k.stackAlloc? = none → k.isTerminator = false → k.isVaStart = false →
       operands (.block E ids env :: fs) loc args = .ok vs →
       simpleOp loc k [res] vs c = .ok ([v], c) →
       RunsPure c ids fs E (env.insert res.name v) env' →
@@ -65,9 +65,9 @@ theorem RunsPure.run {c : Core} {ids : List Nat} {fs : List Frame} :
       runSteps E.length ⟨c, .block (E ++ t) ids env :: fs⟩ = .ok ⟨c, .block t ids env' :: fs⟩
   | _, _, _, .nil, t => rfl
   | _, _, _, .cons (k := k) (res := res) (args := args) (loc := loc) (E := E) (env := env)
-      h1 h2 h3 hops hop hrest, t => by
+      h1 h2 h3 h4 hops hop hrest, t => by
     show runSteps (E.length + 1) _ = _
-    rw [Nat.add_comm, runSteps_add, runSteps_one, List.cons_append, step_simple h1 h2 h3,
+    rw [Nat.add_comm, runSteps_add, runSteps_one, List.cons_append, step_simple h1 h2 h3 h4,
       operands_ops _ E, hops]
     simp only [Except.bind, hop]
     simp only [bindTop, Env.bindAll]
@@ -165,7 +165,7 @@ theorem RunsPure.mid {c : Core} {ids : List Nat} {fs : List Frame} :
     obtain rfl : i = 0 := by simpa using hi
     exact ⟨_, rfl⟩
   | _, _, _, .cons (k := k) (res := res) (args := args) (loc := loc) (E := E) (env := env)
-      h1 h2 h3 hops hop hrest, t, i, hi => by
+      h1 h2 h3 h4 hops hop hrest, t, i, hi => by
     cases i with
     | zero => exact ⟨env, rfl⟩
     | succ i =>
@@ -173,7 +173,7 @@ theorem RunsPure.mid {c : Core} {ids : List Nat} {fs : List Frame} :
       refine ⟨envi, ?_⟩
       have hs : ∀ x : Machine, runSteps (i + 1) x = (runSteps 1 x).bind (runSteps i) := fun x => by
         rw [Nat.add_comm]; exact runSteps_add 1 i x
-      rw [hs, runSteps_one, List.cons_append, step_simple h1 h2 h3, operands_ops _ E, hops]
+      rw [hs, runSteps_one, List.cons_append, step_simple h1 h2 h3 h4, operands_ops _ E, hops]
       simp only [Except.bind, hop, bindTop, Env.bindAll, List.drop_succ_cons]
       exact ei
 
@@ -408,27 +408,30 @@ theorem ovf_runs {c : Core} {ids : List Nat} {fs : List Frame} {env : Env} {loc 
     (Sem.trunc .wrap r.ty.width (wrapVal op (extVal signed (LowerBits.wide op r.ty.width) xa)
       (extVal signed (LowerBits.wide op r.ty.width) xb)))), ?_⟩
   unfold ovfOps
-  refine .cons (by cases signed <;> rfl) (by cases signed <;> rfl) (by cases signed <;> rfl) ?_ (op_ext loc c signed t0 _ xa) ?_
+  refine .cons (by cases signed <;> rfl) (by cases signed <;> rfl) (by cases signed <;> rfl)
+    (by cases signed <;> rfl) ?_ (op_ext loc c signed t0 _ xa) ?_
   · rw [operands_one, operandIn_code (E' := []), ha]; rfl
-  refine .cons (by cases signed <;> rfl) (by cases signed <;> rfl) (by cases signed <;> rfl) ?_ (op_ext loc c signed t1 _ xb) ?_
+  refine .cons (by cases signed <;> rfl) (by cases signed <;> rfl) (by cases signed <;> rfl)
+    (by cases signed <;> rfl) ?_ (op_ext loc c signed t1 _ xb) ?_
   · dsimp only [res]
     rw [operands_one, operandIn_insert_ne h0b, operandIn_code (E' := []), hb]; rfl
-  refine .cons rfl rfl rfl ?_ (op_wrap loc c op t2 (extVal signed (LowerBits.wide op r.ty.width) xa)
+  refine .cons rfl rfl rfl rfl ?_ (op_wrap loc c op t2 (extVal signed (LowerBits.wide op r.ty.width) xa)
     (extVal signed (LowerBits.wide op r.ty.width) xb)) ?_
   · dsimp only [res]
     rw [operands_pair, operandIn_insert_ne h01.symm, operandIn_insert_self,
       operandIn_insert_self]; rfl
-  refine .cons rfl rfl rfl ?_ (op_trunc loc c .wrap r (wrapVal op
+  refine .cons rfl rfl rfl rfl ?_ (op_trunc loc c .wrap r (wrapVal op
     (extVal signed (LowerBits.wide op r.ty.width) xa) (extVal signed (LowerBits.wide op r.ty.width) xb))
     hcr) ?_
   · dsimp only [res]
     rw [operands_one, operandIn_insert_self]; rfl
-  refine .cons (by cases signed <;> rfl) (by cases signed <;> rfl) (by cases signed <;> rfl) ?_
+  refine .cons (by cases signed <;> rfl) (by cases signed <;> rfl) (by cases signed <;> rfl)
+    (by cases signed <;> rfl) ?_
     (op_ext loc c signed t3 (LowerBits.wide op r.ty.width) (Sem.trunc .wrap r.ty.width (wrapVal op
       (extVal signed (LowerBits.wide op r.ty.width) xa)
       (extVal signed (LowerBits.wide op r.ty.width) xb)))) ?_
   · rw [operands_one, operandIn_insert_self]; rfl
-  refine .cons rfl rfl rfl ?_ (op_cmp loc c .ne ov (wrapVal op
+  refine .cons rfl rfl rfl rfl ?_ (op_cmp loc c .ne ov (wrapVal op
       (extVal signed (LowerBits.wide op r.ty.width) xa) (extVal signed (LowerBits.wide op r.ty.width) xb))
     (extVal signed (LowerBits.wide op r.ty.width) (Sem.trunc .wrap r.ty.width (wrapVal op
       (extVal signed (LowerBits.wide op r.ty.width) xa)
@@ -689,13 +692,13 @@ theorem Exp.length_pos {sp : SpaceCfg} {o : Op} {E : List Op} {ts : List String}
 /-- The source op of an expansion is a simple op on variables. -/
 theorem Exp.simple {sp : SpaceCfg} {o : Op} {E : List Op} {ts : List String} (h : Exp sp o E ts) :
     ∃ k res args loc, o = .mk k res args [] loc ∧ k.callee? = none ∧ k.stackAlloc? = none ∧
-      k.isTerminator = false ∧ (∀ a ∈ args, ∃ n, a = .var n) ∧
+      k.isTerminator = false ∧ k.isVaStart = false ∧ (∀ a ∈ args, ∃ n, a = .var n) ∧
       ∀ vs, Dce.ReadOnly (evalSimple loc k res vs) := by
   cases h with
-  | ovf => exact ⟨_, _, _, _, rfl, rfl, rfl, rfl, by simp, readOnly_ovf _ _ _ _ _⟩
-  | field => exact ⟨_, _, _, _, rfl, rfl, rfl, rfl, by simp, readOnly_field _ _ _ _ _⟩
-  | indexW => exact ⟨_, _, _, _, rfl, rfl, rfl, rfl, by simp, readOnly_index _ _ _ _⟩
-  | indexI => exact ⟨_, _, _, _, rfl, rfl, rfl, rfl, by simp, readOnly_index _ _ _ _⟩
+  | ovf => exact ⟨_, _, _, _, rfl, rfl, rfl, rfl, rfl, by simp, readOnly_ovf _ _ _ _ _⟩
+  | field => exact ⟨_, _, _, _, rfl, rfl, rfl, rfl, rfl, by simp, readOnly_field _ _ _ _ _⟩
+  | indexW => exact ⟨_, _, _, _, rfl, rfl, rfl, rfl, rfl, by simp, readOnly_index _ _ _ _⟩
+  | indexI => exact ⟨_, _, _, _, rfl, rfl, rfl, rfl, rfl, by simp, readOnly_index _ _ _ _⟩
 
 /-- Binding results with values agreeing outside hidden names, plus temporaries in the target. -/
 theorem envAgree_bind {D : String → Prop} {et es : Env} (hag : EnvAgree D et es)
@@ -739,7 +742,7 @@ theorem site_ovf {sp : SpaceCfg} {c : Core} {D Db : String → Prop} {op : Arith
   have ha : ¬ D a := hvis a (by simp [Op.reads, Operand.reads])
   have hbv : ¬ D b := hvis b (by simp [Op.reads, Operand.reads])
   simp only [Runs]
-  rw [step_simple rfl rfl rfl, operands_pair]
+  rw [step_simple rfl rfl rfl rfl, operands_pair]
   cases hva : operandIn (.block s ids es :: fs) loc (.var a) with
   | error h => exact .inl ⟨h, rfl, operandIn_var_error hva⟩
   | ok va =>
@@ -840,7 +843,7 @@ theorem site_gen {sp : SpaceCfg} {c : Core} {D Db : String → Prop} {k : OpKind
     {res : List Result} {args : List Operand} {loc : Option Loc} {E : List Op}
     {ts : List String} {t s : List Op} {ids : List Nat} {et es : Env} {ft fs : List Frame}
     (hk1 : k.callee? = none) (hk2 : k.stackAlloc? = none) (hk3 : k.isTerminator = false)
-    (hvars : ∀ a ∈ args, ∃ n, a = .var n) (hro : ∀ vs, Dce.ReadOnly (evalSimple loc k res vs))
+    (hk4 : k.isVaStart = false) (hvars : ∀ a ∈ args, ∃ n, a = .var n) (hro : ∀ vs, Dce.ReadOnly (evalSimple loc k res vs))
     (hreads : ∀ n, (Op.mk k res args [] loc).reads n = true → opsReads n E = true)
     (hfresh : ∀ n ∈ ts, opsReads n t = false)
     (hts : OpsRel (L sp) t s) (hb : StackRel (L sp) Db ft fs) (hDb : ∀ n, Db n → D n)
@@ -871,7 +874,7 @@ theorem site_gen {sp : SpaceCfg} {c : Core} {D Db : String → Prop} {k : OpKind
     rintro rfl
     exact hD hm
   simp only [Runs]
-  rw [step_simple hk1 hk2 hk3]
+  rw [step_simple hk1 hk2 hk3 hk4]
   cases hops : operands (.block s ids es :: fs) loc args with
   | error h => exact .inl ⟨h, rfl, Dce.operands_vars_error hvars hops⟩
   | ok vs =>
@@ -939,9 +942,9 @@ theorem field_hrun {sp : SpaceCfg} {c : Core} {ids : List Nat} {et es : Env} {ft
   rw [hpv] at hops
   cases hops
   obtain ⟨v, rfl⟩ := simpleOp_one hop
-  refine ⟨_, .cons rfl rfl rfl rfl (op_const loc c t0 _ _) (.cons (v := v)
+  refine ⟨_, .cons rfl rfl rfl rfl rfl (op_const loc c t0 _ _) (.cons (v := v)
     (vs := [pv, .int c.space.addrBits (Sem.const c.space.addrBits ((T.fieldOffset? c.space i).getD 0))])
-    rfl rfl rfl ?_ ?_ .nil), ?_⟩
+    rfl rfl rfl rfl ?_ ?_ .nil), ?_⟩
   · dsimp only [res]
     rw [operands_pair, operandIn_insert_ne h0, lookup_of_reads hlook (by simp [Op.reads, Operand.reads]),
       hpv, operandIn_insert_self]; rfl
@@ -975,10 +978,10 @@ theorem indexW_hrun {sp : SpaceCfg} {c : Core} {ids : List Nat} {et es : Env} {f
   cases hops
   obtain ⟨v, rfl⟩ := simpleOp_one hop
   obtain ⟨x, rfl⟩ := index_src hop
-  refine ⟨_, .cons rfl rfl rfl rfl (op_const loc c t0 _ _)
-    (.cons rfl rfl rfl ?_ (op_wrap loc c .mul t1 x (Sem.const c.space.addrBits (T.stride c.space)))
+  refine ⟨_, .cons rfl rfl rfl rfl rfl (op_const loc c t0 _ _)
+    (.cons rfl rfl rfl rfl ?_ (op_wrap loc c .mul t1 x (Sem.const c.space.addrBits (T.stride c.space)))
     (.cons (v := v) (vs := [pv, .int c.space.addrBits
-      (wrapVal .mul x (Sem.const c.space.addrBits (T.stride c.space)))]) rfl rfl rfl ?_ ?_ .nil)), ?_⟩
+      (wrapVal .mul x (Sem.const c.space.addrBits (T.stride c.space)))]) rfl rfl rfl rfl ?_ ?_ .nil)), ?_⟩
   · dsimp only [res]
     rw [operands_pair, operandIn_insert_ne hne.1.2.1,
       lookup_of_reads hlook (by simp [Op.reads, Operand.reads]), hiv, operandIn_insert_self]; rfl
@@ -1020,17 +1023,17 @@ theorem indexI_hrun {sp : SpaceCfg} {c : Core} {ids : List Nat} {et es : Env} {f
   cases hops
   obtain ⟨v, rfl⟩ := simpleOp_one hop
   obtain ⟨x, rfl⟩ := index_src hop
-  refine ⟨_, .cons rfl rfl rfl ?_ (op_ext loc c true t0 _ x)
-    (.cons rfl rfl rfl rfl (op_const loc c t1 _ _)
-    (.cons rfl rfl rfl ?_ (op_wrap loc c .mul t2 (extVal true (2 * c.space.addrBits) x)
+  refine ⟨_, .cons rfl rfl rfl rfl ?_ (op_ext loc c true t0 _ x)
+    (.cons rfl rfl rfl rfl rfl (op_const loc c t1 _ _)
+    (.cons rfl rfl rfl rfl ?_ (op_wrap loc c .mul t2 (extVal true (2 * c.space.addrBits) x)
       (Sem.const (2 * c.space.addrBits) (T.stride c.space)))
-    (.cons rfl rfl rfl ?_ (op_trunc loc c .nsw (res t3 (.int c.space.addrBits))
+    (.cons rfl rfl rfl rfl ?_ (op_trunc loc c .nsw (res t3 (.int c.space.addrBits))
       (wrapVal .mul (extVal true (2 * c.space.addrBits) x)
         (Sem.const (2 * c.space.addrBits) (T.stride c.space)))
       (checkResults_plain loc c _ _ _ (hasTy_int _ _)))
     (.cons (v := v) (vs := [pv, .int c.space.addrBits (Sem.trunc .nsw c.space.addrBits
       (wrapVal .mul (extVal true (2 * c.space.addrBits) x)
-        (Sem.const (2 * c.space.addrBits) (T.stride c.space))))]) rfl rfl rfl ?_ ?_ .nil)))), ?_⟩
+        (Sem.const (2 * c.space.addrBits) (T.stride c.space))))]) rfl rfl rfl rfl ?_ ?_ .nil)))), ?_⟩
   · rw [operands_one, lookup_of_reads hlook (by simp [Op.reads, Operand.reads]), hiv]; rfl
   · dsimp only [res]
     rw [operands_pair, operandIn_insert_ne (Ne.symm hnd.1.1), operandIn_insert_self,
@@ -1138,7 +1141,7 @@ theorem sim (sp : SpaceCfg) : SimulationS (R sp) := by
             exact ⟨fun _ _ => .inl esc, fun _ _ => .inl esc⟩
           · exact start_step hsp hruns (by simp [ovfOps]) _ (by simp [Dce.topLen, ovfOps])
         | field hoff h0 h1 =>
-          rcases site_gen rfl rfl rfl (by simp) (readOnly_field _ _ _ _ _)
+          rcases site_gen rfl rfl rfl rfl (by simp) (readOnly_field _ _ _ _ _)
               (fun n hn => Exp.reads (Exp.field hoff h0 h1) hn) hfresh hts hb hDb hag hnr
               (fun hlook vs outs hops hop => field_hrun hsp hoff h0 h1 hlook vs outs hops hop) with
             ⟨h, e, hab⟩ | hruns
@@ -1147,7 +1150,7 @@ theorem sim (sp : SpaceCfg) : SimulationS (R sp) := by
             exact ⟨fun _ _ => .inl esc, fun _ _ => .inl esc⟩
           · exact start_step hsp hruns (by simp) _ (by simp [Dce.topLen])
         | indexW h01 hne =>
-          rcases site_gen rfl rfl rfl (by simp) (readOnly_index _ _ _ _)
+          rcases site_gen rfl rfl rfl rfl (by simp) (readOnly_index _ _ _ _)
               (fun n hn => Exp.reads (Exp.indexW h01 hne) hn) hfresh hts hb hDb hag hnr
               (fun hlook vs outs hops hop => indexW_hrun hsp h01 hne hlook vs outs hops hop) with
             ⟨h, e, hab⟩ | hruns
@@ -1156,7 +1159,7 @@ theorem sim (sp : SpaceCfg) : SimulationS (R sp) := by
             exact ⟨fun _ _ => .inl esc, fun _ _ => .inl esc⟩
           · exact start_step hsp hruns (by simp) _ (by simp [Dce.topLen])
         | indexI hst hnd hne =>
-          rcases site_gen rfl rfl rfl (by simp) (readOnly_index _ _ _ _)
+          rcases site_gen rfl rfl rfl rfl (by simp) (readOnly_index _ _ _ _)
               (fun n hn => Exp.reads (Exp.indexI hst hnd hne) hn) hfresh hts hb hDb hag hnr
               (fun hlook vs outs hops hop => indexI_hrun hsp hst hnd hne hlook vs outs hops hop) with
             ⟨h, e, hab⟩ | hruns
@@ -1174,11 +1177,11 @@ theorem sim (sp : SpaceCfg) : SimulationS (R sp) := by
 
 /-- Code related by expansions refines its source: the simulation theorem, with stuttering. -/
 theorem refines_of_rel {mod : Module} {tgt src : Func} (hparams : tgt.params = src.params)
-    (hrets : tgt.rets = src.rets) (hops : OpsRel (L mod.space) tgt.body.ops src.body.ops)
+    (hrets : tgt.rets = src.rets) (hva : tgt.variadic = src.variadic) (hops : OpsRel (L mod.space) tgt.body.ops src.body.ops)
     (dec : src.Decided mod) : tgt.Refines mod src := by
   refine SimulationS.refines (sim mod.space) (fun _ _ _ h => h.trace) (fun oracle world args =>
     ⟨oracle, ?_⟩) dec
-  have := init_lockstep (mod := mod) hparams hrets hops oracle world args
+  have := init_lockstep (mod := mod) hparams hrets hva hops oracle world args
   rcases this with ⟨h, e1, e2⟩ | ⟨mt, ms, e1, e2, hR⟩
   · rw [e1, e2]
     by_cases hamb : h.outcome = .ambiguous
@@ -1569,7 +1572,7 @@ theorem Expand.refines {mod : Module} {f g : Func} (h : expand mod.space f = .ok
     simp only [pure, Except.pure, Except.ok.injEq] at h
     subst h
     obtain ⟨-, hrel⟩ := expandOps_rel mod.space f.body.ops 0 p.1 p.2 he hv hno
-    exact refines_of_rel rfl rfl hrel dec
+    exact refines_of_rel rfl rfl rfl hrel dec
 
 end Fir.Lower.Proof
 

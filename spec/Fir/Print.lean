@@ -90,22 +90,43 @@ def Op.floatShown (op : Op) : Bool :=
       | [{ ty := .float t, .. }], some (.nat n) => n < 2 ^ t.width
       | _, _ => false
 
+/-- Where a call's `...` goes (decision: Varargs): after as many arguments as the callee's
+signature has parameters, if it is variadic. `va` gives that for a direct callee by name. -/
+def OpKind.vaMark (va : String → Option Nat) (k : OpKind) : Option Nat :=
+  match k.imm "sig", k.imm "callee" with
+  | some (.ty (.func ps _ true)), _ => some ps.length
+  | some (.ty _), _ => none
+  | _, some (.str f) => va f
+  | _, _ => none
+
+/-- `(%a, ... %b, %c)`: arguments with `...` before the `k`th, or at the end. -/
+def renderArgs (args : List Operand) : Option Nat → String
+  | none => "(" ++ commas (args.map Operand.render) ++ ")"
+  | some k =>
+    let fixed := (args.take k).map Operand.render
+    let rest := args.drop k
+    let va := if rest.isEmpty then "..." else "... " ++ commas (rest.map Operand.render)
+    "(" ++ commas (fixed ++ [va]) ++ ")"
+
 mutual
-  partial def renderRegion (showLocs : Bool) (indent : String) (r : Region) : String :=
-    let body := r.ops.map (renderOp showLocs (indent ++ "  "))
+  partial def renderRegion (va : String → Option Nat) (showLocs : Bool) (indent : String)
+      (r : Region) : String :=
+    let body := r.ops.map (renderOp va showLocs (indent ++ "  "))
     "{\n" ++ String.join body ++ indent ++ "}"
 
   /-- `cf.blocks`'s blocks, each label at the op's indentation and its ops one level in. -/
-  partial def renderBlocks (showLocs : Bool) (indent : String) (rs : List Region) : String :=
+  partial def renderBlocks (va : String → Option Nat) (showLocs : Bool) (indent : String)
+      (rs : List Region) : String :=
     let block (r : Region) :=
       let params := if r.params.isEmpty then "" else
         "(" ++ commas (r.params.map Result.render) ++ ")"
       indent ++ "^" ++ r.label.getD "" ++ params ++ ":\n" ++
-        String.join (r.ops.map (renderOp showLocs (indent ++ "  ")))
+        String.join (r.ops.map (renderOp va showLocs (indent ++ "  ")))
     "{\n" ++ String.join (rs.map block) ++ indent ++ "}"
 
   /-- The readable form, from the op's declared format. -/
-  partial def renderReadable (showLocs : Bool) (indent : String) (op : Op) : String := Id.run do
+  partial def renderReadable (va : String → Option Nat) (showLocs : Bool) (indent : String)
+      (op : Op) : String := Id.run do
     let d := op.kind.decl
     let mut out := op.kind.name
     let mut args := op.args
@@ -148,7 +169,8 @@ mutual
         args := args.drop mine.length
       | .args =>
         let mine := args.take (args.length - op.kind.succArgs)
-        out := out ++ "(" ++ commas (mine.map Operand.render) ++ ")"
+        let mark := (op.kind.vaMark va).filter (· ≤ mine.length)
+        out := out ++ renderArgs mine mark
         args := args.drop mine.length
       | .iter =>
         let params := (op.regions.head?.map (·.params)).getD []
@@ -160,17 +182,18 @@ mutual
     out := out ++ renderOpLoc showLocs op.loc
     for kw in d.regions, r in op.regions do
       match kw with
-      | none => out := out ++ " " ++ renderRegion showLocs indent r
+      | none => out := out ++ " " ++ renderRegion va showLocs indent r
       | some kw =>
         unless r.ops.isEmpty && r.params.isEmpty do
           let params := if r.params.isEmpty then "" else
             "(" ++ commas (r.params.map Result.render) ++ ")"
-          out := out ++ " " ++ kw ++ params ++ " " ++ renderRegion showLocs indent r
-    if d.hasBlocks then out := out ++ " " ++ renderBlocks showLocs indent op.regions
+          out := out ++ " " ++ kw ++ params ++ " " ++ renderRegion va showLocs indent r
+    if d.hasBlocks then out := out ++ " " ++ renderBlocks va showLocs indent op.regions
     pure out
 
   /-- The generic form: `"name"(operands) {attrs} @loc (regions)`. -/
-  partial def renderGeneric (showLocs : Bool) (indent : String) (op : Op) : String :=
+  partial def renderGeneric (va : String → Option Nat) (showLocs : Bool) (indent : String)
+      (op : Op) : String :=
     let d := op.kind.decl
     let attrs := if d.imms.isEmpty then "" else
       let items := d.imms.map fun f =>
@@ -183,28 +206,31 @@ mutual
       let params := if r.params.isEmpty then "" else
         "(" ++ commas (r.params.map Result.render) ++ ")"
       let head := label ++ params
-      (if head.isEmpty then "" else head ++ " ") ++ renderRegion showLocs indent r
+      (if head.isEmpty then "" else head ++ " ") ++ renderRegion va showLocs indent r
     let regions := if op.regions.isEmpty then "" else
       " (" ++ commas (op.regions.map region) ++ ")"
     "\"" ++ op.kind.name ++ "\"(" ++ commas (op.args.map Operand.render) ++ ")" ++ attrs ++
       renderOpLoc showLocs op.loc ++ regions
 
-  partial def renderOp (showLocs : Bool) (indent : String) (op : Op) : String :=
+  partial def renderOp (va : String → Option Nat) (showLocs : Bool) (indent : String) (op : Op) :
+      String :=
     let results := if op.results.isEmpty then "" else
       commas (op.results.map Result.render) ++ " = "
     let line := if op.kind.decl.fits op.kind op.args op.regions && op.floatShown
-      then renderReadable showLocs indent op
-      else renderGeneric showLocs indent op
+      then renderReadable va showLocs indent op
+      else renderGeneric va showLocs indent op
     indent ++ results ++ line ++ "\n"
 end
 
-def Func.render (showLocs : Bool) (f : Func) : String :=
-  let params := commas (f.params.map Result.render)
+/-- A function, with `va` saying where each direct call's `...` goes (`OpKind.vaMark`). -/
+def Func.render (showLocs : Bool) (f : Func) (va : String → Option Nat := fun _ => none) :
+    String :=
+  let params := commas (f.params.map Result.render ++ if f.variadic then ["..."] else [])
   let rets := retsText (f.rets.map toString)
   let file := match f.file with
     | some s => if showLocs then s!" loc \"{s}\"" else ""
     | none => ""
-  s!"func @{f.name}({params}){rets}{file} " ++ renderRegion showLocs "" f.body ++ "\n"
+  s!"func @{f.name}({params}){rets}{file} " ++ renderRegion va showLocs "" f.body ++ "\n"
 
 def hexByte (b : Nat) : String :=
   let d (n : Nat) := Nat.digitChar n
@@ -229,12 +255,14 @@ def SpaceCfg.render (sp : SpaceCfg) : String :=
   let align := if sp.ptrAlign == SpaceCfg.naturalAlign sp.ptrBits then "" else s!" align {sp.ptrAlign}"
   let ints := if sp.ints == defaultInts then "" else
     " int " ++ " ".intercalate (sp.ints.map fun (w, a) => s!"{w}:{a}")
-  s!"memspace default ptr {sp.ptrBits} addr {sp.addrBits}{align}{ints}\n"
+  let va := if sp.vaSize == 32 && sp.vaAlign == 8 then "" else s!" valist {sp.vaSize}:{sp.vaAlign}"
+  s!"memspace default ptr {sp.ptrBits} addr {sp.addrBits}{align}{ints}{va}\n"
 
 /-- `extern func @puts(ptr) -> i32 effects[read(args)] assume` -/
 def Extern.render (x : Extern) : String :=
   let rets := retsText (x.rets.map toString)
-  s!"extern func @{x.name}({commas (x.params.map toString)}){rets} effects[{commas (x.effects.map ExtEffect.render)}] {x.trust.name}\n"
+  let params := x.params.map toString ++ if x.variadic then ["..."] else []
+  s!"extern func @{x.name}({commas params}){rets} effects[{commas (x.effects.map ExtEffect.render)}] {x.trust.name}\n"
 
 def Module.render (m : Module) (showLocs := true) : String :=
   let layer := if m.layer == .hfir then "" else s!"layer {m.layer.render}\n"
@@ -244,7 +272,13 @@ def Module.render (m : Module) (showLocs := true) : String :=
     String.join (m.globals.map Global.render) ++ "\n"
   let externs := if m.externs.isEmpty then "" else
     String.join (m.externs.map Extern.render) ++ "\n"
-  header ++ globals ++ externs ++ "\n".intercalate (m.funcs.map (Func.render showLocs))
+  -- Where each direct call's `...` goes: after a variadic callee's parameters.
+  let va (name : String) : Option Nat :=
+    match m.funcs.find? (·.name == name), m.externs.find? (·.name == name) with
+    | some f, _ => if f.variadic then some f.params.length else none
+    | none, some x => if x.variadic then some x.params.length else none
+    | none, none => none
+  header ++ globals ++ externs ++ "\n".intercalate (m.funcs.map (Func.render showLocs · va))
 
 def hex (n : Nat) : String := "0x" ++ String.ofList (Nat.toDigits 16 n)
 
@@ -257,6 +291,7 @@ def Byte.render : Byte → String
   | .bits b => hex b.toNat
   | .poison => "poison"
   | .frag p i => s!"{p.render}[{i}]"
+  | .va a _ k i => s!"va(#{a}, {k})[{i}]"
 
 mutual
   /-- Integers print signed, except `i1`, which prints as `0` or `1`. Pointers print as their

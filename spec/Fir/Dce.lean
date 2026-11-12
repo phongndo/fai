@@ -134,7 +134,7 @@ calls no function, allocates no stack memory, isn't a terminator, has only varia
 and computing it only reads the core. -/
 def Pure (o : Op) : Prop :=
   ∃ k res args loc, o = .mk k res args [] loc ∧ k.callee? = none ∧ k.stackAlloc? = none ∧
-    k.isTerminator = false ∧ (∀ a ∈ args, ∃ n, a = .var n) ∧
+    k.isTerminator = false ∧ k.isVaStart = false ∧ (∀ a ∈ args, ∃ n, a = .var n) ∧
     ∀ vs, ReadOnly (evalSimple loc k res vs)
 
 /-- The rewrite: the target has nothing where the source has a pure op whose results the rest of
@@ -145,7 +145,7 @@ def L (pt ps t : List Op) : Prop :=
 /-- **Copies are pure.** -/
 theorem copy_pure (x y : String) (T : Ty) (facts : List TrustedFact) (loc : Option Loc) :
     Pure (CopyProp.copyOp x y T facts loc) := by
-  refine ⟨.copy, _, _, loc, rfl, rfl, rfl, rfl, by simp, fun vs c => ?_⟩
+  refine ⟨.copy, _, _, loc, rfl, rfl, rfl, rfl, rfl, by simp, fun vs c => ?_⟩
   match vs with
   | [v] => exact .inr ⟨[v], rfl⟩
   | [] => exact .inl ⟨_, rfl, trivial⟩
@@ -153,13 +153,13 @@ theorem copy_pure (x y : String) (T : Ty) (facts : List TrustedFact) (loc : Opti
 
 theorem const_pure (n : Int) (r : Result) (loc : Option Loc) :
     Pure (.mk (.const n) [r] [] [] loc) := by
-  refine ⟨.const n, _, _, loc, rfl, rfl, rfl, rfl, by simp, fun vs c => ?_⟩
+  refine ⟨.const n, _, _, loc, rfl, rfl, rfl, rfl, rfl, by simp, fun vs c => ?_⟩
   match vs with
   | [] => exact .inr ⟨_, rfl⟩
   | _ :: _ => exact .inl ⟨_, rfl, trivial⟩
 
 theorem poison_pure (r : Result) (loc : Option Loc) : Pure (.mk .poison [r] [] [] loc) := by
-  refine ⟨.poison, _, _, loc, rfl, rfl, rfl, rfl, by simp, fun vs c => ?_⟩
+  refine ⟨.poison, _, _, loc, rfl, rfl, rfl, rfl, rfl, by simp, fun vs c => ?_⟩
   match vs with
   | [] =>
     obtain ⟨n, ty, facts⟩ := r
@@ -241,7 +241,8 @@ result is the oracle's choice from the op and its operands, so computing one onl
 core. -/
 theorem float_pure {k : OpKind} (hk : floatPure k = true) (res : List Result) (args : List Operand)
     (hargs : ∀ a ∈ args, ∃ n, a = .var n) (loc : Option Loc) : Pure (.mk k res args [] loc) := by
-  refine ⟨k, res, args, loc, rfl, ?_, ?_, ?_, hargs, fun vs => ?_⟩
+  refine ⟨k, res, args, loc, rfl, ?_, ?_, ?_, ?_, hargs, fun vs => ?_⟩
+  · cases k <;> simp only [floatPure, reduceCtorEq] at hk <;> rfl
   · cases k <;> simp only [floatPure, reduceCtorEq] at hk <;> rfl
   · cases k <;> simp only [floatPure, reduceCtorEq] at hk <;> rfl
   · cases k <;> simp only [floatPure, reduceCtorEq] at hk <;> rfl
@@ -359,13 +360,13 @@ theorem step_deleted {mt ms : Machine} {o : Op} {t s : List Op} {ids : List Nat}
     (hnr : NoReads D t) (ht : mt.stack = .block t ids et :: ft)
     (hs : ms.stack = .block (o :: s) ids es :: fs) :
     Escapes mt.core.trace ms ∨ ∃ ms1, step ms = .ok ms1 ∧ MRel L mt ms1 ∧ topLen ms1 = s.length := by
-  obtain ⟨k, res, args, loc, rfl, h1, h2, h3, hvars, hro⟩ := hp
+  obtain ⟨k, res, args, loc, rfl, h1, h2, h3, h4, hvars, hro⟩ := hp
   obtain ⟨c, stt⟩ := mt
   obtain ⟨cs, sts⟩ := ms
   dsimp only at hc ht hs
   subst hc ht hs
   have e := step_simple (c := c) (k := k) (res := res) (args := args) (loc := loc) (t := s)
-    (ids := ids) (env := es) (fs := fs) h1 h2 h3
+    (ids := ids) (env := es) (fs := fs) h1 h2 h3 h4
   cases hv : operands (.block s ids es :: fs) loc args with
   | error h =>
     exact .inl (Escapes.one (by rw [runSteps_one, e, hv]; rfl) (.inl (operands_vars_error hvars hv))
@@ -412,11 +413,11 @@ no later op in their region reads (at any depth) gives a function that refines t
 every argument and every oracle. "Later" is in the target: deleted ops don't count as readers, so
 a chain of dead copies can go at once. -/
 theorem refines {mod : Module} {tgt src : Func} (hparams : tgt.params = src.params)
-    (hrets : tgt.rets = src.rets) (hops : OpsRel L tgt.body.ops src.body.ops)
+    (hrets : tgt.rets = src.rets) (hva : tgt.variadic = src.variadic) (hops : OpsRel L tgt.body.ops src.body.ops)
     (dec : src.Decided mod) : tgt.Refines mod src :=
   Simulation.refines sim (fun _ _ h => by rw [h.1]; exact Events.Refines.refl _)
     (fun oracle world args => ⟨oracle, InitMatch.of_lockstep
-      (init_lockstep hparams hrets hops oracle world args) fun _ _ h => h⟩) dec
+      (init_lockstep hparams hrets hva hops oracle world args) fun _ _ h => h⟩) dec
 
 theorem OpsRel.prefix {L : List Op → List Op → List Op → Prop} {t s : List Op} (h : OpsRel L t s) :
     ∀ pre : List Op, OpsRel L (pre ++ t) (pre ++ s)
@@ -429,10 +430,10 @@ a function that refines the original. (`refines` covers copies in nested regions
 once.) -/
 theorem refines_copy {mod : Module} {tgt src : Func} {pre post : List Op} {x y : String} {T : Ty}
     {facts : List TrustedFact} {loc : Option Loc} (hparams : tgt.params = src.params)
-    (hrets : tgt.rets = src.rets) (ht : tgt.body.ops = pre ++ post)
+    (hrets : tgt.rets = src.rets) (hva : tgt.variadic = src.variadic) (ht : tgt.body.ops = pre ++ post)
     (hs : src.body.ops = pre ++ CopyProp.copyOp x y T facts loc :: post)
     (hunread : opsReads y post = false) (dec : src.Decided mod) : tgt.Refines mod src := by
-  refine refines hparams hrets ?_ dec
+  refine refines hparams hrets hva ?_ dec
   rw [ht, hs]
   refine OpsRel.prefix ?_ pre
   have := OpsRel.rw (L := L) (pt := []) (ps := [CopyProp.copyOp x y T facts loc]) (t := post)
@@ -447,14 +448,14 @@ need nothing special: `refines` covers code at any depth, blocks included. -/
 theorem refines_copy_in_block {mod : Module} {tgt src : Func} {pre post bpre bpost : List Op}
     {rest : List Region} {p : Bool} {res : List Result} {ps : List Result} {lbl : Option String}
     {loc cloc : Option Loc} {x y : String} {T : Ty} {facts : List TrustedFact}
-    (hparams : tgt.params = src.params) (hrets : tgt.rets = src.rets)
+    (hparams : tgt.params = src.params) (hrets : tgt.rets = src.rets) (hva : tgt.variadic = src.variadic)
     (ht : tgt.body.ops =
       pre ++ .mk (.blocks p) res [] (.mk ps (bpre ++ bpost) lbl :: rest) loc :: post)
     (hs : src.body.ops = pre ++
       .mk (.blocks p) res []
         (.mk ps (bpre ++ CopyProp.copyOp x y T facts cloc :: bpost) lbl :: rest) loc :: post)
     (hunread : opsReads y bpost = false) (dec : src.Decided mod) : tgt.Refines mod src := by
-  refine refines hparams hrets ?_ dec
+  refine refines hparams hrets hva ?_ dec
   rw [ht, hs]
   refine OpsRel.prefix (.cons (.regions (.cons ?_ (RegionsRel.refl _))) (.refl _)) pre
   refine OpsRel.prefix ?_ bpre

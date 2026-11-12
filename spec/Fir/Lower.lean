@@ -129,7 +129,7 @@ end
 
 /-- A function type with each parameter and result replaced by its scalars. -/
 def flatSig (aw : Nat) : Ty → Ty
-  | .func ps rs => .func (scalarsList aw ps) (scalarsList aw rs)
+  | .func ps rs v => .func (scalarsList aw ps) (scalarsList aw rs) v
   | t => t
 
 /-! ## Types of values -/

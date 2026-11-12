@@ -25,6 +25,10 @@ inductive AllocKind where
   | global (name : String) (const : Bool)
   /-- A function: size 0, so no access can read or write it. -/
   | func (name : String)
+  /-- The variadic arguments of one call of a variadic function, of these types, in 8-byte slots
+  (decision: Varargs), with its first tag. Only `va.arg` reads it; other accesses are `va-arg`
+  UB. It ends when the call returns. -/
+  | va (tag : Nat) (args : List Ty)
   deriving DecidableEq, Repr
 
 /-- An allocation's bytes, by offset. Unwritten bytes are `poison`. -/
@@ -84,12 +88,18 @@ def encodePtr (cfg : SpaceCfg) : Option Ptr → List Byte
   | none => List.replicate (cfg.ptrBits / 8) .poison
   | some p => (List.range (cfg.ptrBits / 8)).map (.frag p)
 
+/-- Whether a byte reads as `poison` in an integer: `poison` itself, or a `va_list` cursor's byte,
+which only `va.arg` gives a meaning (decision: va_list). -/
+def Byte.opaque : Byte → Bool
+  | .poison | .va .. => true
+  | _ => false
+
 /-- Read bytes back as an integer, if none of them is a pointer fragment. (The interpreter first
-turns fragments into address bytes, exposing their pointers.) Any `poison` byte makes the result
-`poison`. -/
+turns fragments into address bytes, exposing their pointers.) Any `poison` byte, or byte of a
+`va_list` cursor, makes the result `poison`. -/
 def decodeInt? (w : Nat) (bs : List Byte) : Option (Val w) :=
   if bs.any (fun | .frag .. => true | _ => false) then none
-  else if bs.any (· == .poison) then some .poison
+  else if bs.any Byte.opaque then some .poison
   else some (.bits (BitVec.ofNat w (undigits (bs.map fun | .bits b => b.toNat | _ => 0))))
 
 /-- The pointer whose fragments these bytes are, in order. -/

@@ -11,8 +11,8 @@ kind, typed results, operands, nested regions, and a source location. A region h
 parameters (block arguments) and a list of ops.
 
 FIR-1 covers integers, structured control flow, memory, and calls between FIR functions, with
-structs and arrays in memory, globals, and calls through function pointers; external functions
-and floats (`f32`, `f64`) came after. Threads come later.
+structs and arrays in memory, globals, and calls through function pointers; external functions,
+floats (`f32`, `f64`), and variadic functions with `va_list` came after. Threads come later.
 -/
 
 namespace Fir
@@ -49,8 +49,9 @@ inductive Ty where
   | struct (policy : Policy) (fields : List Ty)
   /-- `array<4 x i32>` -/
   | array (n : Nat) (elem : Ty)
-  /-- `func<(i32, ptr) -> i32>` -/
-  | func (params rets : List Ty)
+  /-- `func<(i32, ptr) -> i32>`; `func<(ptr, ...) -> i32>` takes variadic arguments after its
+  parameters (decision: Varargs). -/
+  | func (params rets : List Ty) (variadic : Bool)
   /-- `union<i32, ptr>`: an HFIR tagged union, holding one of its variants and a tag saying
   which. Unions are SSA values only: they have no layout. -/
   | union (variants : List Ty)
@@ -59,6 +60,9 @@ inductive Ty where
   | slice
   /-- `f32` or `f64`: an IEEE 754 float (decision: Floats). -/
   | float (f : FloatTy)
+  /-- `va_list`: memory for a cursor over a call's variadic arguments, with the size and
+  alignment the memory space declares (decision: va_list). Not a value type. -/
+  | vaList
   deriving Repr, Inhabited
 
 mutual
@@ -81,11 +85,13 @@ mutual
         | isTrue h => isTrue (by rw [hn, h])
         | isFalse h => isFalse (by intro e; cases e; exact h rfl)
       else isFalse (by intro e; cases e; exact hn rfl)
-    | .func ps rs, .func ps' rs' =>
-      match Ty.decEqList ps ps', Ty.decEqList rs rs' with
-      | isTrue h1, isTrue h2 => isTrue (by rw [h1, h2])
-      | isFalse h, _ => isFalse (by intro e; cases e; exact h rfl)
-      | _, isFalse h => isFalse (by intro e; cases e; exact h rfl)
+    | .func ps rs v, .func ps' rs' v' =>
+      if hv : v = v' then
+        match Ty.decEqList ps ps', Ty.decEqList rs rs' with
+        | isTrue h1, isTrue h2 => isTrue (by rw [h1, h2, hv])
+        | isFalse h, _ => isFalse (by intro e; cases e; exact h rfl)
+        | _, isFalse h => isFalse (by intro e; cases e; exact h rfl)
+      else isFalse (by intro e; cases e; exact hv rfl)
     | .union vs, .union vs' =>
       match Ty.decEqList vs vs' with
       | isTrue h => isTrue (by rw [h])
@@ -93,6 +99,12 @@ mutual
     | .slice, .slice => isTrue rfl
     | .float f, .float f' =>
       if h : f = f' then isTrue (h ▸ rfl) else isFalse (by intro e; cases e; exact h rfl)
+    | .vaList, .vaList => isTrue rfl
+    | .vaList, .int _ | .vaList, .ptr | .vaList, .byte _ | .vaList, .struct .. | .vaList, .array ..
+    | .vaList, .func .. | .vaList, .union _ | .vaList, .slice | .vaList, .float _
+    | .int _, .vaList | .ptr, .vaList | .byte _, .vaList | .struct .., .vaList | .array .., .vaList
+    | .func .., .vaList | .union _, .vaList | .slice, .vaList | .float _, .vaList =>
+      isFalse (by intro e; cases e)
     | .int _, .ptr | .int _, .byte _ | .int _, .struct .. | .int _, .array .. | .int _, .func ..
     | .int _, .union _ | .int _, .slice | .int _, .float _ | .ptr, .int _ | .ptr, .byte _
     | .ptr, .struct .. | .ptr, .array .. | .ptr, .func .. | .ptr, .union _ | .ptr, .slice
@@ -145,8 +157,21 @@ def Ty.isValue : Ty → Bool
 /-- The types HFIR values can have: everything but function types (decision: Aggregate values).
 The verifier checks the parts. -/
 def Ty.isHValue : Ty → Bool
-  | .func .. => false
+  | .func .. | .vaList => false
   | _ => true
+
+/-- The types a variadic argument can have (decision: Varargs): `iN` and `bN` of 8 to 64 bits in
+whole bytes, `ptr`, `f32`, and `f64`. Each takes one register or one 8-byte stack slot. -/
+def Ty.isVararg : Ty → Bool
+  | .int w | .byte w => w % 8 == 0 && 8 ≤ w && w ≤ 64
+  | .ptr | .float _ => true
+  | _ => false
+
+/-- A variadic argument's class: `true` for a float, which travels in an FP register, `false`
+for an integer, bytes, or a pointer. `va.arg` must ask for the argument's class. -/
+def Ty.isFpClass : Ty → Bool
+  | .float _ => true
+  | _ => false
 
 /-- `-> T` or `-> (T, U)`, or nothing, as function headers and types write results. -/
 def retsText (rs : List String) : String :=
@@ -162,7 +187,9 @@ mutual
     | .byte w => s!"b{w}"
     | .struct p fs => s!"struct<{p.name}>\{{", ".intercalate (Ty.renderList fs)}}"
     | .array n t => s!"array<{n} x {t.render}>"
-    | .func ps rs => s!"func<({", ".intercalate (Ty.renderList ps)}){retsText (Ty.renderList rs)}>"
+    | .func ps rs v =>
+      s!"func<({", ".intercalate (Ty.renderList ps ++ if v then ["..."] else [])}){retsText (Ty.renderList rs)}>"
+    | .vaList => "va_list"
     | .union vs => s!"union<{", ".intercalate (Ty.renderList vs)}>"
     | .slice => "slice"
     | .float f => f.name
@@ -193,6 +220,11 @@ structure SpaceCfg where
   ptrAlign : Nat := 8
   /-- `(width in bits, alignment in bytes)`, by increasing width. -/
   ints : List (Nat × Nat) := defaultInts
+  /-- A `va_list`'s size and alignment in bytes (decision: va_list). The default is AAPCS64's on
+  Linux, the first target's: five fields, `{__stack, __gr_top, __vr_top, __gr_offs,
+  __vr_offs}`. -/
+  vaSize : Nat := 32
+  vaAlign : Nat := 8
   deriving DecidableEq, Repr, Inhabited
 
 /-- A pointer's alignment when the `memspace` line doesn't give one. -/
@@ -818,6 +850,35 @@ fir_ops
     effects read write alloc free trap diverge unwind
     rule
       sig sig
+  -- Variadic arguments (decisions: Varargs, va_list). Semantics: `Fir.Interp`.
+  /-- `va.start %ap`: start a cursor over the running call's variadic arguments in the
+  `va_list` at `%ap`, at the first. Only in a variadic function. -/
+  op vaStart
+    name "va.start"
+    format "%"
+    effects read write
+    rule
+      operands [ptr]
+      noResults
+  /-- `va.arg %ap`: the next variadic argument of the cursor in the `va_list` at `%ap`, read as
+  the result type, which must be of the argument's class (integer and pointer, or float); the
+  cursor moves past it. Its bytes are read as a load of the result type reads the argument's. -/
+  op vaArg
+    name "va.arg"
+    format "%"
+    effects read write
+    rule
+      operands [ptr]
+      results t "va.arg has one result"
+      vararg t
+  /-- `va.end %ap`: end the cursor in the `va_list` at `%ap`; its bytes become `poison`. -/
+  op vaEnd
+    name "va.end"
+    format "%"
+    effects write
+    rule
+      operands [ptr]
+      noResults
   -- Floats (decisions: Floats, Float ops). Semantics: `Fir.Float`, through `Fir.Sem`.
   /-- `float.const 1.5`: the result type's float with these bits, written as the shortest
   decimal that reads back to them, `inf`, `-inf`, `nan`, or `nan(0x…)` (see `Fir.FloatText`). -/
@@ -1342,8 +1403,10 @@ fir_ops
       func callee
       operands []
       noResults
-  /-- `aarch64.blr func<(i32) -> i32> x9`: call the function `x9` points to, which has that
-  signature. -/
+  /-- `aarch64.blr func<(i32) -> i32> x9`: call the function `x9` points to, with arguments of
+  the signature's parameter types: its own, or, for a variadic function, every argument's at this
+  call (`func<(ptr, i32, f64) -> i32>` for `printf` with an `i32` and an `f64`; decision:
+  Varargs). -/
   op a64Blr (sig : Ty) (n : Reg)
     name "aarch64.blr"
     format "{sig} {n}"
@@ -1517,9 +1580,15 @@ structure Func where
   rets : List Ty
   file : Option String
   body : Region
+  /-- `func @f(%fmt: ptr, ...)`: a call may pass variadic arguments after the parameters
+  (decision: Varargs). -/
+  variadic : Bool := false
   deriving Inhabited
 
 def Func.params (f : Func) : List Result := f.body.params
+
+/-- The function type of a function. -/
+def Func.ty (f : Func) : Ty := .func (f.params.map (·.ty)) f.rets f.variadic
 
 /-- A global's initial contents. -/
 inductive Init where
@@ -1591,10 +1660,12 @@ structure Extern where
   rets : List Ty
   effects : List ExtEffect
   trust : Trust
+  /-- `extern func @printf(ptr, ...) -> i32 …`: takes variadic arguments (decision: Varargs). -/
+  variadic : Bool := false
   deriving Inhabited
 
 /-- The function type of an external function. -/
-def Extern.ty (x : Extern) : Ty := .func x.params x.rets
+def Extern.ty (x : Extern) : Ty := .func x.params x.rets x.variadic
 
 structure Module where
   /-- `layer …`; HFIR when the module doesn't say. -/

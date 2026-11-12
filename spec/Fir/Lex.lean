@@ -84,6 +84,7 @@ where
       else if c == '/' && cs.head? == some '/' then
         go (s.takeWhile (· != '\n')).2 acc
       else if c == '-' && cs.head? == some '>' then emit (.sym "->") s.advance.advance
+      else if c == '.' && cs.take 2 == ['.', '.'] then emit (.sym "...") s.advance.advance.advance
       else if "(){}[]<>,:=".contains c then emit (.sym c.toString) s.advance
       else if c == '%' || c == '?' || c == '^' then
         let (name, s') := s.advance.takeWhile isNameChar

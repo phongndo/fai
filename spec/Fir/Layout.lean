@@ -20,6 +20,7 @@ Where each part of a struct or array goes in memory, from the memory space's dat
 * `array<N x T>` is `N` strides of `T`, with `T`'s alignment.
 
 * `slice` is laid out as `struct<C>{ptr, iA}`, with `A` the address size.
+* `va_list` takes the size and alignment the memory space declares (decision: va_list).
 
 Function types and unions have no layout; the verifier keeps them out of memory.
 -/
@@ -71,6 +72,7 @@ mutual
     | .array n t => let (s, a) := t.dims sp; (n * alignUp s a, a)
     | .func .. | .union _ => (0, 1)
     | .slice => (sp.sliceLayout.2.1, sp.sliceLayout.2.2)
+    | .vaList => (sp.vaSize, sp.vaAlign)
   /-- Each type's stride and alignment. -/
   def Ty.strides (sp : SpaceCfg) : List Ty → List (Nat × Nat)
     | [] => []

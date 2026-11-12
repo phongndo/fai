@@ -293,6 +293,10 @@ theorem shape (h : StackRel L D ft fs) :
 theorem blockIds (h : StackRel L D ft fs) : Fir.blockIds ft = Fir.blockIds fs := by
   induction h <;> simp_all [Fir.blockIds]
 
+theorem callIds (h : StackRel L D ft fs) (acc : List Nat) :
+    Fir.callIds acc ft = Fir.callIds acc fs := by
+  induction h generalizing acc <;> simp_all [Fir.callIds]
+
 theorem bindTop (h : StackRel L D ft fs) (rs : List Result) (vs : List RVal) :
     StackRel L D (Fir.bindTop rs vs ft) (Fir.bindTop rs vs fs) := by
   cases h with
@@ -645,6 +649,14 @@ theorem execFlat_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : S
       | none =>
         exact Lockstep.ok ((StackRel.nil (D := fun _ => False)).push (.refl _) (fun _ x => x.elim) _ _)
   | none =>
+  cases kind.isVaStart with
+  | true =>
+    simp only [h.operands loc hargs, ite_true, h.callIds]
+    refine lockstep_bind fun vs => ?_
+    refine lockstep_exec rfl fun _ core => ?_
+    exact Lockstep.ok h
+  | false =>
+  simp only [Bool.false_eq_true, ite_false]
   cases kind.stackAlloc? with
   | some sa =>
     refine lockstep_exec rfl fun _ core => ?_
@@ -862,16 +874,17 @@ theorem step_same {R : Machine → Machine → Prop} {mt ms : Machine} {x : Exce
       · exact .inl ⟨0, ms, h', rfl, by rw [hs]; rfl, .inl hamb⟩
       · exact .inr ⟨0, ms, h', rfl, by rw [hs]; rfl, .inl ⟨htr, Outcome.Refines.refl _ hamb⟩⟩
 
-/-- An op without regions that is not a call, stack allocation, or terminator: evaluate its
-operands, compute on the core, bind its results in the current block. -/
+/-- An op without regions that is not a call, `va.start`, stack allocation, or terminator:
+evaluate its operands, compute on the core, bind its results in the current block. -/
 theorem execOp_simple (m : Machine) (k : OpKind) (res : List Result) (args : List Operand)
     (loc : Option Loc) (h1 : k.callee? = none) (h2 : k.stackAlloc? = none)
-    (h3 : k.isTerminator = false) :
+    (h3 : k.isTerminator = false) (h4 : k.isVaStart = false) :
     execOp m (.mk k res args [] loc) =
       (operands m.stack loc args).bind fun vs =>
       (simpleOp loc k res vs m.core).bind fun p =>
       .ok { core := p.2, stack := bindTop res p.1 m.stack } := by
-  simp only [execOp, execFlat, h1, h2, h3, Machine.exec, StateT.run, Bool.false_eq_true, ite_false]
+  simp only [execOp, execFlat, h1, h2, h3, h4, Machine.exec, StateT.run, Bool.false_eq_true,
+    ite_false]
   cases operands m.stack loc args with
   | error h => rfl
   | ok vs =>
@@ -947,11 +960,12 @@ theorem operands_pair (fs : List Frame) (loc : Option Loc) (a b : Operand) :
 bind its results in the current block. -/
 theorem step_simple {c : Core} {k : OpKind} {res : List Result} {args : List Operand}
     {loc : Option Loc} {t : List Op} {ids : List Nat} {env : Env} {fs : List Frame}
-    (h1 : k.callee? = none) (h2 : k.stackAlloc? = none) (h3 : k.isTerminator = false) :
+    (h1 : k.callee? = none) (h2 : k.stackAlloc? = none) (h3 : k.isTerminator = false)
+    (h4 : k.isVaStart = false) :
     step ⟨c, .block (.mk k res args [] loc :: t) ids env :: fs⟩ =
       ((operands (.block t ids env :: fs) loc args).bind fun vs => simpleOp loc k res vs c).bind
         fun p => .ok ⟨p.2, bindTop res p.1 (.block t ids env :: fs)⟩ := by
-  simp only [step, execOp_simple _ k res args loc h1 h2 h3]
+  simp only [step, execOp_simple _ k res args loc h1 h2 h3 h4]
   cases operands (.block t ids env :: fs) loc args <;> rfl
 
 /-! ## Starting a call -/
@@ -959,11 +973,14 @@ theorem step_simple {c : Core} {k : OpKind} {res : List Result} {args : List Ope
 /-- Calls of functions with the same parameters and return types, and related bodies, start in
 lockstep. -/
 theorem init_lockstep {mod : Module} {tgt src : Func} (hparams : tgt.params = src.params)
-    (hrets : tgt.rets = src.rets) (hops : OpsRel L tgt.body.ops src.body.ops)
+    (hrets : tgt.rets = src.rets) (hva : tgt.variadic = src.variadic)
+    (hops : OpsRel L tgt.body.ops src.body.ops)
     (oracle : Oracle) (world : World) (args : List RVal) :
     Lockstep L (Machine.init oracle world mod tgt args) (Machine.init oracle world mod src args) := by
-  simp only [Machine.init, hparams, hrets, bind, Except.bind]
-  cases (enterCall none src.params args).run (Core.initial oracle world mod) with
+  have he : enterFunc none tgt args = enterFunc none src args := by
+    simp only [enterFunc, hparams, hva]
+  simp only [Machine.init, he, hparams, hrets, bind, Except.bind]
+  cases (enterFunc none src args).run (Core.initial oracle world mod) with
   | error h => exact .halt
   | ok r =>
     exact Lockstep.ok ((StackRel.call (D := fun _ => False) (D' := fun _ => False) .nil).push hops

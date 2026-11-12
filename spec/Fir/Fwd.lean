@@ -335,8 +335,8 @@ theorem step_store {mt ms : Machine} {s l c : Op} {t s' : List Op} {ids : List N
     (ft := fun outs core => ⟨core, bindTop [] outs
       (.block (.mk .copy [r] [v] [] loc2 :: t) ids et :: ft)⟩)
     (fs := fun outs core => ⟨core, bindTop [] outs S1⟩) ?_ ?_ ?_ (Events.Refines.refl _) ?_
-  · rw [step_simple rfl rfl rfl, operands_ops _ t, rel.operands loc1 hargs, operands_ops s']
-  · rw [step_simple rfl rfl rfl]
+  · rw [step_simple rfl rfl rfl rfl, operands_ops _ t, rel.operands loc1 hargs, operands_ops s']
+  · rw [step_simple rfl rfl rfl rfl]
   · simp only [Machine.shape]
     exact (shape_cons rfl hb).symm
   · intro outs core' e
@@ -376,7 +376,7 @@ theorem step_mid {mt ms : Machine} (hmid : Mid mt ms) (hsp : 0 < ms.core.space.p
   have rel : StackRel L D (.block t ids et :: ft) (.block s ids es :: fs) :=
     .block hb hDb hts hag hnr'
   have stepS := step_simple (c := core) (k := .load A2) (res := [r]) (args := [op]) (loc := loc)
-    (t := s) (ids := ids) (env := es) (fs := fs) rfl rfl rfl
+    (t := s) (ids := ids) (env := es) (fs := fs) rfl rfl rfl rfl
   rcases hready with ⟨h, e, hesc⟩ | heq
   · have esc : Escapes core.trace ⟨core, _⟩ :=
       Escapes.one (by rw [runSteps_one, stepS, e]; rfl) hesc (Events.Refines.refl _)
@@ -386,7 +386,7 @@ theorem step_mid {mt ms : Machine} (hmid : Mid mt ms) (hsp : 0 < ms.core.space.p
     (ft := fun outs core => ⟨core, bindTop [r] outs (.block t ids et :: ft)⟩)
     (fs := fun outs core => ⟨core, bindTop [r] outs (.block s ids es :: fs)⟩) ?_ ?_ ?_
     (Events.Refines.refl _) ?_
-  · rw [step_simple rfl rfl rfl, rel.operands loc (Op.reads_mk hrc).1]
+  · rw [step_simple rfl rfl rfl rfl, rel.operands loc (Op.reads_mk hrc).1]
   · rw [stepS, heq]
   · simp only [Machine.shape]
     exact (shape_cons rfl hb).symm
@@ -408,11 +408,11 @@ theorem sim : Simulation R := by
   exact step_store hR.1 hp hts hb hDb hag hnr ht hs hsp
 
 theorem init_match {mod : Module} {tgt src : Func} (hsp : 0 < mod.space.ptrBits / 8)
-    (hparams : tgt.params = src.params) (hrets : tgt.rets = src.rets)
+    (hparams : tgt.params = src.params) (hrets : tgt.rets = src.rets) (hva : tgt.variadic = src.variadic)
     (hops : OpsRel L tgt.body.ops src.body.ops) (oracle : Oracle) (world : World)
     (args : List RVal) :
     InitMatch R (Machine.init oracle world mod tgt args) (Machine.init oracle world mod src args) := by
-  rcases init_lockstep (mod := mod) hparams hrets hops oracle world args with ⟨h, e1, e2⟩ |
+  rcases init_lockstep (mod := mod) hparams hrets hva hops oracle world args with ⟨h, e1, e2⟩ |
     ⟨mt, ms, e1, e2, hR⟩
   · rw [e1, e2]
     by_cases hamb : h.outcome = .ambiguous
@@ -426,11 +426,11 @@ a store of the same type through the same pointer with a copy of the stored valu
 that refines the original, for every argument and every oracle. Integer types must be whole bytes,
 and pointers must take at least one byte (the verifier checks both). -/
 theorem refines {mod : Module} {tgt src : Func} (hsp : 8 ≤ mod.space.ptrBits)
-    (hparams : tgt.params = src.params) (hrets : tgt.rets = src.rets)
+    (hparams : tgt.params = src.params) (hrets : tgt.rets = src.rets) (hva : tgt.variadic = src.variadic)
     (hops : OpsRel L tgt.body.ops src.body.ops) (dec : src.Decided mod) : tgt.Refines mod src :=
   Simulation.refines sim (fun _ _ h => by
       rcases h.1 with h | h <;> rw [h.1] <;> exact Events.Refines.refl _)
-    (fun oracle world args => ⟨oracle, init_match (by omega) hparams hrets hops oracle world args⟩) dec
+    (fun oracle world args => ⟨oracle, init_match (by omega) hparams hrets hva hops oracle world args⟩) dec
 
 
 /-! ## Look-alikes that are wrong -/
@@ -442,6 +442,6 @@ theorem forward_partial_byte_wrong :
     ¬ ∀ v : Val 12, decodeInt? 12 (encodeInt 12 v) = some v := by
   intro h
   have := h (.bits 0xFFF)
-  simp [decodeInt?, encodeInt, digits, undigits] at this
+  simp [decodeInt?, encodeInt, digits, undigits, Byte.opaque] at this
 
 end Fir.Fwd

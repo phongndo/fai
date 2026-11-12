@@ -230,6 +230,9 @@ inductive Check where
   | sameWidth (a t : TyE)
   /-- `floatBits v t`: the bits field fits the float `t`. -/
   | floatBits (field : String) (t : TyE)
+  /-- `vararg t`: `t` is a type a variadic argument can have (decision: Varargs): `iN` or `bN`
+  of 8 to 64 bits in whole bytes, `ptr`, `f32`, or `f64`. -/
+  | vararg (t : TyE)
   deriving Repr, Inhabited
 
 /-- Effect categories (decision: Effects); resource tags come later. -/
@@ -494,6 +497,7 @@ def checkTerm (stx : TSyntax `firCheck) : MacroM Term := do
   | "numeric", ts => `(Check.numeric [$(← ts.toArray.mapM tyE),*])
   | "sameWidth", [a, t] => `(Check.sameWidth $(← tyE a) $(← tyE t))
   | "floatBits", [f, t] => `(Check.floatBits $(quote (← argIdent f)) $(← tyE t))
+  | "vararg", [t] => `(Check.vararg $(← tyE t))
   | _, _ => Macro.throwErrorAt stx "unknown check"
 
 partial def flatArg : TSyntax `firArg → List String

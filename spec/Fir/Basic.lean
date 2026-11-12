@@ -68,6 +68,10 @@ inductive Byte where
   | poison
   /-- Byte `i` of pointer `p`, which keeps its provenance when copied. -/
   | frag (p : Ptr) (i : Nat)
+  /-- Byte `i` of a `va_list` cursor (decision: va_list): at variadic argument `pos` of the call
+  whose variadic arguments are allocation `area` (first tag `tag`). Copied exactly like any byte;
+  read as anything but bytes, it is `poison`. Only `va.start` writes one. -/
+  | va (area tag pos i : Nat)
   deriving DecidableEq, Repr
 
 /-- A runtime value. -/
@@ -179,6 +183,9 @@ inductive UBKind where
   | tag
   /-- A float converted to an integer is NaN or out of range (`float.to_int.*.ub`). -/
   | convert
+  /-- `va.arg` of an object that doesn't hold a `va_list` cursor, past the last variadic
+  argument, or of a type whose class (integer and pointer, or float) isn't the argument's. -/
+  | vaArg
   deriving DecidableEq, Repr
 
 /-- The outcome of evaluating one op with result width `w`. -/
@@ -262,5 +269,6 @@ def UBKind.name : UBKind → String
   | .bounds => "bounds"
   | .tag => "tag"
   | .convert => "convert"
+  | .vaArg => "va-arg"
 
 end Fir

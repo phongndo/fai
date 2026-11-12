@@ -196,6 +196,7 @@ def rustRule (d : OpDecl) (checks : List Check) : Except String (List String) :=
       | .numeric xs => pure s!"Check::Numeric({ts xs})"
       | .sameWidth a x => pure s!"Check::SameWidth({t a}, {t x})"
       | .floatBits f x => pure s!"Check::FloatBits({immIndex d f}, {t x})"
+      | .vararg x => pure s!"Check::Vararg({t x})"
     out := out ++ [s]
   if env.length > 4 then throw s!"{d.ctor}: a rule names at most 4 types"
   pure out

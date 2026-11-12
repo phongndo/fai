@@ -150,10 +150,10 @@ theorem step_copy {mt ms : Machine} {x y : String} {T : Ty} {facts : List Truste
       (.block (ss.map (substOp x y) ++ t) ids et :: ft)⟩)
     (fs := fun outs core => ⟨core, bindTop [⟨y, T, facts⟩] outs S⟩) ?_ ?_ ?_
     (Events.Refines.refl _) ?_
-  · rw [copyOp, step_simple rfl rfl rfl, operands_one, operands_one]
+  · rw [copyOp, step_simple rfl rfl rfl rfl, operands_one, operands_one]
     simp only [operandIn]
     rw [lookup_agree (os := ss ++ s) hb hDb hag hx]
-  · rw [copyOp, step_simple rfl rfl rfl]
+  · rw [copyOp, step_simple rfl rfl rfl rfl]
   · simp only [Machine.shape]
     exact (shape_cons rfl hb).symm
   · intro outs core e
@@ -228,6 +228,32 @@ theorem step_mid {cm : Core} {x y : String} {o : Op} {ss t s : List Op} {ids : L
       execFlat ⟨cm, T0⟩ k res (args.map (substOperand x y)) loc := rfl
   have stepS : step ⟨cm, .block (.mk k res args [] loc :: (ss ++ s)) ids es :: fs⟩ =
       execFlat ⟨cm, S0⟩ k res args loc := rfl
+  cases hvs : k.isVaStart with
+  | true =>
+    -- `va.start` finds the call's variadic arguments below the top block, the same on both.
+    have hids : callIds [] T0 = callIds [] S0 := by
+      simp only [T0, S0, callIds]; exact hb.callIds ids
+    refine step_same
+      (x := (operands S0 loc args).bind fun vs => vaStartC loc (callIds [] S0) vs cm)
+      (ft := fun _ core => ⟨core, T0⟩) (fs := fun _ core => ⟨core, S0⟩) ?_ ?_ hshape
+      (Events.Refines.refl _) ?_
+    · rw [stepT]
+      simp only [execFlat, hcallee, hvs, ite_true, hops, hids, Machine.exec, StateT.run]
+      cases operands S0 loc args with
+      | error h => rfl
+      | ok vs =>
+        simp only [bind, Except.bind]
+        cases vaStartC loc (callIds [] S0) vs cm <;> rfl
+    · rw [stepS]
+      simp only [execFlat, hcallee, hvs, ite_true, Machine.exec, StateT.run]
+      cases operands S0 loc args with
+      | error h => rfl
+      | ok vs =>
+        simp only [bind, Except.bind]
+        cases vaStartC loc (callIds [] S0) vs cm <;> rfl
+    · intro _ core _
+      exact mid id _ _ _ rfl rfl hag (fun _ _ => rfl) core
+  | false =>
   cases hsa : k.stackAlloc? with
   | some sa =>
     generalize hd : sa cm.space = dims
@@ -239,11 +265,13 @@ theorem step_mid {cm : Core} {x y : String} {o : Op} {ss t s : List Op} {ids : L
       (fs := fun p core => ⟨core, bindTop res [.ptr (some p)] (addAllocId (idOf p) S0)⟩)
       ?_ ?_ hshape (Events.Refines.refl _) ?_
     · rw [stepT]
-      simp only [execFlat, hcallee, hsa, hd, Machine.exec, StateT.run]
+      simp only [execFlat, hcallee, hvs, hsa, hd, Machine.exec, StateT.run, Bool.false_eq_true,
+        ite_false]
       cases (newAlloc loc size align .stack >>= fun p =>
         checkResults loc res [.ptr (some p)] >>= fun _ => pure p) cm <;> rfl
     · rw [stepS]
-      simp only [execFlat, hcallee, hsa, hd, Machine.exec, StateT.run]
+      simp only [execFlat, hcallee, hvs, hsa, hd, Machine.exec, StateT.run, Bool.false_eq_true,
+        ite_false]
       cases (newAlloc loc size align .stack >>= fun p =>
         checkResults loc res [.ptr (some p)] >>= fun _ => pure p) cm <;> rfl
     · intro p core _
@@ -256,7 +284,7 @@ theorem step_mid {cm : Core} {x y : String} {o : Op} {ss t s : List Op} {ids : L
     have lock : Lockstep L
         (execFlat ⟨cm, T0⟩ k res (args.map (substOperand x y)) loc)
         (execFlat ⟨cm, S0⟩ k res args loc) := by
-      simp only [execFlat, hcallee, hsa, hterm, ite_true, hops]
+      simp only [execFlat, hcallee, hvs, hsa, hterm, ite_true, hops, Bool.false_eq_true, ite_false]
       refine lockstep_bind fun vs => ?_
       simp only [T0, S0, blockIds, List.append_nil]
       refine lockstep_exec rfl fun _ core => ?_
@@ -269,8 +297,8 @@ theorem step_mid {cm : Core} {x y : String} {o : Op} {ss t s : List Op} {ids : L
       (ft := fun outs core => ⟨core, bindTop res outs T0⟩)
       (fs := fun outs core => ⟨core, bindTop res outs S0⟩) ?_ ?_ hshape (Events.Refines.refl _) ?_
     · rw [show substOp x y (.mk k res args [] loc) = .mk k res (args.map (substOperand x y)) [] loc
-        from rfl, step_simple hcallee hsa hterm, hops]
-    · rw [step_simple hcallee hsa hterm]
+        from rfl, step_simple hcallee hsa hterm hvs, hops]
+    · rw [step_simple hcallee hsa hterm hvs]
     · intro outs core _
       exact mid (bindTop res outs) _ _ _ rfl rfl (hag.bindAll _ _)
         (fun n hn => lookup_bindTop hn) core
@@ -305,12 +333,12 @@ theorem sim : Simulation R := by
 original, for every argument and every oracle. The ops rewritten must have no regions, call no
 function, and bind neither `%x` nor `%y`; the run may end with a terminator. -/
 theorem refines {mod : Module} {tgt src : Func} (hparams : tgt.params = src.params)
-    (hrets : tgt.rets = src.rets) (hops : OpsRel L tgt.body.ops src.body.ops)
+    (hrets : tgt.rets = src.rets) (hva : tgt.variadic = src.variadic) (hops : OpsRel L tgt.body.ops src.body.ops)
     (dec : src.Decided mod) : tgt.Refines mod src :=
   Simulation.refines sim (fun _ _ h => by
       rcases h with h | h <;> rw [h.1] <;> exact Events.Refines.refl _)
     (fun oracle world args => ⟨oracle, InitMatch.of_lockstep
-      (init_lockstep hparams hrets hops oracle world args) fun _ _ h => .inl h⟩) dec
+      (init_lockstep hparams hrets hva hops oracle world args) fun _ _ h => .inl h⟩) dec
 
 /-! ## Look-alikes that are wrong -/
 

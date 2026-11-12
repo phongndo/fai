@@ -80,6 +80,10 @@ namespace Fir
 structure PState where
   toks : Array Token
   pos : Nat := 0
+  /-- Each direct call written in the readable form: its callee, where its argument list has
+  `...` (how many arguments come before it), and the position of the list, for the check against
+  the callee's signature once the module is read. -/
+  calls : Array (String × Option Nat × String) := #[]
 
 abbrev P := StateT PState (Except String)
 
@@ -157,12 +161,44 @@ def sepBy (p : P α) (close : String) : P (List α) := do
   expectSym close
   pure items
 
+/-- Comma-separated items, possibly none, ended by `close`, where `...` may stand once before an
+item (`%a, ... %b, %c`) or at the end (`%a, ...`): the items, and how many come before the `...`
+(decision: Varargs). -/
+partial def sepByVa (p : P α) (close : String) : P (List α × Option Nat) := do
+  if ← trySym close then return ([], none)
+  go #[] none
+where
+  go (items : Array α) (mark : Option Nat) : P (List α × Option Nat) := do
+    let (items, mark) ← if mark.isNone && (← trySym "...") then do
+        if ← trySym close then return (items.toList, some items.size)
+        pure (items.push (← p), some items.size)
+      else pure (items.push (← p), mark)
+    if ← trySym close then return (items.toList, mark)
+    expectSym ","
+    go items mark
+
+/-- Parameters, possibly ending with `...`, ended by `close`: the parameters and whether they
+end with `...`. -/
+partial def paramsVa (p : P α) (close : String) : P (List α × Bool) := do
+  if ← trySym close then return ([], false)
+  go #[]
+where
+  go (items : Array α) : P (List α × Bool) := do
+    if ← trySym "..." then
+      unless ← trySym close do fail "'...' must come after the parameters"
+      return (items.toList, true)
+    let items := items.push (← p)
+    if ← trySym close then return (items.toList, false)
+    expectSym ","
+    go items
+
 def nat : P Nat := do
   let n ← int
   if n < 0 then fail "expected a non-negative integer" else pure n.toNat
 
 /-- A type: `i32`, `ptr`, `b8`, `f32`, `f64`, `struct<C>{i32, ptr}`, `array<4 x i32>`,
-`func<(i32, ptr) -> i32>`, `union<i32, ptr>`, or `slice`. -/
+`func<(i32, ptr) -> i32>` (`func<(ptr, ...) -> i32>` when variadic), `union<i32, ptr>`, `slice`, or
+`va_list`. -/
 partial def ty : P Ty := do
   let s ← ident
   match s with
@@ -193,12 +229,13 @@ partial def ty : P Ty := do
   | "func" =>
     expectSym "<"
     expectSym "("
-    let ps ← sepBy ty ")"
+    let (ps, va) ← paramsVa ty ")"
     let rs ← if ← trySym "->" then do
         if ← trySym "(" then sepBy ty ")" else pure [← ty]
       else pure []
     expectSym ">"
-    pure (.func ps rs)
+    pure (.func ps rs va)
+  | "va_list" => pure .vaList
   | _ =>
   match s.toList with
   | c :: digits =>
@@ -356,6 +393,12 @@ def iterArg : P (Result × Operand) := do
   expectSym "="
   pure (r, ← operand)
 
+/-- What's wrong with a call's `...` against a callee that takes `n` parameters and is variadic
+or not. -/
+def vaMarkError (callee : String) (n : Nat) (variadic : Bool) : String :=
+  if variadic then s!"{callee} is variadic: write '...' after its {n} fixed arguments"
+  else s!"{callee} is not variadic: '...' marks variadic arguments"
+
 /-- The readable form after the op name, up to its location: the kind with its immediates, the
 operands, and the parameters `%iter` gives the first region. -/
 def head (kind : OpKind) (d : OpDecl) (results : List Result) :
@@ -382,7 +425,22 @@ def head (kind : OpKind) (d : OpDecl) (results : List Result) :
     | .comma => expectSym ","
     | .keyword kw => unless ← tryIdent kw do fail s!"expected '{kw}'"
     | .variadic => args := args ++ (← variadic)
-    | .args => expectSym "("; args := args ++ (← sepBy operand ")")
+    | .args =>
+      let t ← peekToken
+      expectSym "("
+      let (ops, mark) ← sepByVa operand ")"
+      args := args ++ ops
+      -- A call's variadic arguments follow `...` (decision: Varargs): where the callee's
+      -- signature says. An indirect call's signature is its immediate; a direct call's callee is
+      -- checked once the module is read.
+      match kind.imm "sig", kind.imm "callee" with
+      | some (.ty (.func ps _ v)), _ =>
+        unless mark == (if v then some ps.length else none) do
+          throw s!"{t.line}:{t.col}: {vaMarkError "the signature" ps.length v}"
+      | _, some (.str f) =>
+        modify fun st => { st with calls := st.calls.push (f, mark, s!"{t.line}:{t.col}") }
+      | _, _ => if mark.isSome then fail "'...' marks a call's variadic arguments"
+
     | .iter =>
       if ← tryIdent "iter" then
         expectSym "("
@@ -509,7 +567,7 @@ def func : P Func := do
     | .global s => discard next; pure s
     | t => fail s!"expected a function name like @main but found {t.describe}"
   expectSym "("
-  let params ← sepBy result ")"
+  let (params, variadic) ← paramsVa result ")"
   let rets ← if ← trySym "->" then do
       if ← trySym "(" then sepBy ty ")" else pure [← ty]
     else pure []
@@ -519,9 +577,9 @@ def func : P Func := do
       | t => fail s!"expected a file name string but found {t.describe}"
     else pure none
   let body ← region params
-  pure { name, rets, file, body }
+  pure { name, rets, file, body, variadic }
 
-/-- `memspace default ptr 64 addr 64 [align 8] [int 8:1 16:2 …]` -/
+/-- `memspace default ptr 64 addr 64 [align 8] [int 8:1 16:2 …] [valist 32:8]` -/
 def memspace : P SpaceCfg := do
   let name ← ident
   unless name == "default" do fail "only the default memory space can be declared for now"
@@ -538,7 +596,12 @@ def memspace : P SpaceCfg := do
       expectSym ":"
       ints := ints ++ [(w, ← nat)]
       unless (← peek) matches .int _ do break
-  pure { ptrBits, addrBits, ptrAlign, ints }
+  let (vaSize, vaAlign) ← if ← tryIdent "valist" then do
+      let s ← nat
+      expectSym ":"
+      pure (s, ← nat)
+    else pure (32, 8)
+  pure { ptrBits, addrBits, ptrAlign, ints, vaSize, vaAlign }
 
 /-- Hex digits, two per byte. -/
 def hexBytes (s : String) : Option (List Nat) :=
@@ -628,14 +691,14 @@ def extern : P Extern := do
     | .global s => discard next; pure s
     | t => fail s!"expected a function name like @main but found {t.describe}"
   expectSym "("
-  let params ← sepBy ty ")"
+  let (params, variadic) ← paramsVa ty ")"
   let rets ← if ← trySym "->" then do
       if ← trySym "(" then sepBy ty ")" else pure [← ty]
     else pure []
   unless ← tryIdent "effects" do fail "expected 'effects' after an external function's signature"
   expectSym "["
   let effects ← sepBy extEffect "]"
-  pure { name, params, rets, effects, trust := ← trust }
+  pure { name, params, rets, effects, trust := ← trust, variadic }
 
 /-- `hfir`, `mfir`, or `lfir TARGET`, after `layer`. -/
 def layer : P Layer := do
@@ -669,6 +732,16 @@ def module : P Module := do
     else if ← tryIdent "global" then globals := globals.push (← global)
     else if ← tryIdent "extern" then externs := externs.push (← extern)
     else funcs := funcs.push (← func)
+  -- Each direct call's `...` where its callee's signature says (decision: Varargs). A callee that
+  -- isn't declared is the verifier's to report.
+  for (f, mark, pos) in (← get).calls do
+    let sig : Option (Nat × Bool) :=
+      match funcs.find? (·.name == f), externs.find? (·.name == f) with
+      | some fn, _ => some (fn.params.length, fn.variadic)
+      | none, some x => some (x.params.length, x.variadic)
+      | none, none => none
+    if let some (n, v) := sig then
+      unless mark == (if v then some n else none) do throw s!"{pos}: {vaMarkError s!"@{f}" n v}"
   pure { layer := layer?.getD .hfir, space, globals := globals.toList, externs := externs.toList,
          funcs := funcs.toList }
 

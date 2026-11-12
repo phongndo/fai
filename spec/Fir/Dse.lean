@@ -520,7 +520,7 @@ theorem step_dse {mt ms : Machine} {s1 s2 : Op} {t s : List Op} {ids : List Nat}
   -- The source runs the deleted store.
   have step1 := step_simple (c := c) (k := .store T1 A1) (res := []) (args := [.var x1, .var xp])
     (loc := loc1) (t := .mk (.store T2 A2) [] [v2, .var xp] [] loc2 :: s) (ids := ids) (env := es)
-    (fs := fs) rfl rfl rfl
+    (fs := fs) rfl rfl rfl rfl
   simp only [List.cons_append, List.nil_append, bindTop_nil] at step1 ⊢
   rw [operands_ops _ s] at step1
   cases hx1 : operandIn (.block s ids es :: fs) loc1 (.var x1) with
@@ -554,8 +554,8 @@ theorem step_dse {mt ms : Machine} {s1 s2 : Op} {t s : List Op} {ids : List Nat}
       simpleOp loc2 (.store T2 A2) [] vs c)
     (ft := fun outs core => ⟨core, bindTop [] outs (.block t ids et :: ft)⟩)
     (fs := fun outs core => ⟨core, bindTop [] outs (.block s ids es :: fs)⟩) ?_ ?_ ?_ ?_ ?_
-  · rw [step_simple rfl rfl rfl, rel.operands loc2 hargs]
-  · rw [step_simple rfl rfl rfl]
+  · rw [step_simple rfl rfl rfl rfl, rel.operands loc2 hargs]
+  · rw [step_simple rfl rfl rfl rfl]
     congr 1
     refine Except.bind_congr fun vs e => ?_
     rw [operands_pair, hxp2] at e
@@ -583,10 +583,10 @@ theorem sim : Simulation (MRel L) := by
 immediately followed by a store of the same size through the same pointer gives a function that
 refines the original, for every argument and every oracle. -/
 theorem refines {mod : Module} {tgt src : Func} (hparams : tgt.params = src.params)
-    (hrets : tgt.rets = src.rets) (hops : OpsRel L tgt.body.ops src.body.ops)
+    (hrets : tgt.rets = src.rets) (hva : tgt.variadic = src.variadic) (hops : OpsRel L tgt.body.ops src.body.ops)
     (dec : src.Decided mod) : tgt.Refines mod src :=
   Simulation.refines sim (fun _ _ h => by rw [h.1]; exact Events.Refines.refl _)
     (fun oracle world args => ⟨oracle, InitMatch.of_lockstep
-      (init_lockstep hparams hrets hops oracle world args) fun _ _ h => h⟩) dec
+      (init_lockstep hparams hrets hva hops oracle world args) fun _ _ h => h⟩) dec
 
 end Fir.Dse

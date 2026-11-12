@@ -116,11 +116,11 @@ theorem decode_encodeInt (w : Nat) (hw : w % 8 = 0) (hpos : 0 < w) (v : Val w) :
   cases v with
   | poison =>
     have : 0 < w / 8 := by omega
-    simp [decodeInt?, encodeInt, List.any_replicate, Nat.ne_of_gt this]
+    simp [decodeInt?, encodeInt, List.any_replicate, Nat.ne_of_gt this, Byte.opaque]
   | bits b =>
     have hpow : (256 : Nat) ^ (w / 8) = 2 ^ w := by
       rw [show (256 : Nat) = 2 ^ 8 by rfl, ← Nat.pow_mul, show 8 * (w / 8) = w by omega]
-    simp [decodeInt?, encodeInt, List.any_map, Function.comp_def]
+    simp [decodeInt?, encodeInt, List.any_map, Function.comp_def, Byte.opaque]
     rw [map_mod_digits, undigits_digits, hpow, Nat.mod_eq_of_lt b.isLt]
     simp
 
@@ -128,7 +128,7 @@ theorem decode_encodeInt (w : Nat) (hw : w % 8 = 0) (hpos : 0 < w) (v : Val w) :
 theorem decode_fresh (w : Nat) (hw : 8 ≤ w) :
     decodeInt? w (List.replicate (w / 8) .poison) = some .poison := by
   have : 0 < w / 8 := by omega
-  simp [decodeInt?, List.any_replicate, Nat.ne_of_gt this]
+  simp [decodeInt?, List.any_replicate, Nat.ne_of_gt this, Byte.opaque]
 
 /-- A pointer stored and loaded back is the same pointer, provenance included. -/
 theorem ptrOfFrags_encodePtr (cfg : SpaceCfg) (p : Ptr) (h : 0 < cfg.ptrBits / 8) :

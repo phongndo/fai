@@ -47,6 +47,10 @@ interpreter.
   it, and `func.ret` doesn't appear in it.
 * Facts: ranges apply to integers, `nonnull` and `align` to pointers, and `noalias` and
   `readonly` only to pointer parameters of functions.
+* Varargs: a variadic function, external function, or function type takes variadic arguments
+  after its parameters, each an `iN` or `bN` of 8 to 64 bits in whole bytes, a `ptr`, or a float
+  (`Ty.isVararg`), which is also what `va.arg` reads; `va.start` is only in a variadic function.
+  `va_list` is a memory type: no value, parameter, or part of a value has it.
 * Signatures: every function's parameter and result types are value types. This is checked
   for all functions before any body, so calls only ever compare value types.
 
@@ -78,9 +82,11 @@ structure VState where
   holes : Array Hole := #[]
   space : SpaceCfg := {}
   layer : Layer := .hfir
-  /-- Each function's parameter and return types. -/
-  sigs : Std.HashMap String (List Ty × List Ty) := {}
+  /-- Each function's parameter and return types, and whether it is variadic. -/
+  sigs : Std.HashMap String (List Ty × List Ty × Bool) := {}
   globals : Std.HashSet String := {}
+  /-- Whether the function being checked is variadic (`va.start` is allowed in it). -/
+  variadic : Bool := false
 
 abbrev VM := StateT VState (Except String)
 
@@ -92,12 +98,19 @@ def verr (loc : Option Loc) (msg : String) : VM α := throw s!"{Loc.render loc}:
 
 abbrev VScope := Std.HashMap String Ty
 
+/-- Whether a type has a `va_list` in it, which values can't (decision: va_list). -/
+partial def Ty.hasVaList : Ty → Bool
+  | .vaList => true
+  | .struct _ fs | .union fs => fs.any Ty.hasVaList
+  | .array _ e => e.hasVaList
+  | _ => false
+
 /-- Check that a type is well formed: valid widths, parts with a layout, function types of
 value types, and sizes that fit the address space. -/
 partial def checkTy (loc : Option Loc) : Ty → VM Unit
   | .int 0 => verr loc "i0 is not a valid type"
   | .byte w => unless w > 0 && w % 8 == 0 do verr loc s!"b{w} is not a valid type"
-  | .int _ | .ptr | .float _ => pure ()
+  | .int _ | .ptr | .float _ | .vaList => pure ()
   | t@(.struct _ fs) => do
     for f in fs do
       checkTy loc f
@@ -107,17 +120,17 @@ partial def checkTy (loc : Option Loc) : Ty → VM Unit
     checkTy loc e
     unless e.hasLayout do verr loc s!"{e} can't be part of {t}"
     checkSize t
-  | t@(.func ps rs) => do
+  | t@(.func ps rs _) => do
     let l := (← get).layer
     for x in ps ++ rs do
       checkTy loc x
-      unless l.valueTy x do verr loc s!"{x} can't be a parameter or result of {t}"
+      unless l.valueTy x && !x.hasVaList do verr loc s!"{x} can't be a parameter or result of {t}"
   | .slice => pure ()
   | t@(.union vs) => do
     if vs.isEmpty then verr loc s!"{t} needs at least one variant"
     for v in vs do
       checkTy loc v
-      unless v.isHValue do verr loc s!"{v} can't be a variant of {t}"
+      unless v.isHValue && !v.hasVaList do verr loc s!"{v} can't be a variant of {t}"
 where
   checkSize (t : Ty) : VM Unit := do
     let sp := (← get).space
@@ -126,7 +139,7 @@ where
 /-- Check that a value's type is a well-formed value type. -/
 def checkValueTy (loc : Option Loc) (t : Ty) : VM Unit := do
   checkTy loc t
-  unless (← get).layer.valueTy t do verr loc s!"{t} is not a value type"
+  unless (← get).layer.valueTy t && !t.hasVaList do verr loc s!"{t} is not a value type"
 
 /-- Check that a type is well formed and has a layout. -/
 def checkSized (loc : Option Loc) (t : Ty) : VM Unit := do
@@ -239,8 +252,8 @@ def checkSimple (loc : Option Loc) (k : OpKind) (ins outs : List Ty) : VM Unit :
     | .deny names msg => if names.contains k.name then verr loc msg
     | .call f =>
       let some (.str callee) := k.imm f | verr loc "malformed op"
-      let some (params, rets) := st.sigs[callee]? | verr loc s!"no function @{callee}"
-      expectTys loc s!"arguments of @{callee}" ins params
+      let some (params, rets, va) := st.sigs[callee]? | verr loc s!"no function @{callee}"
+      checkArgs loc s!"arguments of @{callee}" ins params va
       expectTys loc s!"results of @{callee}" outs rets
     | .sized t => checkSized loc (ty t)
     | .field t f =>
@@ -253,8 +266,8 @@ def checkSimple (loc : Option Loc) (k : OpKind) (ins outs : List Ty) : VM Unit :
     | .sig f =>
       let some (.ty t) := k.imm f | verr loc "malformed op"
       checkTy loc t
-      let .func ps rs := t | verr loc s!"{t} is not a function type"
-      expectTys loc "operands" ins (.ptr :: ps)
+      let .func ps rs va := t | verr loc s!"{t} is not a function type"
+      checkArgs loc "operands" ins (.ptr :: ps) va
       expectTys loc "results" outs rs
     | .global f =>
       let some (.str g) := k.imm f | verr loc "malformed op"
@@ -310,6 +323,18 @@ def checkSimple (loc : Option Loc) (k : OpKind) (ins outs : List Ty) : VM Unit :
       let some (.nat n) := k.imm f | verr loc "malformed op"
       let t := ty t
       unless n < 2 ^ t.width do verr loc s!"{n} is not the bits of a {t}"
+    | .vararg t =>
+      let t := ty t
+      unless t.isVararg do verr loc s!"{t} can't be a variadic argument"
+where
+  /-- A call's arguments against a signature's parameters: exactly them, or, for a variadic
+  signature, them and then variadic arguments of the types `Ty.isVararg` allows. -/
+  checkArgs (loc : Option Loc) (what : String) (ins params : List Ty) (va : Bool) : VM Unit := do
+    if !va then expectTys loc what ins params
+    else
+      expectTys loc what (ins.take params.length) params
+      for t in ins.drop params.length do
+        unless t.isVararg do verr loc s!"{what}: {t} can't be a variadic argument"
 
 def nearestLoop : List RegionCtx → Option (List Ty × List Ty)
   | [] => none
@@ -459,6 +484,9 @@ mutual
       let mut inner := scope
       for r in body.params do inner ← define loc inner r
       verifyOps (.loopBody ps outs :: ctx) inner loc body.ops
+    | .vaStart, [] =>
+      unless (← get).variadic do verr loc "va.start is only allowed in a variadic function"
+      checkSimple loc .vaStart ins outs
     | k, [] =>
       if k.isTerminator && k.decl.rule.isSome then
         -- A target's branch, return, or trap: it ends a block of the target's code.
@@ -490,7 +518,7 @@ mutual
 end
 
 def verifyFunc (f : Func) : VM Unit := do
-  modify fun s => { s with defined := {} }
+  modify fun s => { s with defined := {}, variadic := f.variadic }
   for t in f.rets do checkValueTy none t
   let mut scope : VScope := {}
   for r in f.params do scope ← define none scope r (isParam := true)
@@ -534,6 +562,8 @@ def verifyModule (m : Module) : Except String (Array Hole) := do
       sp.addrBits ≤ sp.ptrBits do
     throw s!"memspace: pointer size {sp.ptrBits} and address size {sp.addrBits} must be positive multiples of 8, with the address size at most the pointer size"
   unless isPow2 sp.ptrAlign do throw s!"memspace: pointer alignment {sp.ptrAlign} must be a power of two"
+  unless sp.vaSize > 0 && isPow2 sp.vaAlign do
+    throw s!"memspace: va_list size {sp.vaSize} must be positive and its alignment {sp.vaAlign} a power of two"
   let mut last := 0
   for (w, a) in sp.ints do
     unless w > last do throw "memspace: integer alignments must be listed by increasing width"
@@ -545,15 +575,15 @@ def verifyModule (m : Module) : Except String (Array Hole) := do
     if names.contains g.name then throw s!"global @{g.name} is defined more than once"
     names := names.insert g.name
   let globals := names
-  let mut sigs : Std.HashMap String (List Ty × List Ty) := {}
+  let mut sigs : Std.HashMap String (List Ty × List Ty × Bool) := {}
   for x in m.externs do
     if names.contains x.name then throw s!"function @{x.name} is defined more than once"
     names := names.insert x.name
-    sigs := sigs.insert x.name (x.params, x.rets)
+    sigs := sigs.insert x.name (x.params, x.rets, x.variadic)
   for f in m.funcs do
     if names.contains f.name then throw s!"function @{f.name} is defined more than once"
     names := names.insert f.name
-    sigs := sigs.insert f.name (f.params.map (·.ty), f.rets)
+    sigs := sigs.insert f.name (f.params.map (·.ty), f.rets, f.variadic)
   -- Globals.
   let st : VState := { space := sp, layer := m.layer, sigs, globals }
   for g in m.globals do

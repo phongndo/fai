@@ -30,7 +30,8 @@ classes. The instructions' bit-level meaning is
   either for the register they move.
 * **Calls** follow AAPCS64 (decision: Calling convention): integer and pointer arguments in
   `x0`…`x7` and float arguments in `d0`…`d7`, counted separately, then 8-byte stack slots from
-  `sp` in order (`argLocs`); one or two results in `d0`, `d1` when all are floats of one format,
+  `sp` in order (`argLocs`), variadic arguments as fixed ones on Linux (decision: Varargs; `blr`
+  names the call's argument types, which an external callee's event reads); one or two results in `d0`, `d1` when all are floats of one format,
   otherwise in `x0`, `x1` (a float as its bits), more in 8-byte slots at the address the caller
   passes in `x8` (`resRegs`). A narrow integer or an `f32` travels in the low bits of its
   register. `bl` enters an LFIR function, which must leave `x19`…`x29`, `sp`, and `d8`…`d15` as
@@ -210,7 +211,7 @@ def wordOfBytes (loc : Option Loc) (bs : List Byte) : LM Word := do
   for b in bs do
     let d ← match b with
       | .bits x => pure x.toNat
-      | .poison => do pure ((← liftCM choose) % 256).toNat
+      | .poison | .va .. => do pure ((← liftCM choose) % 256).toNat
       | f@(.frag ..) => do
         match ← liftCM (fragToBits loc f) with
         | .bits x => pure x.toNat
@@ -379,9 +380,11 @@ def enter (loc : Option Loc) (f : Func) : LM Unit := do
     setResults rloc f.rets outs
   | _ => stuckL loc s!"@{f.name}'s body must be aarch64.code or func.ret"
 
-/-- Call an external function: one event, then its results where the convention puts them. -/
-def callExt (loc : Option Loc) (x : Extern) : LM Unit := do
-  let vs ← argVals loc x.params
+/-- Call an external function with arguments of types `ps` (its parameters', or, through `blr`,
+the call's, variadic arguments included): one event, then its results where the convention puts
+them. -/
+def callExt (loc : Option Loc) (x : Extern) (ps : List Ty) : LM Unit := do
+  let vs ← argVals loc ps
   let e ← liftCM (callExtern loc x vs)
   modify fun m => { m with core := { m.core with trace := m.core.trace ++ [e] } }
   match e.results with
@@ -390,13 +393,16 @@ def callExt (loc : Option Loc) (x : Extern) : LM Unit := do
     setResults loc x.rets rs
     clobber ((resRegs x.rets).getD [])
 
-def callNamed (loc : Option Loc) (name : String) : LM Unit := do
+/-- Call a function by name. An external one reads its arguments by `site`, the call's argument
+types, if given (`blr`: a variadic callee's variadic arguments are in them), else by its
+parameters. -/
+def callNamed (loc : Option Loc) (name : String) (site : Option (List Ty) := none) : LM Unit := do
   let c := (← get).core
   match c.funcs[name]?, c.externs[name]? with
   | some f, _ =>
     writeReg (.x 30) (.bits 0)
     enter loc f
-  | none, some x => callExt loc x
+  | none, some x => callExt loc x (site.getD x.params)
   | none, none => stuckL loc s!"no function @{name}"
 
 /-- The function a word points to the start of. -/
@@ -605,7 +611,11 @@ def exec (op : Op) : LM Unit := do
   | .a64BExn t f => jump loc (if (← get).exn.isSome then t.label else f.label)
   | .a64Trap r => halt (.trap r) loc
   | .a64Bl callee => callNamed loc callee
-  | .a64Blr _ n => callNamed loc (← funcAt loc (← readReg loc n))
+  | .a64Blr sig n =>
+    let site := match sig with
+      | .func ps _ _ => some ps
+      | _ => none
+    callNamed loc (← funcAt loc (← readReg loc n)) site
   | .a64BlAlloc family align =>
     let size ← readBits loc (.x 0)
     if (← liftCM choose) != 0 then writeReg (.x 0) (.bits 0)
@@ -643,8 +653,10 @@ def start (f : Func) (args : List RVal) : LM Unit := do
     down (8 * f.rets.length)
     modify fun m => { m with resArea := m.sp }
     writeReg (.x 8) (← get).sp
-  let locs := argLocs (f.params.map (·.ty))
-  let slots := stackSlots (f.params.map (·.ty))
+  -- A variadic function's variadic arguments go where fixed ones of their types would.
+  let tys := if f.variadic then args.map RVal.scalarTy else f.params.map (·.ty)
+  let locs := argLocs tys
+  let slots := stackSlots tys
   if slots > 0 then
     down (8 * slots)
     for (v, l) in args.zip locs do
