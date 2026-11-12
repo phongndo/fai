@@ -725,7 +725,7 @@ private:
         const VarDecl *vd = pendingVars.back();
         pendingVars.pop_back();
         try {
-          FirGlobal g = globals[vd->getCanonicalDecl()];
+          FirGlobal g = globals.find(vd->getCanonicalDecl())->second; // made by globalFor
           if (const Expr *init = vd->getInit()) {
             const APValue *v = vd->evaluateValue();
             if (!v)
@@ -743,7 +743,7 @@ private:
         Expr::EvalResult r;
         if (!cle->getInitializer()->EvaluateAsRValue(r, ctx, true))
           unsupported(cle->getBeginLoc(), "this compound literal's initializer (not a constant)");
-        ok(fir_global_set_init(m, exprGlobals[cle],
+        ok(fir_global_set_init(m, exprGlobals.find(cle)->second, // made by litGlobal
                                initFrom(r.Val, cle->getType(), cle->getBeginLoc())),
            "fir_global_set_init");
       } catch (Abort &) {
@@ -1456,11 +1456,12 @@ private:
     if (const auto *cle = dyn_cast<CompoundLiteralExpr>(e)) {
       if (cle->isFileScope())
         return {ck(fir_mem_global(b, litGlobal(cle)), "mem.global")};
-      FirValue slot = litSlots.lookup(cle);
-      if (!slot)
+      // FIR ids start at 0, so a missing entry can't be told from `lookup`'s default.
+      auto it = litSlots.find(cle);
+      if (it == litSlots.end())
         unsupported(loc, "this compound literal");
-      initObject(slot, cle->getType(), cle->getInitializer());
-      return {slot};
+      initObject(it->second, cle->getType(), cle->getInitializer());
+      return {it->second};
     }
     if (const auto *ce = dyn_cast<CastExpr>(e)) {
       if (ce->getCastKind() == CK_NoOp || ce->getCastKind() == CK_LValueBitCast)
@@ -1848,8 +1849,12 @@ private:
         globalFor(vd, vd->getLocation());
       return;
     }
-    if (const Expr *init = vd->getInit())
-      initObject(slots.lookup(vd), vd->getType(), init);
+    if (const Expr *init = vd->getInit()) {
+      auto it = slots.find(vd);
+      if (it == slots.end())
+        unsupported(vd->getLocation(), "this local variable");
+      initObject(it->second, vd->getType(), init);
+    }
   }
 
   void ifStmt(const IfStmt *s) {
