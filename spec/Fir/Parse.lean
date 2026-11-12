@@ -287,10 +287,17 @@ def operand : P Operand := do
   | .hole s => discard next; expectSym ":"; pure (.hole s (← ty))
   | t => fail s!"expected an operand but found {t.describe}"
 
-/-- Zero or more comma-separated operands. -/
+/-- The token after the next one. -/
+def peek2 : P Tok := do
+  let s ← get
+  pure ((s.toks[s.pos + 1]?.getD default).tok)
+
+/-- Zero or more comma-separated operands. A value followed by `:` is the next op's result, not
+an operand (an op with no operands and no location ends its line). -/
 def variadic : P (List Operand) := do
   match ← peek with
-  | .value _ | .hole _ => sepBy1 operand
+  | .value _ => if (← peek2) == .sym ":" then pure [] else sepBy1 operand
+  | .hole _ => sepBy1 operand
   | _ => pure []
 
 def optLoc : P (Option Loc) := do

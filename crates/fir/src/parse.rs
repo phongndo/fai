@@ -435,6 +435,16 @@ impl<'a> Parser<'a> {
 
     /// Zero or more comma-separated operands, into the scratch buffer.
     fn variadic(&mut self) -> PResult<()> {
+        // A value followed by `:` is the next op's result, not an operand (an op with no
+        // operands and no location ends its line).
+        if let Tok::Value(_) = self.peek()
+            && matches!(
+                self.lexer.clone().next_token().map(|t| t.tok),
+                Ok(Tok::Sym(Sym::Colon))
+            )
+        {
+            return Ok(());
+        }
         if matches!(self.peek(), Tok::Value(_) | Tok::Hole(_)) {
             loop {
                 let o = self.operand()?;
