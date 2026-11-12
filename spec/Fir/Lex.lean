@@ -55,7 +55,7 @@ private def LexState.advance (s : LexState) : LexState :=
 
 private def LexState.takeWhile (s : LexState) (p : Char → Bool) : String × LexState :=
   let cs := s.chars.takeWhile p
-  (String.ofList cs, { s with chars := s.chars.drop cs.length, col := s.col + cs.length })
+  (String.ofList cs, cs.foldl (fun st _ => st.advance) s)
 
 partial def lex (input : String) : Except String (Array Token) :=
   go { chars := input.toList } #[]
