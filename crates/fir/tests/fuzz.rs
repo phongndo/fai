@@ -132,6 +132,8 @@ fn interpreter_matches_reference_on_random_programs() {
                             ("exn.throw", "(programs with exn.throw)"),
                             ("func.invoke", "(programs with func.invoke)"),
                             ("float.", "(programs with float ops)"),
+                            ("...", "(programs with variadic functions)"),
+                            ("va.arg", "(programs with va.arg)"),
                         ] {
                             if prog.text.contains(op) {
                                 *st.entry(what.to_owned()).or_default() += 1;

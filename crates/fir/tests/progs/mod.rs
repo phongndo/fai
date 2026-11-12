@@ -46,6 +46,15 @@
 //! `freeze`, `poison`, and `copy` of floats, and floats as parameters, results, loop and block
 //! state, parts of aggregates and unions, globals (with float initializers), and values loaded
 //! and stored (and read back as integers and bytes).
+//!
+//! Varargs: functions (the entry included) and external functions are sometimes variadic, each
+//! with a list of variadic argument types its calls usually pass (integers of 8 to 64 bits,
+//! pointers, and floats, sometimes more than eight of a class), so most runs stay defined;
+//! direct and indirect calls pass them after `...`, sometimes other types or another number.
+//! Variadic bodies read their arguments with `va.arg` (usually of the passed type, sometimes of
+//! another width of its class or of the other class, or past the end), restart with `va.start`,
+//! copy the cursor with `mem.copy va_list` (C's `va_copy`), and end it with `va.end`. The entry's
+//! runs pass typed variadic arguments (`i32 5`).
 
 use std::fmt::Write;
 
@@ -231,6 +240,25 @@ pub struct Program {
 struct Sig {
     params: Vec<T>,
     rets: Vec<T>,
+    /// For a variadic function, the types of the variadic arguments its calls usually pass.
+    va: Option<Vec<T>>,
+}
+
+/// The types of a list of variadic arguments: up to `max` integers of 8 to 64 bits, pointers,
+/// and floats.
+fn va_tys(rng: &mut Rng, max: u64) -> Vec<T> {
+    (0..rng.below(max + 1))
+        .map(|_| match rng.below(10) {
+            0..=3 => T::I(rng.pick(&[8, 16, 32, 64, 64])),
+            4..=5 => T::P,
+            _ => T::F(rng.pick(&[32, 64, 64])),
+        })
+        .collect()
+}
+
+/// Whether two variadic argument types are of the same class (integer and pointer, or float).
+fn same_class(a: T, b: T) -> bool {
+    matches!(a, T::F(_)) == matches!(b, T::F(_))
 }
 
 /// A struct or array type, or a value type inside one.
@@ -440,6 +468,9 @@ struct Gen<'r> {
     /// Values read back after stores in the function's top region, which `func.ret` prefers, so
     /// that what memory holds shows in the outcome.
     watch: Vec<(String, T)>,
+    /// In a variadic function: its `va_list`, and how many of its variadic arguments the
+    /// generated `va.arg`s have read so far.
+    va: Option<(String, usize)>,
 }
 
 impl Gen<'_> {
@@ -487,9 +518,14 @@ impl Gen<'_> {
                 "check"
             };
             let name = self.fn_name(k);
+            let dots = match (&self.sigs[k].va, ps.is_empty()) {
+                (None, _) => "",
+                (Some(_), true) => "...",
+                (Some(_), false) => ", ...",
+            };
             write!(
                 self.out,
-                "extern func @{name}({}){rets} effects[{}] {trust}",
+                "extern func @{name}({}{dots}){rets} effects[{}] {trust}",
                 ps.join(", "),
                 effects.join(", ")
             )
@@ -899,6 +935,9 @@ impl Gen<'_> {
     /// One random op (possibly with regions).
     fn stmt(&mut self) {
         self.ops_left = self.ops_left.saturating_sub(1);
+        if self.va.is_some() && self.depth == 0 && self.rng.chance(15) {
+            return self.va_op();
+        }
         if self.rng.chance(14) {
             return self.float_op();
         }
@@ -2042,10 +2081,81 @@ impl Gen<'_> {
         self.fnptrs.push((name, k));
     }
 
+    /// The arguments of a call of function `k` (whose signature is `sig`'s): one per parameter,
+    /// then for a variadic one `...` and its variadic arguments, usually of the types it
+    /// expects (`k`'s), sometimes others.
+    fn call_args(&mut self, k: usize, sig: usize) -> String {
+        let params = self.sigs[sig].params.clone();
+        let mut args: Vec<String> = params.iter().map(|t| self.operand(*t)).collect();
+        if self.sigs[sig].va.is_some() {
+            let mut tys = self.sigs[k].va.clone().unwrap_or_default();
+            if self.rng.chance(10) {
+                tys = va_tys(self.rng, 6);
+            } else if self.rng.chance(5) && !tys.is_empty() {
+                tys.pop();
+            }
+            let vas: Vec<String> = tys.iter().map(|t| self.operand(*t)).collect();
+            args.push(if vas.is_empty() {
+                "...".to_owned()
+            } else {
+                format!("... {}", vas.join(", "))
+            });
+        }
+        args.join(", ")
+    }
+
+    /// One statement of a variadic function's top region: usually the next variadic argument,
+    /// read as its type (sometimes another width of its class, or the other class, which is
+    /// UB, as is reading past the end); sometimes a restart, a copy of the cursor, or its end.
+    fn va_op(&mut self) {
+        let Some((ap, read)) = self.va.clone() else {
+            return;
+        };
+        let tys = self.sigs[self.func].va.clone().unwrap_or_default();
+        match self.rng.below(20) {
+            0 => {
+                self.op(&[], &format!("va.start %{ap}"));
+                self.va = Some((ap, 0));
+            }
+            1 => {
+                let aq = self.def(T::P, "mem.stack.of va_list, align 8");
+                self.op(&[], &format!("mem.copy va_list %{aq}, %{ap}, align 8"));
+                self.va = Some((aq, read));
+            }
+            2 => {
+                self.op(&[], &format!("va.end %{ap}"));
+                self.va = None;
+            }
+            _ => {
+                if read >= tys.len() && self.rng.chance(85) {
+                    return;
+                }
+                let want = tys.get(read).copied().unwrap_or(T::I(64));
+                let t = if self.rng.chance(85) {
+                    want
+                } else {
+                    let others = va_tys(self.rng, 3);
+                    match others
+                        .iter()
+                        .find(|&&o| self.rng.chance(70) == same_class(o, want))
+                    {
+                        Some(&o) => o,
+                        None => want,
+                    }
+                };
+                self.def(t, &format!("va.arg %{ap}"));
+                self.va = Some((ap, read + 1));
+            }
+        }
+    }
+
     /// The text of function `k`'s type.
     fn sig_text(&self, k: usize) -> String {
         let sig = &self.sigs[k];
-        let ps: Vec<String> = sig.params.iter().map(T::to_string).collect();
+        let mut ps: Vec<String> = sig.params.iter().map(T::to_string).collect();
+        if sig.va.is_some() {
+            ps.push("...".to_owned());
+        }
         let rs: Vec<String> = sig.rets.iter().map(T::to_string).collect();
         let rets = match rs.len() {
             0 => String::new(),
@@ -2083,25 +2193,22 @@ impl Gen<'_> {
             )
         };
         // The signature: usually the callee's own.
+        let target = k;
         let k = if self.rng.chance(8) {
             self.rng.below(self.sigs.len() as u64) as usize
         } else {
             k
         };
         let sig = self.sig_text(k);
-        let params = self.sigs[k].params.clone();
         let rets = self.sigs[k].rets.clone();
-        let args: Vec<String> = params.iter().map(|t| self.operand(*t)).collect();
+        let args = self.call_args(target, k);
         let results: Vec<(String, T, String)> = rets
             .iter()
             .map(|t| (self.fresh(), *t, String::new()))
             .collect();
         let call = match self.handler() {
-            Some(h) => format!(
-                "func.invoke.indirect {sig} {p}({}) unwind ^{h}",
-                args.join(", ")
-            ),
-            None => format!("func.call.indirect {sig} {p}({})", args.join(", ")),
+            Some(h) => format!("func.invoke.indirect {sig} {p}({args}) unwind ^{h}"),
+            None => format!("func.call.indirect {sig} {p}({args})"),
         };
         self.op(&results, &call);
     }
@@ -2387,9 +2494,8 @@ impl Gen<'_> {
     fn call_op(&mut self) {
         let callee =
             self.func + 1 + self.rng.below((self.sigs.len() - self.func - 1) as u64) as usize;
-        let params = self.sigs[callee].params.clone();
         let rets = self.sigs[callee].rets.clone();
-        let args: Vec<String> = params.iter().map(|t| self.operand(*t)).collect();
+        let args = self.call_args(callee, callee);
         // An external function's results sometimes carry facts, which the world's zeros may
         // break: UB after the event.
         let external = callee >= self.nfuncs;
@@ -2405,12 +2511,8 @@ impl Gen<'_> {
             })
             .collect();
         let call = match self.handler() {
-            Some(h) => format!(
-                "func.invoke @{}({}) unwind ^{h}",
-                self.fn_name(callee),
-                args.join(", ")
-            ),
-            None => format!("func.call @{}({})", self.fn_name(callee), args.join(", ")),
+            Some(h) => format!("func.invoke @{}({args}) unwind ^{h}", self.fn_name(callee)),
+            None => format!("func.call @{}({args})", self.fn_name(callee)),
         };
         self.op(&results, &call);
     }
@@ -2423,6 +2525,7 @@ impl Gen<'_> {
         self.fnptrs.clear();
         self.ops_left = 45;
         self.watch.clear();
+        self.va = None;
         let (params, rets) = (self.sigs[idx].params.clone(), self.sigs[idx].rets.clone());
         let mut ps = Vec::new();
         for t in &params {
@@ -2465,8 +2568,28 @@ impl Gen<'_> {
         } else {
             ""
         };
+        if self.sigs[idx].va.is_some() {
+            ps.push("...".to_owned());
+        }
         write!(self.out, "func @f{idx}({}){rs}{file} {{", ps.join(", ")).unwrap();
         self.newline();
+        if self.sigs[idx].va.is_some() {
+            // A struct field sometimes holds the va_list.
+            let ap = if self.rng.chance(20) {
+                let s = self.def(T::P, "mem.stack.of struct<C>{i8, va_list}, align 1");
+                let ty = "struct<C>{i8, va_list}";
+                if self.mfir {
+                    let off = self.def(T::I(self.addr), &format!("ty.offset {ty}, 1"));
+                    self.def(T::P, &format!("ptr.offset.inbounds %{s}, %{off}"))
+                } else {
+                    self.def(T::P, &format!("ptr.field.inbounds {ty} %{s}, 1"))
+                }
+            } else {
+                self.def(T::P, "mem.stack.of va_list, align 8")
+            };
+            self.op(&[], &format!("va.start %{ap}"));
+            self.va = Some((ap, 0));
+        }
         let n = 4 + self.rng.below(18);
         for _ in 0..n {
             if self.ops_left == 0 {
@@ -2632,7 +2755,10 @@ pub fn program(rng: &mut Rng) -> Program {
                 },
             })
             .collect();
-        sigs.push(Sig { params, rets });
+        let va = rng
+            .chance(if i == 0 { 15 } else { 25 })
+            .then(|| va_tys(rng, 6));
+        sigs.push(Sig { params, rets, va });
     }
     // External functions: their parameters are often pointers, so calls expose memory.
     for _ in 0..rng.pick(&[0, 0, 1, 1, 2, 3]) {
@@ -2655,9 +2781,12 @@ pub fn program(rng: &mut Rng) -> Program {
                 _ => T::I(rng.width(&[1, 8, 32, 64, 65, 128])),
             })
             .collect();
-        sigs.push(Sig { params, rets });
+        // Sometimes variadic, with more than eight arguments of a class.
+        let va = rng.chance(30).then(|| va_tys(rng, 12));
+        sigs.push(Sig { params, rets, va });
     }
     let entry_params = sigs[0].params.clone();
+    let entry_va = sigs[0].va.clone();
     // The data layout: usually the default alignments, sometimes others.
     let natural = 1u64 << (u64::from(ptr_size) / 8).max(1).ilog2();
     let ptr_align = match rng.below(12) {
@@ -2700,6 +2829,7 @@ pub fn program(rng: &mut Rng) -> Program {
         fnptrs: Vec::new(),
         mfir: layer == Some("mfir"),
         watch: Vec::new(),
+        va: None,
     };
     if let Some(l) = layer {
         write!(g.out, "layer {l}").unwrap();
@@ -2731,7 +2861,11 @@ pub fn program(rng: &mut Rng) -> Program {
     let rng = g.rng;
     let runs = (0..3)
         .map(|_| {
-            let args = entry_params.iter().map(|t| arg(rng, *t)).collect();
+            let mut args: Vec<String> = entry_params.iter().map(|t| arg(rng, *t)).collect();
+            // A variadic entry's variadic arguments, with their types.
+            for &t in entry_va.iter().flatten() {
+                args.push(format!("{t} {}", arg(rng, t)));
+            }
             let fuel = rng.pick(&[3000, 3000, 3000, 200, 40]);
             (args, fuel)
         })
