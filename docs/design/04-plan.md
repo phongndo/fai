@@ -368,6 +368,21 @@ Lowering proofs, Backend testing, C external functions.
   cursor's, as it refines `poison` (`Byte.Refines`).
 - **Not yet:** `fai-cc`'s varargs (track F2); macOS's variant (open item 4); aggregates as
   variadic arguments (track A); integers wider than 64 bits as variadic arguments.
+- **Fixed after review:** variadic arguments take 8-byte slots, but a pointer was encoded at its
+  full width, so with `memspace default ptr 128 addr 64` the next argument overwrote a pointer's
+  upper bytes (both interpreters agreed, so nothing compared differently); the verifier, the
+  builder, both interpreters' entry arguments, and the variadic-arguments allocation now allow a
+  `ptr` only where pointers take at most 64 bits (`SpaceCfg.isVararg`, decision: Varargs), and
+  the fuzzer passes an `i64` in its place under wider pointers (`tests/varargs/layout.fir`,
+  `layout-wide.fir`, and three error fixtures). The backend harness's taint analysis joined
+  every variadic argument in the module into one list every `va.arg` read, so an address passed
+  to one function excused a difference in another's; it now keeps a summary per callee, and a
+  `va_list`'s bytes name the functions whose `va.start` wrote them, through copies and pointers.
+  It also counted the location of any tainted op as a tainted trap location, so `trap overflow`
+  at an `int.add.wrap` was excused; it now records only ops that can trap, with their reasons,
+  and excuses a trap only when its reason is one of them and every op at its location that can
+  trap with it is tainted. Self-tests reject both reported outcomes and accept the legitimate
+  cases.
 
 ### Track F2b: varargs and printf in fai-cc (done)
 
