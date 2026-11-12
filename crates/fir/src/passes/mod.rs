@@ -62,16 +62,19 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use crate::body::{Body, OpId, Ops};
+pub use crate::contract::Policy;
 use crate::ir::{Loc, Module};
 use crate::verify::render_loc;
 
-/// What a pass runs over.
+/// What a pass runs over. A pass returns how many changes it made, or why its own checker
+/// refused its candidate (the code is then unchanged; see [`dce`]). It gets the policy that says
+/// which permissions it may use ([`Policy`]).
 #[derive(Clone, Copy)]
 pub enum PassFn {
     /// Each function's body in turn.
-    Func(fn(&mut Body, &mut Remarks) -> u32),
+    Func(fn(&mut Body, &mut Remarks, Policy) -> Result<u32, String>),
     /// The whole module.
-    Module(fn(&mut Module, &mut Remarks) -> u32),
+    Module(fn(&mut Module, &mut Remarks, Policy) -> Result<u32, String>),
 }
 
 /// A pass: a name for pipelines and remarks, and the function that runs it. Both return how
@@ -89,17 +92,17 @@ pub const PASSES: &[Pass] = &[
     Pass {
         name: "dse",
         summary: "delete a store overwritten at once by a same-size store through the same pointer",
-        run: PassFn::Func(dse::run),
+        run: PassFn::Func(|b, r, _| Ok(dse::run(b, r))),
     },
     Pass {
         name: "fwd",
         summary: "turn a load right after a store of its type through the same pointer into a copy",
-        run: PassFn::Func(fwd::run),
+        run: PassFn::Func(|b, r, _| Ok(fwd::run(b, r))),
     },
     Pass {
         name: "copyprop",
         summary: "read %x for %y after %y = copy %x, up to the first op with regions or a call",
-        run: PassFn::Func(copyprop::run),
+        run: PassFn::Func(|b, r, _| Ok(copyprop::run(b, r))),
     },
     Pass {
         name: "dce",
@@ -261,19 +264,27 @@ impl fmt::Display for Report {
     }
 }
 
-/// A module that failed verification after a pass: the pass (or `input`, for a module that was
-/// broken before any pass ran), the round, and the verifier's message.
+/// A module that failed verification after a pass (the pass, or `input` for a module that was
+/// broken before any pass ran), or a pass whose checker refused its candidate (`rejected`): the
+/// round, and the verifier's or checker's message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PassError {
     pub pass: &'static str,
     pub round: u32,
     pub message: String,
+    pub rejected: bool,
 }
 
 impl fmt::Display for PassError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.pass == "input" {
             write!(f, "the input doesn't verify: {}", self.message)
+        } else if self.rejected {
+            write!(
+                f,
+                "pass {} (round {}): its checker rejected the change: {}",
+                self.pass, self.round, self.message
+            )
         } else {
             write!(
                 f,
@@ -294,6 +305,8 @@ pub struct Pipeline {
     /// Verify the module (and check each body's internal links) before the first pass and after
     /// every pass. On in development builds (decision: Verifier).
     pub verify_each: bool,
+    /// Which permissions the passes may use: proved ones only, or trusted ones too.
+    pub policy: Policy,
 }
 
 impl Pipeline {
@@ -304,6 +317,7 @@ impl Pipeline {
             fixpoint: false,
             max_rounds: 1,
             verify_each: cfg!(debug_assertions),
+            policy: Policy::default(),
         }
     }
 
@@ -357,7 +371,12 @@ impl Pipeline {
             let mut changed = 0;
             for (i, p) in self.passes.iter().enumerate() {
                 let start = Instant::now();
-                let n = run_pass(p, m, remarks);
+                let n = run_pass(p, m, remarks, self.policy).map_err(|message| PassError {
+                    pass: p.name,
+                    round,
+                    message,
+                    rejected: true,
+                })?;
                 let stats = &mut report.passes[i];
                 stats.time += start.elapsed();
                 stats.runs += 1;
@@ -375,18 +394,25 @@ impl Pipeline {
     }
 }
 
-/// Run one pass over the module; how many changes it made.
-pub fn run_pass(p: &Pass, m: &mut Module, remarks: &mut Remarks) -> u32 {
+/// Run one pass over the module; how many changes it made, or its checker's objection (naming
+/// the function).
+pub fn run_pass(
+    p: &Pass,
+    m: &mut Module,
+    remarks: &mut Remarks,
+    policy: Policy,
+) -> Result<u32, String> {
     match p.run {
         PassFn::Func(f) => {
             let mut n = 0;
             for (i, func) in m.funcs.iter_mut().enumerate() {
                 remarks.set_func(i as u32);
-                n += f(&mut func.body, remarks);
+                n += f(&mut func.body, remarks, policy)
+                    .map_err(|e| format!("@{}: {e}", func.name))?;
             }
-            n
+            Ok(n)
         }
-        PassFn::Module(f) => f(m, remarks),
+        PassFn::Module(f) => f(m, remarks, policy),
     }
 }
 
@@ -397,6 +423,7 @@ fn check(m: &Module, pass: &'static str, round: u32, time: &mut Duration) -> Res
         pass,
         round,
         message,
+        rejected: false,
     };
     for f in &m.funcs {
         f.body
@@ -437,7 +464,7 @@ pub(crate) mod test_util {
     /// change count, the text without locations, and the remarks.
     pub fn apply(
         text: &str,
-        f: fn(&mut crate::Body, &mut Remarks) -> u32,
+        f: impl FnOnce(&mut crate::Body, &mut Remarks) -> u32,
     ) -> (u32, String, Vec<String>) {
         let mut m: Module = crate::parse_module(text).unwrap();
         crate::verify_module(&m).unwrap();
@@ -509,10 +536,10 @@ mod tests {
         );
     }
 
-    fn breaks(body: &mut Body, _: &mut Remarks) -> u32 {
+    fn breaks(body: &mut Body, _: &mut Remarks, _: Policy) -> Result<u32, String> {
         let last = body.ops(body.entry()).last().unwrap();
         body.erase(last);
-        1
+        Ok(1)
     }
 
     static BROKEN: Pass = Pass {

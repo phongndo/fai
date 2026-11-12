@@ -183,9 +183,14 @@ fn optimized_fixtures_refine_the_originals() {
         }
     }
     eprintln!("{files} fixtures, {runs} runs; changes:");
+    let ev = common::evidence::Evidence::new("opt_fixtures");
     for (p, n) in PASSES.iter().zip(&totals) {
         eprintln!("  {n:6}  {}", p.name);
+        ev.count(format!("pass {}: changes", p.name), *n);
     }
+    ev.count("fixtures", files as u64);
+    ev.count("runs compared", runs as u64);
+    ev.write();
     assert!(files > 0 && runs > 0);
     assert!(fails.is_empty(), "{}", fails.join("\n"));
 }
@@ -310,14 +315,21 @@ fn optimized_random_programs_refine_the_originals() {
         }
     });
     let fired = fired.into_inner().unwrap();
+    let ev = common::evidence::Evidence::new("opt_fuzz");
+    ev.fact("seed", seed.to_string());
+    ev.count("programs", count);
     eprintln!("{count} programs (seed {seed}); changes, and programs changed, per pass:");
     for (p, (n, progs)) in PASSES.iter().zip(&fired) {
         eprintln!("  {n:8} {progs:6}  {}", p.name);
+        ev.count(format!("pass {}: changes", p.name), *n);
+        ev.count(format!("pass {}: programs changed", p.name), *progs);
     }
     eprintln!("runs compared:");
     for (c, n) in compared.into_inner().unwrap() {
         eprintln!("  {n:8}  {c:?}");
+        ev.count(format!("runs compared: {c:?}"), n);
     }
+    ev.write();
     eprintln!("runs of lowered HFIR programs compared:");
     for (c, n) in lowered.into_inner().unwrap() {
         eprintln!("  {n:8}  {c:?}");
@@ -769,7 +781,9 @@ fn large_inputs() {
             let mut m = m.clone();
             let mut r = Remarks::new(false);
             let t = Instant::now();
-            let changes = fir::passes::run_pass(p, &mut m, &mut r);
+            let changes =
+                fir::passes::run_pass(p, &mut m, &mut r, fir::contract::Policy::VerifiedOnly)
+                    .unwrap();
             let dt = t.elapsed();
             eprintln!(
                 "  {:>9} alone: {changes:8} changes, {:7.1} ms, {:5.1} ns/op",
