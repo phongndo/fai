@@ -221,7 +221,8 @@ pub enum Check {
     SameWidth(TyE, TyE),
     /// The immediate is the bits of a value of the float type.
     FloatBits(u8, TyE),
-    /// A variadic argument can have the type (Lean's `Ty.isVararg`).
+    /// A variadic argument can have the type in the module's memory space (Lean's
+    /// `SpaceCfg.isVararg`).
     Vararg(TyE),
 }
 

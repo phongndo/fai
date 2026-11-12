@@ -504,7 +504,7 @@ pub fn run_detail_with(
                 _ => return Err(format!("1:1: unknown type '{t}'")),
             },
         };
-        if !ty.is_vararg() {
+        if !m.space.is_vararg(ty) {
             return Err(format!(
                 "bad argument '{a}': {ty} can't be a variadic argument"
             ));
@@ -2586,13 +2586,13 @@ impl<'m> Machine<'m> {
                 .all(|&v| self.scalar_ty(v).is_vararg())
     }
 
-    /// The allocation holding a call's variadic arguments, one 8-byte slot each (Lean's
-    /// `newVaArea`).
+    /// The allocation holding a call's variadic arguments, one 8-byte slot each, holding one
+    /// argument (Lean's `newVaArea`, `SpaceCfg.isVararg`).
     fn new_va_area(&mut self, loc: Option<Loc>, vs: &[Value]) -> R<u32> {
-        if !vs.iter().all(|&v| self.scalar_ty(v).is_vararg()) {
+        if !vs.iter().all(|&v| self.space.is_vararg(self.scalar_ty(v))) {
             return stuck(
                 loc,
-                "a variadic argument must be an iN or bN of 8 to 64 bits, a ptr, or a float",
+                "a variadic argument must be an iN or bN of 8 to 64 bits, a ptr of at most 64 bits, or a float",
             );
         }
         let p = self.new_alloc(loc, 8 * vs.len() as u64, 8, Kind::Stack);

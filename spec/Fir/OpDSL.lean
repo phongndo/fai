@@ -231,7 +231,8 @@ inductive Check where
   /-- `floatBits v t`: the bits field fits the float `t`. -/
   | floatBits (field : String) (t : TyE)
   /-- `vararg t`: `t` is a type a variadic argument can have (decision: Varargs): `iN` or `bN`
-  of 8 to 64 bits in whole bytes, `ptr`, `f32`, or `f64`. -/
+  of 8 to 64 bits in whole bytes, `ptr` (if pointers take at most 64 bits), `f32`, or `f64`
+  (`SpaceCfg.isVararg`). -/
   | vararg (t : TyE)
   deriving Repr, Inhabited
 

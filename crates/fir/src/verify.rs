@@ -843,7 +843,7 @@ fn check_simple(
                 if *va {
                     let n = params.len().min(ins.len());
                     expect_tys_in(types, ctypes, loc, &what, &ins[..n], params)?;
-                    check_varargs(types, loc, &what, &ins[n..])?;
+                    check_varargs(types, space, loc, &what, &ins[n..])?;
                 } else {
                     expect_tys_in(types, ctypes, loc, &what, ins, params)?;
                 }
@@ -885,7 +885,7 @@ fn check_simple(
                     want.extend_from_slice(ps);
                     expect_tys(types, loc, "operands", &ins[..n], &want)?;
                 }
-                check_varargs(types, loc, "operands", &ins[n..])?;
+                check_varargs(types, space, loc, "operands", &ins[n..])?;
                 expect_tys(types, loc, "results", outs, rs)?;
             }
             Check::Global(i) => {
@@ -1019,7 +1019,7 @@ fn check_simple(
             }
             Check::Vararg(t) => {
                 let t = ty(&t);
-                if !t.is_vararg() {
+                if !space.is_vararg(t) {
                     return verr(loc, format!("{} can't be a variadic argument", show(t)));
                 }
             }
@@ -1028,9 +1028,15 @@ fn check_simple(
     Ok(())
 }
 
-/// A call's variadic arguments (Lean's `checkArgs`): each of a type `Ty.isVararg` allows.
-fn check_varargs(types: &Types, loc: Option<Loc>, what: &str, ins: &[Ty]) -> VResult<()> {
-    match ins.iter().find(|t| !t.is_vararg()) {
+/// A call's variadic arguments (Lean's `checkArgs`): each of a type `SpaceCfg.isVararg` allows.
+fn check_varargs(
+    types: &Types,
+    space: &SpaceCfg,
+    loc: Option<Loc>,
+    what: &str,
+    ins: &[Ty],
+) -> VResult<()> {
+    match ins.iter().find(|&&t| !space.is_vararg(t)) {
         Some(&t) => verr(
             loc,
             format!("{what}: {} can't be a variadic argument", types.show(t)),

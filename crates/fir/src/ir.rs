@@ -52,7 +52,8 @@ impl Ty {
     }
 
     /// Whether a variadic argument can have this type (Lean's `Ty.isVararg`): `iN` and `bN` of 8
-    /// to 64 bits in whole bytes, `ptr`, `f32`, and `f64`.
+    /// to 64 bits in whole bytes, `ptr`, `f32`, and `f64`. Each takes one 8-byte slot, so a
+    /// pointer must also fit one ([`SpaceCfg::is_vararg`]).
     pub fn is_vararg(self) -> bool {
         match self {
             Ty::Int(w) | Ty::Byte(w) => w % 8 == 0 && (8..=64).contains(&w),
@@ -142,6 +143,16 @@ impl SpaceCfg {
     pub fn natural_align(ptr_bits: u32) -> u32 {
         let bytes = ptr_bits / 8;
         if bytes == 0 { 1 } else { 1 << bytes.ilog2() }
+    }
+
+    /// Whether a variadic argument can have type `t` in this space (Lean's `SpaceCfg.isVararg`):
+    /// [`Ty::is_vararg`]'s types, a `ptr` only if pointers take at most 64 bits, as each argument
+    /// takes one 8-byte slot.
+    pub fn is_vararg(&self, t: Ty) -> bool {
+        match t {
+            Ty::Ptr => self.ptr_bits <= 64,
+            _ => t.is_vararg(),
+        }
     }
 
     /// The alignment of `iN` and `bN`: the entry for the smallest width at least `w`, or else the

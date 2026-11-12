@@ -53,12 +53,12 @@ def parseArg (t : Ty) (s : String) : Except String RVal :=
 
 /-- A variadic argument, written with its type: `i32 5`, `f64 1.5`, `ptr null` (decision:
 Varargs). -/
-def parseVarArg (s : String) : Except String RVal := do
+def parseVarArg (sp : SpaceCfg) (s : String) : Except String RVal := do
   match s.splitOn " " |>.filter (· ≠ "") with
   | [t, v] =>
     let toks ← lex t
     let (ty, _) ← P.ty.run { toks }
-    unless ty.isVararg do throw s!"bad argument '{s}': {ty} can't be a variadic argument"
+    unless sp.isVararg ty do throw s!"bad argument '{s}': {ty} can't be a variadic argument"
     parseArg ty v
   | _ => throw s!"bad argument '{s}': a variadic argument needs its type, like i32 5"
 
@@ -97,7 +97,7 @@ def runFuncR (m : Module) (name : String) (args : List String) (fuel : Nat)
   else if args.length != n then
     throw s!"@{name} takes {n} arguments but got {args.length}"
   let vals ← (f.params.zip args).mapM fun (r, a) => parseArg r.ty a
-  let vals := vals ++ (← (args.drop n).mapM parseVarArg)
+  let vals := vals ++ (← (args.drop n).mapM (parseVarArg m.space))
   if m.layer matches .lfir _ then return { ending := AArch64.run m f vals fuel }
   let lowerHalt (h : Halt) : Halt := match h.outcome with
     | .ret vs => if lowerRets then

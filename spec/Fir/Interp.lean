@@ -616,10 +616,11 @@ def argsFit (ps : List Ty) (variadic : Bool) (vs : List RVal) : Bool :=
     ((vs.take ps.length).zip ps).all (fun (v, t) => v.hasTy t) &&
     (vs.drop ps.length).all (·.scalarTy.isVararg)
 
-/-- Make the allocation that holds a call's variadic arguments: 8-byte slots, aligned to 8. -/
+/-- Make the allocation that holds a call's variadic arguments: 8-byte slots, aligned to 8, each
+holding one argument (`SpaceCfg.isVararg`). -/
 def newVaArea (loc : Option Loc) (vs : List RVal) : CM Nat := do
-  unless vs.all (·.scalarTy.isVararg) do
-    halt (.stuck "a variadic argument must be an iN or bN of 8 to 64 bits, a ptr, or a float") loc
+  unless vs.all ((← get).space.isVararg ·.scalarTy) do
+    halt (.stuck "a variadic argument must be an iN or bN of 8 to 64 bits, a ptr of at most 64 bits, or a float") loc
   let p ← newAlloc loc (8 * vs.length) 8 (.va 0 [])
   let .rel a t _ := p | halt (.stuck "malformed allocation") loc
   let al ← getAlloc loc a

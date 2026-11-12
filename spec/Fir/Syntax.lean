@@ -161,7 +161,8 @@ def Ty.isHValue : Ty → Bool
   | _ => true
 
 /-- The types a variadic argument can have (decision: Varargs): `iN` and `bN` of 8 to 64 bits in
-whole bytes, `ptr`, `f32`, and `f64`. Each takes one register or one 8-byte stack slot. -/
+whole bytes, `ptr`, `f32`, and `f64`. Each takes one register or one 8-byte stack slot, so a
+pointer must also fit one (`SpaceCfg.isVararg`). -/
 def Ty.isVararg : Ty → Bool
   | .int w | .byte w => w % 8 == 0 && 8 ≤ w && w ≤ 64
   | .ptr | .float _ => true
@@ -226,6 +227,13 @@ structure SpaceCfg where
   vaSize : Nat := 32
   vaAlign : Nat := 8
   deriving DecidableEq, Repr, Inhabited
+
+/-- The types a variadic argument can have in a memory space: `Ty.isVararg`'s, a `ptr` only if
+the space's pointers take at most 64 bits, as each argument takes one 8-byte slot (decision:
+Varargs). -/
+def SpaceCfg.isVararg (sp : SpaceCfg) : Ty → Bool
+  | .ptr => sp.ptrBits ≤ 64
+  | t => t.isVararg
 
 /-- A pointer's alignment when the `memspace` line doesn't give one. -/
 def SpaceCfg.naturalAlign (ptrBits : Nat) : Nat := floorPow2 (ptrBits / 8)

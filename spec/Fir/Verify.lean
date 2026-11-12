@@ -48,8 +48,9 @@ interpreter.
 * Facts: ranges apply to integers, `nonnull` and `align` to pointers, and `noalias` and
   `readonly` only to pointer parameters of functions.
 * Varargs: a variadic function, external function, or function type takes variadic arguments
-  after its parameters, each an `iN` or `bN` of 8 to 64 bits in whole bytes, a `ptr`, or a float
-  (`Ty.isVararg`), which is also what `va.arg` reads; `va.start` is only in a variadic function.
+  after its parameters, each an `iN` or `bN` of 8 to 64 bits in whole bytes, a `ptr` (if the
+  memory space's pointers take at most 64 bits), or a float (`SpaceCfg.isVararg`), which is also
+  what `va.arg` reads; `va.start` is only in a variadic function.
   `va_list` is a memory type: no value, parameter, or part of a value has it.
 * Signatures: every function's parameter and result types are value types. This is checked
   for all functions before any body, so calls only ever compare value types.
@@ -325,16 +326,16 @@ def checkSimple (loc : Option Loc) (k : OpKind) (ins outs : List Ty) : VM Unit :
       unless n < 2 ^ t.width do verr loc s!"{n} is not the bits of a {t}"
     | .vararg t =>
       let t := ty t
-      unless t.isVararg do verr loc s!"{t} can't be a variadic argument"
+      unless (← get).space.isVararg t do verr loc s!"{t} can't be a variadic argument"
 where
   /-- A call's arguments against a signature's parameters: exactly them, or, for a variadic
-  signature, them and then variadic arguments of the types `Ty.isVararg` allows. -/
+  signature, them and then variadic arguments of the types `SpaceCfg.isVararg` allows. -/
   checkArgs (loc : Option Loc) (what : String) (ins params : List Ty) (va : Bool) : VM Unit := do
     if !va then expectTys loc what ins params
     else
       expectTys loc what (ins.take params.length) params
       for t in ins.drop params.length do
-        unless t.isVararg do verr loc s!"{what}: {t} can't be a variadic argument"
+        unless (← get).space.isVararg t do verr loc s!"{what}: {t} can't be a variadic argument"
 
 def nearestLoop : List RegionCtx → Option (List Ty × List Ty)
   | [] => none

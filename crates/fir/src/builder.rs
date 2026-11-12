@@ -1382,7 +1382,8 @@ impl<'m> FuncBuilder<'m> {
                         self.show_list(&ins[..n])
                     ));
                 }
-                if let Some(&t) = ins[n..].iter().find(|t| !t.is_vararg()) {
+                let space = &self.m.module.space;
+                if let Some(&t) = ins[n..].iter().find(|&&t| !space.is_vararg(t)) {
                     let name = &self.m.syms[f.index()].name;
                     return err(format!(
                         "arguments of @{name}: {} can't be a variadic argument",
@@ -1417,7 +1418,8 @@ impl<'m> FuncBuilder<'m> {
                         self.show_list(&ins[..n])
                     ));
                 }
-                if let Some(&t) = ins[n..].iter().find(|t| !t.is_vararg()) {
+                let space = &self.m.module.space;
+                if let Some(&t) = ins[n..].iter().find(|&&t| !space.is_vararg(t)) {
                     return err(format!(
                         "operands: {} can't be a variadic argument",
                         types.show(t)
@@ -1561,7 +1563,7 @@ impl<'m> FuncBuilder<'m> {
                 }
                 Check::Vararg(t) => {
                     let t = ty(&vars, t);
-                    if !t.is_vararg() {
+                    if !self.m.module.space.is_vararg(t) {
                         return err(format!("{} can't be a variadic argument", self.show(t)));
                     }
                 }

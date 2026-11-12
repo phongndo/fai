@@ -244,13 +244,14 @@ struct Sig {
     va: Option<Vec<T>>,
 }
 
-/// The types of a list of variadic arguments: up to `max` integers of 8 to 64 bits, pointers,
-/// and floats.
-fn va_tys(rng: &mut Rng, max: u64) -> Vec<T> {
+/// The types of a list of variadic arguments: up to `max` integers of 8 to 64 bits, pointers
+/// (if they take at most 64 bits, `ptr_size`), and floats.
+fn va_tys(rng: &mut Rng, max: u64, ptr_size: u32) -> Vec<T> {
     (0..rng.below(max + 1))
         .map(|_| match rng.below(10) {
             0..=3 => T::I(rng.pick(&[8, 16, 32, 64, 64])),
-            4..=5 => T::P,
+            4..=5 if ptr_size <= 64 => T::P,
+            4..=5 => T::I(64),
             _ => T::F(rng.pick(&[32, 64, 64])),
         })
         .collect()
@@ -2090,7 +2091,7 @@ impl Gen<'_> {
         if self.sigs[sig].va.is_some() {
             let mut tys = self.sigs[k].va.clone().unwrap_or_default();
             if self.rng.chance(10) {
-                tys = va_tys(self.rng, 6);
+                tys = va_tys(self.rng, 6, self.ptr_size);
             } else if self.rng.chance(5) && !tys.is_empty() {
                 tys.pop();
             }
@@ -2134,7 +2135,7 @@ impl Gen<'_> {
                 let t = if self.rng.chance(85) {
                     want
                 } else {
-                    let others = va_tys(self.rng, 3);
+                    let others = va_tys(self.rng, 3, self.ptr_size);
                     match others
                         .iter()
                         .find(|&&o| self.rng.chance(70) == same_class(o, want))
@@ -2757,7 +2758,7 @@ pub fn program(rng: &mut Rng) -> Program {
             .collect();
         let va = rng
             .chance(if i == 0 { 15 } else { 25 })
-            .then(|| va_tys(rng, 6));
+            .then(|| va_tys(rng, 6, ptr_size));
         sigs.push(Sig { params, rets, va });
     }
     // External functions: their parameters are often pointers, so calls expose memory.
@@ -2782,7 +2783,7 @@ pub fn program(rng: &mut Rng) -> Program {
             })
             .collect();
         // Sometimes variadic, with more than eight arguments of a class.
-        let va = rng.chance(30).then(|| va_tys(rng, 12));
+        let va = rng.chance(30).then(|| va_tys(rng, 12, ptr_size));
         sigs.push(Sig { params, rets, va });
     }
     let entry_params = sigs[0].params.clone();
