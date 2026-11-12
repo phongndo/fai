@@ -147,6 +147,49 @@ integers (`char` is `i8`, not `b8`).
 - **Deferred:** floats, varargs, by-value structs, and `printf` (track F2); the gaps above;
   macOS binaries (the corpus needs Linux); an `effects` shorthand for "anything".
 
+### Track M: Floats in the IR (done)
+
+Decisions: Floats, Float ops, NaN choice, Float text.
+
+- Lean: `spec/Fir/Float.lean` specifies IEEE 754 generically over the format (`FloatFmt`):
+  decoding to a sign and a whole number of units (the smallest subnormal), each op's exact
+  result as a rational number of units, one rounding function (`round`, ties to even),
+  `sqrt` through an integer square root with a sticky bit, `fma` rounded once, conversions
+  between formats and to and from integers, and NaN results as the oracle's choice
+  (`nanResult`). `spec/Fir/FloatText.lean` reads and writes constants (the shortest decimal
+  that rounds back). `f32`/`f64` are `Ty.float`, values `RVal.float`; the ops are in the op
+  table (`float.*`, `int.to_float`), with new checks (`floats`, `numeric`, `sameWidth`,
+  `floatBits`) and a `FloatBits` immediate; the interpreter runs them in `evalFloat`.
+- Proofs (`spec/Fir/FloatProofs.lean`, no `sorry`, only `propext`, `Classical.choice`, and
+  `Quot.sound`): rounding a representable value is the identity (`round_decode`, and
+  `decode_round` the other way), `neg_neg`, `add_comm` and `mul_comm` up to the NaN choice
+  (`nanResult_perm`), `cvt_cvt` and `ext_trunc` (`f32` through `f64` and back), and
+  `truncInt_ofInt` (integers of at most `m + 1` bits; `f32` and `f64` instances).
+  `Dce.float_pure` proves the float ops that can't trap pure. The existing proofs were
+  extended for the new value (`RVal.float`: refinement, `Dse`, `Fwd.Exact` with floats, `Space`).
+- Rust: `crates/fir/src/float.rs` (host arithmetic with NaN canonicalization, exact rounding
+  for wide integers and decimals, the same shortest-decimal algorithm as Lean), the parser,
+  printer, verifier, interpreter, builder (`float_const` and friends, generated), C API
+  (`FIR_TYPE_F32`/`F64`, the `FirFBinOp`, `FirFUnOp`, `FirFPred`, `FirCvtEdge` constants,
+  `fir_float_const_f32`/`_f64`, `FIR_TRAP_REASON_CONVERT`; version 1.2), lowering
+  (floats scalarize like integers), and passes (`dce` deletes the pure float ops; `dse` and
+  `fwd` handle float stores and loads). The AArch64 backend rejects floats with a compile
+  error; its tests count and skip float runs, and the narrow fuzzer makes none.
+- Tests: `tests/float/` (arithmetic and signed zeros, ties to even and subnormals at both
+  formats' limits, NaN payloads through every copying op and memory, all 14 predicates with
+  and without NaN, conversions at the limits for every modifier and width class, `fma` single
+  rounding, `sqrt` of negatives and subnormals, `f64` → `f32` overflow and underflow,
+  aggregates, unions, slices, and globals holding floats, and 20 error fixtures);
+  `fir-ref test` passes on every file, and `fir run` prints what `fir-ref run` prints on every
+  run line. The fuzzer generates float programs (every op and modifier, edge-case constants,
+  floats in signatures, loop and block state, aggregates, unions, memory, and globals), checked
+  against `fir-ref` and through lowering, the passes, and builder rebuilds (`FIR_FUZZ=3000` on
+  seeds 7 and 11 for `fuzz.rs`, `opt.rs`, and `builder.rs`: no differences; float ops in about
+  97% of the programs); `tests/capi/modules.c` builds, prints, and runs float functions through
+  the C API and checks the compile error.
+- Not yet: floats on AArch64 (track N), float initializers for globals (`zero` or `bytes` for
+  now), `f16`/`bf16`.
+
 ## Not in this round
 
 - Proofs beyond the float semantics and the purity of the new pure ops: scalarizing, lowering
