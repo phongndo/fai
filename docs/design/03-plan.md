@@ -138,7 +138,7 @@ Instruction selection, Register allocation, Traps at run time, AOT driver, Backe
 ## Not in this round
 
 - The C frontend (Clang AST → HFIR, decided), floats, and full varargs: the next round, the first
-  compiler on top.
+  compiler on top ([04-plan.md](04-plan.md)).
 - Trust upgrades: Arm's ASL semantics for isel checking, the regalloc certificate checker,
   proved passes matched to their Rust implementations, the assurance report.
 - Open dialects, the binary format, JIT, Wasm.
