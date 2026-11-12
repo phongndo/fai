@@ -499,6 +499,39 @@ pub unsafe extern "C" fn fir_func_call_indirect(fb: *mut FirBuilder, sig: FirTyp
     }
 }
 
+/// `va.start %ap`: start a cursor over the running call's variadic arguments in the
+/// `va_list` at `%ap`, at the first. Only in a variadic function.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_va_start(fb: *mut FirBuilder, p: FirValue) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.va_start(Operand::from_raw(p)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `va.arg %ap`: the next variadic argument of the cursor in the `va_list` at `%ap`, read as
+/// the result type, which must be of the argument's class (integer and pointer, or float); the
+/// cursor moves past it. Its bytes are read as a load of the result type reads the argument's.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_va_arg(fb: *mut FirBuilder, result: FirType, p: FirValue) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.va_arg(crate::ty(result)?, Operand::from_raw(p)).map(|v| v.raw())
+        })
+    }
+}
+
+/// `va.end %ap`: end the cursor in the `va_list` at `%ap`; its bytes become `poison`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_va_end(fb: *mut FirBuilder, p: FirValue) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.va_end(Operand::from_raw(p)).map(|op| op.raw())
+        })
+    }
+}
+
 /// `float.const 1.5`: the result type's float with these bits, written as the shortest
 /// decimal that reads back to them, `inf`, `-inf`, `nan`, or `nan(0x…)` (see `Fir.FloatText`).
 #[unsafe(no_mangle)]
@@ -1094,8 +1127,10 @@ pub unsafe extern "C" fn fir_aarch64_bl(fb: *mut FirBuilder, callee: FirFunc) ->
     }
 }
 
-/// `aarch64.blr func<(i32) -> i32> x9`: call the function `x9` points to, which has that
-/// signature.
+/// `aarch64.blr func<(i32) -> i32> x9`: call the function `x9` points to, with arguments
+/// of the signature's parameter types: its own, or, for a variadic function, every argument's
+/// at this call (`func<(ptr, i32, f64) -> i32>` for `printf` with an `i32` and an `f64`;
+/// decision: Varargs).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_blr(fb: *mut FirBuilder, sig: FirType, n: FirReg) -> FirOp {
     unsafe {

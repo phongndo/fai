@@ -32,8 +32,9 @@
 //! values (`FirValue`, which also stands for holes), ops (`FirOp`), and regions (`FirRegion`,
 //! which also stands for blocks of `cf.blocks`) of the function being built. `FIR_INVALID` is
 //! no id. Value types are ids made without a module: `fir_type_int(32)`, `fir_type_byte(8)`,
-//! `FIR_TYPE_PTR`, `FIR_TYPE_F32`, `FIR_TYPE_F64`, and HFIR's `FIR_TYPE_SLICE`; struct, array,
-//! union, and function types are made in a module (`fir_type_struct`, …).
+//! `FIR_TYPE_PTR`, `FIR_TYPE_F32`, `FIR_TYPE_F64`, and HFIR's `FIR_TYPE_SLICE`; the memory type
+//! `FIR_TYPE_VA_LIST` too; struct, array, union, and function types are made in a module
+//! (`fir_type_struct`, …).
 //!
 //! **Ops.** One function per op, generated from its declaration (`src/generated/ops.rs`), named
 //! like the Rust builder's methods with `fir_` in front: its arguments are the builder, the
@@ -85,7 +86,7 @@ mod ops;
 pub use ops::*;
 
 /// The API's version: the major version times 65536, plus the minor version.
-pub const FIR_API_VERSION: u32 = (1 << 16) | 3;
+pub const FIR_API_VERSION: u32 = (1 << 16) | 4;
 
 /// No id: what a call returns when it fails.
 pub const FIR_INVALID: u32 = u32::MAX;
@@ -148,6 +149,10 @@ pub const FIR_TYPE_SLICE: FirType = 0xC000_0001;
 pub const FIR_TYPE_F32: FirType = 0xC000_0002;
 /// `f64`: IEEE 754 binary64.
 pub const FIR_TYPE_F64: FirType = 0xC000_0003;
+/// `va_list`: memory for a cursor over a call's variadic arguments (`va.start`, `va.arg`), laid
+/// out by the memory space (32 bytes, aligned to 8, by default: AAPCS64's on Linux). Not a value
+/// type: it is the type of `mem.stack.of`, struct fields, and `mem.copy` (C's `va_copy`).
+pub const FIR_TYPE_VA_LIST: FirType = 0xC000_0004;
 const TY_TAG: u32 = 3 << 30;
 const TY_BYTE: u32 = 1 << 30;
 const TY_AGG: u32 = 2 << 30;
@@ -741,6 +746,7 @@ pub(crate) fn ty(t: FirType) -> Result<Ty, BuildError> {
         _ if t == FIR_TYPE_SLICE => Ty::Slice,
         _ if t == FIR_TYPE_F32 => Ty::Float(FloatTy::F32),
         _ if t == FIR_TYPE_F64 => Ty::Float(FloatTy::F64),
+        _ if t == FIR_TYPE_VA_LIST => Ty::VaList,
         _ => return Err(BuildError::new(format!("{t:#x} is not a type"))),
     })
 }
@@ -754,6 +760,7 @@ fn ty_to_c(t: Ty) -> FirType {
         Ty::Slice => FIR_TYPE_SLICE,
         Ty::Float(FloatTy::F32) => FIR_TYPE_F32,
         Ty::Float(FloatTy::F64) => FIR_TYPE_F64,
+        Ty::VaList => FIR_TYPE_VA_LIST,
     }
 }
 
@@ -906,6 +913,27 @@ pub unsafe extern "C" fn fir_module_set_space(
                     .map(|e| (e.width, e.align))
                     .collect();
             }
+            m.mb.set_space(sp);
+            Ok(())
+        })
+    }
+}
+
+/// Set the size and alignment in bytes of the module's `va_list` (its memory space's `valist`;
+/// 32 and 8 by default). Set it before building functions.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_module_set_va_list(
+    m: *mut FirModule,
+    size: u32,
+    align: u32,
+) -> FirStatus {
+    unsafe {
+        module_status(m, |m| {
+            let sp = SpaceCfg {
+                va_size: size,
+                va_align: align,
+                ..m.mb.module().space.clone()
+            };
             m.mb.set_space(sp);
             Ok(())
         })
@@ -1189,10 +1217,24 @@ pub unsafe extern "C" fn fir_type_func(
     rets: *const FirType,
     nrets: usize,
 ) -> FirType {
+    unsafe { fir_type_func_va(m, params, nparams, rets, nrets, false) }
+}
+
+/// `func<(params, ...) -> rets>` if `variadic`, else `func<(params) -> rets>`: the signature of
+/// an indirect call of a variadic function, which passes variadic arguments after `params`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_type_func_va(
+    m: *mut FirModule,
+    params: *const FirType,
+    nparams: usize,
+    rets: *const FirType,
+    nrets: usize,
+    variadic: bool,
+) -> FirType {
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             let (ps, rs) = (tys(params, nparams)?, tys(rets, nrets)?);
-            Ok(ty_to_c(m.mb.func_ty(&ps, &rs)?))
+            Ok(ty_to_c(m.mb.func_ty_va(&ps, &rs, variadic)?))
         })
     }
 }
@@ -1302,6 +1344,27 @@ pub unsafe extern "C" fn fir_func_declare(
     }
 }
 
+/// `fir_func_declare` of a function that takes variadic arguments after `params` if
+/// `variadic` (`func @name(%a: T, ...)`): its body reads them with `fir_va_start` and
+/// `fir_va_arg`, and a call (`fir_func_call`) passes them after the fixed arguments.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_func_declare_va(
+    m: *mut FirModule,
+    name: *const c_char,
+    params: *const FirType,
+    nparams: usize,
+    rets: *const FirType,
+    nrets: usize,
+    variadic: bool,
+) -> FirFunc {
+    unsafe {
+        module_id(m, FIR_INVALID, |m| {
+            let (ps, rs) = (tys(params, nparams)?, tys(rets, nrets)?);
+            Ok(m.mb.declare_func_va(cstr(name)?, &ps, &rs, variadic)?.raw())
+        })
+    }
+}
+
 /// The function or external function named `name`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_func_find(m: *mut FirModule, name: *const c_char) -> FirFunc {
@@ -1339,6 +1402,36 @@ pub unsafe extern "C" fn fir_extern_declare(
                 .collect::<Result<Vec<_>, _>>()?;
             let f =
                 m.mb.extern_func(cstr(name)?, &ps, &rs, &es, Trust::from_c(trust)?)?;
+            Ok(f.raw())
+        })
+    }
+}
+
+/// `fir_extern_declare` of a function that takes variadic arguments after `params` if
+/// `variadic` (`extern func @printf(ptr, ...) -> i32 …`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_extern_declare_va(
+    m: *mut FirModule,
+    name: *const c_char,
+    params: *const FirType,
+    nparams: usize,
+    rets: *const FirType,
+    nrets: usize,
+    variadic: bool,
+    effects: *const FirEffect,
+    neffects: usize,
+    trust: FirTrust,
+) -> FirFunc {
+    unsafe {
+        module_id(m, FIR_INVALID, |m| {
+            let (ps, rs) = (tys(params, nparams)?, tys(rets, nrets)?);
+            let es = list(effects, neffects)
+                .iter()
+                .map(|&e| ExtEffect::from_c(e))
+                .collect::<Result<Vec<_>, _>>()?;
+            let trust = Trust::from_c(trust)?;
+            let f =
+                m.mb.extern_func_va(cstr(name)?, &ps, &rs, variadic, &es, trust)?;
             Ok(f.raw())
         })
     }

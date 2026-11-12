@@ -14,6 +14,13 @@
  * leaves d8-d15 as it found them. The native program compares every result with what C computes
  * itself, bit for bit, and the interpreter's run of the mixed function with C's too.
  *
+ * A third module checks variadic functions across the C boundary (decision: Varargs): FIR calls
+ * glibc's printf (directly and through a pointer) and snprintf with integers, pointers, and
+ * doubles past the argument registers, and vprintf with a va_list it starts and copies itself;
+ * C calls a variadic FIR function that forwards its arguments to vprintf, and one that sums
+ * twelve ints and twelve doubles (beyond eight of each class) with va.arg. The native output must
+ * be exactly what the host's snprintf makes of the same formats and arguments.
+ *
  * crates/fir-capi/tests/c.rs builds and runs it, with the toolchain in the environment:
  * FIR_E2E_CC (an AArch64 C compiler), FIR_E2E_RUN (the emulator, empty to run natively), and
  * FIR_E2E_DIR (a scratch directory). Without FIR_E2E_CC the native half is skipped. It prints
@@ -518,6 +525,163 @@ static const char *float_main =
     "  return 0;\n"
     "}\n";
 
+/* Variadic functions across the C boundary. */
+
+static const char *va_fmt1 = "printf: %d %s %.3f %ld %c|";
+static const char *va_fmt2 = "%d-%d-%d-%d-%d-%d-%d-%d-%d-%.1f-%.1f";
+static const char *va_fmt3 = "snprintf: %s|";
+static const char *va_fmt4 = "indirect: %d %.2f\n";
+static const char *va_word = "words";
+
+/* `global const @name: array<n x i8>` holding the string `s` and its terminating zero. */
+static FirGlobal string_global(FirModule *m, const char *name, const char *s) {
+  size_t n = strlen(s) + 1;
+  FirType arr = ID(fir_type_array(m, n, fir_type_int(8)));
+  return ID(fir_global_declare(m, name, arr, true, 1,
+                               ID(fir_init_bytes(m, (const uint8_t *)s, n))));
+}
+
+static FirModule *build_varargs(void) {
+  FirModule *m = cur = fir_module_new();
+  OK(fir_module_set_va_list(m, 32, 8));
+  FirType i8 = fir_type_int(8), i32 = fir_type_int(32), i64 = fir_type_int(64),
+          f64 = FIR_TYPE_F64, ptr = FIR_TYPE_PTR, va = FIR_TYPE_VA_LIST;
+  FirEffect all[8] = {FIR_EFFECT_READ_ARGS,     FIR_EFFECT_READ_EXPOSED, FIR_EFFECT_WRITE_ARGS,
+                      FIR_EFFECT_WRITE_EXPOSED, FIR_EFFECT_ALLOC,        FIR_EFFECT_FREE,
+                      FIR_EFFECT_TRAP,          FIR_EFFECT_DIVERGE};
+  FirFunc printf_ =
+      ID(fir_extern_declare_va(m, "printf", &ptr, 1, &i32, 1, true, all, 8, FIR_TRUST_ASSUME));
+  FirType sn_ps[3] = {ptr, i64, ptr};
+  FirFunc snprintf_ =
+      ID(fir_extern_declare_va(m, "snprintf", sn_ps, 3, &i32, 1, true, all, 8, FIR_TRUST_ASSUME));
+  FirType vp_ps[2] = {ptr, ptr};
+  FirFunc vprintf_ =
+      ID(fir_extern_declare_va(m, "vprintf", vp_ps, 2, &i32, 1, false, all, 8, FIR_TRUST_ASSUME));
+  FirGlobal g1 = string_global(m, "fmt1", va_fmt1), g2 = string_global(m, "fmt2", va_fmt2),
+            g3 = string_global(m, "fmt3", va_fmt3), g4 = string_global(m, "fmt4", va_fmt4),
+            gw = string_global(m, "word", va_word);
+  FirFunc show = ID(fir_func_declare_va(m, "va_show", NULL, 0, &i32, 1, false));
+  FirFunc forward = ID(fir_func_declare_va(m, "vforward", &ptr, 1, &i32, 1, true));
+  FirFunc vsum = ID(fir_func_declare_va(m, "vsum", &i32, 1, &f64, 1, true));
+  FirType printf_sig = ID(fir_type_func_va(m, &ptr, 1, &i32, 1, true));
+
+  /* @va_show() -> i32: printf with an int, a string, a double, a long, and a char; snprintf with
+   * nine ints (four on the stack) and two doubles into a buffer, then printf of the buffer; and
+   * printf through a pointer. Gives snprintf's count. */
+  FirBuilder *b = fir_func_begin(m, show);
+  FirValue a1[6] = {ID(fir_mem_global(b, g1)), ID(fir_int_const(b, i32, -7)),
+                    ID(fir_mem_global(b, gw)), ID(fir_float_const_f64(b, 2.5)),
+                    ID(fir_int_const(b, i64, -1234567890123)), ID(fir_int_const(b, i8, 'Z'))};
+  ID(fir_func_call(b, printf_, a1, 6));
+  FirValue buf = ID(fir_mem_stack(b, 64, 1));
+  FirValue a2[14];
+  a2[0] = buf;
+  a2[1] = ID(fir_int_const(b, i64, 64));
+  a2[2] = ID(fir_mem_global(b, g2));
+  for (int k = 1; k <= 9; k++) a2[2 + k] = ID(fir_int_const(b, i32, k));
+  a2[12] = ID(fir_float_const_f64(b, 0.5));
+  a2[13] = ID(fir_float_const_f64(b, 1.5));
+  FirValue n = result(b, ID(fir_func_call(b, snprintf_, a2, 14)), 0);
+  FirValue a3[2] = {ID(fir_mem_global(b, g3)), buf};
+  ID(fir_func_call(b, printf_, a3, 2));
+  FirValue p = ID(fir_func_addr(b, printf_));
+  FirValue a4[3] = {ID(fir_mem_global(b, g4)), ID(fir_int_const(b, i32, 42)),
+                    ID(fir_float_const_f64(b, 0.25))};
+  ID(fir_func_call_indirect(b, printf_sig, p, a4, 3));
+  ID(fir_func_ret(b, &n, 1));
+  OK(fir_func_end(b));
+
+  /* @vforward(%fmt: ptr, ...) -> i32: vprintf of its variadic arguments, twice: once through
+   * the va_list it starts, once through a copy (C's va_copy is a copy of the bytes). */
+  b = fir_func_begin(m, forward);
+  FirValue fmt = ID(fir_builder_param(b, 0));
+  FirValue ap = ID(fir_mem_stack_of(b, va, 8)), aq = ID(fir_mem_stack_of(b, va, 8));
+  ID(fir_va_start(b, ap));
+  ID(fir_mem_copy(b, va, aq, ap, 8));
+  FirValue v1[2] = {fmt, ap}, v2[2] = {fmt, aq};
+  FirValue r1 = result(b, ID(fir_func_call(b, vprintf_, v1, 2)), 0);
+  FirValue r2 = result(b, ID(fir_func_call(b, vprintf_, v2, 2)), 0);
+  ID(fir_va_end(b, aq));
+  ID(fir_va_end(b, ap));
+  FirValue rs = ID(fir_int_arith(b, FIR_ARITH_OP_ADD, FIR_OVF_WRAP, r1, r2));
+  ID(fir_func_ret(b, &rs, 1));
+  OK(fir_func_end(b));
+
+  /* @vsum(%n: i32, ...) -> f64: n pairs of an int and a double, acc = 2 acc + int + double. */
+  b = fir_func_begin(m, vsum);
+  FirValue count = ID(fir_builder_param(b, 0));
+  FirValue list = ID(fir_mem_stack_of(b, va, 8));
+  ID(fir_va_start(b, list));
+  FirValue inits[2] = {ID(fir_int_const(b, i32, 0)), ID(fir_float_const_f64(b, 0.0))};
+  FirOp loop = ID(fir_cf_loop_begin(b, &f64, 1, false, inits, 2));
+  FirRegion body = ID(fir_op_region(b, loop, 0));
+  FirValue i = ID(fir_region_param(b, body, 0)), acc = ID(fir_region_param(b, body, 1));
+  OK(fir_position_at_end(b, body));
+  FirOp done = ID(fir_cf_if_begin(b, NULL, 0, ID(fir_int_cmp(b, FIR_PRED_SGE, i, count))));
+  OK(fir_position_at_end(b, ID(fir_op_region(b, done, 0))));
+  ID(fir_cf_break(b, &acc, 1));
+  OK(fir_position_at_end(b, body));
+  FirValue x = ID(fir_va_arg(b, i32, list)), y = ID(fir_va_arg(b, f64, list));
+  FirValue twice = ID(fir_float_bin(b, FIR_FBIN_OP_ADD, acc, acc));
+  FirValue fx = ID(fir_int_to_float(b, f64, true, x));
+  FirValue plus = ID(fir_float_bin(b, FIR_FBIN_OP_ADD, twice, fx));
+  FirValue next[2] = {ID(fir_int_arith(b, FIR_ARITH_OP_ADD, FIR_OVF_WRAP, i,
+                                       ID(fir_int_const(b, i32, 1)))),
+                      ID(fir_float_bin(b, FIR_FBIN_OP_ADD, plus, y))};
+  ID(fir_cf_continue(b, next, 2));
+  OK(fir_position_at_end(b, ID(fir_builder_entry(b))));
+  FirValue total = result(b, loop, 0);
+  ID(fir_va_end(b, list));
+  ID(fir_func_ret(b, &total, 1));
+  OK(fir_func_end(b));
+  return m;
+}
+
+/* The varargs module's native side: C calls the FIR functions, the output must match the host's
+ * snprintf of the same formats (`va_expected`). */
+static const char *va_main =
+    "#include <stdio.h>\n"
+    "#include <stdint.h>\n"
+    "void __fir_trap(uint32_t r, uint32_t line, uint32_t col) {\n"
+    "  printf(\"trap %u @%u:%u\\n\", r, line, col);\n"
+    "}\n"
+    "int va_show(void);\n"
+    "int vforward(const char *fmt, ...);\n"
+    "double vsum(int n, ...);\n"
+    "int main(void) {\n"
+    "  int n = va_show();\n"
+    "  printf(\"va_show %d\\n\", n);\n"
+    "  int k = vforward(\"vforward: %d %s %.2f %ld %d %d %d %d %d %d %.1f|\\n\", 1, \"two\",\n"
+    "                   3.5, 4L, 5, 6, 7, 8, 9, 10, -0.5);\n"
+    "  printf(\"vforward %d\\n\", k);\n"
+    "  double s = vsum(12, 1, 0.5, 2, 1.5, 3, 2.5, 4, 3.5, 5, 4.5, 6, 5.5, 7, 6.5, 8, 7.5, 9,\n"
+    "                  8.5, 10, 9.5, 11, 10.5, -12, 11.5);\n"
+    "  double want = 0;\n"
+    "  for (int i = 1; i <= 12; i++) want = 2 * want + (i == 12 ? -12 : i) + (i - 0.5);\n"
+    "  printf(s == want ? \"vsum ok\\n\" : \"vsum: got %a, want %a\\n\", s, want);\n"
+    "  return 0;\n"
+    "}\n";
+
+/* What va_main must print, from the host's snprintf. */
+static void va_expected(char *out, size_t cap) {
+  char buf[64], line[256];
+  size_t len = 0;
+  snprintf(line, sizeof line, va_fmt1, -7, va_word, 2.5, -1234567890123L, 'Z');
+  len += (size_t)snprintf(out + len, cap - len, "%s", line);
+  int n = snprintf(buf, sizeof buf, va_fmt2, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5, 1.5);
+  len += (size_t)snprintf(out + len, cap - len, va_fmt3, buf);
+  len += (size_t)snprintf(out + len, cap - len, va_fmt4, 42, 0.25);
+  len += (size_t)snprintf(out + len, cap - len, "va_show %d\n", n);
+  int k = 0;
+  for (int t = 0; t < 2; t++) {
+    int w = snprintf(line, sizeof line, "vforward: %d %s %.2f %ld %d %d %d %d %d %d %.1f|\n", 1,
+                     "two", 3.5, 4L, 5, 6, 7, 8, 9, 10, -0.5);
+    len += (size_t)snprintf(out + len, cap - len, "%s", line);
+    k += w;
+  }
+  len += (size_t)snprintf(out + len, cap - len, "vforward %d\nvsum ok\n", k);
+}
+
 static int write_file(const char *path, const char *text) {
   FILE *f = fopen(path, "w");
   if (f == NULL) return 0;
@@ -679,6 +843,70 @@ int main(void) {
     printf("native floats: %d of 14 checks pass\n", checks);
   }
   fir_module_free(fm);
+
+  /* Varargs across the C boundary. */
+  FirModule *vm = build_varargs();
+  OK(fir_module_verify(vm));
+  char *vout = NULL;
+  const char *vargs[7] = {"3", "i32 1", "f64 0.5", "i32 2", "f64 1.5", "i32 3", "f64 2.5"};
+  OK(fir_module_run(vm, "vsum", vargs, 7, FIR_DEFAULT_FUEL, &vout));
+  CHECK(vout != NULL && strcmp(vout, "returned f64 18.5") == 0);
+  printf("fir run @vsum(3, i32 1, f64 0.5, i32 2, f64 1.5, i32 3, f64 2.5): %s\n",
+         vout ? vout : "?");
+  fir_string_free(vout);
+  vout = NULL;
+  OK(fir_module_run(vm, "va_show", NULL, 0, FIR_DEFAULT_FUEL, &vout));
+  CHECK(vout != NULL && strncmp(vout, "@printf(ptr #", 13) == 0 &&
+        strstr(vout, "i64 -1234567890123, i8 90) -> i32 0; @snprintf(") != NULL &&
+        strstr(vout, "f64 0.25) -> i32 0; returned i32 0") != NULL);
+  printf("fir run @va_show(): %s\n", vout ? vout : "?");
+  fir_string_free(vout);
+  char *dar = NULL;
+  CHECK(fir_module_compile(vm, "aarch64", false, FIR_OS_DARWIN, &dar) == FIR_ERR_COMPILE &&
+        strstr(fir_module_error(vm), "macOS") != NULL);
+  cur = vm;
+  if (cc != NULL && *cc != '\0' && dir != NULL) {
+    char want_out[2048];
+    va_expected(want_out, sizeof want_out);
+    int matched = 0;
+    for (int opt = 0; opt < 2; opt++) {
+      char *vas = NULL;
+      OK(fir_module_compile(vm, "aarch64", opt == 1, FIR_OS_LINUX, &vas));
+      char sf[1024], cf[1024], bin[1024], cmd[4096];
+      const char *name = opt ? "varargs-O" : "varargs";
+      snprintf(sf, sizeof sf, "%s/%s.s", dir, name);
+      snprintf(cf, sizeof cf, "%s/%s_main.c", dir, name);
+      snprintf(bin, sizeof bin, "%s/%s", dir, name);
+      if (vas == NULL || !write_file(sf, vas) || !write_file(cf, va_main)) {
+        failures++;
+        fir_string_free(vas);
+        continue;
+      }
+      fir_string_free(vas);
+      snprintf(cmd, sizeof cmd, "\"%s\" -O1 -w \"%s\" \"%s\" -o \"%s\"", cc, cf, sf, bin);
+      if (system(cmd) != 0) {
+        fprintf(stderr, "building %s failed\n", bin);
+        failures++;
+        continue;
+      }
+      snprintf(cmd, sizeof cmd, "%s%s\"%s\"", runner ? runner : "", runner && *runner ? " " : "",
+               bin);
+      FILE *pipe = popen(cmd, "r");
+      char got[2048];
+      size_t len = pipe != NULL ? fread(got, 1, sizeof got - 1, pipe) : 0;
+      got[len] = '\0';
+      if (pipe != NULL) pclose(pipe);
+      printf("native%s varargs:\n%s", opt ? " -O" : "", got);
+      if (strcmp(got, want_out) == 0) {
+        matched++;
+      } else {
+        fprintf(stderr, "%s: got\n%s\nwant\n%s\n", name, got, want_out);
+        failures++;
+      }
+    }
+    printf("native varargs: %d of 2 programs match the host's printf\n", matched);
+  }
+  fir_module_free(vm);
   if (failures > 0) {
     fprintf(stderr, "%d checks failed\n", failures);
     return 1;

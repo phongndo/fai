@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 // The API's version: the major version times 65536, plus the minor version.
-#define FIR_API_VERSION ((1 << 16) | 3)
+#define FIR_API_VERSION ((1 << 16) | 4)
 
 // No id: what a call returns when it fails.
 #define FIR_INVALID UINT32_MAX
@@ -230,6 +230,11 @@ typedef uint32_t FirFUnaryOp;
 
 // `f64`: IEEE 754 binary64.
 #define FIR_TYPE_F64 3221225475
+
+// `va_list`: memory for a cursor over a call's variadic arguments (`va.start`, `va.arg`), laid
+// out by the memory space (32 bytes, aligned to 8, by default: AAPCS64's on Linux). Not a value
+// type: it is the type of `mem.stack.of`, struct fields, and `mem.copy` (C's `va_copy`).
+#define FIR_TYPE_VA_LIST 3221225476
 
 #define FIR_OVF_WRAP 0
 
@@ -616,6 +621,10 @@ FirStatus fir_module_set_space(struct FirModule *m,
                                const struct FirIntAlign *ints,
                                size_t nints);
 
+// Set the size and alignment in bytes of the module's `va_list` (its memory space's `valist`;
+// 32 and 8 by default). Set it before building functions.
+FirStatus fir_module_set_va_list(struct FirModule *m, uint32_t size, uint32_t align);
+
 // Set the module's layer: HFIR (the default), MFIR, or LFIR for the target `target` (such as
 // `"aarch64"`; ignored for the other layers). Set it before building functions: each op is
 // checked against it as it is built.
@@ -689,6 +698,15 @@ FirType fir_type_func(struct FirModule *m,
                       const FirType *rets,
                       size_t nrets);
 
+// `func<(params, ...) -> rets>` if `variadic`, else `func<(params) -> rets>`: the signature of
+// an indirect call of a variadic function, which passes variadic arguments after `params`.
+FirType fir_type_func_va(struct FirModule *m,
+                         const FirType *params,
+                         size_t nparams,
+                         const FirType *rets,
+                         size_t nrets,
+                         bool variadic);
+
 // A type's size and alignment in bytes, in the module's memory space (its data layout), as
 // `ty.size` and `ty.align` give them: what a frontend checks its own layout against. Scalars,
 // structs, and arrays have a layout; function and union types don't.
@@ -706,6 +724,17 @@ FirFunc fir_func_declare(struct FirModule *m,
                          const FirType *rets,
                          size_t nrets);
 
+// `fir_func_declare` of a function that takes variadic arguments after `params` if
+// `variadic` (`func @name(%a: T, ...)`): its body reads them with `fir_va_start` and
+// `fir_va_arg`, and a call (`fir_func_call`) passes them after the fixed arguments.
+FirFunc fir_func_declare_va(struct FirModule *m,
+                            const char *name,
+                            const FirType *params,
+                            size_t nparams,
+                            const FirType *rets,
+                            size_t nrets,
+                            bool variadic);
+
 // The function or external function named `name`.
 FirFunc fir_func_find(struct FirModule *m, const char *name);
 
@@ -720,6 +749,19 @@ FirFunc fir_extern_declare(struct FirModule *m,
                            const FirEffect *effects,
                            size_t neffects,
                            FirTrust trust);
+
+// `fir_extern_declare` of a function that takes variadic arguments after `params` if
+// `variadic` (`extern func @printf(ptr, ...) -> i32 …`).
+FirFunc fir_extern_declare_va(struct FirModule *m,
+                              const char *name,
+                              const FirType *params,
+                              size_t nparams,
+                              const FirType *rets,
+                              size_t nrets,
+                              bool variadic,
+                              const FirEffect *effects,
+                              size_t neffects,
+                              FirTrust trust);
 
 // `global [const] @name: ty [align align] = init`. An initializer that takes the address of a
 // global declared later is set afterwards with `fir_global_set_init`.
@@ -1024,6 +1066,18 @@ FirOp fir_func_call_indirect(struct FirBuilder *fb,
                              const FirValue *args,
                              size_t nargs);
 
+// `va.start %ap`: start a cursor over the running call's variadic arguments in the
+// `va_list` at `%ap`, at the first. Only in a variadic function.
+FirOp fir_va_start(struct FirBuilder *fb, FirValue p);
+
+// `va.arg %ap`: the next variadic argument of the cursor in the `va_list` at `%ap`, read as
+// the result type, which must be of the argument's class (integer and pointer, or float); the
+// cursor moves past it. Its bytes are read as a load of the result type reads the argument's.
+FirValue fir_va_arg(struct FirBuilder *fb, FirType result, FirValue p);
+
+// `va.end %ap`: end the cursor in the `va_list` at `%ap`; its bytes become `poison`.
+FirOp fir_va_end(struct FirBuilder *fb, FirValue p);
+
 // `float.const 1.5`: the result type's float with these bits, written as the shortest
 // decimal that reads back to them, `inf`, `-inf`, `nan`, or `nan(0x…)` (see `Fir.FloatText`).
 FirValue fir_float_const(struct FirBuilder *fb, FirType result, uint64_t value);
@@ -1309,8 +1363,10 @@ FirOp fir_aarch64_trap(struct FirBuilder *fb, FirTrapReason reason);
 // registers.
 FirOp fir_aarch64_bl(struct FirBuilder *fb, FirFunc callee);
 
-// `aarch64.blr func<(i32) -> i32> x9`: call the function `x9` points to, which has that
-// signature.
+// `aarch64.blr func<(i32) -> i32> x9`: call the function `x9` points to, with arguments
+// of the signature's parameter types: its own, or, for a variadic function, every argument's
+// at this call (`func<(ptr, i32, f64) -> i32>` for `printf` with an `i32` and an `f64`;
+// decision: Varargs).
 FirOp fir_aarch64_blr(struct FirBuilder *fb, FirType sig, FirReg n);
 
 // `aarch64.bl.alloc c.malloc, align 16`: allocate `x0` bytes from the family's allocator;
