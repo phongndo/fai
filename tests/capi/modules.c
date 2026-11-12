@@ -562,6 +562,152 @@ static void errors(void) {
   CHECK(strcmp(fir_module_error(NULL), "no module") == 0);
 }
 
+/* AArch64 LFIR: machine code on registers, with a function's code as the labeled blocks of
+ * aarch64.code. Virtual registers (FIR_REG_V0 + n) need no allocation to run. */
+static void lfir(void) {
+  FirModule *m = cur = fir_module_new();
+  OK(fir_module_set_layer(m, FIR_LAYER_LFIR, "aarch64"));
+  FirType i64 = fir_type_int(64);
+  FirType two[2] = {i64, i64};
+  const FirReg x0 = 0, x1 = 1, x9 = 9;
+  FirReg v[8];
+  for (int k = 0; k < 8; k++) v[k] = FIR_REG_V0 + (FirReg)k;
+  FirGlobal cell = ID(fir_global_declare(m, "cell", i64, false, 8, ID(fir_init_int(m, 0))));
+  FirFunc five = ID(fir_func_declare(m, "five", NULL, 0, &i64, 1));
+  FirFunc calc = ID(fir_func_declare(m, "calc", two, 2, &i64, 1));
+  FirFunc heap = ID(fir_func_declare(m, "heap", NULL, 0, &i64, 1));
+
+  FirBuilder *b = fir_func_begin(m, five);
+  FirOp code = ID(fir_aarch64_code_begin(b));
+  OK(fir_position_at_end(b, ID(fir_block_new(b, code, "entry", NULL, 0))));
+  ID(fir_aarch64_mov_wide(b, FIR_MOV_OP_MOVZ, FIR_SF_X, x0, 5, 0));
+  ID(fir_aarch64_ret(b));
+  OK(fir_blocks_end(b, code));
+  OK(fir_func_end(b));
+
+  b = fir_func_begin(m, calc);
+  OK(fir_value_set_name(b, ID(fir_builder_param(b, 0)), "a"));
+  OK(fir_value_set_name(b, ID(fir_builder_param(b, 1)), "b"));
+  code = ID(fir_aarch64_code_begin(b));
+  FirRegion entry = ID(fir_block_new(b, code, "entry", NULL, 0));
+  FirRegion small = ID(fir_block_new(b, code, "small", NULL, 0));
+  FirRegion big = ID(fir_block_new(b, code, "big", NULL, 0));
+  FirRegion done = ID(fir_block_new(b, code, "done", NULL, 0));
+  OK(fir_position_at_end(b, entry));
+  ID(fir_aarch64_alu(b, FIR_ALU_OP_ADD, FIR_SF_X, v[0], x0, x1));
+  ID(fir_aarch64_alu_imm(b, FIR_ALU_IMM_OP_ADD, FIR_SF_X, v[1], v[0], 5));
+  ID(fir_aarch64_shift_imm(b, FIR_SHIFT_IMM_OP_LSL, FIR_SF_X, v[2], v[1], 1));
+  ID(fir_aarch64_ext(b, true, FIR_SF_X, v[3], v[2], 8));
+  ID(fir_aarch64_mov_wide(b, FIR_MOV_OP_MOVZ, FIR_SF_X, v[4], 3, 0));
+  ID(fir_aarch64_mov_wide(b, FIR_MOV_OP_MOVK, FIR_SF_X, v[4], 0, 16));
+  ID(fir_aarch64_alu(b, FIR_ALU_OP_SUBS, FIR_SF_X, FIR_REG_XZR, v[3], v[4]));
+  ID(fir_aarch64_csel(b, FIR_CSEL_OP_CSEL, FIR_COND_GT, FIR_SF_X, v[5], v[3], v[4]));
+  ID(fir_aarch64_adrl(b, x9, cell));
+  ID(fir_aarch64_str(b, FIR_MEM_SIZE_X, v[5], x9, 0));
+  ID(fir_aarch64_ldr(b, FIR_MEM_SIZE_X, v[6], x9, 0));
+  ID(fir_aarch64_b_cond(b, FIR_COND_GE, to(big, NULL, 0), to(small, NULL, 0)));
+  OK(fir_position_at_end(b, small));
+  ID(fir_aarch64_mov(b, FIR_SF_X, x0, v[6]));
+  ID(fir_aarch64_b(b, to(done, NULL, 0)));
+  OK(fir_position_at_end(b, big));
+  ID(fir_aarch64_adrl_func(b, v[7], five));
+  ID(fir_aarch64_blr(b, ID(fir_type_func(m, NULL, 0, &i64, 1)), v[7]));
+  ID(fir_aarch64_alu(b, FIR_ALU_OP_ADD, FIR_SF_X, x0, x0, v[6]));
+  ID(fir_aarch64_b(b, to(done, NULL, 0)));
+  OK(fir_position_at_end(b, done));
+  ID(fir_aarch64_ret(b));
+  /* Registers and modifiers are checked. */
+  CHECK(fir_aarch64_mov(b, FIR_SF_X, 40, x0) == FIR_INVALID);
+  expect_error("40 is not a register", __LINE__);
+  CHECK(fir_aarch64_alu(b, 99, FIR_SF_X, x0, x0, x0) == FIR_INVALID);
+  expect_error("99 is not a FirAluOp", __LINE__);
+  OK(fir_blocks_end(b, code));
+  OK(fir_func_end(b));
+
+  b = fir_func_begin(m, heap);
+  code = ID(fir_aarch64_code_begin(b));
+  entry = ID(fir_block_new(b, code, "entry", NULL, 0));
+  FirRegion ok = ID(fir_block_new(b, code, "ok", NULL, 0));
+  FirRegion oom = ID(fir_block_new(b, code, "oom", NULL, 0));
+  OK(fir_position_at_end(b, entry));
+  ID(fir_aarch64_mov_wide(b, FIR_MOV_OP_MOVZ, FIR_SF_X, x0, 16, 0));
+  ID(fir_aarch64_bl_alloc(b, "c.malloc", 16));
+  ID(fir_aarch64_alu_imm(b, FIR_ALU_IMM_OP_SUBS, FIR_SF_X, FIR_REG_XZR, x0, 0));
+  ID(fir_aarch64_b_cond(b, FIR_COND_EQ, to(oom, NULL, 0), to(ok, NULL, 0)));
+  OK(fir_position_at_end(b, ok));
+  ID(fir_aarch64_bl_free(b, "c.malloc"));
+  ID(fir_aarch64_bl(b, five));
+  ID(fir_aarch64_ret(b));
+  OK(fir_position_at_end(b, oom));
+  OK(fir_set_loc(b, 7, 9));
+  ID(fir_aarch64_trap(b, FIR_TRAP_REASON_OOM));
+  OK(fir_blocks_end(b, code));
+  OK(fir_func_end(b));
+
+  OK(fir_module_verify(m));
+  expect_text(m, true,
+              "layer lfir aarch64\n"
+              "\n"
+              "global @cell: i64 align 8 = 0\n"
+              "\n"
+              "func @five() -> i64 {\n"
+              "  aarch64.code {\n"
+              "  ^entry:\n"
+              "    aarch64.movz.x x0, 5, 0\n"
+              "    aarch64.ret\n"
+              "  }\n"
+              "}\n"
+              "\n"
+              "func @calc(%a: i64, %b: i64) -> i64 {\n"
+              "  aarch64.code {\n"
+              "  ^entry:\n"
+              "    aarch64.add.x v0, x0, x1\n"
+              "    aarch64.add.imm.x v1, v0, 5\n"
+              "    aarch64.lsl.imm.x v2, v1, 1\n"
+              "    aarch64.sbfx.x v3, v2, 8\n"
+              "    aarch64.movz.x v4, 3, 0\n"
+              "    aarch64.movk.x v4, 0, 16\n"
+              "    aarch64.subs.x xzr, v3, v4\n"
+              "    aarch64.csel.gt.x v5, v3, v4\n"
+              "    aarch64.adrl x9, @cell\n"
+              "    aarch64.str.x v5, x9, 0\n"
+              "    aarch64.ldr.x v6, x9, 0\n"
+              "    aarch64.b.ge ^big, ^small\n"
+              "  ^small:\n"
+              "    aarch64.mov.x x0, v6\n"
+              "    aarch64.b ^done\n"
+              "  ^big:\n"
+              "    aarch64.adrl.func v7, @five\n"
+              "    aarch64.blr func<() -> i64> v7\n"
+              "    aarch64.add.x x0, x0, v6\n"
+              "    aarch64.b ^done\n"
+              "  ^done:\n"
+              "    aarch64.ret\n"
+              "  }\n"
+              "}\n"
+              "\n"
+              "func @heap() -> i64 {\n"
+              "  aarch64.code {\n"
+              "  ^entry:\n"
+              "    aarch64.movz.x x0, 16, 0\n"
+              "    aarch64.bl.alloc c.malloc, align 16\n"
+              "    aarch64.subs.imm.x xzr, x0, 0\n"
+              "    aarch64.b.eq ^oom, ^ok\n"
+              "  ^ok:\n"
+              "    aarch64.bl.free c.malloc\n"
+              "    aarch64.bl @five\n"
+              "    aarch64.ret\n"
+              "  ^oom:\n"
+              "    aarch64.trap.oom @7:9\n"
+              "  }\n"
+              "}\n");
+  const char *small_args[] = {"-10", "2"}, *big_args[] = {"1", "2"};
+  expect_run(m, "calc", small_args, 2, "returned i64 3");
+  expect_run(m, "calc", big_args, 2, "returned i64 21");
+  expect_run(m, "heap", NULL, 0, "returned i64 5");
+  fir_module_free(m);
+}
+
 int main(void) {
   CHECK(fir_api_version() == FIR_API_VERSION);
   blocks_loop();
@@ -569,6 +715,7 @@ int main(void) {
   globals_and_calls();
   control_and_ints();
   errors();
+  lfir();
   if (failures > 0) {
     fprintf(stderr, "%d checks failed\n", failures);
     return 1;

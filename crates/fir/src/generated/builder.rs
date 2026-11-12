@@ -489,4 +489,204 @@ impl FuncBuilder<'_> {
         let made = self.simple(kind, Res::Sig(sig_id))?;
         Ok(self.all_results(made))
     }
+
+    /// `aarch64.code { ^entry: … ^b1: … }`: a function's machine code, as labeled blocks entered
+    /// at the first. Each block ends with a branch, `aarch64.ret`, or `aarch64.trap`. It is the whole
+    /// body of an LFIR function, which finds its arguments where the calling convention puts them.
+    ///
+    /// Makes the op with empty regions; see the closure form.
+    pub fn aarch64_code_begin(&mut self) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let kind = OpKind::A64Code;
+        self.region_op(kind, &[], 0, false)
+    }
+
+    /// `aarch64.code { ^entry: … ^b1: … }`: a function's machine code, as labeled blocks entered
+    /// at the first. Each block ends with a branch, `aarch64.ret`, or `aarch64.trap`. It is the whole
+    /// body of an LFIR function, which finds its arguments where the calling convention puts them.
+    ///
+    /// Builds each region in a closure, with the insertion point at its end, and returns to
+    /// the insertion point after the op.
+    pub fn aarch64_code(&mut self, blocks: impl FnOnce(&mut Self, OpId) -> Result<(), BuildError>) -> Result<Results, BuildError> {
+        let op = self.aarch64_code_begin()?;
+        self.in_blocks(op, blocks)?;
+        Ok(self.all_results(op))
+    }
+
+    /// `aarch64.add.x x0, x1, x2` and friends: three-register data processing; see `AluOp`.
+    pub fn aarch64_alu(&mut self, op: AluOp, sf: Sf, d: Reg, n: Reg, m: Reg) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let d_r = self.reg(d)?;
+        let n_r = self.reg(n)?;
+        let m_r = self.reg(m)?;
+        let kind = OpKind::A64Alu { op, sf, d: d_r, n: n_r, m: m_r };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.add.imm.x x0, x1, 16`: data processing with an immediate; see `AluImmOp`.
+    pub fn aarch64_alu_imm(&mut self, op: AluImmOp, sf: Sf, d: Reg, n: Reg, imm: impl Into<IntImm>) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let d_r = self.reg(d)?;
+        let n_r = self.reg(n)?;
+        let imm_id = self.int_imm(imm.into());
+        let kind = OpKind::A64AluImm { op, sf, d: d_r, n: n_r, imm: imm_id };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.lsl.imm.x x0, x1, 3`: a shift by an immediate below the size.
+    pub fn aarch64_shift_imm(&mut self, op: ShiftImmOp, sf: Sf, d: Reg, n: Reg, amount: u32) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let d_r = self.reg(d)?;
+        let n_r = self.reg(n)?;
+        let kind = OpKind::A64ShiftImm { op, sf, d: d_r, n: n_r, amount };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.sbfx.x x0, x1, 8`: the low `width` bits (1 to the size), sign-extended (`sbfx`) or
+    /// zero-extended (`ubfx`).
+    pub fn aarch64_ext(&mut self, signed: bool, sf: Sf, d: Reg, n: Reg, width: u32) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let d_r = self.reg(d)?;
+        let n_r = self.reg(n)?;
+        let kind = OpKind::A64Ext { signed, sf, d: d_r, n: n_r, width };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.mov.x x0, x1`: copy a register (`sp` included).
+    pub fn aarch64_mov(&mut self, sf: Sf, d: Reg, n: Reg) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let d_r = self.reg(d)?;
+        let n_r = self.reg(n)?;
+        let kind = OpKind::A64Mov { sf, d: d_r, n: n_r };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.movz.x x0, 4660, 16`: a 16-bit immediate shifted left by `hw` (0, 16, 32, or 48):
+    /// zero elsewhere (`movz`), inverted (`movn`), or inserted into the register (`movk`).
+    pub fn aarch64_mov_wide(&mut self, op: MovOp, sf: Sf, d: Reg, imm: u32, hw: u32) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let d_r = self.reg(d)?;
+        let kind = OpKind::A64MovWide { op, sf, d: d_r, imm, hw };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.csel.eq.x x0, x1, x2`: `x1` if the condition holds, else `x2` (incremented,
+    /// inverted, or negated for `csinc`, `csinv`, `csneg`).
+    pub fn aarch64_csel(&mut self, op: CselOp, c: Cond, sf: Sf, d: Reg, n: Reg, m: Reg) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let d_r = self.reg(d)?;
+        let n_r = self.reg(n)?;
+        let m_r = self.reg(m)?;
+        let kind = OpKind::A64Csel { op, c, sf, d: d_r, n: n_r, m: m_r };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.ldr.w x0, x1, 8`: load 1, 2, 4, or 8 bytes from `x1 + 8`, zero-extended.
+    pub fn aarch64_ldr(&mut self, size: MemSize, d: Reg, base: Reg, off: impl Into<IntImm>) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let d_r = self.reg(d)?;
+        let base_r = self.reg(base)?;
+        let off_id = self.int_imm(off.into());
+        let kind = OpKind::A64Ldr { size, d: d_r, base: base_r, off: off_id };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.str.w x0, x1, 8`: store the low 1, 2, 4, or 8 bytes of `x0` at `x1 + 8`.
+    pub fn aarch64_str(&mut self, size: MemSize, s: Reg, base: Reg, off: impl Into<IntImm>) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let s_r = self.reg(s)?;
+        let base_r = self.reg(base)?;
+        let off_id = self.int_imm(off.into());
+        let kind = OpKind::A64Str { size, s: s_r, base: base_r, off: off_id };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.adrl x0, @g`: the address of a global (`adrp` and `add`).
+    pub fn aarch64_adrl(&mut self, d: Reg, global: GlobalRef) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let d_r = self.reg(d)?;
+        let global_id = self.global_imm(global)?;
+        let kind = OpKind::A64Adrl { d: d_r, global: global_id };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.adrl.func x0, @f`: the address of a function (`adrp` and `add`, or a GOT load for
+    /// an external one).
+    pub fn aarch64_adrl_func(&mut self, d: Reg, callee: FuncRef) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let d_r = self.reg(d)?;
+        let callee_id = self.func_imm(callee)?;
+        let kind = OpKind::A64AdrlFunc { d: d_r, callee: callee_id };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.b ^b`: jump to a block of the enclosing `aarch64.code`.
+    pub fn aarch64_b(&mut self, dest: Target<'_>) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let dest_id = self.succ(dest)?;
+        let kind = OpKind::A64B { dest: dest_id };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.b.eq ^t, ^f`: jump to `^t` if the condition holds, otherwise to `^f`.
+    pub fn aarch64_b_cond(&mut self, c: Cond, t: Target<'_>, f: Target<'_>) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let t_id = self.succ(t)?;
+        let f_id = self.succ(f)?;
+        let kind = OpKind::A64BCond { c, t: t_id, f: f_id };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.ret`: return to the caller, with the results where the calling convention puts
+    /// them.
+    pub fn aarch64_ret(&mut self) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let kind = OpKind::A64Ret;
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.trap.div0`: trap with a reason (a call to `__fir_trap` with the reason and the
+    /// op's location).
+    pub fn aarch64_trap(&mut self, reason: TrapReason) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let kind = OpKind::A64Trap(reason);
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.bl @f`: call a function; the arguments and results are where the calling
+    /// convention puts them for `@f`'s signature, and the call clobbers the caller-saved
+    /// registers.
+    pub fn aarch64_bl(&mut self, callee: FuncRef) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let callee_id = self.func_imm(callee)?;
+        let kind = OpKind::A64Bl { callee: callee_id };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.blr func<(i32) -> i32> x9`: call the function `x9` points to, which has that
+    /// signature.
+    pub fn aarch64_blr(&mut self, sig: Ty, n: Reg) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let sig_id = self.ty_imm(sig)?;
+        let n_r = self.reg(n)?;
+        let kind = OpKind::A64Blr { sig: sig_id, n: n_r };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.bl.alloc c.malloc, align 16`: allocate `x0` bytes from the family's allocator;
+    /// `x0` is the memory, or null if allocation failed (a call to `malloc` or `aligned_alloc`).
+    pub fn aarch64_bl_alloc(&mut self, family: &str, align: u32) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let family_id = self.str_imm(family)?;
+        let kind = OpKind::A64BlAlloc { family: family_id, align };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.bl.free c.malloc`: free `x0` (a call to `free`).
+    pub fn aarch64_bl_free(&mut self, family: &str) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let family_id = self.str_imm(family)?;
+        let kind = OpKind::A64BlFree { family: family_id };
+        self.simple(kind, Res::None)
+    }
 }

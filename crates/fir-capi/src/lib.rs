@@ -40,7 +40,9 @@
 //! none has a default), then the op's immediates and operands as its text writes them; lists are
 //! a pointer and a length. Ops with regions are made with their regions empty
 //! (`fir_cf_if_begin`); `fir_op_region` and `fir_position_at_end` fill them, and
-//! `fir_block_new` adds the blocks of `cf.blocks`.
+//! `fir_block_new` adds the blocks of `cf.blocks` and `aarch64.code`. The `aarch64.*` ops of
+//! LFIR (`fir_module_set_layer(m, FIR_LAYER_LFIR, "aarch64")`) name registers as `FirReg`
+//! numbers.
 //!
 //! **Errors.** No Rust panic crosses the boundary. A call that fails returns `FIR_INVALID`, a
 //! null pointer, or a `FirStatus` other than `FIR_OK`, adds nothing to the module, and leaves a
@@ -65,9 +67,10 @@ use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use fir::{
-    AllocFail, ArithOp, BitOp, BuildError, DivOp, Edge, ExtEffect, FactArg, FuncBuilder, FuncRef,
-    GlobalRef, Init, IntImm, MemClass, ModuleBuilder, OpId, Operand, Ovf, Policy, Pred, RegionId,
-    ShiftEdge, ShiftOp, SpaceCfg, SwitchCase, Target, TruncMode, Trust, Ty, TyId, ValueDef,
+    AllocFail, AluImmOp, AluOp, ArithOp, BitOp, BuildError, Cond, CselOp, DivOp, Edge, ExtEffect,
+    FactArg, FuncBuilder, FuncRef, GlobalRef, Init, IntImm, MemClass, MemSize, ModuleBuilder,
+    MovOp, OpId, Operand, Ovf, Policy, Pred, RegionId, Sf, ShiftEdge, ShiftImmOp, ShiftOp,
+    SpaceCfg, SwitchCase, Target, TrapReason, TruncMode, Trust, Ty, TyId, ValueDef,
 };
 
 #[path = "generated/ops.rs"]
@@ -278,6 +281,99 @@ pub const FIR_FACT_ALIGN: FirFactKind = 3;
 pub const FIR_FACT_NOALIAS: FirFactKind = 4;
 pub const FIR_FACT_READONLY: FirFactKind = 5;
 
+/// A register of an `aarch64.*` op: `x0`…`x30` are 0…30, then `FIR_REG_SP` and `FIR_REG_XZR`;
+/// the virtual register `vN` is `FIR_REG_V0 + N`.
+pub type FirReg = u32;
+pub const FIR_REG_SP: FirReg = 31;
+pub const FIR_REG_XZR: FirReg = 32;
+pub const FIR_REG_V0: FirReg = 64;
+
+/// The operation size of an `aarch64.*` op (`Sf`): 32 or 64 bits.
+pub type FirSf = u32;
+pub const FIR_SF_W: FirSf = 0;
+pub const FIR_SF_X: FirSf = 1;
+
+/// An AArch64 condition (`Cond`).
+pub type FirCond = u32;
+pub const FIR_COND_EQ: FirCond = 0;
+pub const FIR_COND_NE: FirCond = 1;
+pub const FIR_COND_HS: FirCond = 2;
+pub const FIR_COND_LO: FirCond = 3;
+pub const FIR_COND_MI: FirCond = 4;
+pub const FIR_COND_PL: FirCond = 5;
+pub const FIR_COND_VS: FirCond = 6;
+pub const FIR_COND_VC: FirCond = 7;
+pub const FIR_COND_HI: FirCond = 8;
+pub const FIR_COND_LS: FirCond = 9;
+pub const FIR_COND_GE: FirCond = 10;
+pub const FIR_COND_LT: FirCond = 11;
+pub const FIR_COND_GT: FirCond = 12;
+pub const FIR_COND_LE: FirCond = 13;
+
+/// `aarch64.add`, `aarch64.sub`, … on three registers (`AluOp`).
+pub type FirAluOp = u32;
+pub const FIR_ALU_OP_ADD: FirAluOp = 0;
+pub const FIR_ALU_OP_ADDS: FirAluOp = 1;
+pub const FIR_ALU_OP_SUB: FirAluOp = 2;
+pub const FIR_ALU_OP_SUBS: FirAluOp = 3;
+pub const FIR_ALU_OP_AND: FirAluOp = 4;
+pub const FIR_ALU_OP_ANDS: FirAluOp = 5;
+pub const FIR_ALU_OP_ORR: FirAluOp = 6;
+pub const FIR_ALU_OP_EOR: FirAluOp = 7;
+pub const FIR_ALU_OP_BIC: FirAluOp = 8;
+pub const FIR_ALU_OP_LSL: FirAluOp = 9;
+pub const FIR_ALU_OP_LSR: FirAluOp = 10;
+pub const FIR_ALU_OP_ASR: FirAluOp = 11;
+pub const FIR_ALU_OP_MUL: FirAluOp = 12;
+pub const FIR_ALU_OP_SDIV: FirAluOp = 13;
+pub const FIR_ALU_OP_UDIV: FirAluOp = 14;
+pub const FIR_ALU_OP_SMULH: FirAluOp = 15;
+pub const FIR_ALU_OP_UMULH: FirAluOp = 16;
+
+/// `aarch64.add.imm`, … with an immediate (`AluImmOp`).
+pub type FirAluImmOp = u32;
+pub const FIR_ALU_IMM_OP_ADD: FirAluImmOp = 0;
+pub const FIR_ALU_IMM_OP_ADDS: FirAluImmOp = 1;
+pub const FIR_ALU_IMM_OP_SUB: FirAluImmOp = 2;
+pub const FIR_ALU_IMM_OP_SUBS: FirAluImmOp = 3;
+pub const FIR_ALU_IMM_OP_AND: FirAluImmOp = 4;
+pub const FIR_ALU_IMM_OP_ANDS: FirAluImmOp = 5;
+pub const FIR_ALU_IMM_OP_ORR: FirAluImmOp = 6;
+pub const FIR_ALU_IMM_OP_EOR: FirAluImmOp = 7;
+
+/// `aarch64.lsl.imm`, `aarch64.lsr.imm`, `aarch64.asr.imm` (`ShiftImmOp`).
+pub type FirShiftImmOp = u32;
+pub const FIR_SHIFT_IMM_OP_LSL: FirShiftImmOp = 0;
+pub const FIR_SHIFT_IMM_OP_LSR: FirShiftImmOp = 1;
+pub const FIR_SHIFT_IMM_OP_ASR: FirShiftImmOp = 2;
+
+/// `aarch64.movz`, `aarch64.movn`, `aarch64.movk` (`MovOp`).
+pub type FirMovOp = u32;
+pub const FIR_MOV_OP_MOVZ: FirMovOp = 0;
+pub const FIR_MOV_OP_MOVN: FirMovOp = 1;
+pub const FIR_MOV_OP_MOVK: FirMovOp = 2;
+
+/// `aarch64.csel`, `aarch64.csinc`, `aarch64.csinv`, `aarch64.csneg` (`CselOp`).
+pub type FirCselOp = u32;
+pub const FIR_CSEL_OP_CSEL: FirCselOp = 0;
+pub const FIR_CSEL_OP_CSINC: FirCselOp = 1;
+pub const FIR_CSEL_OP_CSINV: FirCselOp = 2;
+pub const FIR_CSEL_OP_CSNEG: FirCselOp = 3;
+
+/// The access size of `aarch64.ldr` and `aarch64.str`: 1, 2, 4, or 8 bytes (`MemSize`).
+pub type FirMemSize = u32;
+pub const FIR_MEM_SIZE_B: FirMemSize = 0;
+pub const FIR_MEM_SIZE_H: FirMemSize = 1;
+pub const FIR_MEM_SIZE_W: FirMemSize = 2;
+pub const FIR_MEM_SIZE_X: FirMemSize = 3;
+
+/// Why `aarch64.trap` traps (`TrapReason`).
+pub type FirTrapReason = u32;
+pub const FIR_TRAP_REASON_DIV0: FirTrapReason = 0;
+pub const FIR_TRAP_REASON_OVERFLOW: FirTrapReason = 1;
+pub const FIR_TRAP_REASON_SHIFT: FirTrapReason = 2;
+pub const FIR_TRAP_REASON_OOM: FirTrapReason = 3;
+
 /// A C enum's value as the Rust value it stands for.
 pub(crate) trait CEnum: Sized {
     fn from_c(x: u32) -> Result<Self, BuildError>;
@@ -326,6 +422,39 @@ c_enum!(DivOp, "FirDivOp":
 c_enum!(ShiftOp, "FirShiftOp":
     FIR_SHIFT_OP_SHL => ShiftOp::Shl, FIR_SHIFT_OP_SHR_U => ShiftOp::ShrU,
     FIR_SHIFT_OP_SHR_S => ShiftOp::ShrS);
+c_enum!(Sf, "FirSf": FIR_SF_W => Sf::W, FIR_SF_X => Sf::X);
+c_enum!(Cond, "FirCond":
+    FIR_COND_EQ => Cond::Eq, FIR_COND_NE => Cond::Ne, FIR_COND_HS => Cond::Hs,
+    FIR_COND_LO => Cond::Lo, FIR_COND_MI => Cond::Mi, FIR_COND_PL => Cond::Pl,
+    FIR_COND_VS => Cond::Vs, FIR_COND_VC => Cond::Vc, FIR_COND_HI => Cond::Hi,
+    FIR_COND_LS => Cond::Ls, FIR_COND_GE => Cond::Ge, FIR_COND_LT => Cond::Lt,
+    FIR_COND_GT => Cond::Gt, FIR_COND_LE => Cond::Le);
+c_enum!(AluOp, "FirAluOp":
+    FIR_ALU_OP_ADD => AluOp::Add, FIR_ALU_OP_ADDS => AluOp::Adds, FIR_ALU_OP_SUB => AluOp::Sub,
+    FIR_ALU_OP_SUBS => AluOp::Subs, FIR_ALU_OP_AND => AluOp::And, FIR_ALU_OP_ANDS => AluOp::Ands,
+    FIR_ALU_OP_ORR => AluOp::Orr, FIR_ALU_OP_EOR => AluOp::Eor, FIR_ALU_OP_BIC => AluOp::Bic,
+    FIR_ALU_OP_LSL => AluOp::Lsl, FIR_ALU_OP_LSR => AluOp::Lsr, FIR_ALU_OP_ASR => AluOp::Asr,
+    FIR_ALU_OP_MUL => AluOp::Mul, FIR_ALU_OP_SDIV => AluOp::Sdiv, FIR_ALU_OP_UDIV => AluOp::Udiv,
+    FIR_ALU_OP_SMULH => AluOp::Smulh, FIR_ALU_OP_UMULH => AluOp::Umulh);
+c_enum!(AluImmOp, "FirAluImmOp":
+    FIR_ALU_IMM_OP_ADD => AluImmOp::Add, FIR_ALU_IMM_OP_ADDS => AluImmOp::Adds,
+    FIR_ALU_IMM_OP_SUB => AluImmOp::Sub, FIR_ALU_IMM_OP_SUBS => AluImmOp::Subs,
+    FIR_ALU_IMM_OP_AND => AluImmOp::And, FIR_ALU_IMM_OP_ANDS => AluImmOp::Ands,
+    FIR_ALU_IMM_OP_ORR => AluImmOp::Orr, FIR_ALU_IMM_OP_EOR => AluImmOp::Eor);
+c_enum!(ShiftImmOp, "FirShiftImmOp":
+    FIR_SHIFT_IMM_OP_LSL => ShiftImmOp::Lsl, FIR_SHIFT_IMM_OP_LSR => ShiftImmOp::Lsr,
+    FIR_SHIFT_IMM_OP_ASR => ShiftImmOp::Asr);
+c_enum!(MovOp, "FirMovOp":
+    FIR_MOV_OP_MOVZ => MovOp::Movz, FIR_MOV_OP_MOVN => MovOp::Movn, FIR_MOV_OP_MOVK => MovOp::Movk);
+c_enum!(CselOp, "FirCselOp":
+    FIR_CSEL_OP_CSEL => CselOp::Csel, FIR_CSEL_OP_CSINC => CselOp::Csinc,
+    FIR_CSEL_OP_CSINV => CselOp::Csinv, FIR_CSEL_OP_CSNEG => CselOp::Csneg);
+c_enum!(MemSize, "FirMemSize":
+    FIR_MEM_SIZE_B => MemSize::B, FIR_MEM_SIZE_H => MemSize::H, FIR_MEM_SIZE_W => MemSize::W,
+    FIR_MEM_SIZE_X => MemSize::X);
+c_enum!(TrapReason, "FirTrapReason":
+    FIR_TRAP_REASON_DIV0 => TrapReason::Div0, FIR_TRAP_REASON_OVERFLOW => TrapReason::Overflow,
+    FIR_TRAP_REASON_SHIFT => TrapReason::Shift, FIR_TRAP_REASON_OOM => TrapReason::Oom);
 c_enum!(AllocFail, "FirAllocFail":
     FIR_ALLOC_FAIL_NULL => AllocFail::Null, FIR_ALLOC_FAIL_TRAP => AllocFail::Trap);
 c_enum!(Policy, "FirPolicy":
@@ -1126,8 +1255,8 @@ pub unsafe extern "C" fn fir_position_before(fb: *mut FirBuilder, op: FirOp) -> 
     unsafe { builder_status(fb, |f| f.position_before(OpId::from_raw(op))) }
 }
 
-/// A new block of the `cf.blocks` op `op`, labeled `label` (null or empty: its id) and with
-/// these parameter types. The first block made is the entry, without parameters. Blocks are
+/// A new block of the `cf.blocks` (or `aarch64.code`) op `op`, labeled `label` (null or empty:
+/// its id) and with these parameter types. The first block made is the entry, without parameters. Blocks are
 /// given to the op in the order made, by `fir_blocks_end` or when the function ends.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_block_new(
@@ -1146,7 +1275,7 @@ pub unsafe extern "C" fn fir_block_new(
     }
 }
 
-/// Give a `cf.blocks` op the blocks made for it; no more can be added.
+/// Give a `cf.blocks` (or `aarch64.code`) op the blocks made for it; no more can be added.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_blocks_end(fb: *mut FirBuilder, op: FirOp) -> FirStatus {
     unsafe { builder_status(fb, |f| f.end_blocks(OpId::from_raw(op))) }

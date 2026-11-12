@@ -4,7 +4,8 @@
 //!   (the typed method of each op, the scoped and the `_begin` forms of ops with regions, names,
 //!   facts, holes, locations, globals, and external functions), and must verify and print
 //!   byte for byte as the parsed module does. So the builder can say everything the text can.
-//!   The fuzzer's random programs (see `progs`) are rebuilt the same way.
+//!   The fuzzer's random programs (see `progs`) are rebuilt the same way, and so is the AArch64
+//!   backend's LFIR of the fixtures and of random programs, before and after allocation.
 //! * Eager checks reject what they should, and leave nothing behind.
 
 #[allow(dead_code)]
@@ -378,6 +379,48 @@ impl<'a> Replay<'a> {
                 let sig = self.ty(f, sig);
                 new_op = Some(f.func_call_indirect(sig, ops[0], &ops[1..])?.op);
             }
+            OpKind::A64Code => {
+                // The `_begin` form, with the blocks made and ended by hand, as the C API does.
+                made = None;
+                let new = f.aarch64_code_begin()?;
+                let at = f.insert_point();
+                let mut blocks = Vec::new();
+                for &r in s.regions(op) {
+                    let label = s.str(s.label(r).expect("a block has a label"));
+                    blocks.push((label, f.block(new, label, &[])?));
+                }
+                self.labels.push(blocks);
+                for (i, &r) in s.regions(op).iter().enumerate() {
+                    f.position_at_end(self.labels.last().unwrap()[i].1)?;
+                    self.region(f, r)?;
+                }
+                self.labels.pop();
+                f.end_blocks(new)?;
+                f.set_insert_point(at)?;
+                new_op = Some(new);
+            }
+            k @ (OpKind::A64Alu { .. }
+            | OpKind::A64AluImm { .. }
+            | OpKind::A64ShiftImm { .. }
+            | OpKind::A64Ext { .. }
+            | OpKind::A64Mov { .. }
+            | OpKind::A64MovWide { .. }
+            | OpKind::A64Csel { .. }
+            | OpKind::A64Ldr { .. }
+            | OpKind::A64Str { .. }
+            | OpKind::A64Adrl { .. }
+            | OpKind::A64AdrlFunc { .. }
+            | OpKind::A64B { .. }
+            | OpKind::A64BCond { .. }
+            | OpKind::A64Ret
+            | OpKind::A64Trap(_)
+            | OpKind::A64Bl { .. }
+            | OpKind::A64Blr { .. }
+            | OpKind::A64BlAlloc { .. }
+            | OpKind::A64BlFree { .. }) => {
+                made = None;
+                new_op = Some(self.a64_op(f, k)?);
+            }
         }
         let new_op = match (made, new_op) {
             (Some(v), _) => match f.body().def(v) {
@@ -393,6 +436,67 @@ impl<'a> Replay<'a> {
             self.define(f, old, new)?;
         }
         Ok(())
+    }
+}
+
+impl Replay<'_> {
+    /// An `aarch64.*` instruction (any op but `aarch64.code`).
+    fn a64_op(&self, f: &mut FuncBuilder<'_>, k: OpKind) -> Result<OpId, BuildError> {
+        let s = self.src;
+        let target = |dest: SuccId| Target::new(self.block(s.succ(dest).label), &[]);
+        match k {
+            OpKind::A64Alu { op, sf, d, n, m } => f.aarch64_alu(op, sf, d, n, m),
+            OpKind::A64AluImm { op, sf, d, n, imm } => {
+                f.aarch64_alu_imm(op, sf, d, n, int(s.int(imm)))
+            }
+            OpKind::A64ShiftImm {
+                op,
+                sf,
+                d,
+                n,
+                amount,
+            } => f.aarch64_shift_imm(op, sf, d, n, amount),
+            OpKind::A64Ext {
+                signed,
+                sf,
+                d,
+                n,
+                width,
+            } => f.aarch64_ext(signed, sf, d, n, width),
+            OpKind::A64Mov { sf, d, n } => f.aarch64_mov(sf, d, n),
+            OpKind::A64MovWide { op, sf, d, imm, hw } => f.aarch64_mov_wide(op, sf, d, imm, hw),
+            OpKind::A64Csel { op, c, sf, d, n, m } => f.aarch64_csel(op, c, sf, d, n, m),
+            OpKind::A64Ldr { size, d, base, off } => f.aarch64_ldr(size, d, base, int(s.int(off))),
+            OpKind::A64Str {
+                size,
+                s: r,
+                base,
+                off,
+            } => f.aarch64_str(size, r, base, int(s.int(off))),
+            OpKind::A64Adrl { d, global } => {
+                let g = f.module().global_ref(s.str(global)).unwrap();
+                f.aarch64_adrl(d, g)
+            }
+            OpKind::A64AdrlFunc { d, callee } => {
+                let c = f.module().func_ref(s.str(callee)).unwrap();
+                f.aarch64_adrl_func(d, c)
+            }
+            OpKind::A64B { dest } => f.aarch64_b(target(dest)),
+            OpKind::A64BCond { c, t, f: e } => f.aarch64_b_cond(c, target(t), target(e)),
+            OpKind::A64Ret => f.aarch64_ret(),
+            OpKind::A64Trap(reason) => f.aarch64_trap(reason),
+            OpKind::A64Bl { callee } => {
+                let c = f.module().func_ref(s.str(callee)).unwrap();
+                f.aarch64_bl(c)
+            }
+            OpKind::A64Blr { sig, n } => {
+                let sig = self.ty(f, sig);
+                f.aarch64_blr(sig, n)
+            }
+            OpKind::A64BlAlloc { family, align } => f.aarch64_bl_alloc(s.str(family), align),
+            OpKind::A64BlFree { family } => f.aarch64_bl_free(s.str(family)),
+            _ => unreachable!("not an aarch64 instruction: {}", k.mnemonic()),
+        }
     }
 }
 
@@ -452,6 +556,47 @@ fn builder_rebuilds_random_programs() {
         check_rebuilds(&format!("program {k}"), &m, &mut fails);
     }
     assert!(fails.is_empty(), "{}", fails.join("\n"));
+}
+
+/// The backend's LFIR of every fixture it compiles and of random programs (the fuzzer's narrow
+/// mode), before and after register allocation, rebuilt the same way: every `aarch64.*` op
+/// the backend makes, through the builder.
+#[test]
+fn builder_rebuilds_backend_lfir() {
+    use fir::backend::aarch64 as a64;
+    let mut fails = Vec::new();
+    let mut rebuilt = 0;
+    let mut lfir = |name: &str, m: &Module, fails: &mut Vec<String>| {
+        let Ok(mut mm) = a64::select(m) else { return };
+        let before = a64::lfir::to_module(m, &mm);
+        a64::allocate(m, &mut mm);
+        let after = a64::lfir::to_module(m, &mm);
+        for (stage, l) in [("vregs", before), ("allocated", after)] {
+            if let Err(e) = verify_module(&l) {
+                fails.push(format!("{name} ({stage}): the LFIR doesn't verify: {e}"));
+                continue;
+            }
+            check_rebuilds(&format!("{name} ({stage})"), &l, fails);
+        }
+        rebuilt += 1;
+    };
+    for file in common::fir_files() {
+        let text = std::fs::read_to_string(&file).unwrap();
+        let Ok(m) = parse_module(&text) else { continue };
+        if verify_module(&m).is_err() || matches!(m.layer, Layer::Lfir(_)) {
+            continue;
+        }
+        lfir(&common::display_name(&file), &m, &mut fails);
+    }
+    for k in 0..200 {
+        let mut rng = progs::Rng::narrow(0x1f1e ^ (k << 20));
+        let prog = progs::program(&mut rng);
+        let m = parse_module(&prog.text).unwrap();
+        verify_module(&m).unwrap();
+        lfir(&format!("program {k}"), &m, &mut fails);
+    }
+    assert!(fails.is_empty(), "{}", fails.join("\n"));
+    assert!(rebuilt >= 200, "only {rebuilt} modules compiled to LFIR");
 }
 
 fn i32() -> Ty {
@@ -517,6 +662,37 @@ fn eager_checks_reject_and_leave_nothing() {
         let c = f.int_cmp(Pred::Ult, a, a).unwrap();
         assert_eq!(f.ty(c), Ty::Int(1));
     });
+}
+
+#[test]
+fn aarch64_ops_check_registers_and_the_layer() {
+    with_func(|f| {
+        assert_eq!(
+            message(f.aarch64_ret()),
+            "aarch64.ret is not allowed in layer hfir; it is allowed in lfir aarch64"
+        );
+    });
+    let mut mb = ModuleBuilder::new();
+    mb.set_layer(Layer::Lfir("aarch64"));
+    let mut f = mb.func("g", &[], &[]).unwrap();
+    let code = f.aarch64_code_begin().unwrap();
+    let entry = f.block(code, "entry", &[]).unwrap();
+    f.position_at_end(entry).unwrap();
+    let ops = f.body().num_ops();
+    for bad in [33, 63, u32::MAX] {
+        assert_eq!(
+            message(f.aarch64_mov(Sf::X, Reg(bad), Reg::SP)),
+            format!("{bad} is not a register")
+        );
+    }
+    assert_eq!(f.body().num_ops(), ops, "a rejected op is not added");
+    f.aarch64_mov(Sf::X, Reg::virt(7), Reg::XZR).unwrap();
+    f.aarch64_ret().unwrap();
+    f.end_blocks(code).unwrap();
+    f.finish().unwrap();
+    let m = mb.finish();
+    verify_module(&m).unwrap();
+    assert!(m.render(false).contains("aarch64.mov.x v7, xzr"));
 }
 
 #[test]

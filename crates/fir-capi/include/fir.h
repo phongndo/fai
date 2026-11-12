@@ -126,6 +126,37 @@ typedef struct FirCase {
   struct FirTarget target;
 } FirCase;
 
+// `aarch64.add`, `aarch64.sub`, … on three registers (`AluOp`).
+typedef uint32_t FirAluOp;
+
+// The operation size of an `aarch64.*` op (`Sf`): 32 or 64 bits.
+typedef uint32_t FirSf;
+
+// A register of an `aarch64.*` op: `x0`…`x30` are 0…30, then `FIR_REG_SP` and `FIR_REG_XZR`;
+// the virtual register `vN` is `FIR_REG_V0 + N`.
+typedef uint32_t FirReg;
+
+// `aarch64.add.imm`, … with an immediate (`AluImmOp`).
+typedef uint32_t FirAluImmOp;
+
+// `aarch64.lsl.imm`, `aarch64.lsr.imm`, `aarch64.asr.imm` (`ShiftImmOp`).
+typedef uint32_t FirShiftImmOp;
+
+// `aarch64.movz`, `aarch64.movn`, `aarch64.movk` (`MovOp`).
+typedef uint32_t FirMovOp;
+
+// `aarch64.csel`, `aarch64.csinc`, `aarch64.csinv`, `aarch64.csneg` (`CselOp`).
+typedef uint32_t FirCselOp;
+
+// An AArch64 condition (`Cond`).
+typedef uint32_t FirCond;
+
+// The access size of `aarch64.ldr` and `aarch64.str`: 1, 2, 4, or 8 bytes (`MemSize`).
+typedef uint32_t FirMemSize;
+
+// Why `aarch64.trap` traps (`TrapReason`).
+typedef uint32_t FirTrapReason;
+
 #define FIR_OK 0
 
 // An argument names nothing, breaks the op's typing rule, or clashes with a declaration.
@@ -290,6 +321,130 @@ typedef struct FirCase {
 #define FIR_FACT_NOALIAS 4
 
 #define FIR_FACT_READONLY 5
+
+#define FIR_REG_SP 31
+
+#define FIR_REG_XZR 32
+
+#define FIR_REG_V0 64
+
+#define FIR_SF_W 0
+
+#define FIR_SF_X 1
+
+#define FIR_COND_EQ 0
+
+#define FIR_COND_NE 1
+
+#define FIR_COND_HS 2
+
+#define FIR_COND_LO 3
+
+#define FIR_COND_MI 4
+
+#define FIR_COND_PL 5
+
+#define FIR_COND_VS 6
+
+#define FIR_COND_VC 7
+
+#define FIR_COND_HI 8
+
+#define FIR_COND_LS 9
+
+#define FIR_COND_GE 10
+
+#define FIR_COND_LT 11
+
+#define FIR_COND_GT 12
+
+#define FIR_COND_LE 13
+
+#define FIR_ALU_OP_ADD 0
+
+#define FIR_ALU_OP_ADDS 1
+
+#define FIR_ALU_OP_SUB 2
+
+#define FIR_ALU_OP_SUBS 3
+
+#define FIR_ALU_OP_AND 4
+
+#define FIR_ALU_OP_ANDS 5
+
+#define FIR_ALU_OP_ORR 6
+
+#define FIR_ALU_OP_EOR 7
+
+#define FIR_ALU_OP_BIC 8
+
+#define FIR_ALU_OP_LSL 9
+
+#define FIR_ALU_OP_LSR 10
+
+#define FIR_ALU_OP_ASR 11
+
+#define FIR_ALU_OP_MUL 12
+
+#define FIR_ALU_OP_SDIV 13
+
+#define FIR_ALU_OP_UDIV 14
+
+#define FIR_ALU_OP_SMULH 15
+
+#define FIR_ALU_OP_UMULH 16
+
+#define FIR_ALU_IMM_OP_ADD 0
+
+#define FIR_ALU_IMM_OP_ADDS 1
+
+#define FIR_ALU_IMM_OP_SUB 2
+
+#define FIR_ALU_IMM_OP_SUBS 3
+
+#define FIR_ALU_IMM_OP_AND 4
+
+#define FIR_ALU_IMM_OP_ANDS 5
+
+#define FIR_ALU_IMM_OP_ORR 6
+
+#define FIR_ALU_IMM_OP_EOR 7
+
+#define FIR_SHIFT_IMM_OP_LSL 0
+
+#define FIR_SHIFT_IMM_OP_LSR 1
+
+#define FIR_SHIFT_IMM_OP_ASR 2
+
+#define FIR_MOV_OP_MOVZ 0
+
+#define FIR_MOV_OP_MOVN 1
+
+#define FIR_MOV_OP_MOVK 2
+
+#define FIR_CSEL_OP_CSEL 0
+
+#define FIR_CSEL_OP_CSINC 1
+
+#define FIR_CSEL_OP_CSINV 2
+
+#define FIR_CSEL_OP_CSNEG 3
+
+#define FIR_MEM_SIZE_B 0
+
+#define FIR_MEM_SIZE_H 1
+
+#define FIR_MEM_SIZE_W 2
+
+#define FIR_MEM_SIZE_X 3
+
+#define FIR_TRAP_REASON_DIV0 0
+
+#define FIR_TRAP_REASON_OVERFLOW 1
+
+#define FIR_TRAP_REASON_SHIFT 2
+
+#define FIR_TRAP_REASON_OOM 3
 
 #ifdef __cplusplus
 extern "C" {
@@ -461,8 +616,8 @@ FirStatus fir_position_at_end(struct FirBuilder *fb, FirRegion r);
 // Put the next ops right before an op.
 FirStatus fir_position_before(struct FirBuilder *fb, FirOp op);
 
-// A new block of the `cf.blocks` op `op`, labeled `label` (null or empty: its id) and with
-// these parameter types. The first block made is the entry, without parameters. Blocks are
+// A new block of the `cf.blocks` (or `aarch64.code`) op `op`, labeled `label` (null or empty:
+// its id) and with these parameter types. The first block made is the entry, without parameters. Blocks are
 // given to the op in the order made, by `fir_blocks_end` or when the function ends.
 FirRegion fir_block_new(struct FirBuilder *fb,
                         FirOp op,
@@ -470,7 +625,7 @@ FirRegion fir_block_new(struct FirBuilder *fb,
                         const FirType *params,
                         size_t nparams);
 
-// Give a `cf.blocks` op the blocks made for it; no more can be added.
+// Give a `cf.blocks` (or `aarch64.code`) op the blocks made for it; no more can be added.
 FirStatus fir_blocks_end(struct FirBuilder *fb, FirOp op);
 
 // The source location the next ops get, `@line:col`.
@@ -689,6 +844,106 @@ FirOp fir_func_call_indirect(struct FirBuilder *fb,
                              FirValue p,
                              const FirValue *args,
                              size_t nargs);
+
+// `aarch64.code { ^entry: … ^b1: … }`: a function's machine code, as labeled blocks entered
+// at the first. Each block ends with a branch, `aarch64.ret`, or `aarch64.trap`. It is the whole
+// body of an LFIR function, which finds its arguments where the calling convention puts them.
+//
+// Makes the op with empty regions: fill them with `fir_position_at_end`.
+FirOp fir_aarch64_code_begin(struct FirBuilder *fb);
+
+// `aarch64.add.x x0, x1, x2` and friends: three-register data processing; see `AluOp`.
+FirOp fir_aarch64_alu(struct FirBuilder *fb, FirAluOp op, FirSf sf, FirReg d, FirReg n, FirReg m);
+
+// `aarch64.add.imm.x x0, x1, 16`: data processing with an immediate; see `AluImmOp`.
+FirOp fir_aarch64_alu_imm(struct FirBuilder *fb,
+                          FirAluImmOp op,
+                          FirSf sf,
+                          FirReg d,
+                          FirReg n,
+                          int64_t imm);
+
+// `aarch64.lsl.imm.x x0, x1, 3`: a shift by an immediate below the size.
+FirOp fir_aarch64_shift_imm(struct FirBuilder *fb,
+                            FirShiftImmOp op,
+                            FirSf sf,
+                            FirReg d,
+                            FirReg n,
+                            uint32_t amount);
+
+// `aarch64.sbfx.x x0, x1, 8`: the low `width` bits (1 to the size), sign-extended (`sbfx`) or
+// zero-extended (`ubfx`).
+FirOp fir_aarch64_ext(struct FirBuilder *fb,
+                      bool signed_,
+                      FirSf sf,
+                      FirReg d,
+                      FirReg n,
+                      uint32_t width);
+
+// `aarch64.mov.x x0, x1`: copy a register (`sp` included).
+FirOp fir_aarch64_mov(struct FirBuilder *fb, FirSf sf, FirReg d, FirReg n);
+
+// `aarch64.movz.x x0, 4660, 16`: a 16-bit immediate shifted left by `hw` (0, 16, 32, or 48):
+// zero elsewhere (`movz`), inverted (`movn`), or inserted into the register (`movk`).
+FirOp fir_aarch64_mov_wide(struct FirBuilder *fb,
+                           FirMovOp op,
+                           FirSf sf,
+                           FirReg d,
+                           uint32_t imm,
+                           uint32_t hw);
+
+// `aarch64.csel.eq.x x0, x1, x2`: `x1` if the condition holds, else `x2` (incremented,
+// inverted, or negated for `csinc`, `csinv`, `csneg`).
+FirOp fir_aarch64_csel(struct FirBuilder *fb,
+                       FirCselOp op,
+                       FirCond c,
+                       FirSf sf,
+                       FirReg d,
+                       FirReg n,
+                       FirReg m);
+
+// `aarch64.ldr.w x0, x1, 8`: load 1, 2, 4, or 8 bytes from `x1 + 8`, zero-extended.
+FirOp fir_aarch64_ldr(struct FirBuilder *fb, FirMemSize size, FirReg d, FirReg base, int64_t off);
+
+// `aarch64.str.w x0, x1, 8`: store the low 1, 2, 4, or 8 bytes of `x0` at `x1 + 8`.
+FirOp fir_aarch64_str(struct FirBuilder *fb, FirMemSize size, FirReg s, FirReg base, int64_t off);
+
+// `aarch64.adrl x0, @g`: the address of a global (`adrp` and `add`).
+FirOp fir_aarch64_adrl(struct FirBuilder *fb, FirReg d, FirGlobal global);
+
+// `aarch64.adrl.func x0, @f`: the address of a function (`adrp` and `add`, or a GOT load for
+// an external one).
+FirOp fir_aarch64_adrl_func(struct FirBuilder *fb, FirReg d, FirFunc callee);
+
+// `aarch64.b ^b`: jump to a block of the enclosing `aarch64.code`.
+FirOp fir_aarch64_b(struct FirBuilder *fb, struct FirTarget dest);
+
+// `aarch64.b.eq ^t, ^f`: jump to `^t` if the condition holds, otherwise to `^f`.
+FirOp fir_aarch64_b_cond(struct FirBuilder *fb, FirCond c, struct FirTarget t, struct FirTarget f);
+
+// `aarch64.ret`: return to the caller, with the results where the calling convention puts
+// them.
+FirOp fir_aarch64_ret(struct FirBuilder *fb);
+
+// `aarch64.trap.div0`: trap with a reason (a call to `__fir_trap` with the reason and the
+// op's location).
+FirOp fir_aarch64_trap(struct FirBuilder *fb, FirTrapReason reason);
+
+// `aarch64.bl @f`: call a function; the arguments and results are where the calling
+// convention puts them for `@f`'s signature, and the call clobbers the caller-saved
+// registers.
+FirOp fir_aarch64_bl(struct FirBuilder *fb, FirFunc callee);
+
+// `aarch64.blr func<(i32) -> i32> x9`: call the function `x9` points to, which has that
+// signature.
+FirOp fir_aarch64_blr(struct FirBuilder *fb, FirType sig, FirReg n);
+
+// `aarch64.bl.alloc c.malloc, align 16`: allocate `x0` bytes from the family's allocator;
+// `x0` is the memory, or null if allocation failed (a call to `malloc` or `aligned_alloc`).
+FirOp fir_aarch64_bl_alloc(struct FirBuilder *fb, const char *family, uint32_t align);
+
+// `aarch64.bl.free c.malloc`: free `x0` (a call to `free`).
+FirOp fir_aarch64_bl_free(struct FirBuilder *fb, const char *family);
 
 #ifdef __cplusplus
 }  // extern "C"

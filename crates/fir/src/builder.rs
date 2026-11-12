@@ -861,7 +861,7 @@ impl<'m> FuncBuilder<'m> {
         })
     }
 
-    /// A new block of the `cf.blocks` op `op`, with this label (empty: its region id) and
+    /// A new block of the `cf.blocks` (or `aarch64.code`) op `op`, with this label (empty: its region id) and
     /// parameters. The first block is the entry; it has no parameters. Blocks are added to the
     /// op in the order they are made, when [`FuncBuilder::end_blocks`] is called or the
     /// function is finished.
@@ -869,7 +869,7 @@ impl<'m> FuncBuilder<'m> {
         self.check_op(op)?;
         let st = &mut self.m.st;
         let Some(i) = st.blocks.iter().rposition(|(o, _)| *o == op) else {
-            return err("blocks can only be added to a cf.blocks op not yet ended");
+            return err("blocks can only be added to a cf.blocks or aarch64.code op not yet ended");
         };
         let tys = self.import_list(params)?;
         let st = &mut self.m.st;
@@ -893,11 +893,12 @@ impl<'m> FuncBuilder<'m> {
         Ok(r)
     }
 
-    /// Give a `cf.blocks` op the blocks made for it so far; no more can be added.
+    /// Give a `cf.blocks` (or `aarch64.code`) op the blocks made for it so far; no more can be
+    /// added.
     pub fn end_blocks(&mut self, op: OpId) -> Result<(), BuildError> {
         let st = &mut self.m.st;
         let Some(i) = st.blocks.iter().rposition(|(o, _)| *o == op) else {
-            return err("the op is not a cf.blocks op being built");
+            return err("the op is not a cf.blocks or aarch64.code op being built");
         };
         let (op, blocks) = st.blocks.remove(i);
         st.body.set_regions(op, &blocks);
@@ -1022,6 +1023,16 @@ impl<'m> FuncBuilder<'m> {
             ));
         }
         Ok(out)
+    }
+
+    /// A register immediate: `x0`…`x30`, `sp`, `xzr`, or a virtual register (what the text can
+    /// name).
+    pub(crate) fn reg(&self, r: Reg) -> Result<Reg, BuildError> {
+        if r.is_gpr() || r == Reg::SP || r == Reg::XZR || (r.is_virtual() && r.0 != u32::MAX) {
+            Ok(r)
+        } else {
+            err(format!("{} is not a register", r.0))
+        }
     }
 
     /// A branch target, its arguments added to the operands.

@@ -7,7 +7,7 @@
 
 use std::os::raw::c_char;
 
-use fir::{FuncRef, GlobalRef, Operand};
+use fir::{FuncRef, GlobalRef, Operand, Reg};
 
 use crate::*;
 
@@ -494,6 +494,223 @@ pub unsafe extern "C" fn fir_func_call_indirect(fb: *mut FirBuilder, sig: FirTyp
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.func_call_indirect(crate::ty(sig)?, Operand::from_raw(p), crate::values(args, nargs)).map(|r| r.op.raw())
+        })
+    }
+}
+
+/// `aarch64.code { ^entry: … ^b1: … }`: a function's machine code, as labeled blocks entered
+/// at the first. Each block ends with a branch, `aarch64.ret`, or `aarch64.trap`. It is the whole
+/// body of an LFIR function, which finds its arguments where the calling convention puts them.
+///
+/// Makes the op with empty regions: fill them with `fir_position_at_end`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_code_begin(fb: *mut FirBuilder) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_code_begin().map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.add.x x0, x1, x2` and friends: three-register data processing; see `AluOp`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_alu(fb: *mut FirBuilder, op: FirAluOp, sf: FirSf, d: FirReg, n: FirReg, m: FirReg) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_alu(AluOp::from_c(op)?, Sf::from_c(sf)?, Reg(d), Reg(n), Reg(m)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.add.imm.x x0, x1, 16`: data processing with an immediate; see `AluImmOp`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_alu_imm(fb: *mut FirBuilder, op: FirAluImmOp, sf: FirSf, d: FirReg, n: FirReg, imm: i64) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_alu_imm(AluImmOp::from_c(op)?, Sf::from_c(sf)?, Reg(d), Reg(n), imm).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.lsl.imm.x x0, x1, 3`: a shift by an immediate below the size.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_shift_imm(fb: *mut FirBuilder, op: FirShiftImmOp, sf: FirSf, d: FirReg, n: FirReg, amount: u32) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_shift_imm(ShiftImmOp::from_c(op)?, Sf::from_c(sf)?, Reg(d), Reg(n), amount).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.sbfx.x x0, x1, 8`: the low `width` bits (1 to the size), sign-extended (`sbfx`) or
+/// zero-extended (`ubfx`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_ext(fb: *mut FirBuilder, signed: bool, sf: FirSf, d: FirReg, n: FirReg, width: u32) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_ext(signed, Sf::from_c(sf)?, Reg(d), Reg(n), width).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.mov.x x0, x1`: copy a register (`sp` included).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_mov(fb: *mut FirBuilder, sf: FirSf, d: FirReg, n: FirReg) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_mov(Sf::from_c(sf)?, Reg(d), Reg(n)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.movz.x x0, 4660, 16`: a 16-bit immediate shifted left by `hw` (0, 16, 32, or 48):
+/// zero elsewhere (`movz`), inverted (`movn`), or inserted into the register (`movk`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_mov_wide(fb: *mut FirBuilder, op: FirMovOp, sf: FirSf, d: FirReg, imm: u32, hw: u32) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_mov_wide(MovOp::from_c(op)?, Sf::from_c(sf)?, Reg(d), imm, hw).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.csel.eq.x x0, x1, x2`: `x1` if the condition holds, else `x2` (incremented,
+/// inverted, or negated for `csinc`, `csinv`, `csneg`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_csel(fb: *mut FirBuilder, op: FirCselOp, c: FirCond, sf: FirSf, d: FirReg, n: FirReg, m: FirReg) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_csel(CselOp::from_c(op)?, Cond::from_c(c)?, Sf::from_c(sf)?, Reg(d), Reg(n), Reg(m)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.ldr.w x0, x1, 8`: load 1, 2, 4, or 8 bytes from `x1 + 8`, zero-extended.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_ldr(fb: *mut FirBuilder, size: FirMemSize, d: FirReg, base: FirReg, off: i64) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_ldr(MemSize::from_c(size)?, Reg(d), Reg(base), off).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.str.w x0, x1, 8`: store the low 1, 2, 4, or 8 bytes of `x0` at `x1 + 8`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_str(fb: *mut FirBuilder, size: FirMemSize, s: FirReg, base: FirReg, off: i64) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_str(MemSize::from_c(size)?, Reg(s), Reg(base), off).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.adrl x0, @g`: the address of a global (`adrp` and `add`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_adrl(fb: *mut FirBuilder, d: FirReg, global: FirGlobal) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_adrl(Reg(d), GlobalRef::from_raw(global)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.adrl.func x0, @f`: the address of a function (`adrp` and `add`, or a GOT load for
+/// an external one).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_adrl_func(fb: *mut FirBuilder, d: FirReg, callee: FirFunc) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_adrl_func(Reg(d), FuncRef::from_raw(callee)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.b ^b`: jump to a block of the enclosing `aarch64.code`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_b(fb: *mut FirBuilder, dest: FirTarget) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            let dest_args = crate::values(dest.args, dest.nargs);
+            builder.aarch64_b(crate::target(dest, dest_args)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.b.eq ^t, ^f`: jump to `^t` if the condition holds, otherwise to `^f`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_b_cond(fb: *mut FirBuilder, c: FirCond, t: FirTarget, f: FirTarget) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            let t_args = crate::values(t.args, t.nargs);
+            let f_args = crate::values(f.args, f.nargs);
+            builder.aarch64_b_cond(Cond::from_c(c)?, crate::target(t, t_args), crate::target(f, f_args)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.ret`: return to the caller, with the results where the calling convention puts
+/// them.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_ret(fb: *mut FirBuilder) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_ret().map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.trap.div0`: trap with a reason (a call to `__fir_trap` with the reason and the
+/// op's location).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_trap(fb: *mut FirBuilder, reason: FirTrapReason) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_trap(TrapReason::from_c(reason)?).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.bl @f`: call a function; the arguments and results are where the calling
+/// convention puts them for `@f`'s signature, and the call clobbers the caller-saved
+/// registers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_bl(fb: *mut FirBuilder, callee: FirFunc) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_bl(FuncRef::from_raw(callee)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.blr func<(i32) -> i32> x9`: call the function `x9` points to, which has that
+/// signature.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_blr(fb: *mut FirBuilder, sig: FirType, n: FirReg) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_blr(crate::ty(sig)?, Reg(n)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.bl.alloc c.malloc, align 16`: allocate `x0` bytes from the family's allocator;
+/// `x0` is the memory, or null if allocation failed (a call to `malloc` or `aligned_alloc`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_bl_alloc(fb: *mut FirBuilder, family: *const c_char, align: u32) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_bl_alloc(crate::cstr(family)?, align).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.bl.free c.malloc`: free `x0` (a call to `free`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_bl_free(fb: *mut FirBuilder, family: *const c_char) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_bl_free(crate::cstr(family)?).map(|op| op.raw())
         })
     }
 }

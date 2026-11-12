@@ -37,11 +37,12 @@ def docLines (indent doc : String) : List String :=
     let l := l.trimAscii.toString
     if l.isEmpty then s!"{indent}///" else s!"{indent}/// {l}"
 
-/-- A variant names its fields when one is a `bool`, a number, a string, or a branch target (as in
-`GenRust`). -/
+/-- A variant names its fields when one is a `bool`, a number, a string, a branch target, or a
+register (as in `GenRust`). -/
 def isStruct (d : OpDecl) : Bool :=
   d.fields.any fun f => match f.ty with
-    | .nat | .align | .index | .symbol | .func | .global | .flag | .mod "Bool" | .succ | .cases => true
+    | .nat | .align | .index | .symbol | .func | .global | .flag | .mod "Bool" | .succ | .cases
+    | .reg => true
     | _ => false
 
 /-- `OpKind::Variant(a, b)` or `OpKind::Variant { x: a, y: b }`, each field from its text. -/
@@ -59,13 +60,15 @@ def snake (s : String) : String :=
     if c.isUpper then (if i == 0 then "" else "_") ++ c.toLower.toString else c.toString)
 
 /-- The method's name: the dialect, then the constructor in snake case, unless it already starts
-with the dialect. -/
+with the dialect. The `aarch64` dialect's constructors start with `A64`, which the dialect
+replaces: `A64BlAlloc` is `aarch64_bl_alloc`. -/
 def methodName (d : OpDecl) (i : Nat) : String :=
   let sn := snake d.rust
   match opNames.find? (·.value.declIdx == i) with
   | some s =>
     match s.text.splitOn "." with
     | dialect :: _ :: _ =>
+      let sn := if dialect == "aarch64" && sn.startsWith "a64_" then (sn.drop 4).toString else sn
       if sn == dialect || sn.startsWith (dialect ++ "_") then sn else dialect ++ "_" ++ sn
     | _ => sn
   | none => sn
@@ -181,6 +184,9 @@ def fieldParam (f : Field) : Param :=
     { name := n, rust := "&[SwitchCase<'_>]", c := [(n, "*const FirCase"), (s!"n{n}", "usize")],
       cConv := [s!"let {n}_v = crate::switch_cases({n}, n{n});"], cArg := s!"&{n}_v",
       rustConv := [s!"let {n}_id = self.cases({n})?;"], kindVal := some s!"{n}_id" }
+  | .reg =>
+    { name := n, rust := "Reg", c := [(n, "FirReg")], cArg := s!"Reg({n})",
+      rustConv := [s!"let {n}_r = self.reg({n})?;"], kindVal := some s!"{n}_r" }
 
 def operandParam (n : String) : Param :=
   { name := n, rust := "impl Into<Operand>", c := [(n, "FirValue")],
@@ -189,6 +195,13 @@ def operandParam (n : String) : Param :=
 def listParam (n : String) : Param :=
   { name := n, rust := "&[Operand]", c := [(n, "*const FirValue"), (s!"n{n}", "usize")],
     cArg := s!"crate::values({n}, n{n})", rustConv := [s!"self.operand_list({n});"] }
+
+/-- An op with regions or blocks takes its result types, unless it is a terminator
+(`aarch64.code`), which has none. -/
+def hasResults (d : OpDecl) : Bool :=
+  match resMode d with
+  | .regions => !d.terminator
+  | _ => true
 
 def resultsParam : ResMode → List Param
   | .given 1 =>
@@ -202,7 +215,7 @@ def resultsParam : ResMode → List Param
 /-- The parameters, in order: result types, modifiers, then the format's immediates and
 operands. -/
 def params (d : OpDecl) : List Param := Id.run do
-  let mut ps := resultsParam (resMode d)
+  let mut ps := if hasResults d then resultsParam (resMode d) else []
   for f in d.fields do
     if !f.ty.isImm then ps := ps ++ [fieldParam f]
   let mut ops := operandNames d
@@ -261,7 +274,8 @@ def rustOp (d : OpDecl) (i : Nat) : List String := Id.run do
   match mode with
   | .regions =>
     let iter := d.items.contains .iter
-    out := out ++ [s!"        self.region_op(kind, results, {nRegions d}, {iter})"]
+    let results := if hasResults d then "results" else "&[]"
+    out := out ++ [s!"        self.region_op(kind, {results}, {nRegions d}, {iter})"]
   | .none => out := out ++ [s!"        self.simple(kind, {res})"]
   | .implied 1 | .given 1 =>
     out := out ++ [s!"        let made = self.simple(kind, {res})?;", "        Ok(self.result(made, 0))"]
@@ -356,7 +370,7 @@ def generateCapi : String := Id.run do
     "",
     "use std::os::raw::c_char;",
     "",
-    "use fir::{FuncRef, GlobalRef, Operand};",
+    "use fir::{FuncRef, GlobalRef, Operand, Reg};",
     "",
     "use crate::*;",
     ""]
