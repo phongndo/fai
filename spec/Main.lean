@@ -8,6 +8,7 @@ fir-ref run FILE [@FUNC] [ARG...] [--fuel N]   run a function (default @main)
 fir-ref check FILE                             verify; list holes
 fir-ref fmt FILE [--no-locs] [--unverified]    print canonical text (--unverified: parse only)
 fir-ref test PATH...                           run the test files (.fir) under PATH
+fir-ref lower FILE [--no-locs]                 lower an HFIR module to MFIR and print it
 ```
 
 Arguments are integers, `null` (for pointers), or `poison`. Every free choice takes the oracle's
@@ -20,10 +21,14 @@ A test file is a `.fir` module with expectations in comments:
 ```
 // run: @f(1, 2) -> returned i32 3
 // error: is not defined
+// lower-error: cannot lower
 ```
 
 `run` compares the outcome line exactly. `error` expects parsing or verification to fail with a
-message containing the text. Every test file must also print, reparse, and print identically.
+message containing the text, and `lower-error` lowering to fail so. Every test file must also print, reparse, and print identically.
+An HFIR test file must also lower to MFIR (`Fir.Lower`) that verifies and prints stably, and
+every `run` line must give the same outcome on the lowering, unless the HFIR run ends in UB (or
+gets stuck), where the lowering must perform the same events first and may then do anything.
 -/
 
 open Fir
@@ -40,26 +45,68 @@ def parseArg (t : Ty) (s : String) : Except String RVal :=
   | .ptr, "poison" => .ok (.ptr none)
   | _, _ => .error s!"bad argument '{s}' for {t}"
 
-partial def drive (m : Machine) (steps limit : Nat) : String :=
+/-- How a run went: its events, how it ended, and whether that ending lets a refinement do
+anything (UB or stuck) or is unknown (out of fuel). -/
+structure RunResult where
+  events : List Event := []
+  ending : String
+  absorbing : Bool := false
+  outOfFuel : Bool := false
+  deriving Inhabited
+
+def RunResult.render (r : RunResult) : String := renderRun r.events r.ending
+
+def RunResult.ofHalt (events : List Event) (h : Halt) : RunResult :=
+  { events, ending := renderHalt h, absorbing := h.outcome matches .ub _ | .stuck _ }
+
+partial def drive (m : Machine) (steps limit : Nat) (post : Halt → Halt := id) : RunResult :=
   if steps ≥ limit then
-    renderRun m.core.trace <|
-      s!"out of fuel after {limit} steps" ++ (if m.inProgressLoop then " in a progress loop" else "")
+    { events := m.core.trace, outOfFuel := true,
+      ending := s!"out of fuel after {limit} steps" ++
+        (if m.inProgressLoop then " in a progress loop" else "") }
   else
     match step m with
-    | .ok m' => drive m' (steps + 1) limit
-    | .error h => renderRun m.core.trace (renderHalt h)
+    | .ok m' => drive m' (steps + 1) limit post
+    | .error h => .ofHalt m.core.trace (post h)
 
-/-- Run a function and describe the outcome in one line. -/
-def runFunc (m : Module) (name : String) (args : List String) (fuel : Nat) :
-    Except String String := do
+/-- Run a function. With `lowerRets`, returned values are shown as the scalars the lowering
+returns instead (`Lower.lowerValue`). -/
+def runFuncR (m : Module) (name : String) (args : List String) (fuel : Nat)
+    (lowerRets := false) : Except String RunResult := do
   let some f := m.find? name | throw s!"no function @{name}"
   if args.length != f.params.length then
     throw s!"@{name} takes {f.params.length} arguments but got {args.length}"
   let vals ← (f.params.zip args).mapM fun (r, a) => parseArg r.ty a
-  if m.layer matches .lfir _ then return AArch64.run m f vals fuel
+  if m.layer matches .lfir _ then return { ending := AArch64.run m f vals fuel }
+  let lowerHalt (h : Halt) : Halt := match h.outcome with
+    | .ret vs => if lowerRets then
+        { h with outcome := .ret (Lower.lowerValues m.space.addrBits f.rets vs) } else h
+    | _ => h
   match Machine.init (fun _ => 0) World.zero m f vals with
-  | .error h => pure (renderHalt h)
-  | .ok mach => pure (drive mach 0 fuel)
+  | .error h => pure (.ofHalt [] h)
+  | .ok mach => pure (drive mach 0 fuel lowerHalt)
+
+/-- Run a function and describe the outcome in one line. -/
+def runFunc (m : Module) (name : String) (args : List String) (fuel : Nat) :
+    Except String String :=
+  (runFuncR m name args fuel).map RunResult.render
+
+/-- Whether a run of the lowering `tgt` agrees with the HFIR run `src`: the same outcome line,
+unless `src` ends in UB or gets stuck, where `tgt` must have `src`'s events first. A source that
+runs out of fuel is not compared. -/
+def RunResult.lowersTo (src tgt : RunResult) : Bool :=
+  src.outOfFuel || src.render == tgt.render ||
+    (src.absorbing && (src.events.map Event.render).isPrefixOf (tgt.events.map Event.render))
+
+/-- The lowering gets more fuel: it takes more steps than the HFIR program. -/
+def loweredFuel (fuel : Nat) : Nat := 16 * fuel
+
+/-- Lower a verified HFIR module and check the result. -/
+def lowerChecked (m : Module) : Except String Module := do
+  let l ← Lower.lowerModule m
+  match verifyModule l with
+  | .ok _ => pure l
+  | .error e => throw s!"the lowering doesn't verify: {e}"
 
 def load (text : String) : Except String (Module × Array Hole) := do
   let m ← parseModule text
@@ -80,6 +127,7 @@ def parseCall (s : String) : Option (String × List String) := do
 inductive Expect where
   | run (name : String) (args : List String) (outcome : String)
   | error (text : String)
+  | lowerError (text : String)
 
 def expectations (text : String) : Except String (List Expect) :=
   (text.splitOn "\n").filterMapM fun line =>
@@ -96,6 +144,8 @@ def expectations (text : String) : Except String (List Expect) :=
       | _ => .error s!"bad run line: {line}"
     else if line.startsWith "// error:" then
       .ok (some (.error (line.drop 9).trimAscii.toString))
+    else if line.startsWith "// lower-error:" then
+      .ok (some (.lowerError (line.drop 15).trimAscii.toString))
     else .ok none
 
 /-- Run one test file. Returns the failures. -/
@@ -122,6 +172,30 @@ def testFile (text : String) : Except String (List String) := do
           | .error e => s!"error: {e}"
         if got != want then
           fails := fails ++ [s!"@{name}({", ".intercalate args}): expected '{want}' but got '{got}'"]
+    let lowerErrs := exps.filterMap fun | .lowerError t => some t | _ => none
+    if m.layer == .hfir then
+      match lowerChecked m with
+      | .error e =>
+        if lowerErrs.isEmpty then fails := fails ++ [s!"lowering: {e}"]
+        for t in lowerErrs do
+          unless (e.splitOn t).length > 1 do
+            fails := fails ++ [s!"lowering error '{e}' does not contain '{t}'"]
+      | .ok l =>
+        unless lowerErrs.isEmpty do
+          fails := fails ++ [s!"expected lowering to fail with '{lowerErrs.head!}'"]
+        let printed := l.render
+        match parseModule printed with
+        | .error e => fails := fails ++ [s!"the printed lowering does not parse: {e}"]
+        | .ok l2 =>
+          if l2.render != printed then fails := fails ++ ["printing the lowering is not stable"]
+        for e in exps do
+          if let .run name args _ := e then
+            match runFuncR m name args defaultFuel (lowerRets := true),
+                runFuncR l name args (loweredFuel defaultFuel) with
+            | .ok src, .ok tgt =>
+              unless src.lowersTo tgt do
+                fails := fails ++ [s!"@{name}({", ".intercalate args}) lowered: expected '{src.render}' but got '{tgt.render}'"]
+            | _, _ => pure ()
     pure fails
 
 partial def firFiles (p : System.FilePath) : IO (Array System.FilePath) := do
@@ -157,7 +231,8 @@ def usage : String := "usage:
   fir-ref run FILE [@FUNC] [ARG...] [--fuel N]
   fir-ref check FILE
   fir-ref fmt FILE [--no-locs] [--unverified]
-  fir-ref test PATH..."
+  fir-ref test PATH...
+  fir-ref lower FILE [--no-locs]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -189,4 +264,9 @@ def main (args : List String) : IO UInt32 := do
       | .ok m => print m
     else withModule file fun m _ => print m
   | "test" :: paths@(_ :: _) => cmdTest paths
+  | "lower" :: file :: opts =>
+    withModule file fun m _ => do
+      match lowerChecked m with
+      | .ok l => IO.print (l.render (showLocs := !opts.contains "--no-locs")); pure 0
+      | .error e => IO.eprintln s!"{file}: {e}"; pure 1
   | _ => IO.eprintln usage; pure 2

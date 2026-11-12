@@ -23,3 +23,5 @@ import Fir.Dce
 import Fir.AArch64Syntax
 import Fir.AArch64
 import Fir.AArch64Machine
+import Fir.Lower
+import Fir.LowerBits
