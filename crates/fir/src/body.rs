@@ -997,6 +997,128 @@ impl Body {
         }
     }
 
+    /// Take these operand slots out of their values' use lists with one walk of each list, so
+    /// that removing many uses of one value stays linear (removing them one by one walks the
+    /// list each time). Slots in no list are skipped.
+    fn unlink_uses(&mut self, slots: impl IntoIterator<Item = u32>) {
+        if !self.uses_built {
+            return;
+        }
+        let mut dying = rustc_hash::FxHashSet::default();
+        let mut values = Vec::new();
+        for u in slots {
+            if self.use_next[u as usize] != DETACHED
+                && dying.insert(u)
+                && let OperandKind::Value(v) = self.operands[u as usize].get()
+            {
+                values.push(v);
+            }
+        }
+        values.sort_unstable();
+        values.dedup();
+        for v in values {
+            let (mut prev, mut cur) = (NONE, self.first_use[v.index()]);
+            while let Some(u) = opt(cur) {
+                let next = self.use_next[u as usize];
+                if dying.contains(&u) {
+                    match opt(prev) {
+                        Some(p) => self.use_next[p as usize] = next,
+                        None => self.first_use[v.index()] = next,
+                    }
+                    self.use_next[u as usize] = DETACHED;
+                } else {
+                    prev = u;
+                }
+                cur = next;
+            }
+        }
+    }
+
+    /// Erase these ops, as [`Body::erase`] does each, unlinking their uses with one walk of each
+    /// value's use list. A value defined by one of them may be used by another of them.
+    pub fn erase_many(&mut self, ops: &[OpId]) {
+        if self.uses_built {
+            let mut slots = Vec::new();
+            let mut work: Vec<OpId> = ops
+                .iter()
+                .copied()
+                .filter(|&o| !self.is_erased(o))
+                .collect();
+            while let Some(o) = work.pop() {
+                slots.extend(self.op_shape[o.index()].operands.range().map(|u| u as u32));
+                for &r in self.regions(o) {
+                    work.extend(self.ops(r));
+                }
+            }
+            self.unlink_uses(slots);
+        }
+        for &op in ops {
+            self.erase(op);
+        }
+    }
+
+    /// Set many operands at once (`(op, index, operand)`), as [`Body::set_operand`] does each,
+    /// unlinking the old uses with one walk of each value's use list.
+    pub fn set_operands(&mut self, edits: &[(OpId, usize, Operand)]) {
+        let slots: Vec<u32> = edits
+            .iter()
+            .map(|&(op, i, _)| {
+                assert!(!self.is_erased(op), "set_operands on an erased op");
+                self.operand_use(op, i).0
+            })
+            .collect();
+        self.unlink_uses(slots.iter().copied());
+        for (&u, &(_, _, new)) in slots.iter().zip(edits) {
+            // A slot set twice is relinked only once.
+            if self.uses_built && self.use_next[u as usize] != DETACHED {
+                self.unlink_use(u);
+            }
+            self.operands[u as usize] = new;
+            if self.uses_built {
+                self.link_use(u);
+            }
+        }
+    }
+
+    /// Make the uses of `old` that `pick` chooses uses of `new`, in one walk of `old`'s list.
+    /// Returns how many were moved. Needs the use lists built.
+    pub fn replace_uses_where(
+        &mut self,
+        old: ValueId,
+        new: ValueId,
+        mut pick: impl FnMut(&Body, UseId) -> bool,
+    ) -> u32 {
+        self.need_uses();
+        if old == new {
+            return 0;
+        }
+        let (mut prev, mut cur, mut n) = (NONE, self.first_use[old.index()], 0);
+        while let Some(u) = opt(cur) {
+            let next = self.use_next[u as usize];
+            if pick(self, UseId(u)) {
+                match opt(prev) {
+                    Some(p) => self.use_next[p as usize] = next,
+                    None => self.first_use[old.index()] = next,
+                }
+                self.operands[u as usize] = Operand::value(new);
+                self.use_next[u as usize] = std::mem::replace(&mut self.first_use[new.index()], u);
+                n += 1;
+            } else {
+                prev = u;
+            }
+            cur = next;
+        }
+        n
+    }
+
+    /// Change an op's kind, keeping its operands, results, regions, and location; the new kind
+    /// must suit them (the verifier checks). Store-to-load forwarding turns a load into a copy
+    /// this way.
+    pub fn set_kind(&mut self, op: OpId, kind: OpKind) {
+        assert!(!self.is_erased(op), "set_kind on an erased op");
+        self.op_kind[op.index()] = kind;
+    }
+
     /// Make every use of `old` a use of `new`. Needs the use lists built.
     pub fn replace_all_uses(&mut self, old: ValueId, new: ValueId) {
         self.need_uses();
@@ -1453,7 +1575,7 @@ mod tests {
                     .collect();
                 let name = format!("v{step}");
                 let spec = || vec![val(&name)];
-                match rand(7) {
+                match rand(10) {
                     0 | 1 => {
                         // Sometimes with a region holding an op of its own.
                         let regions = if rand(4) == 0 { vec![vec![]] } else { vec![] };
@@ -1505,6 +1627,50 @@ mod tests {
                         }
                         b.erase(op);
                         values.retain(|v| !defined.contains(v));
+                    }
+                    6 if !live.is_empty() => {
+                        // Several operands at once, sometimes the same slot twice.
+                        let mut edits = Vec::new();
+                        for _ in 0..rand(5) {
+                            let op = live[rand(live.len())];
+                            let k = b.operands(op).len();
+                            if k > 0 {
+                                let o = Operand::value(values[rand(values.len())]);
+                                edits.push((op, rand(k), o));
+                            }
+                        }
+                        b.set_operands(&edits);
+                    }
+                    7 if b.has_use_lists() => {
+                        let (old, new) = (values[rand(values.len())], values[rand(values.len())]);
+                        let mut flip = rand(1 << 20);
+                        b.replace_uses_where(old, new, |_, _| {
+                            flip >>= 1;
+                            flip & 1 == 1
+                        });
+                    }
+                    8 if !live.is_empty() && b.has_use_lists() => {
+                        // Erase a few ops at once, after redirecting the uses of what they
+                        // define from outside them.
+                        let ops: Vec<OpId> =
+                            (0..1 + rand(3)).map(|_| live[rand(live.len())]).collect();
+                        let mut defined = Vec::new();
+                        for &op in &ops {
+                            defined.extend(b.results(op));
+                            for &rg in b.regions(op) {
+                                for inner in b.ops(rg) {
+                                    defined.extend(b.results(inner));
+                                }
+                            }
+                        }
+                        let keep = values.iter().copied().find(|v| !defined.contains(v));
+                        if let Some(keep) = keep {
+                            for v in &defined {
+                                b.replace_uses_where(*v, keep, |b, u| !ops.contains(&b.user(u).0));
+                            }
+                            b.erase_many(&ops);
+                            values.retain(|v| !defined.contains(v));
+                        }
                     }
                     _ if !live.is_empty() => b.unlink(live[rand(live.len())]),
                     _ => {}
