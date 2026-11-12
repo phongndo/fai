@@ -21,11 +21,6 @@ fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name).map_or(default, |s| s.parse().expect(name))
 }
 
-/// The Lean runtime can't shift a natural number left by `2^32` or more bits, so `fir-ref`
-/// crashes on `int.shl.total` (or `.mask` never reaches it) with such an amount instead of giving
-/// 0. Those runs have no reference outcome.
-const LEAN_SHIFT_PANIC: &str = "INTERNAL PANIC: Nat.shiftl exponent is too big";
-
 /// What a run prints: stdout, stderr, and the exit code.
 type Printed = (String, String, i32);
 
@@ -105,14 +100,6 @@ fn interpreter_matches_reference_on_random_programs() {
                     let mut keep = false;
                     for (args, fuel) in &prog.runs {
                         let (a, b) = (ours(&m, args, *fuel), theirs(&tool, &file, args, *fuel));
-                        if b.1.contains(LEAN_SHIFT_PANIC) {
-                            *stats
-                                .lock()
-                                .unwrap()
-                                .entry("lean panic (shl)".to_owned())
-                                .or_default() += 1;
-                            continue;
-                        }
                         *stats.lock().unwrap().entry(kind(&b)).or_default() += 1;
                         if show.as_ref().is_some_and(|k| b.0.starts_with(k)) {
                             keep = true;

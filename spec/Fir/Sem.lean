@@ -145,7 +145,9 @@ def shift (op : ShiftOp) (edge : ShiftEdge) : Val w → Val w → OpOut w
       | .trap, _ => .trap .shift
       | _, .poison => .ok .poison
       | .mask, .bits x => .ok (.bits (shiftBits op x (n.toNat % w)))
-      | _, .bits x => .ok (.bits (shiftBits op x n.toNat))
+      -- Shifting by `w` gives the same as by any larger amount, and keeps the runtime from
+      -- computing a huge power of two.
+      | _, .bits x => .ok (.bits (shiftBits op x w))
 
 /-! ## Comparison, selection, casts -/
 
