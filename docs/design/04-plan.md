@@ -80,7 +80,7 @@ M and F run in parallel; then N; then V and A one after the other (both change t
 ## Varargs and aggregates by value (tracks V and A)
 
 Designed when their tracks start, against AAPCS64 (Linux first; macOS's variant, where variadic
-arguments all go on the stack, stays open). Constraints: a variadic call names its fixed and
+arguments all go on the stack, stays open). Track V's design is in its Progress entry. Constraints: a variadic call names its fixed and
 variadic argument types; `va.start`, `va.arg T`, `va.copy`, `va.end` work on a `va_list` the
 target lays out (AAPCS64's five-field structure on Linux), so FIR can pass one to `vprintf`; by-value
 aggregates in signatures follow AAPCS64's classification and lower to scalars, registers, and
@@ -305,6 +305,62 @@ Decisions: C frontend (float mapping, no contraction), C frontend testing.
 - **Not yet:** `printf` with floats (track V); glibc's `isgreater` macros (statement
   expressions under Clang); float builtins without a FIR op (`__builtin_fmin`, …); rounding
   modes and exception flags (`FENV_ACCESS`).
+
+### Track V: Varargs (done)
+
+Decisions: Varargs, va_list (new), and Calling convention, External functions, External call
+semantics, Function pointers, Instruction selection, LFIR for AArch64, AArch64 semantics,
+Register allocation, Data layout, Aggregates, Memory bytes, Stack lifetime, Builder API, API,
+Lowering proofs, Backend testing, C external functions.
+
+- **IR:** `func @f(%fmt: ptr, ...)`, `extern func @printf(ptr, ...) -> i32 …`, and
+  `func<(ptr, ...) -> i32>`; a call writes `...` before its variadic arguments
+  (`func.call @printf(%fmt, ... %x, %y)`), where the callee's signature says, which the parsers
+  check and the printers follow (the op doesn't store it, so the call ops, builder methods, and C
+  functions are unchanged). Variadic arguments are `iN`/`bN` of 8 to 64 bits, `ptr`, `f32`, or
+  `f64`, passed as given. `va_list` is a memory type laid out by the memory space (`valist 32:8`
+  by default, AAPCS64's on Linux). `va.start`, `va.arg`, `va.end` (HFIR and MFIR); `va_copy` is
+  `mem.copy va_list`.
+- **Semantics (Lean, both interpreters):** a call of a variadic function puts its variadic
+  arguments in an allocation of their own (`AllocKind.va`), freed when the call returns; a
+  `va_list` holds a cursor (`Byte.va` bytes naming that allocation and a position) that only
+  `va.arg` reads and that reads as `poison` as anything else; `va.arg` reads the next argument's
+  bytes as its result type, and is UB `va-arg` without a cursor, past the end, or across classes
+  (integer and pointer, or float), `use-after-free` after the call returned. Indirect calls
+  through the other kind of signature are `bad-call`. External calls show every argument, and a
+  `va_list` an external function reads lets it reach the arguments.
+- **Proofs:** every existing proof builds, with no `sorry`; `#print axioms` of `Dse.refines`,
+  `Fwd.refines`, `CopyProp.refines`, `Dce.refines`, `Lower.Proof.Expand.refines`,
+  `lowerFunc_refines`, `step_space`, and `step_trace` shows only `propext`, `Classical.choice`,
+  and `Quot.sound`. The lockstep layer (`execFlat_eq`), copy propagation, and `Space` handle
+  `va.start`, which reads the stack, and variadic calls (`enterFunc`); `Pure` and `RunsPure`
+  exclude `va.start`; the refinement theorems take `tgt.variadic = src.variadic`. No new theorem
+  about varargs: the argument that native code refines the cursor model is in decision va_list.
+- **AArch64 (Linux):** variadic calls are `adrl.func` + `blr` with the call's argument types as
+  the signature; a variadic function that uses `va.start` saves the leftover `x` and `d`
+  argument registers in register save areas; `va.start` and `va.arg` (AAPCS64's algorithm) are
+  plain LFIR instructions, so neither the LFIR op set nor the register allocator and its checker
+  changed. The LFIR machines (Lean and Rust) read an external callee's arguments by `blr`'s
+  signature. `--os darwin` rejects varargs with a compile error.
+- **Builder and C API (version 1.4):** `declare_func_va`, `extern_func_va`, `func_ty_va`;
+  `FIR_TYPE_VA_LIST`, `fir_type_func_va`, `fir_func_declare_va`, `fir_extern_declare_va`,
+  `fir_module_set_va_list`, and the generated `fir_va_start`, `fir_va_arg`, `fir_va_end`.
+- **Tests:** `tests/varargs/` (definitions and calls with mixed classes, more than eight of each
+  class, `va_copy`, a `va_list` passed to another function and in a struct, nested variadic
+  calls, restarts, narrow and wide reads, variadic externs and indirect calls; 30 run lines, 10
+  of them UB (`va-arg`, `use-after-free`, `bad-call`), and 19
+  error fixtures): `fir-ref test` and `fir run` agree on every run line; every run that the
+  backend compiles matches natively under qemu, with and without `-O`, and in LFIR before and
+  after allocation (also in `fir-ref`). `tests/capi/e2e.c` builds a module through the C API
+  that calls glibc's `printf` (directly and through a pointer), `snprintf` (integers on the
+  stack), and `vprintf` through a `va_list` it starts and copies, and that C calls with twelve
+  ints and twelve doubles; the native output must equal the host's `snprintf` of the same
+  formats. The fuzzer makes variadic functions (the entry included) and external functions,
+  calls passing their usual argument types or others, and `va.arg` (sometimes of another width,
+  class, or past the end), restarts, copies, and ends: `FIR_FUZZ=3000` on seeds 43 and 59 for
+  `fuzz.rs`, `opt.rs`, `builder.rs`, and `aarch64.rs`: no differences (SEEDSTATS).
+- **Not yet:** `fai-cc`'s varargs (track F2); macOS's variant (open item 4); aggregates as
+  variadic arguments (track A); integers wider than 64 bits as variadic arguments.
 
 ## Not in this round
 
