@@ -11,151 +11,326 @@ spot. A proof about such a rewrite only reasons about the rewritten spot itself.
 
 `OpsRel L` relates target code to source code that is the same except that `L` relates some
 target op sequences to source op sequences, at any depth (inside `cf.if` and `cf.loop`
-regions too). `MRel L` relates machines with the same core whose stacks hold related code.
+regions too). `L` also sees the target ops that follow a rewritten sequence in its region, so a
+rewrite can depend on what the rest of the region reads.
+
+## Environments that differ
+
+The two machines' environments need not be equal. `StackRel L D` relates frame stacks that hold
+related code and whose block frames' environments agree on every name outside a set of
+*hidden* names, which no target code that can still run there reads. `D` is what is hidden at the
+top of the stack: it includes what each frame below hides, up to the nearest call frame (lookups
+stop there, so a callee starts with nothing hidden). A lookup of a name outside `D` gives the same
+answer on both stacks (`StackRel.lookup`), so lockstep steps read the same operands even when the
+environments differ.
+
+Rewrites that keep the environments equal (dead stores, forwarding, copy propagation) never hide a
+name. Dead code elimination hides the results of deleted ops: the source binds them, the target
+doesn't, and nothing the target runs afterwards reads them. mem2reg will add a relation between
+the cores' memories, and hidden names that rewritten target code does read (the promoted values),
+related to the source's memory rather than its environment.
+
+`MRel L` relates machines with the same core whose stacks are related this way.
 -/
 
 namespace Fir
 
+/-! ## Reads -/
+
+/-- Whether an operand reads `%n`. -/
+def Operand.reads (n : String) : Operand → Bool
+  | .var m => m == n
+  | .hole .. => false
+
+mutual
+/-- Whether an op reads `%n`: as an operand, or in any op inside its regions, at any depth. -/
+def Op.reads (n : String) : Op → Bool
+  | .mk _ _ args rs _ => args.any (Operand.reads n) || regionsReads n rs
+
+/-- Whether any op in these regions reads `%n`, at any depth. -/
+def regionsReads (n : String) : List Region → Bool
+  | [] => false
+  | .mk _ ops :: rs => opsReads n ops || regionsReads n rs
+
+/-- Whether any op in `ops` reads `%n`, at any depth. -/
+def opsReads (n : String) : List Op → Bool
+  | [] => false
+  | o :: os => o.reads n || opsReads n os
+end
+
+/-- No op in `ops` reads a name in `D`, at any depth. -/
+def NoReads (D : String → Prop) (ops : List Op) : Prop := ∀ n, D n → opsReads n ops = false
+
+theorem opsReads_append (n : String) : ∀ (a b : List Op),
+    opsReads n (a ++ b) = (opsReads n a || opsReads n b)
+  | [], _ => by simp [opsReads]
+  | o :: a, b => by simp [opsReads, opsReads_append n a b, Bool.or_assoc]
+
+theorem NoReads.cons {D : String → Prop} {o : Op} {t : List Op} (h : NoReads D (o :: t)) :
+    (∀ n, D n → o.reads n = false) ∧ NoReads D t := by
+  constructor <;> intro n hn <;> have := h n hn <;> simp_all [opsReads]
+
+theorem NoReads.append_right {D : String → Prop} {a b : List Op} (h : NoReads D (a ++ b)) :
+    NoReads D b := by
+  intro n hn; have := h n hn; simp_all [opsReads_append]
+
+theorem NoReads.append_left {D : String → Prop} {a b : List Op} (h : NoReads D (a ++ b)) :
+    NoReads D a := by
+  intro n hn; have := h n hn; simp_all [opsReads_append]
+
+/-- An op that reads no name in `D` has operands that read none, and regions that read none. -/
+theorem Op.reads_mk {D : String → Prop} {k res args rs loc}
+    (h : ∀ n, D n → Op.reads n (.mk k res args rs loc) = false) :
+    (∀ n, D n → args.any (Operand.reads n) = false) ∧ ∀ n, D n → regionsReads n rs = false := by
+  constructor <;> intro n hn <;> have := h n hn <;> simp_all [Op.reads]
+
+/-! ## Related code -/
+
 mutual
 /-- Two ops that are the same, or differ only in their regions' code. -/
-inductive OpRel (L : List Op → List Op → Prop) : Op → Op → Prop
+inductive OpRel (L : List Op → List Op → List Op → Prop) : Op → Op → Prop
   | refl (o : Op) : OpRel L o o
   | regions {k res args rt rs loc} : RegionsRel L rt rs →
       OpRel L (.mk k res args rt loc) (.mk k res args rs loc)
 
-inductive RegionsRel (L : List Op → List Op → Prop) : List Region → List Region → Prop
+inductive RegionsRel (L : List Op → List Op → List Op → Prop) : List Region → List Region → Prop
   | nil : RegionsRel L [] []
   | cons {ps ot os rt rs} : OpsRel L ot os → RegionsRel L rt rs →
       RegionsRel L (.mk ps ot :: rt) (.mk ps os :: rs)
 
-/-- Op lists that are the same except where `L` relates a target sequence to a source one. -/
-inductive OpsRel (L : List Op → List Op → Prop) : List Op → List Op → Prop
+/-- Op lists that are the same except where `L` relates a target sequence to a source one. `L`
+also sees the target ops after the sequence, up to the end of the region. -/
+inductive OpsRel (L : List Op → List Op → List Op → Prop) : List Op → List Op → Prop
   | refl (l : List Op) : OpsRel L l l
   | cons {o o' t s} : OpRel L o o' → OpsRel L t s → OpsRel L (o :: t) (o' :: s)
-  | rw {pt ps t s} : L pt ps → OpsRel L t s → OpsRel L (pt ++ t) (ps ++ s)
+  | rw {pt ps t s} : L pt ps t → OpsRel L t s → OpsRel L (pt ++ t) (ps ++ s)
 end
 
-variable {L : List Op → List Op → Prop}
+variable {L : List Op → List Op → List Op → Prop}
 
 theorem RegionsRel.refl : (rs : List Region) → RegionsRel L rs rs
   | [] => .nil
   | .mk _ _ :: rs => .cons (.refl _) (RegionsRel.refl rs)
 
-/-- Frames that are the same except for related code. -/
-inductive FrameRel (L : List Op → List Op → Prop) : Frame → Frame → Prop
-  | refl (f : Frame) : FrameRel L f f
-  | block {t s ids} : OpsRel L t s → FrameRel L (.block t ids) (.block s ids)
-  | loop {p bt bs rs loc} : RegionsRel L [bt] [bs] →
-      FrameRel L (.loop p bt rs loc) (.loop p bs rs loc)
+/-- The cases at the head of related code: both at the end, the same op up to regions, or a
+rewritten sequence. -/
+theorem OpsRel.head {t0 s0 : List Op} (h : OpsRel L t0 s0) :
+    (t0 = [] ∧ s0 = []) ∨
+    (∃ ot os t s, t0 = ot :: t ∧ s0 = os :: s ∧ OpRel L ot os ∧ OpsRel L t s) ∨
+    (∃ pt ps t s, t0 = pt ++ t ∧ s0 = ps ++ s ∧ L pt ps t ∧ OpsRel L t s) := by
+  cases h with
+  | refl =>
+    cases t0 with
+    | nil => exact .inl ⟨rfl, rfl⟩
+    | cons o l => exact .inr (.inl ⟨o, o, l, l, rfl, rfl, .refl _, .refl _⟩)
+  | cons ho hr => exact .inr (.inl ⟨_, _, _, _, rfl, rfl, ho, hr⟩)
+  | rw hl hr => exact .inr (.inr ⟨_, _, _, _, rfl, rfl, hl, hr⟩)
 
-/-- Machines with the same core whose stacks hold related code. -/
-def MRel (L : List Op → List Op → Prop) (mt ms : Machine) : Prop :=
-  mt.core = ms.core ∧ Forall2 (FrameRel L) mt.stack ms.stack
+/-! ## Related stacks -/
+
+/-- Two environments agree on every name outside `D`. -/
+def EnvAgree (D : String → Prop) (et es : Env) : Prop := ∀ n, ¬ D n → et[n]? = es[n]?
+
+theorem EnvAgree.refl (D : String → Prop) (e : Env) : EnvAgree D e e := fun _ _ => rfl
+
+theorem EnvAgree.insert {D : String → Prop} {et es : Env} (h : EnvAgree D et es) (k : String)
+    (v : RVal) : EnvAgree D (et.insert k v) (es.insert k v) := by
+  intro n hn
+  simp only [Std.HashMap.getElem?_insert]
+  split
+  · rfl
+  · exact h n hn
+
+theorem EnvAgree.bindAll {D : String → Prop} : ∀ {et es : Env}, EnvAgree D et es →
+    ∀ (rs : List Result) (vs : List RVal), EnvAgree D (et.bindAll rs vs) (es.bindAll rs vs)
+  | _, _, h, r :: rs, v :: vs => by
+    simp only [Env.bindAll]; exact EnvAgree.bindAll (h.insert r.name v) rs vs
+  | _, _, h, [], _ => by simpa [Env.bindAll] using h
+  | _, _, h, _ :: _, [] => by simpa [Env.bindAll] using h
+
+theorem EnvAgree.mono {D D' : String → Prop} {et es : Env} (h : EnvAgree D et es)
+    (hD : ∀ n, D n → D' n) : EnvAgree D' et es := fun n hn => h n fun h' => hn (hD n h')
+
+/-- Binding names changes only those names. -/
+theorem Env.getElem?_bindAll {n : String} : ∀ (env : Env) (rs : List Result) (vs : List RVal),
+    (∀ r ∈ rs, r.name ≠ n) → (env.bindAll rs vs)[n]? = env[n]?
+  | env, r :: rs, v :: vs, h => by
+    simp only [Env.bindAll]
+    rw [Env.getElem?_bindAll _ rs vs fun r' hr' => h r' (by simp [hr']),
+      Std.HashMap.getElem?_insert]
+    simp [h r (by simp)]
+  | _, [], _, _ => by simp [Env.bindAll]
+  | _, _ :: _, [], _ => by simp [Env.bindAll]
+
+/-- Frame stacks that hold related code, and whose environments agree outside hidden names that
+no target code still to run there reads. `D` is the set of names hidden at the top. -/
+inductive StackRel (L : List Op → List Op → List Op → Prop) :
+    (String → Prop) → List Frame → List Frame → Prop
+  | nil {D} : StackRel L D [] []
+  | block {D Db t s ids et es ft fs} : StackRel L Db ft fs → (∀ n, Db n → D n) →
+      OpsRel L t s → EnvAgree D et es → NoReads D t →
+      StackRel L D (.block t ids et :: ft) (.block s ids es :: fs)
+  | ifJoin {D rs loc ft fs} : StackRel L D ft fs →
+      StackRel L D (.ifJoin rs loc :: ft) (.ifJoin rs loc :: fs)
+  | loop {D p bt bs rs loc ft fs} : StackRel L D ft fs → RegionsRel L [bt] [bs] →
+      NoReads D bt.ops → StackRel L D (.loop p bt rs loc :: ft) (.loop p bs rs loc :: fs)
+  | call {D D' rs rets scopes loc ft fs} : StackRel L D' ft fs →
+      StackRel L D (.call rs rets scopes loc :: ft) (.call rs rets scopes loc :: fs)
+
+/-- Machines with the same core whose stacks hold related code and related environments. -/
+def MRel (L : List Op → List Op → List Op → Prop) (mt ms : Machine) : Prop :=
+  mt.core = ms.core ∧ ∃ D, StackRel L D mt.stack ms.stack
 
 /-- Two results of a step: the same halt, or related machines. -/
-def Lockstep (L : List Op → List Op → Prop) (rt rs : Except Halt Machine) : Prop :=
+def Lockstep (L : List Op → List Op → List Op → Prop) (rt rs : Except Halt Machine) : Prop :=
   (∃ h, rt = .error h ∧ rs = .error h) ∨ (∃ mt ms, rt = .ok mt ∧ rs = .ok ms ∧ MRel L mt ms)
 
 theorem Lockstep.halt {h : Halt} : Lockstep L (.error h) (.error h) := .inl ⟨h, rfl, rfl⟩
 
-/-! ## Frames -/
+theorem Lockstep.ok {c : Core} {D : String → Prop} {ft fs : List Frame}
+    (h : StackRel L D ft fs) : Lockstep L (.ok ⟨c, ft⟩) (.ok ⟨c, fs⟩) :=
+  .inr ⟨_, _, rfl, rfl, rfl, D, h⟩
 
-theorem Forall2.length_eq {r : α → β → Prop} :
-    ∀ {as : List α} {bs : List β}, Forall2 r as bs → as.length = bs.length
-  | [], [], _ => rfl
-  | _ :: _, _ :: _, ⟨_, h⟩ => by simp [Forall2.length_eq h]
-  | [], _ :: _, h => h.elim
-  | _ :: _, [], h => h.elim
+/-! ## Facts about related stacks -/
 
-theorem FrameRel.isProgressLoop {f f' : Frame} (h : FrameRel L f f') :
-    f.isProgressLoop = f'.isProgressLoop := by
+namespace StackRel
+
+variable {D : String → Prop} {ft fs : List Frame}
+
+/-- **Lookups of names that aren't hidden agree.** -/
+theorem lookup (h : StackRel L D ft fs) {n : String} (hn : ¬ D n) :
+    Fir.lookup n ft = Fir.lookup n fs := by
+  induction h with
+  | nil => rfl
+  | block _ hDb _ hag _ ih =>
+    simp only [Fir.lookup]
+    rw [hag n hn]
+    split
+    · rfl
+    · exact ih fun h => hn (hDb n h)
+  | ifJoin _ ih => exact ih hn
+  | loop _ _ _ ih => exact ih hn
+  | call => rfl
+
+theorem operandIn (h : StackRel L D ft fs) (loc : Option Loc) {a : Operand}
+    (ha : ∀ n, D n → a.reads n = false) : Fir.operandIn ft loc a = Fir.operandIn fs loc a := by
+  cases a with
+  | var n =>
+    have hn : ¬ D n := fun hd => by simp [Operand.reads] at ha; exact ha n hd rfl
+    simp only [Fir.operandIn, h.lookup hn]
+  | hole => rfl
+
+/-- Operands that read no hidden name have the same values. -/
+theorem operands (h : StackRel L D ft fs) (loc : Option Loc) :
+    ∀ {args : List Operand}, (∀ n, D n → args.any (Operand.reads n) = false) →
+      Fir.operands ft loc args = Fir.operands fs loc args
+  | [], _ => rfl
+  | a :: args, ha => by
+    have h1 : ∀ n, D n → a.reads n = false := fun n hn => by have := ha n hn; simp_all
+    have h2 : ∀ n, D n → args.any (Operand.reads n) = false := fun n hn => by
+      have := ha n hn; simp_all
+    have := h.operands loc h2
+    simp only [Fir.operands, List.mapM_cons] at this ⊢
+    rw [h.operandIn loc h1, this]
+
+theorem tail {f f' : Frame} (h : StackRel L D (f :: ft) (f' :: fs)) : ∃ D', StackRel L D' ft fs := by
   cases h with
-  | refl => rfl
-  | block => rfl
-  | loop => rename_i p _ _ _ _ _; cases p <;> rfl
+  | block h => exact ⟨_, h⟩
+  | ifJoin h => exact ⟨_, h⟩
+  | loop h => exact ⟨_, h⟩
+  | call h => exact ⟨_, h⟩
 
-theorem shape_eq {ft fs : List Frame} (h : Forall2 (FrameRel L) ft fs) :
+theorem length_eq (h : StackRel L D ft fs) : ft.length = fs.length := by
+  induction h <;> simp_all
+
+theorem shape (h : StackRel L D ft fs) :
     ft.map Frame.isProgressLoop = fs.map Frame.isProgressLoop := by
-  induction ft generalizing fs with
-  | nil => cases fs <;> simp_all [Forall2]
-  | cons f ft ih =>
-    cases fs with
-    | nil => exact h.elim
-    | cons f' fs => simp [h.1.isProgressLoop, ih h.2]
+  induction h with
+  | @loop _ p _ _ _ _ _ _ _ _ _ ih => cases p <;> simp_all [Frame.isProgressLoop]
+  | _ => simp_all [Frame.isProgressLoop]
 
-theorem blockIds_eq {ft fs : List Frame} (h : Forall2 (FrameRel L) ft fs) :
-    blockIds ft = blockIds fs := by
-  induction ft generalizing fs with
-  | nil => cases fs <;> simp_all [Forall2]
-  | cons f ft ih =>
-    cases fs with
-    | nil => exact h.elim
-    | cons f' fs =>
-      obtain ⟨hf, h⟩ := h
-      cases hf with
-      | refl => cases f <;> simp [blockIds, ih h]
-      | block => simp [blockIds, ih h]
-      | loop => simp [blockIds, ih h]
+theorem blockIds (h : StackRel L D ft fs) : Fir.blockIds ft = Fir.blockIds fs := by
+  induction h <;> simp_all [Fir.blockIds]
 
-theorem splitStack_eq {α : Type} {pick : Frame → Option α} (XR : α → α → Prop)
-    (hpick : ∀ f f', FrameRel L f f' → Option.Rel XR (pick f) (pick f'))
-    (hcall : ∀ f f', FrameRel L f f' → f.isCall = f'.isCall) :
-    ∀ {ft fs : List Frame}, Forall2 (FrameRel L) ft fs →
-      Option.Rel (fun x y => Forall2 (FrameRel L) x.1 y.1 ∧ XR x.2.1 y.2.1 ∧
-        Forall2 (FrameRel L) x.2.2 y.2.2) (splitStack pick ft) (splitStack pick fs)
-  | [], [], _ => .none
-  | f :: ft, f' :: fs, ⟨hf, h⟩ => by
-    simp only [splitStack]
-    have hrel := hpick f f' hf
-    cases hp : pick f <;> cases hp' : pick f' <;> rw [hp, hp'] at hrel <;> cases hrel
-    · rw [hcall f f' hf]
-      cases f'.isCall
-      · simp only [Bool.false_eq_true, ite_false]
-        have ih := splitStack_eq XR hpick hcall h
-        revert ih
-        generalize splitStack pick ft = x
-        generalize splitStack pick fs = y
-        intro ih
-        cases ih with
-        | none => exact .none
-        | some hxy => exact .some ⟨⟨hf, hxy.1⟩, hxy.2⟩
-      · simp only [ite_true]
-        exact .none
-    · rename_i hxy
-      exact .some ⟨trivial, hxy, h⟩
-  | [], _ :: _, h => h.elim
-  | _ :: _, [], h => h.elim
+theorem bindTop (h : StackRel L D ft fs) (rs : List Result) (vs : List RVal) :
+    StackRel L D (Fir.bindTop rs vs ft) (Fir.bindTop rs vs fs) := by
+  cases h with
+  | nil => exact .nil
+  | block h hDb ho hag hnr => exact .block h hDb ho (hag.bindAll rs vs) hnr
+  | ifJoin h => exact .ifJoin h
+  | loop h hb hnr => exact .loop h hb hnr
+  | call h => exact .call h
 
-abbrev LoopSplit := List Frame × (Bool × Region × List Result × Option Loc) × List Frame
+theorem addAllocId (h : StackRel L D ft fs) (id : Nat) :
+    StackRel L D (Fir.addAllocId id ft) (Fir.addAllocId id fs) := by
+  cases h with
+  | nil => exact .nil
+  | block h hDb ho hag hnr => exact .block h hDb ho hag hnr
+  | ifJoin h => exact .ifJoin h
+  | loop h hb hnr => exact .loop h hb hnr
+  | call h => exact .call h
 
-abbrev CallSplit := List Frame × (Env × List Result × List Ty × List Nat × Option Loc) × List Frame
+/-- A new block on top, holding related code that reads no hidden name, with the same
+environment on both sides. -/
+theorem push {t s : List Op} (h : StackRel L D ft fs) (ho : OpsRel L t s) (hnr : NoReads D t)
+    (ids : List Nat) (env : Env) : StackRel L D (.block t ids env :: ft) (.block s ids env :: fs) :=
+  .block h (fun _ x => x) ho (EnvAgree.refl _ _) hnr
 
-theorem splitStack_loop {ft fs : List Frame} (h : Forall2 (FrameRel L) ft fs) :
-    Option.Rel (fun (x y : LoopSplit) => Forall2 (FrameRel L) x.1 y.1 ∧
-      (x.2.1.1 = y.2.1.1 ∧ RegionsRel L [x.2.1.2.1] [y.2.1.2.1] ∧ x.2.1.2.2 = y.2.1.2.2) ∧
-      Forall2 (FrameRel L) x.2.2 y.2.2) (splitStack pickLoop ft) (splitStack pickLoop fs) :=
-  splitStack_eq (fun (x y : Bool × Region × List Result × Option Loc) =>
-      x.1 = y.1 ∧ RegionsRel L [x.2.1] [y.2.1] ∧ x.2.2 = y.2.2)
-    (fun f f' hf => by
-      cases hf with
-      | refl f =>
-        cases f with
-        | loop p body rs loc => exact .some ⟨rfl, RegionsRel.refl _, rfl⟩
-        | _ => exact .none
-      | block => exact .none
-      | loop hb => exact .some ⟨rfl, hb, rfl⟩)
-    (fun f f' hf => by cases hf <;> rfl) h
+/-- Where `cf.break` and `cf.continue` go: the same loop on both sides, with related frames
+below it. -/
+theorem splitLoop (h : StackRel L D ft fs) :
+    (splitStack pickLoop ft = none ∧ splitStack pickLoop fs = none) ∨
+    ∃ at' as' p bt bs rs loc bt' bs' D', splitStack pickLoop ft = some (at', (p, bt, rs, loc), bt') ∧
+      splitStack pickLoop fs = some (as', (p, bs, rs, loc), bs') ∧
+      Fir.blockIds at' = Fir.blockIds as' ∧
+      StackRel L D' (.loop p bt rs loc :: bt') (.loop p bs rs loc :: bs') := by
+  induction h with
+  | nil => exact .inl ⟨rfl, rfl⟩
+  | @block D Db t s ids et es ft fs _ _ _ _ _ ih =>
+    simp only [splitStack, pickLoop, Frame.isCall, Bool.false_eq_true, ite_false]
+    rcases ih with ⟨e1, e2⟩ | ⟨at', as', p, bt, bs, rs, loc, bt', bs', D', e1, e2, hids, hr⟩
+    · exact .inl ⟨by rw [e1]; rfl, by rw [e2]; rfl⟩
+    · exact .inr ⟨_, _, p, bt, bs, rs, loc, bt', bs', D', by rw [e1]; rfl, by rw [e2]; rfl,
+        by simp [Fir.blockIds, hids], hr⟩
+  | ifJoin _ ih =>
+    simp only [splitStack, pickLoop, Frame.isCall, Bool.false_eq_true, ite_false]
+    rcases ih with ⟨e1, e2⟩ | ⟨at', as', p, bt, bs, rs, loc, bt', bs', D', e1, e2, hids, hr⟩
+    · exact .inl ⟨by rw [e1]; rfl, by rw [e2]; rfl⟩
+    · exact .inr ⟨_, _, p, bt, bs, rs, loc, bt', bs', D', by rw [e1]; rfl, by rw [e2]; rfl,
+        by simp [Fir.blockIds, hids], hr⟩
+  | loop h hb hnr _ =>
+    exact .inr ⟨[], [], _, _, _, _, _, _, _, _, rfl, rfl, rfl, .loop h hb hnr⟩
+  | call => exact .inl ⟨rfl, rfl⟩
 
-theorem splitStack_call {ft fs : List Frame} (h : Forall2 (FrameRel L) ft fs) :
-    Option.Rel (fun (x y : CallSplit) => Forall2 (FrameRel L) x.1 y.1 ∧ x.2.1 = y.2.1 ∧
-      Forall2 (FrameRel L) x.2.2 y.2.2) (splitStack pickCall ft) (splitStack pickCall fs) :=
-  splitStack_eq Eq
-    (fun f f' hf => by
-      cases hf with
-      | refl f => cases pickCall f <;> constructor <;> rfl
-      | block => exact .none
-      | loop => exact .none)
-    (fun f f' hf => by cases hf <;> rfl) h
+/-- Where `func.ret` goes: the same call on both sides, with related frames below it. -/
+theorem splitCall (h : StackRel L D ft fs) :
+    (splitStack pickCall ft = none ∧ splitStack pickCall fs = none) ∨
+    ∃ at' as' x bt' bs' D', splitStack pickCall ft = some (at', x, bt') ∧
+      splitStack pickCall fs = some (as', x, bs') ∧
+      Fir.blockIds at' = Fir.blockIds as' ∧ StackRel L D' bt' bs' := by
+  induction h with
+  | nil => exact .inl ⟨rfl, rfl⟩
+  | block _ _ _ _ _ ih =>
+    simp only [splitStack, pickCall, Frame.isCall, Bool.false_eq_true, ite_false]
+    rcases ih with ⟨e1, e2⟩ | ⟨at', as', x, bt', bs', D', e1, e2, hids, hr⟩
+    · exact .inl ⟨by rw [e1]; rfl, by rw [e2]; rfl⟩
+    · exact .inr ⟨_, _, x, bt', bs', D', by rw [e1]; rfl, by rw [e2]; rfl,
+        by simp [Fir.blockIds, hids], hr⟩
+  | ifJoin _ ih =>
+    simp only [splitStack, pickCall, Frame.isCall, Bool.false_eq_true, ite_false]
+    rcases ih with ⟨e1, e2⟩ | ⟨at', as', x, bt', bs', D', e1, e2, hids, hr⟩
+    · exact .inl ⟨by rw [e1]; rfl, by rw [e2]; rfl⟩
+    · exact .inr ⟨_, _, x, bt', bs', D', by rw [e1]; rfl, by rw [e2]; rfl,
+        by simp [Fir.blockIds, hids], hr⟩
+  | loop _ _ _ ih =>
+    simp only [splitStack, pickCall, Frame.isCall, Bool.false_eq_true, ite_false]
+    rcases ih with ⟨e1, e2⟩ | ⟨at', as', x, bt', bs', D', e1, e2, hids, hr⟩
+    · exact .inl ⟨by rw [e1]; rfl, by rw [e2]; rfl⟩
+    · exact .inr ⟨_, _, x, bt', bs', D', by rw [e1]; rfl, by rw [e2]; rfl,
+        by simp [Fir.blockIds, hids], hr⟩
+  | call h => exact .inr ⟨[], [], _, _, _, _, rfl, rfl, rfl, h⟩
+
+end StackRel
 
 /-! ## Core computations -/
 
@@ -169,370 +344,394 @@ theorem lockstep_exec {xt xs : Machine} {c : CM α} {kt ks : α × Machine → E
   | error h => exact .halt
   | ok p => exact hk p.1 p.2
 
-/-- The result of a core computation run on related machines, then returned. -/
-theorem Forall2.cons' {r : α → β → Prop} {a : α} {b : β} {as : List α} {bs : List β}
-    (h : r a b) (hs : Forall2 r as bs) : Forall2 r (a :: as) (b :: bs) := ⟨h, hs⟩
+/-- Running the same `Except` computation, then continuing on related machines. -/
+theorem lockstep_bind {x : Except Halt α} {kt ks : α → Except Halt Machine}
+    (hk : ∀ a, Lockstep L (kt a) (ks a)) : Lockstep L (x >>= kt) (x >>= ks) := by
+  cases x with
+  | error h => exact .halt
+  | ok a => exact hk a
 
-theorem MRel.mk' {mt ms : Machine} (hc : mt.core = ms.core)
-    (hst : Forall2 (FrameRel L) mt.stack ms.stack) : MRel L mt ms := ⟨hc, hst⟩
+theorem bindResults_eq {c : Core} {D : String → Prop} {ft fs : List Frame}
+    (h : StackRel L D ft fs) (loc : Option Loc) (rs : List Result) (vs : List RVal) :
+    Lockstep L (Machine.bindResults ⟨c, ft⟩ loc rs vs) (Machine.bindResults ⟨c, fs⟩ loc rs vs) := by
+  unfold Machine.bindResults
+  refine lockstep_exec rfl fun _ core => ?_
+  exact Lockstep.ok (h.bindTop rs vs)
 
-theorem lockstep_exec_pure {xt xs : Machine} {c : CM α} (hc : xt.core = xs.core)
-    (hst : Forall2 (FrameRel L) xt.stack xs.stack) :
-    Lockstep L (xt.exec c >>= fun r => pure r.2) (xs.exec c >>= fun r => pure r.2) :=
-  lockstep_exec hc fun _ _ => .inr ⟨_, _, rfl, rfl, rfl, hst⟩
-
-theorem enterBody_eq {mt ms : Machine} (hR : MRel L mt ms) (loc : Option Loc) {bt bs : Region}
-    (hb : RegionsRel L [bt] [bs]) (vs : List RVal) :
-    Lockstep L (enterBody mt loc bt vs) (enterBody ms loc bs vs) := by
-  obtain ⟨hc, hst⟩ := hR
+theorem enterBody_eq {c : Core} {D : String → Prop} {ft fs : List Frame}
+    (h : StackRel L D ft fs) (loc : Option Loc) {bt bs : Region} (hb : RegionsRel L [bt] [bs])
+    (hnr : NoReads D bt.ops) (vs : List RVal) :
+    Lockstep L (enterBody ⟨c, ft⟩ loc bt vs) (enterBody ⟨c, fs⟩ loc bs vs) := by
   cases hb with
   | cons hops _ =>
     unfold enterBody
-    refine lockstep_exec (by exact hc) ?_
-    intro _ core
-    exact .inr ⟨_, _, rfl, rfl, MRel.mk' rfl (Forall2.cons' (.block hops) hst)⟩
+    refine lockstep_exec rfl fun _ core => ?_
+    exact Lockstep.ok (h.push hops hnr _ _)
 
 /-! ## Control flow -/
 
-theorem terminate_eq {mt ms : Machine} (hR : MRel L mt ms) (loc : Option Loc) (k : OpKind)
-    (vs : List RVal) : Lockstep L (terminate mt loc k vs) (terminate ms loc k vs) := by
-  obtain ⟨hc, hst⟩ := hR
+theorem terminate_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : StackRel L D ft fs)
+    (loc : Option Loc) (k : OpKind) (vs : List RVal) :
+    Lockstep L (terminate ⟨c, ft⟩ loc k vs) (terminate ⟨c, fs⟩ loc k vs) := by
   cases k
   case yield =>
     unfold terminate
-    cases ht : mt.stack with
-    | nil =>
-      cases hs : ms.stack with
-      | nil => exact .halt
-      | cons => rw [ht, hs] at hst; exact hst.elim
-    | cons f rt =>
-      cases hs : ms.stack with
-      | nil => rw [ht, hs] at hst; exact hst.elim
-      | cons f' rs =>
-        rw [ht, hs] at hst
-        obtain ⟨hf, hrest⟩ := hst
-        cases hf with
-        | refl f =>
-          cases f with
-          | ifJoin rs' loc' => exact lockstep_exec_pure (xt := { mt with stack := rt }) hc hrest
-          | _ => exact .halt
-        | block => exact .halt
-        | loop => exact .halt
+    cases h with
+    | ifJoin h => exact bindResults_eq h _ _ _
+    | nil => exact .halt
+    | block => exact .halt
+    | loop => exact .halt
+    | call => exact .halt
   case brk =>
     unfold terminate
-    have hsp := splitStack_loop hst
-    revert hsp
-    cases splitStack pickLoop mt.stack <;> cases splitStack pickLoop ms.stack <;> intro hsp
-    · exact .halt
-    · cases hsp
-    · cases hsp
-    · rename_i x y
-      obtain ⟨above, ⟨p, body, rs, loc'⟩, below⟩ := x
-      obtain ⟨above', ⟨p', body', rs', loc''⟩, below'⟩ := y
-      cases hsp with
-      | some hxy =>
-        obtain ⟨habove, ⟨-, -, he⟩, hbelow⟩ := hxy
-        simp only [Prod.mk.injEq] at he
-        obtain ⟨rfl, rfl⟩ := he
-        simp only
-        rw [blockIds_eq habove]
-        exact lockstep_exec_pure hc hbelow
+    rcases h.splitLoop with ⟨e1, e2⟩ | ⟨at', as', p, bt, bs, rs, loc', bt', bs', D', e1, e2, hids, hr⟩
+    · simp only [e1, e2]; exact .halt
+    · simp only [e1, e2, hids]
+      refine lockstep_exec rfl fun _ core => ?_
+      obtain ⟨_, hr⟩ := hr.tail
+      exact bindResults_eq hr _ _ _
   case cont =>
     unfold terminate
-    have hsp := splitStack_loop hst
-    revert hsp
-    cases splitStack pickLoop mt.stack <;> cases splitStack pickLoop ms.stack <;> intro hsp
-    · exact .halt
-    · cases hsp
-    · cases hsp
-    · rename_i x y
-      obtain ⟨above, ⟨p, body, rs, loc'⟩, below⟩ := x
-      obtain ⟨above', ⟨p', body', rs', loc''⟩, below'⟩ := y
-      cases hsp with
-      | some hxy =>
-        obtain ⟨habove, ⟨hp, hb, he⟩, hbelow⟩ := hxy
-        simp only [Prod.mk.injEq] at he
-        obtain ⟨rfl, rfl⟩ := he
-        dsimp only at hp
-        subst hp
-        simp only
-        rw [blockIds_eq habove]
-        refine lockstep_exec (by exact hc) ?_
-        intro _ core
-        refine enterBody_eq ?_ loc hb vs
-        exact MRel.mk' rfl (Forall2.cons' (.loop hb) hbelow)
+    rcases h.splitLoop with ⟨e1, e2⟩ | ⟨at', as', p, bt, bs, rs, loc', bt', bs', D', e1, e2, hids, hr⟩
+    · simp only [e1, e2]; exact .halt
+    · simp only [e1, e2, hids]
+      refine lockstep_exec rfl fun _ core => ?_
+      cases hr with
+      | loop h0 hb hnr => exact enterBody_eq (.loop h0 hb hnr) loc hb hnr vs
   case ret =>
     unfold terminate
-    have hsp := splitStack_call hst
-    revert hsp
-    cases splitStack pickCall mt.stack <;> cases splitStack pickCall ms.stack <;> intro hsp
-    · exact .halt
-    · cases hsp
-    · cases hsp
-    · rename_i x y
-      obtain ⟨above, info, below⟩ := x
-      obtain ⟨above', info', below'⟩ := y
-      cases hsp with
-      | some hxy =>
-        obtain ⟨habove, rfl, hbelow⟩ := hxy
-        obtain ⟨saved, rs, rets, scopes, loc'⟩ := info
-        simp only
+    rcases h.splitCall with ⟨e1, e2⟩ | ⟨at', as', x, bt', bs', D', e1, e2, hids, hr⟩
+    · simp only [e1, e2]; exact .halt
+    · obtain ⟨rs, rets, scopes, loc'⟩ := x
+      simp only [e1, e2, hids]
+      split
+      · exact .halt
+      · refine lockstep_exec rfl fun _ core => ?_
+        simp only [List.isEmpty_iff_length_eq_zero, hr.length_eq]
         split
         · exact .halt
-        · rw [blockIds_eq habove]
-          refine lockstep_exec (by exact hc) ?_
-          intro _ core
-          simp only [Forall2.length_eq hbelow, List.isEmpty_iff_length_eq_zero]
-          split
-          · exact .halt
-          · exact lockstep_exec_pure rfl hbelow
+        · exact bindResults_eq hr _ _ _
   all_goals exact .halt
 
-theorem addAllocId_eq {ft fs : List Frame} (h : Forall2 (FrameRel L) ft fs) (id : Nat) :
-    Forall2 (FrameRel L) (addAllocId id ft) (addAllocId id fs) := by
-  cases ft with
-  | nil => cases fs with
-    | nil => trivial
-    | cons => exact h.elim
-  | cons f rt =>
-    cases fs with
-    | nil => exact h.elim
-    | cons f' rs =>
-      obtain ⟨hf, hrest⟩ := h
-      cases hf with
-      | refl f => cases f <;> exact Forall2.cons' (.refl _) hrest
-      | block hops => exact Forall2.cons' (.block hops) hrest
-      | loop hb => exact Forall2.cons' (.loop hb) hrest
-
-theorem execFlat_eq {mt ms : Machine} (hR : MRel L mt ms) (kind : OpKind) (results : List Result)
-    (args : List Operand) (loc : Option Loc) :
-    Lockstep L (execFlat mt kind results args loc) (execFlat ms kind results args loc) := by
-  obtain ⟨hc, hst⟩ := hR
+/-- An op without regions, with the current block (the op removed) on top of related stacks. -/
+theorem execFlat_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : StackRel L D ft fs)
+    (kind : OpKind) (results : List Result) {args : List Operand}
+    (hargs : ∀ n, D n → args.any (Operand.reads n) = false) (loc : Option Loc) :
+    Lockstep L (execFlat ⟨c, ft⟩ kind results args loc) (execFlat ⟨c, fs⟩ kind results args loc) := by
   unfold execFlat
   cases kind.callee? with
   | some callee =>
-    simp only
-    refine lockstep_exec (by exact hc) ?_
-    intro vs core
-    simp only
-    cases core.funcs[callee]? with
+    simp only [h.operands loc hargs]
+    refine lockstep_bind fun vs => ?_
+    cases c.funcs[callee]? with
     | none => exact .halt
     | some f =>
-      simp only
-      refine lockstep_exec rfl ?_
-      intro _ core'
-      exact .inr ⟨_, _, rfl, rfl, MRel.mk' rfl
-        (Forall2.cons' (.refl _) (Forall2.cons' (.refl _) hst))⟩
+      refine lockstep_exec rfl fun _ core => ?_
+      exact Lockstep.ok ((StackRel.call (D := fun _ => False) h).push (.refl _) (fun _ x => x.elim) _ _)
   | none =>
   cases kind.stackAlloc? with
   | some sa =>
-    simp only
-    refine lockstep_exec (by exact hc) ?_
-    intro p core
-    exact .inr ⟨_, _, rfl, rfl, MRel.mk' rfl (addAllocId_eq hst _)⟩
+    refine lockstep_exec rfl fun _ core => ?_
+    exact Lockstep.ok ((h.addAllocId _).bindTop _ _)
   | none =>
   simp only
   split
-  · refine lockstep_exec (by exact hc) ?_
-    intro vs core
-    simp only
-    cases ht : mt.stack with
-    | nil =>
-      cases hs : ms.stack with
-      | nil =>
-        refine terminate_eq ?_ loc kind vs
-        exact MRel.mk' rfl trivial
-      | cons => rw [ht, hs] at hst; exact hst.elim
-    | cons f rt =>
-      cases hs : ms.stack with
-      | nil => rw [ht, hs] at hst; exact hst.elim
-      | cons f' rs =>
-        rw [ht, hs] at hst
-        obtain ⟨hf, hrest⟩ := hst
-        simp only
-        rw [blockIds_eq (Forall2.cons' hf (show Forall2 (FrameRel L) [] [] from trivial))]
-        refine lockstep_exec rfl ?_
-        intro _ core'
-        refine terminate_eq ?_ loc kind vs
-        exact MRel.mk' rfl hrest
-  · exact lockstep_exec_pure hc hst
+  · simp only [h.operands loc hargs]
+    refine lockstep_bind fun vs => ?_
+    cases h with
+    | nil => exact terminate_eq (D := D) .nil loc kind vs
+    | block h' =>
+      simp only [blockIds, List.append_nil]
+      refine lockstep_exec rfl fun _ core => ?_
+      exact terminate_eq h' loc kind vs
+    | ifJoin h' =>
+      refine lockstep_exec rfl fun _ core => ?_
+      exact terminate_eq h' loc kind vs
+    | loop h' =>
+      refine lockstep_exec rfl fun _ core => ?_
+      exact terminate_eq h' loc kind vs
+    | call h' =>
+      refine lockstep_exec rfl fun _ core => ?_
+      exact terminate_eq h' loc kind vs
+  · simp only [h.operands loc hargs]
+    refine lockstep_bind fun vs => ?_
+    refine lockstep_exec rfl fun _ core => ?_
+    exact Lockstep.ok (h.bindTop _ _)
 
-theorem execOp_eq {mt ms : Machine} (hR : MRel L mt ms) {ot os : Op} (ho : OpRel L ot os) :
-    Lockstep L (execOp mt ot) (execOp ms os) := by
+/-- An op, with the current block (the op removed) on top of related stacks. -/
+theorem execOp_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : StackRel L D ft fs)
+    {ot os : Op} (ho : OpRel L ot os) (hr : ∀ n, D n → ot.reads n = false) :
+    Lockstep L (execOp ⟨c, ft⟩ ot) (execOp ⟨c, fs⟩ os) := by
   obtain ⟨k, res, args, rt, rs, loc, hreg, rfl, rfl⟩ :
       ∃ k res args rt rs loc, RegionsRel L rt rs ∧ ot = .mk k res args rt loc ∧
         os = .mk k res args rs loc := by
     cases ho with
     | refl => cases ot; exact ⟨_, _, _, _, _, _, RegionsRel.refl _, rfl, rfl⟩
     | regions h => exact ⟨_, _, _, _, _, _, h, rfl, rfl⟩
-  obtain ⟨hc, hst⟩ := hR
+  obtain ⟨hargs, hregs⟩ := Op.reads_mk hr
   rcases hreg with _ | ⟨hops1, _ | ⟨hops2, _ | ⟨hops3, hrest⟩⟩⟩
-  · exact execFlat_eq (MRel.mk' hc hst) k res args loc
+  · exact execFlat_eq h k res hargs loc
   · simp only [execOp]
     cases k.loopProgress? with
     | none => exact .halt
     | some p =>
-      simp only
-      refine lockstep_exec (by exact hc) ?_
-      intro vs core
-      refine enterBody_eq ?_ loc (.cons hops1 .nil) vs
-      exact MRel.mk' rfl (Forall2.cons' (.loop (.cons hops1 .nil)) hst)
+      simp only [h.operands loc hargs]
+      refine lockstep_bind fun vs => ?_
+      refine enterBody_eq (.loop h (.cons hops1 .nil) ?_) loc (.cons hops1 .nil) ?_ vs <;>
+      · intro n hn; have := hregs n hn; simp_all [regionsReads, Region.ops]
   · simp only [execOp]
     split
-    · refine lockstep_exec (by exact hc) ?_
-      intro c core
-      cases c with
+    · simp only [h.operands loc hargs]
+      refine lockstep_bind fun vs => ?_
+      refine lockstep_exec rfl fun x core => ?_
+      cases x with
       | poison => exact .halt
       | bits b =>
-        refine .inr ⟨_, _, rfl, rfl, MRel.mk' rfl (Forall2.cons' ?_ (Forall2.cons' (.refl _) hst))⟩
+        have hj := StackRel.ifJoin (rs := res) (loc := loc) h
         by_cases hb : b = 1
-        · simp only [hb, ite_true]; exact .block hops1
-        · simp only [hb, ite_false]; exact .block hops2
+        · simp only [hb, ite_true]
+          refine Lockstep.ok (hj.push hops1 (fun n hn => ?_) _ _)
+          have := hregs n hn; simp_all [regionsReads]
+        · simp only [hb, ite_false]
+          refine Lockstep.ok (hj.push hops2 (fun n hn => ?_) _ _)
+          have := hregs n hn; simp_all [regionsReads]
     · exact .halt
   · exact .halt
 
-/-- A step from machines whose next ops are related (or both at the end of a block) gives the
-same halt or related machines. A step at the start of a rewritten sequence is not covered: that
-is what each rewrite's proof handles. -/
-theorem step_eq {mt ms : Machine} (hR : MRel L mt ms)
-    (hhead : ∀ ot t ids rt, mt.stack = .block (ot :: t) ids :: rt →
-      ∃ os s rs, ms.stack = .block (os :: s) ids :: rs ∧ OpRel L ot os ∧ OpsRel L t s)
-    (hnil : ∀ ids rt, mt.stack = .block [] ids :: rt → ∃ rs, ms.stack = .block [] ids :: rs) :
-    Lockstep L (step mt) (step ms) := by
-  obtain ⟨hc, hst⟩ := hR
-  cases ht : mt.stack with
-  | nil =>
-    cases hs : ms.stack with
-    | nil => simp only [step, ht, hs]; exact .halt
-    | cons => rw [ht, hs] at hst; exact hst.elim
-  | cons f rt =>
-    cases hs : ms.stack with
-    | nil => rw [ht, hs] at hst; exact hst.elim
-    | cons f' rs =>
-      have hst' := hst
-      rw [ht, hs] at hst'
-      obtain ⟨hf, hrest⟩ := hst'
-      cases f with
-      | block ops ids =>
-        cases ops with
-        | nil =>
-          obtain ⟨rs', hs'⟩ := hnil ids rt ht
-          rw [hs] at hs'
-          simp only [List.cons.injEq] at hs'
-          obtain ⟨rfl, rfl⟩ := hs'
-          simp only [step, ht, hs]
-          refine lockstep_exec (by exact hc) ?_
-          intro _ core
-          refine terminate_eq ?_ none .yield []
-          exact MRel.mk' rfl hrest
-        | cons ot t =>
-          obtain ⟨os, s, rs', hs', ho, hops⟩ := hhead ot t ids rt ht
-          rw [hs] at hs'
-          simp only [List.cons.injEq] at hs'
-          obtain ⟨rfl, rfl⟩ := hs'
-          simp only [step, ht, hs]
-          refine execOp_eq ?_ ho
-          exact MRel.mk' hc (Forall2.cons' (.block hops) hrest)
-      | _ =>
-        cases hf <;> (simp only [step, ht, hs]; exact .halt)
+/-- The step from related machines whose top blocks are not at a rewritten sequence. -/
+theorem step_eq {c : Core} {D Db : String → Prop} {t0 s0 : List Op} {ids : List Nat}
+    {et es : Env} {ft fs : List Frame} (h : StackRel L Db ft fs) (hDb : ∀ n, Db n → D n)
+    (hag : EnvAgree D et es) (hnr : NoReads D t0)
+    (hhead : (t0 = [] ∧ s0 = []) ∨
+      (∃ ot os t s, t0 = ot :: t ∧ s0 = os :: s ∧ OpRel L ot os ∧ OpsRel L t s)) :
+    Lockstep L (step ⟨c, .block t0 ids et :: ft⟩) (step ⟨c, .block s0 ids es :: fs⟩) := by
+  rcases hhead with ⟨rfl, rfl⟩ | ⟨ot, os, t, s, rfl, rfl, ho, hts⟩
+  · simp only [step]
+    refine lockstep_exec rfl fun _ core => ?_
+    exact terminate_eq h none .yield []
+  · simp only [step]
+    obtain ⟨hr, hnr'⟩ := hnr.cons
+    exact execOp_eq (.block h hDb hts hag hnr') ho hr
 
-/-! ## Steps that run the same core computation -/
+/-! ## Simulation steps -/
 
-theorem execOp_simple (m : Machine) (k : OpKind) (res : List Result) (args : List Operand)
-    (loc : Option Loc) (h1 : k.callee? = none) (h2 : k.stackAlloc? = none)
-    (h3 : k.isTerminator = false) :
-    execOp m (.mk k res args [] loc) =
-      match simpleOp loc k res args m.core with
-      | .ok (_, core) => .ok { m with core }
-      | .error h => .error h := by
-  simp only [execOp, execFlat, h1, h2, h3, Machine.exec, StateT.run, Bool.false_eq_true, ite_false]
-  cases simpleOp loc k res args m.core with
-  | error h => rfl
-  | ok r => rfl
-
-theorem shape_cons {f f' : Frame} {rt rs : List Frame} (h : f.isProgressLoop = f'.isProgressLoop)
-    (hrest : Forall2 (FrameRel L) rt rs) :
+theorem shape_cons {f f' : Frame} {D : String → Prop} {rt rs : List Frame}
+    (h : f.isProgressLoop = f'.isProgressLoop) (hrest : StackRel L D rt rs) :
     (f :: rt).map Frame.isProgressLoop = (f' :: rs).map Frame.isProgressLoop := by
-  simp [h, shape_eq hrest]
+  simp [h, hrest.shape]
 
-/-- The machine after a core computation `x`, with stack `m`'s. -/
-def afterOp (m : Machine) : Except Halt (Unit × Core) → Except Halt Machine
-  | .ok (_, core) => .ok { m with core }
-  | .error h => .error h
+/-- A lockstep step is a simulation step, for machines whose stacks agree on `progress` loops. -/
+theorem StepMatch.of_lockstep {mt ms : Machine} (hshape : ms.shape = mt.shape)
+    (h : Lockstep L (step mt) (step ms)) : StepMatch (MRel L) mt ms := by
+  constructor
+  · intro mt' e
+    rcases h with ⟨h, e1, _⟩ | ⟨mt'', ms', e1, e2, hR'⟩
+    · rw [e] at e1; cases e1
+    · rw [e, Except.ok.injEq] at e1
+      subst e1
+      refine .inr ⟨0, ms', by rw [runSteps_one]; exact e2, hR', fun j mj hj ej => ?_⟩
+      obtain rfl : j = 0 := by omega
+      simp only [runSteps, Except.ok.injEq] at ej
+      subst ej
+      exact hshape
+  · intro ht e
+    rcases h with ⟨h, e1, e2⟩ | ⟨_, _, e1, _⟩
+    · rw [e, Except.error.injEq] at e1
+      subst e1
+      by_cases hamb : ht.behavior = .ambiguous
+      · exact .inl ⟨1, ht, by rw [runSteps_one]; exact e2, .inr hamb⟩
+      · exact .inr ⟨1, ht, by rw [runSteps_one]; exact e2, Behavior.Refines.refl _ hamb⟩
+    · rw [e] at e1; cases e1
+
+/-- A step from related machines. The machines step in lockstep, unless the target's top block
+starts a rewritten sequence: `site` handles that case, which is all a rewrite's proof has to do.
+`lift` turns the lockstep relation into the proof's own. -/
+theorem StepMatch.of_mrel {R : Machine → Machine → Prop} {mt ms : Machine} (hR : MRel L mt ms)
+    (lift : ∀ mt' k ms', runSteps (k + 1) ms = .ok ms' → MRel L mt' ms' → R mt' ms')
+    (site : ∀ D Db pt ps t s ids et es ft fs, L pt ps t → OpsRel L t s → StackRel L Db ft fs →
+      (∀ n, Db n → D n) → EnvAgree D et es → NoReads D (pt ++ t) →
+      mt.stack = .block (pt ++ t) ids et :: ft → ms.stack = .block (ps ++ s) ids es :: fs →
+      StepMatch R mt ms) :
+    StepMatch R mt ms := by
+  obtain ⟨hc, D, h⟩ := hR
+  obtain ⟨ct, stt⟩ := mt
+  obtain ⟨cs, sts⟩ := ms
+  dsimp only at hc h
+  subst hc
+  have hshape : (Machine.mk ct sts).shape = (Machine.mk ct stt).shape := h.shape.symm
+  cases h with
+  | @block D Db t0 s0 ids et es ft fs hb hDb ho hag hnr =>
+    rcases ho.head with hh | hh | ⟨pt, ps, t, s, rfl, rfl, hl, hts⟩
+    · exact (StepMatch.of_lockstep hshape (step_eq hb hDb hag hnr (.inl hh))).mono lift
+    · exact (StepMatch.of_lockstep hshape (step_eq hb hDb hag hnr (.inr hh))).mono lift
+    · exact site D Db pt ps t s ids et es ft fs hl hts hb hDb hag hnr rfl rfl
+  | nil => exact (StepMatch.of_lockstep hshape .halt).mono lift
+  | ifJoin => exact (StepMatch.of_lockstep hshape .halt).mono lift
+  | loop => exact (StepMatch.of_lockstep hshape .halt).mono lift
+  | call => exact (StepMatch.of_lockstep hshape .halt).mono lift
+
+/-- A source step that the target doesn't take, before a step match: the source runs one step
+ahead of the target. -/
+theorem StepMatch.prepend {R : Machine → Machine → Prop} {mt ms ms1 : Machine}
+    (e : step ms = .ok ms1) (hshape : ms.shape = mt.shape) (h : StepMatch R mt ms1) :
+    StepMatch R mt ms := by
+  have run1 : runSteps 1 ms = .ok ms1 := by rw [runSteps_one, e]
+  constructor
+  · intro mt' et
+    rcases h.1 mt' et with hesc | ⟨k, ms', ek, hR, hsh⟩
+    · exact .inl (hesc.back run1)
+    · refine .inr ⟨k + 1, ms', ?_, hR, fun j mj hj ej => ?_⟩
+      · rw [show k + 1 + 1 = 1 + (k + 1) by omega, runSteps_add, run1, Except.ok_bind]; exact ek
+      cases j with
+      | zero => simp only [runSteps, Except.ok.injEq] at ej; subst ej; exact hshape
+      | succ j =>
+        rw [show j + 1 = 1 + j by omega, runSteps_add, run1, Except.ok_bind] at ej
+        exact hsh j mj (by omega) ej
+  · intro ht et
+    rcases h.2 ht et with hesc | ⟨j, hs, ej, href⟩
+    · exact .inl (hesc.back run1)
+    · exact .inr ⟨1 + j, hs, by rw [runSteps_add, run1, Except.ok_bind]; exact ej, href⟩
 
 /-- One target step matched by one source step that runs the same core computation, from tops of
 the stack that differ only in code. -/
-theorem step_same {R : Machine → Machine → Prop} {mt ms mt'' ms'' : Machine} {x : Except Halt (Unit × Core)}
-    (ht : step mt = afterOp mt'' x) (hs : step ms = afterOp ms'' x)
-    (hshape : ms.shape = mt.shape)
-    (hR : ∀ u core, x = .ok (u, core) → R { mt'' with core } { ms'' with core }) :
-    StepMatch R mt ms := by
+theorem step_same {R : Machine → Machine → Prop} {mt ms : Machine} {x : Except Halt (α × Core)}
+    {ft fs : α → Core → Machine}
+    (ht : step mt = x.bind fun p => .ok (ft p.1 p.2))
+    (hs : step ms = x.bind fun p => .ok (fs p.1 p.2)) (hshape : ms.shape = mt.shape)
+    (hR : ∀ a core, x = .ok (a, core) → R (ft a core) (fs a core)) : StepMatch R mt ms := by
   cases x with
   | ok p =>
-    obtain ⟨_, core⟩ := p
     refine ⟨fun mt' e => ?_, fun h e => ?_⟩
-    · rw [ht, afterOp] at e
+    · rw [ht] at e
       cases e
-      refine .inr ⟨0, { ms'' with core }, by rw [runSteps_one, hs, afterOp], hR _ core rfl, ?_⟩
+      refine .inr ⟨0, fs p.1 p.2, by rw [runSteps_one, hs]; rfl, hR p.1 p.2 rfl, ?_⟩
       intro j mj hj ej
       obtain rfl : j = 0 := by omega
       simp only [runSteps, Except.ok.injEq] at ej
       subst ej
       exact hshape
-    · rw [ht, afterOp] at e; cases e
+    · rw [ht] at e; cases e
   | error h' =>
     refine ⟨fun mt' e => ?_, fun h e => ?_⟩
-    · rw [ht, afterOp] at e; cases e
-    · rw [ht, afterOp] at e
+    · rw [ht] at e; cases e
+    · rw [ht] at e
       cases e
       by_cases hamb : h'.behavior = .ambiguous
-      · exact .inl ⟨1, h', by rw [runSteps_one, hs, afterOp], .inr hamb⟩
-      · exact .inr ⟨1, h', by rw [runSteps_one, hs, afterOp], Behavior.Refines.refl _ hamb⟩
+      · exact .inl ⟨1, h', by rw [runSteps_one, hs]; rfl, .inr hamb⟩
+      · exact .inr ⟨1, h', by rw [runSteps_one, hs]; rfl, Behavior.Refines.refl _ hamb⟩
 
-/-- A lockstep step is a simulation step: the source takes one step. -/
-theorem StepMatch.of_lockstep {mt ms : Machine} (hR : MRel L mt ms)
-    (h : Lockstep L (step mt) (step ms)) : StepMatch (MRel L) mt ms := by
-  constructor
-  · intro mt' e
-    rcases h with ⟨h, e1, _⟩ | ⟨mt'', ms', e1, e2, hR'⟩
-    · rw [e] at e1; cases e1
-    · rw [e, Except.ok.injEq] at e1
-      subst e1
-      refine .inr ⟨0, ms', by rw [runSteps_one]; exact e2, hR', fun j mj hj ej => ?_⟩
-      obtain rfl : j = 0 := by omega
-      simp only [runSteps, Except.ok.injEq] at ej
-      subst ej
-      exact (shape_eq hR.2).symm
-  · intro ht e
-    rcases h with ⟨h, e1, e2⟩ | ⟨_, _, e1, _⟩
-    · rw [e, Except.error.injEq] at e1
-      subst e1
-      by_cases hamb : ht.behavior = .ambiguous
-      · exact .inl ⟨1, ht, by rw [runSteps_one]; exact e2, .inr hamb⟩
-      · exact .inr ⟨1, ht, by rw [runSteps_one]; exact e2, Behavior.Refines.refl _ hamb⟩
-    · rw [e] at e1; cases e1
+/-- An op without regions that is not a call, stack allocation, or terminator: evaluate its
+operands, compute on the core, bind its results in the current block. -/
+theorem execOp_simple (m : Machine) (k : OpKind) (res : List Result) (args : List Operand)
+    (loc : Option Loc) (h1 : k.callee? = none) (h2 : k.stackAlloc? = none)
+    (h3 : k.isTerminator = false) :
+    execOp m (.mk k res args [] loc) =
+      (operands m.stack loc args).bind fun vs =>
+      (simpleOp loc k res vs m.core).bind fun p =>
+      .ok { core := p.2, stack := bindTop res p.1 m.stack } := by
+  simp only [execOp, execFlat, h1, h2, h3, Machine.exec, StateT.run, Bool.false_eq_true, ite_false]
+  cases operands m.stack loc args with
+  | error h => rfl
+  | ok vs =>
+    simp only [bind, Except.bind]
+    cases simpleOp loc k res vs m.core with
+    | error h => rfl
+    | ok r => rfl
 
-/-- A lockstep step is a simulation step, for machines whose stacks agree on `progress` loops. -/
-theorem StepMatch.of_lockstep' {mt ms : Machine} (hshape : ms.shape = mt.shape)
-    (h : Lockstep L (step mt) (step ms)) : StepMatch (MRel L) mt ms := by
-  constructor
-  · intro mt' e
-    rcases h with ⟨h, e1, _⟩ | ⟨mt'', ms', e1, e2, hR'⟩
-    · rw [e] at e1; cases e1
-    · rw [e, Except.ok.injEq] at e1
-      subst e1
-      refine .inr ⟨0, ms', by rw [runSteps_one]; exact e2, hR', fun j mj hj ej => ?_⟩
-      obtain rfl : j = 0 := by omega
-      simp only [runSteps, Except.ok.injEq] at ej
-      subst ej
-      exact hshape
-  · intro ht e
-    rcases h with ⟨h, e1, e2⟩ | ⟨_, _, e1, _⟩
-    · rw [e, Except.error.injEq] at e1
-      subst e1
-      by_cases hamb : ht.behavior = .ambiguous
-      · exact .inl ⟨1, ht, by rw [runSteps_one]; exact e2, .inr hamb⟩
-      · exact .inr ⟨1, ht, by rw [runSteps_one]; exact e2, Behavior.Refines.refl _ hamb⟩
-    · rw [e] at e1; cases e1
+/-! ## Stepping simple ops -/
+
+theorem Except.bind_congr {x : Except ε α} {f g : α → Except ε β} (h : ∀ a, x = .ok a → f a = g a) :
+    x.bind f = x.bind g := by
+  cases x with
+  | error => rfl
+  | ok a => exact h a rfl
+
+/-- Binding no results changes nothing. -/
+theorem bindTop_nil (vs : List RVal) : ∀ fs : List Frame, bindTop [] vs fs = fs
+  | [] => rfl
+  | .block _ _ _ :: _ => by simp [bindTop, Env.bindAll]
+  | .ifJoin .. :: _ => rfl
+  | .loop .. :: _ => rfl
+  | .call .. :: _ => rfl
+
+/-- Lookups don't depend on the code left in a block. -/
+theorem lookup_ops (n : String) (o o' : List Op) (ids : List Nat) (env : Env) (fs : List Frame) :
+    lookup n (.block o ids env :: fs) = lookup n (.block o' ids env :: fs) := rfl
+
+theorem operandIn_ops (o o' : List Op) (ids : List Nat) (env : Env) (fs : List Frame)
+    (loc : Option Loc) (a : Operand) :
+    operandIn (.block o ids env :: fs) loc a = operandIn (.block o' ids env :: fs) loc a := by
+  cases a <;> rfl
+
+theorem operands_ops (o o' : List Op) (ids : List Nat) (env : Env) (fs : List Frame)
+    (loc : Option Loc) (args : List Operand) :
+    operands (.block o ids env :: fs) loc args = operands (.block o' ids env :: fs) loc args := by
+  simp only [operands]
+  congr 1
+
+/-- A value an operand has doesn't depend on where the op is. -/
+theorem operandIn_loc {fs : List Frame} {loc loc' : Option Loc} {a : Operand} {v : RVal}
+    (e : operandIn fs loc a = .ok v) : operandIn fs loc' a = .ok v := by
+  cases a with
+  | var x =>
+    simp only [operandIn] at e ⊢
+    split at e
+    · exact e
+    · cases e
+  | hole => cases e
+
+/-- Reading an undefined variable gets stuck. -/
+theorem operandIn_var_error {fs : List Frame} {loc : Option Loc} {x : String} {h : Halt}
+    (e : operandIn fs loc (.var x) = .error h) : h.behavior.Absorbing := by
+  simp only [operandIn] at e
+  split at e
+  · cases e
+  · cases e; trivial
+
+theorem operands_one (fs : List Frame) (loc : Option Loc) (a : Operand) :
+    operands fs loc [a] = (operandIn fs loc a).bind fun va => .ok [va] := by
+  simp only [operands, List.mapM_cons, List.mapM_nil]
+  cases operandIn fs loc a <;> rfl
+
+theorem operands_pair (fs : List Frame) (loc : Option Loc) (a b : Operand) :
+    operands fs loc [a, b] =
+      (operandIn fs loc a).bind fun va => (operandIn fs loc b).bind fun vb => .ok [va, vb] := by
+  simp only [operands, List.mapM_cons, List.mapM_nil]
+  cases operandIn fs loc a <;> cases operandIn fs loc b <;> rfl
+
+/-- The step that runs a simple op: evaluate its operands on the stack, compute on the core,
+bind its results in the current block. -/
+theorem step_simple {c : Core} {k : OpKind} {res : List Result} {args : List Operand}
+    {loc : Option Loc} {t : List Op} {ids : List Nat} {env : Env} {fs : List Frame}
+    (h1 : k.callee? = none) (h2 : k.stackAlloc? = none) (h3 : k.isTerminator = false) :
+    step ⟨c, .block (.mk k res args [] loc :: t) ids env :: fs⟩ =
+      ((operands (.block t ids env :: fs) loc args).bind fun vs => simpleOp loc k res vs c).bind
+        fun p => .ok ⟨p.2, bindTop res p.1 (.block t ids env :: fs)⟩ := by
+  simp only [step, execOp_simple _ k res args loc h1 h2 h3]
+  cases operands (.block t ids env :: fs) loc args <;> rfl
+
+/-! ## Starting a call -/
+
+/-- Calls of functions with the same parameters and return types, and related bodies, start in
+lockstep. -/
+theorem init_lockstep {mod : Module} {tgt src : Func} (hparams : tgt.params = src.params)
+    (hrets : tgt.rets = src.rets) (hops : OpsRel L tgt.body.ops src.body.ops)
+    (oracle : Nat → Int) (args : List RVal) :
+    Lockstep L (Machine.init oracle mod tgt args) (Machine.init oracle mod src args) := by
+  simp only [Machine.init, hparams, hrets, bind, Except.bind]
+  cases (enterCall none src.params args).run (Core.initial oracle mod) with
+  | error h => exact .halt
+  | ok r =>
+    exact Lockstep.ok ((StackRel.call (D := fun _ => False) (D' := fun _ => False) .nil).push hops
+      (fun _ x => x.elim) _ _)
+
+/-- Calls that start in lockstep match, for any relation that holds of lockstep machines. -/
+theorem InitMatch.of_lockstep {R : Machine → Machine → Prop} {it is : Except Halt Machine}
+    (h : Lockstep L it is) (lift : ∀ mt ms, MRel L mt ms → R mt ms) : InitMatch R it is := by
+  rcases h with ⟨h, rfl, rfl⟩ | ⟨mt, ms, rfl, rfl, hR⟩
+  · by_cases hamb : h.behavior = .ambiguous
+    · exact .inl ⟨h, rfl, .inr hamb⟩
+    · exact .inr (.inr ⟨h, h, rfl, rfl, Behavior.Refines.refl _ hamb⟩)
+  · exact .inr (.inl ⟨mt, ms, rfl, rfl, lift mt ms hR⟩)
 
 end Fir

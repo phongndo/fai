@@ -4,7 +4,7 @@ import Fir.Sim
 # The memory space is fixed for a run
 
 No step changes the core's memory space (its pointer and address sizes): every core computation
-updates other fields only. Proofs that need facts about the space, such as pointers taking at
+updates other fields only, and the control layer changes only the stack. Proofs that need facts about the space, such as pointers taking at
 least one byte, get them from the module once and keep them for the whole run.
 -/
 
@@ -12,7 +12,8 @@ namespace Fir
 
 /-- A core computation started on a core where `proj` is `v` ends on one where it is still `v`.
 The combinators below build such proofs from a computation's structure, for any part of the core
-that the computation's updates leave alone. -/
+that the computation's updates leave alone (with `proj := id`, for computations that only read
+the core). -/
 def Keeps (proj : Core → γ) (v : γ) (x : CM α) : Prop :=
   ∀ c r, proj c = v → x c = .ok r → proj r.2 = v
 
@@ -152,23 +153,15 @@ theorem keeps_freshTag (parent : Option Nat) : KeepsSpace sp (freshTag parent) :
   unfold freshTag; keeps
 macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_freshTag)
 
-theorem keeps_evalOperand (loc : Option Loc) (o : Operand) : KeepsSpace sp (evalOperand loc o) := by
-  intro c r hc e
-  simp only [evalOperand] at e
-  cases h : operandIn c.env loc o with
-  | error => rw [h] at e; cases e
-  | ok v => rw [h] at e; cases e; exact hc
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_evalOperand)
-
-theorem keeps_bindAll (loc : Option Loc) : ∀ (rs : List Result) (vs : List RVal),
-    KeepsSpace sp (bindAll loc rs vs)
-  | [], [] => by unfold bindAll; keeps
+theorem keeps_checkTypes (loc : Option Loc) : ∀ (rs : List Result) (vs : List RVal),
+    KeepsSpace sp (checkTypes loc rs vs)
+  | [], [] => by unfold checkTypes; keeps
   | r :: rs, v :: vs => by
-    unfold bindAll; keeps
-    all_goals exact keeps_bindAll loc rs vs
-  | [], _ :: _ => by unfold bindAll; keeps
-  | _ :: _, [] => by unfold bindAll; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_bindAll)
+    unfold checkTypes; keeps
+    all_goals exact keeps_checkTypes loc rs vs
+  | [], _ :: _ => by unfold checkTypes; keeps
+  | _ :: _, [] => by unfold checkTypes; keeps
+macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_checkTypes)
 
 theorem keeps_getAlloc (loc : Option Loc) (a : Nat) : KeepsSpace sp (getAlloc loc a) := by
   unfold getAlloc; keeps
@@ -267,10 +260,10 @@ theorem keeps_factHolds (loc : Option Loc) (f : Fact) (v : RVal) :
   unfold factHolds ptrFactHolds; keeps
 macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_factHolds)
 
-theorem keeps_bindResults (loc : Option Loc) (rs : List Result) (vs : List RVal) :
-    KeepsSpace sp (bindResults loc rs vs) := by
-  unfold bindResults; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_bindResults)
+theorem keeps_checkResults (loc : Option Loc) (rs : List Result) (vs : List RVal) :
+    KeepsSpace sp (checkResults loc rs vs) := by
+  unfold checkResults; keeps
+macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_checkResults)
 
 theorem keeps_asInt (loc : Option Loc) (w : Nat) (v : RVal) : KeepsSpace sp (asInt loc w v) := by
   unfold asInt; keeps
@@ -289,10 +282,15 @@ theorem keeps_evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs 
   unfold evalSimple; keeps
 macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_evalSimple)
 
-theorem keeps_simpleOp (loc : Option Loc) (k : OpKind) (rs : List Result) (args : List Operand) :
-    KeepsSpace sp (simpleOp loc k rs args) := by
+theorem keeps_simpleOp (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVal) :
+    KeepsSpace sp (simpleOp loc k rs vs) := by
   unfold simpleOp; keeps
 macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_simpleOp)
+
+theorem keeps_openScope (loc : Option Loc) (r : Result) (v : RVal) :
+    KeepsSpace sp (openScope loc r v) := by
+  unfold openScope; keeps
+macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_openScope)
 
 theorem keeps_enterCall (loc : Option Loc) (params : List Result) (vs : List RVal) :
     KeepsSpace sp (enterCall loc params vs) := by
@@ -336,6 +334,18 @@ theorem EndsIn.exec_pure {sp : SpaceCfg} {m : Machine} {x : CM α} (hm : m.core.
 theorem EndsIn.throw_bind {sp : SpaceCfg} (h : Halt) (f : α → Except Halt Machine) :
     EndsIn sp (throw h >>= f) := by intro _ e; cases e
 
+/-- A computation that doesn't touch the machine, then a continuation. -/
+theorem EndsIn.bind' {sp : SpaceCfg} {x : Except Halt α} {f : α → Except Halt Machine}
+    (hf : ∀ a, EndsIn sp (f a)) : EndsIn sp (x >>= f) := by
+  intro m' e
+  cases x with
+  | error h => cases e
+  | ok a => exact hf a m' e
+
+theorem EndsIn.bindResults {sp : SpaceCfg} {m : Machine} (hm : m.core.space = sp) (loc : Option Loc)
+    (rs : List Result) (vs : List RVal) : EndsIn sp (m.bindResults loc rs vs) :=
+  exec_bind hm (keeps_checkResults loc rs vs) fun _ _ h => ok' h
+
 /-- One step of `ends_in` that applies a lemma about a named step function. Extended below. -/
 syntax "ends_lemma" : tactic
 macro_rules | `(tactic| ends_lemma) => `(tactic| fail)
@@ -347,6 +357,8 @@ macro "ends_in" : tactic => `(tactic| repeat' (first
   | exact Fir.EndsIn.throw_bind _ _
   | exact Fir.EndsIn.ok' (by assumption)
   | refine Fir.EndsIn.exec_bind (by first | rfl | assumption) (by keeps) (fun _ _ _ => ?_)
+  | exact Fir.EndsIn.bindResults (by first | rfl | assumption) _ _ _
+  | refine Fir.EndsIn.bind' (fun _ => ?_)
   | ends_lemma
   | dsimp only
   | split))
@@ -397,6 +409,6 @@ theorem init_space {oracle : Nat → Int} {mod : Module} {f : Func} {args : List
   | ok p =>
     rw [ec] at e
     cases e
-    exact keeps_enterCall none f.params args _ p rfl ec
+    exact keeps_enterCall none f.params args _ _ rfl ec
 
 end Fir

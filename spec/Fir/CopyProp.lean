@@ -18,208 +18,29 @@ terminator, as long as none of them has regions or calls a function, and none bi
 elimination, a separate rewrite.
 
 Both machines run the same ops on the same core, so they stay in lockstep with equal cores. The
-new fact is an invariant on the environment: after the copy, `%x` and `%y` hold the same value,
-and the ops crossed don't rebind either, so reading one is reading the other.
+new fact is an invariant on the source's environment: after the copy, looking up `%x` and `%y`
+gives the same value, and the ops crossed don't rebind either, so reading one is reading the
+other.
 -/
 
 namespace Fir.CopyProp
 
-/-! ## The environment -/
+/-! ## Lookups after binding -/
 
-/-- A core computation that doesn't change the environment. -/
-abbrev KeepsEnv (e : Env) (x : CM α) : Prop := Keeps Core.env e x
+/-- Binding names in the top block changes lookups of those names only. -/
+theorem lookup_bindAll {n : String} {o : List Op} {ids : List Nat} {env : Env} {fs : List Frame}
+    {rs : List Result} {vs : List RVal} (h : ∀ r ∈ rs, r.name ≠ n) :
+    lookup n (.block o ids (env.bindAll rs vs) :: fs) = lookup n (.block o ids env :: fs) := by
+  simp only [lookup, Env.getElem?_bindAll env rs vs h]
 
-section
-variable {e : Env}
+theorem lookup_bindTop {n : String} {o : List Op} {ids : List Nat} {env : Env} {fs : List Frame}
+    {rs : List Result} {vs : List RVal} (h : ∀ r ∈ rs, r.name ≠ n) :
+    lookup n (bindTop rs vs (.block o ids env :: fs)) = lookup n (.block o ids env :: fs) :=
+  lookup_bindAll h
 
-theorem keepsEnv_choose : KeepsEnv e choose := by unfold choose; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible exact keepsEnv_choose)
-
-theorem keepsEnv_freshId (used : Nat → Bool) (keys : List Nat) :
-    KeepsEnv e (freshId used keys) := by
-  unfold freshId; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_freshId)
-
-theorem keepsEnv_freshTag (parent : Option Nat) : KeepsEnv e (freshTag parent) := by
-  unfold freshTag; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_freshTag)
-
-theorem keepsEnv_getAlloc (loc : Option Loc) (a : Nat) : KeepsEnv e (getAlloc loc a) := by
-  unfold getAlloc; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_getAlloc)
-
-theorem keepsEnv_setAlloc (a : Nat) (al : Alloc) : KeepsEnv e (setAlloc a al) := by
-  unfold setAlloc; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_setAlloc)
-
-theorem keepsEnv_realize (loc : Option Loc) (a : Nat) : KeepsEnv e (realize loc a) := by
-  unfold realize; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_realize)
-
-theorem keepsEnv_ptrAddr (loc : Option Loc) (p : Ptr) : KeepsEnv e (ptrAddr loc p) := by
-  unfold ptrAddr; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_ptrAddr)
-
-theorem keepsEnv_ptrExpose (loc : Option Loc) (p : Ptr) : KeepsEnv e (ptrExpose loc p) := by
-  unfold ptrExpose; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_ptrExpose)
-
-theorem keepsEnv_fromExposed (n : Nat) : KeepsEnv e (fromExposed n) := by
-  unfold fromExposed; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_fromExposed)
-
-theorem keepsEnv_resolve (loc : Option Loc) (p : Ptr) (n : Nat) : KeepsEnv e (resolve loc p n) := by
-  unfold resolve; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_resolve)
-
-theorem keepsEnv_access (loc : Option Loc) (p : Ptr) (n A : Nat) (w : Bool) :
-    KeepsEnv e (access loc p n A w) := by
-  intro c r hc e
-  simp only [access, bind, Except.bind, pure, Except.pure] at e
-  split at e
-  · cases e
-  · split at e
-    · cases e
-    · cases e; exact hc
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_access)
-
-theorem keepsEnv_fragToBits (loc : Option Loc) (b : Byte) : KeepsEnv e (fragToBits loc b) := by
-  unfold fragToBits; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_fragToBits)
-
-theorem keepsEnv_decodeAs (loc : Option Loc) (T : Ty) (bs : List Byte) :
-    KeepsEnv e (decodeAs loc T bs) := by
-  unfold decodeAs; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_decodeAs)
-
-theorem keepsEnv_loadC (loc : Option Loc) (T : Ty) (A : Nat) (p : Option Ptr) :
-    KeepsEnv e (loadC loc T A p) := by
-  unfold loadC; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_loadC)
-
-theorem keepsEnv_storeC (loc : Option Loc) (T : Ty) (A : Nat) (v : RVal) (p : Option Ptr) :
-    KeepsEnv e (storeC loc T A v p) := by
-  cases p with
-  | none => exact Keeps.ub' _ _ _
-  | some p =>
-    intro c r hc e
-    cases hty : v.hasTy T with
-    | false =>
-      simp [storeC, hty, halt, throw, throwThe, MonadExcept.throw, bind, Except.bind] at e
-    | true =>
-      simp only [storeC, hty, bind, Except.bind, pure, Except.pure] at e
-      cases ha : access loc p (v.encode c.space).length A true c with
-      | error => rw [ha] at e; cases e
-      | ok q => rw [ha] at e; cases e; exact keepsEnv_access loc p _ A true c q hc ha
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_storeC)
-
-theorem keepsEnv_newAlloc (loc : Option Loc) (size align : Nat) (kind : AllocKind) :
-    KeepsEnv e (newAlloc loc size align kind) := by
-  unfold newAlloc; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_newAlloc)
-
-theorem keepsEnv_freePtr (loc : Option Loc) (family : String) (p : Option Ptr) :
-    KeepsEnv e (freePtr loc family p) := by
-  unfold freePtr; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_freePtr)
-
-theorem keepsEnv_ptrView (p : Ptr) : KeepsEnv e (ptrView p) := by
-  unfold ptrView; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_ptrView)
-
-theorem keepsEnv_cmpPtrs (loc : Option Loc) (pred : Pred) (p q : Ptr) :
-    KeepsEnv e (cmpPtrs loc pred p q) := by
-  unfold cmpPtrs; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_cmpPtrs)
-
-theorem keepsEnv_factHolds (loc : Option Loc) (f : Fact) (v : RVal) :
-    KeepsEnv e (factHolds loc f v) := by
-  unfold factHolds ptrFactHolds; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_factHolds)
-
-theorem keepsEnv_asInt (loc : Option Loc) (w : Nat) (v : RVal) : KeepsEnv e (asInt loc w v) := by
-  unfold asInt; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_asInt)
-
-theorem keepsEnv_asPtr (loc : Option Loc) (v : RVal) : KeepsEnv e (asPtr loc v) := by
-  unfold asPtr; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_asPtr)
-
-theorem keepsEnv_fromOut (loc : Option Loc) (o : OpOut w) : KeepsEnv e (fromOut loc o) := by
-  unfold fromOut; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_fromOut)
-
-theorem keepsEnv_evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVal) :
-    KeepsEnv e (evalSimple loc k rs vs) := by
-  unfold evalSimple; keeps
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_evalSimple)
-
-theorem keepsEnv_evalOperand (loc : Option Loc) (o : Operand) : KeepsEnv e (evalOperand loc o) := by
-  intro c r hc e
-  simp only [evalOperand] at e
-  cases h : operandIn c.env loc o with
-  | error => rw [h] at e; cases e
-  | ok v => rw [h] at e; cases e; exact hc
-macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keepsEnv_evalOperand)
-
-end
-
-/-- A run of `x` that succeeds runs `x`, then `f` on what it gives. -/
-theorem bind_ok {x : CM α} {f : α → CM β} {c : Core} {r : β × Core}
-    (e : (x >>= f) c = .ok r) : ∃ a c', x c = .ok (a, c') ∧ f a c' = .ok r := by
-  simp only [bind, StateT.bind, Except.bind] at e
-  cases ex : x c with
-  | error h => rw [ex] at e; cases e
-  | ok p => rw [ex] at e; exact ⟨p.1, p.2, rfl, e⟩
-
-/-- Binding results changes only their names. -/
-theorem bindAll_other {loc : Option Loc} {n : String} :
-    ∀ {rs : List Result} {vs : List RVal} {c c1 : Core}, bindAll loc rs vs c = .ok ((), c1) →
-      (∀ r ∈ rs, r.name ≠ n) → c1.env[n]? = c.env[n]?
-  | [], [], _, _, e, _ => by cases e; rfl
-  | r :: rs, v :: vs, c, c1, e, h => by
-    unfold bindAll at e
-    dsimp only at e
-    split at e
-    case isFalse => obtain ⟨_, _, e1, _⟩ := bind_ok e; cases e1
-    obtain ⟨_, c'', e3, e4⟩ := bind_ok e
-    cases e3
-    rw [bindAll_other e4 fun r' hr' => h r' (by simp [hr'])]
-    simp [Std.HashMap.getElem?_insert, h r (by simp)]
-  | [], _ :: _, _, _, e, _ => by cases e
-  | _ :: _, [], _, _, e, _ => by cases e
-
-theorem bindAll_self {loc : Option Loc} {r : Result} {v : RVal} {c c1 : Core}
-    (e : bindAll loc [r] [v] c = .ok ((), c1)) : c1.env[r.name]? = some v := by
-  unfold bindAll at e
-  dsimp only at e
-  split at e
-  case isFalse => obtain ⟨_, _, e1, _⟩ := bind_ok e; cases e1
-  obtain ⟨_, c'', e3, e4⟩ := bind_ok e
-  cases e3
-  unfold bindAll at e4
-  cases e4
-  simp
-
-theorem bindResults_bindAll {loc : Option Loc} {rs : List Result} {vs : List RVal} {c c1 : Core}
-    (e : bindResults loc rs vs c = .ok ((), c1)) :
-    ∃ c', bindAll loc rs vs c = .ok ((), c') ∧ c1.env = c'.env := by
-  unfold bindResults at e
-  obtain ⟨_, c', e1, e2⟩ := bind_ok e
-  refine ⟨c', e1, ?_⟩
-  exact (by keeps : KeepsEnv c'.env _) c' _ rfl e2
-
-/-- A simple op changes the environment only at its results. -/
-theorem simpleOp_other {loc : Option Loc} {k : OpKind} {res : List Result} {args : List Operand}
-    {c c1 : Core} {n : String} (e : simpleOp loc k res args c = .ok ((), c1))
-    (h : ∀ r ∈ res, r.name ≠ n) : c1.env[n]? = c.env[n]? := by
-  unfold simpleOp at e
-  obtain ⟨vs, c2, e1, e2⟩ := bind_ok e
-  obtain ⟨out, c3, e3, e4⟩ := bind_ok e2
-  have h2 : c2.env = c.env := Keeps.mapM' (fun o => keepsEnv_evalOperand loc o) c _ rfl e1
-  have h3 : c3.env = c2.env := keepsEnv_evalSimple loc k res vs c2 _ rfl e3
-  obtain ⟨c', e5, h5⟩ := bindResults_bindAll e4
-  rw [h5, bindAll_other e5 h, h3, h2]
+theorem lookup_addAllocId {n : String} {o : List Op} {ids : List Nat} {env : Env}
+    {fs : List Frame} (a : Nat) :
+    lookup n (addAllocId a (.block o ids env :: fs)) = lookup n (.block o ids env :: fs) := rfl
 
 /-! ## Substitution -/
 
@@ -232,45 +53,38 @@ def substOperand (x y : String) : Operand → Operand
 def substOp (x y : String) : Op → Op
   | .mk k res args rs loc => .mk k res (args.map (substOperand x y)) rs loc
 
-/-- `%x` and `%y` are both defined, with the same value. -/
-def Agree (env : Env) (x y : String) : Prop := ∃ v, env[x]? = some v ∧ env[y]? = some v
+/-- Looking up `%x` and `%y` in `fs` gives the same value. -/
+def Agree (fs : List Frame) (x y : String) : Prop :=
+  ∃ v, lookup x fs = some v ∧ lookup y fs = some v
 
-theorem operandIn_subst {env : Env} {x y : String} (h : Agree env x y) (loc : Option Loc)
-    (o : Operand) : operandIn env loc (substOperand x y o) = operandIn env loc o := by
-  cases o with
+/-- An operand reading `%x` for `%y` on the target has the value the original has on the source,
+when the stacks' lookups agree on what the target reads and `%x` and `%y` agree on the source. -/
+theorem operandIn_subst {ft fs : List Frame} {x y : String} (hag : Agree fs x y)
+    (hl : ∀ n, (substOperand x y a).reads n = true → lookup n ft = lookup n fs) (loc : Option Loc) :
+    operandIn ft loc (substOperand x y a) = operandIn fs loc a := by
+  cases a with
   | var n =>
     by_cases hn : n = y
     · subst hn
-      obtain ⟨v, hx, hy⟩ := h
-      simp [substOperand, operandIn, hx, hy]
-    · simp [substOperand, hn]
+      obtain ⟨v, hx, hy⟩ := hag
+      have := hl x (by simp [substOperand, Operand.reads])
+      simp [substOperand, operandIn, this, hx, hy]
+    · have := hl n (by simp [substOperand, Operand.reads, hn])
+      simp [substOperand, operandIn, hn, this]
   | hole => rfl
 
-theorem mapM_subst {c : Core} {x y : String} (h : Agree c.env x y) (loc : Option Loc) :
-    ∀ args : List Operand,
-      (args.map (substOperand x y)).mapM (evalOperand loc) c = args.mapM (evalOperand loc) c
-  | [] => rfl
-  | o :: args => by
-    simp only [List.map_cons, List.mapM_cons, bind, StateT.bind, evalOperand,
-      operandIn_subst h loc o]
-    cases operandIn c.env loc o with
-    | error => rfl
-    | ok v =>
-      simp only [Except.map, Except.ok_bind]
-      rw [mapM_subst h loc args]
-
-theorem simpleOp_subst {c : Core} {x y : String} (h : Agree c.env x y) (loc : Option Loc)
-    (k : OpKind) (res : List Result) (args : List Operand) :
-    simpleOp loc k res (args.map (substOperand x y)) c = simpleOp loc k res args c := by
-  simp only [simpleOp, bind, StateT.bind]
-  rw [mapM_subst h loc args]
-
-
-theorem exec_mapM_subst {m : Machine} {x y : String} (h : Agree m.core.env x y) (loc : Option Loc)
-    (args : List Operand) :
-    m.exec ((args.map (substOperand x y)).mapM (evalOperand loc)) =
-      m.exec (args.mapM (evalOperand loc)) := by
-  simp only [Machine.exec, StateT.run, mapM_subst h loc args]
+theorem operands_subst {ft fs : List Frame} {x y : String} (hag : Agree fs x y) (loc : Option Loc) :
+    ∀ {args : List Operand},
+      (∀ n, (args.map (substOperand x y)).any (Operand.reads n) = true →
+        lookup n ft = lookup n fs) →
+      operands ft loc (args.map (substOperand x y)) = operands fs loc args
+  | [], _ => rfl
+  | a :: args, hl => by
+    have h1 := operandIn_subst (a := a) hag (fun n hn => hl n (by simp [hn])) loc
+    have h2 := operands_subst hag loc (args := args) (fun n hn => hl n (by
+      simp only [List.map_cons, List.any_cons, Bool.or_eq_true]; exact .inr hn))
+    simp only [operands, List.map_cons, List.mapM_cons] at h2 ⊢
+    rw [h1, h2]
 
 /-! ## The rewrite -/
 
@@ -285,276 +99,204 @@ def copyOp (x y : String) (T : Ty) (facts : List TrustedFact) (loc : Option Loc)
   .mk .copy [⟨y, T, facts⟩] [.var x] [] loc
 
 /-- The rewrite: after `%y = copy %x`, the ops `ss` read `%x` where they read `%y`. -/
-def L (pt ps : List Op) : Prop :=
+def L (pt ps _ : List Op) : Prop :=
   ∃ x y T facts loc ss, x ≠ y ∧ (∀ o ∈ ss, Flat x y o) ∧
     ps = copyOp x y T facts loc :: ss ∧ pt = copyOp x y T facts loc :: ss.map (substOp x y)
 
 /-- After the copy: the target is about to run the substituted ops, the source the original
-ones, and `%x` and `%y` agree. -/
+ones, and `%x` and `%y` agree on the source. Apart from that, the top blocks are related as in
+lockstep. -/
 def Mid (mt ms : Machine) : Prop :=
-  mt.core = ms.core ∧ ∃ x y ss t s ids rt rs, (∀ o ∈ ss, Flat x y o) ∧
-    mt.stack = .block (ss.map (substOp x y) ++ t) ids :: rt ∧
-    ms.stack = .block (ss ++ s) ids :: rs ∧ OpsRel L t s ∧ Forall2 (FrameRel L) rt rs ∧
-    Agree ms.core.env x y
+  mt.core = ms.core ∧ ∃ D Db x y ss t s ids et es ft fs, (∀ o ∈ ss, Flat x y o) ∧
+    mt.stack = .block (ss.map (substOp x y) ++ t) ids et :: ft ∧
+    ms.stack = .block (ss ++ s) ids es :: fs ∧ OpsRel L t s ∧ StackRel L Db ft fs ∧
+    (∀ n, Db n → D n) ∧ EnvAgree D et es ∧ NoReads D (ss.map (substOp x y) ++ t) ∧
+    Agree ms.stack x y
 
 /-- Related states: in lockstep, or inside a substituted run of ops. -/
 def R (mt ms : Machine) : Prop := MRel L mt ms ∨ Mid mt ms
 
 /-! ## Steps -/
 
-/-- Running the copy makes `%x` and `%y` agree. -/
-theorem copy_agree {loc : Option Loc} {x y : String} {T : Ty} {facts : List TrustedFact}
-    {c c1 : Core} (hxy : x ≠ y)
-    (e : simpleOp loc .copy [⟨y, T, facts⟩] [.var x] c = .ok ((), c1)) : Agree c1.env x y := by
-  rw [Fwd.simpleOp_one] at e
-  cases hx : operandIn c.env loc (.var x) with
-  | error h => rw [hx] at e; cases e
-  | ok v =>
-    rw [hx] at e
-    simp only [Except.bind, Fwd.evalSimple_copy] at e
-    obtain ⟨c', e1, h1⟩ := bindResults_bindAll e
-    have hv : c.env[x]? = some v := by
-      simp only [operandIn] at hx
-      split at hx
-      · cases hx; assumption
-      · cases hx
-    refine ⟨v, ?_, ?_⟩
-    · rw [h1, bindAll_other e1 (by simpa using fun h => hxy h.symm), hv]
-    · rw [h1]; exact bindAll_self e1
-
-/-- One target step matched by one source step that runs the same core computation. -/
-theorem step_same' {mt ms : Machine} {x : Except Halt (α × Core)} {ft fs : α → Core → Machine}
-    (ht : step mt = x.bind fun p => .ok (ft p.1 p.2))
-    (hs : step ms = x.bind fun p => .ok (fs p.1 p.2)) (hshape : ms.shape = mt.shape)
-    (hR : ∀ a core, x = .ok (a, core) → R (ft a core) (fs a core)) : StepMatch R mt ms := by
-  cases x with
-  | ok p =>
-    refine ⟨fun mt' e => ?_, fun h e => ?_⟩
-    · rw [ht] at e
-      cases e
-      refine .inr ⟨0, fs p.1 p.2, by rw [runSteps_one, hs]; rfl, hR p.1 p.2 rfl, ?_⟩
-      intro j mj hj ej
-      obtain rfl : j = 0 := by omega
-      simp only [runSteps, Except.ok.injEq] at ej
-      subst ej
-      exact hshape
-    · rw [ht] at e; cases e
-  | error h' =>
-    refine ⟨fun mt' e => ?_, fun h e => ?_⟩
-    · rw [ht] at e; cases e
-    · rw [ht] at e
-      cases e
-      by_cases hamb : h'.behavior = .ambiguous
-      · exact .inl ⟨1, h', by rw [runSteps_one, hs]; rfl, .inr hamb⟩
-      · exact .inr ⟨1, h', by rw [runSteps_one, hs]; rfl, Behavior.Refines.refl _ hamb⟩
+/-- Lookups on two stacks whose top blocks' environments agree outside `D`, with related frames
+below, agree outside `D`, whatever code the blocks hold. -/
+theorem lookup_agree {D Db : String → Prop} {ot os : List Op} {ids : List Nat} {et es : Env}
+    {ft fs : List Frame} (hb : StackRel L Db ft fs) (hDb : ∀ n, Db n → D n)
+    (hag : EnvAgree D et es) {n : String} (hn : ¬ D n) :
+    lookup n (.block ot ids et :: ft) = lookup n (.block os ids es :: fs) := by
+  rw [lookup_ops n ot [], lookup_ops n os []]
+  exact (StackRel.block hb hDb (.refl []) hag (fun _ _ => rfl)).lookup hn
 
 /-- At a rewritten spot, both run the copy, and land in the substituted run of ops. -/
 theorem step_copy {mt ms : Machine} {x y : String} {T : Ty} {facts : List TrustedFact}
-    {loc : Option Loc} {ss t s : List Op} {ids : List Nat} {rt rs : List Frame}
-    (hc : mt.core = ms.core) (hxy : x ≠ y) (hflat : ∀ o ∈ ss, Flat x y o) (hts : OpsRel L t s)
-    (hrest : Forall2 (FrameRel L) rt rs)
-    (ht : mt.stack = .block (copyOp x y T facts loc :: (ss.map (substOp x y) ++ t)) ids :: rt)
-    (hs : ms.stack = .block (copyOp x y T facts loc :: (ss ++ s)) ids :: rs) :
+    {loc : Option Loc} {ss t s : List Op} {ids : List Nat} {et es : Env} {ft fs : List Frame}
+    {D Db : String → Prop} (hc : mt.core = ms.core) (hxy : x ≠ y)
+    (hflat : ∀ o ∈ ss, Flat x y o) (hts : OpsRel L t s) (hb : StackRel L Db ft fs)
+    (hDb : ∀ n, Db n → D n) (hag : EnvAgree D et es)
+    (hnr : NoReads D (copyOp x y T facts loc :: (ss.map (substOp x y) ++ t)))
+    (ht : mt.stack = .block (copyOp x y T facts loc :: (ss.map (substOp x y) ++ t)) ids et :: ft)
+    (hs : ms.stack = .block (copyOp x y T facts loc :: (ss ++ s)) ids es :: fs) :
     StepMatch R mt ms := by
-  refine step_same' (x := simpleOp loc .copy [⟨y, T, facts⟩] [.var x] ms.core)
-    (ft := fun _ core => { core, stack := .block (ss.map (substOp x y) ++ t) ids :: rt })
-    (fs := fun _ core => { core, stack := .block (ss ++ s) ids :: rs }) ?_ ?_ ?_ ?_
-  · simp only [step, ht, copyOp, execOp_simple _ .copy _ _ _ rfl rfl rfl, hc]
-    cases simpleOp loc .copy [⟨y, T, facts⟩] [.var x] ms.core <;> rfl
-  · simp only [step, hs, copyOp, execOp_simple _ .copy _ _ _ rfl rfl rfl]
-    cases simpleOp loc .copy [⟨y, T, facts⟩] [.var x] ms.core <;> rfl
-  · simp only [Machine.shape, ht, hs]
-    exact (shape_cons rfl hrest).symm
-  · intro _ core e
-    exact .inr ⟨rfl, x, y, ss, t, s, ids, rt, rs, hflat, rfl, rfl, hts, hrest, copy_agree hxy e⟩
+  obtain ⟨c, stt⟩ := mt
+  obtain ⟨cs, sts⟩ := ms
+  dsimp only at hc ht hs
+  subst hc ht hs
+  obtain ⟨hrc, hnr'⟩ := NoReads.cons hnr
+  have hx : ¬ D x := fun h => by have := hrc x h; simp [copyOp, Op.reads, Operand.reads] at this
+  let S : List Frame := .block (ss ++ s) ids es :: fs
+  refine step_same
+    (x := (operands S loc [.var x]).bind fun vs => simpleOp loc .copy [⟨y, T, facts⟩] vs c)
+    (ft := fun outs core => ⟨core, bindTop [⟨y, T, facts⟩] outs
+      (.block (ss.map (substOp x y) ++ t) ids et :: ft)⟩)
+    (fs := fun outs core => ⟨core, bindTop [⟨y, T, facts⟩] outs S⟩) ?_ ?_ ?_ ?_
+  · rw [copyOp, step_simple rfl rfl rfl, operands_one, operands_one]
+    simp only [operandIn]
+    rw [lookup_agree (os := ss ++ s) hb hDb hag hx]
+  · rw [copyOp, step_simple rfl rfl rfl]
+  · simp only [Machine.shape]
+    exact (shape_cons rfl hb).symm
+  · intro outs core e
+    rw [operands_one] at e
+    cases hv : operandIn S loc (.var x) with
+    | error h => rw [hv] at e; cases e
+    | ok v =>
+    rw [hv] at e
+    simp only [Except.bind, Fwd.simpleOp_eq, Fwd.evalSimple_copy] at e
+    cases hcr : checkResults loc [⟨y, T, facts⟩] [v] c with
+    | error h => rw [hcr] at e; cases e
+    | ok q =>
+    rw [hcr] at e
+    simp only [Except.ok.injEq, Prod.mk.injEq] at e
+    obtain ⟨rfl, rfl⟩ := e
+    have hlx : lookup x S = some v := by
+      simp only [operandIn] at hv
+      split at hv
+      · cases hv; assumption
+      · cases hv
+    refine .inr ⟨rfl, D, Db, x, y, ss, t, s, ids, _, _, ft, fs, hflat, rfl, rfl, hts, hb, hDb,
+      hag.bindAll _ _, hnr', v, ?_, ?_⟩
+    · show lookup x (bindTop _ _ S) = some v
+      rw [lookup_bindTop (by simpa using fun h => hxy h.symm)]
+      exact hlx
+    · simp [S, bindTop, lookup, Env.bindAll]
 
 /-- Inside the substituted run: both run the next op, reading the same values. -/
 theorem step_mid {cm : Core} {x y : String} {o : Op} {ss t s : List Op} {ids : List Nat}
-    {rt rs : List Frame} (hflat : ∀ o' ∈ o :: ss, Flat x y o') (hts : OpsRel L t s)
-    (hrest : Forall2 (FrameRel L) rt rs) (hag : Agree cm.env x y) :
-    StepMatch R ⟨cm, .block (substOp x y o :: (ss.map (substOp x y) ++ t)) ids :: rt⟩
-      ⟨cm, .block (o :: (ss ++ s)) ids :: rs⟩ := by
+    {et es : Env} {ft fs : List Frame} {D Db : String → Prop}
+    (hflat : ∀ o' ∈ o :: ss, Flat x y o') (hts : OpsRel L t s) (hb : StackRel L Db ft fs)
+    (hDb : ∀ n, Db n → D n) (hag : EnvAgree D et es)
+    (hnr : NoReads D (substOp x y o :: (ss.map (substOp x y) ++ t)))
+    (hxy : Agree (.block (o :: (ss ++ s)) ids es :: fs) x y) :
+    StepMatch R ⟨cm, .block (substOp x y o :: (ss.map (substOp x y) ++ t)) ids et :: ft⟩
+      ⟨cm, .block (o :: (ss ++ s)) ids es :: fs⟩ := by
   obtain ⟨k, res, args, loc, rfl, hcallee, hres⟩ := hflat o (by simp)
   have hflat' : ∀ o' ∈ ss, Flat x y o' := fun o' h => hflat o' (by simp [h])
-  let mt : Machine :=
-    ⟨cm, .block (substOp x y (.mk k res args [] loc) :: (ss.map (substOp x y) ++ t)) ids :: rt⟩
-  let ms : Machine := ⟨cm, .block (.mk k res args [] loc :: (ss ++ s)) ids :: rs⟩
-  have hshape : ms.shape = mt.shape := by
-    simp only [Machine.shape, mt, ms]
-    exact (shape_cons rfl hrest).symm
-  have hagT := hag
+  obtain ⟨hro, hnr'⟩ := NoReads.cons hnr
+  have hargs := (Op.reads_mk hro).1
   -- The machines with the op popped.
-  let xt : Machine := { core := cm, stack := .block (ss.map (substOp x y) ++ t) ids :: rt }
-  let xs : Machine := { core := cm, stack := .block (ss ++ s) ids :: rs }
-  have stepT : step mt = execFlat xt k res (args.map (substOperand x y)) loc := by
-    simp only [step, execOp]; rfl
-  have stepS : step ms = execFlat xs k res args loc := by
-    simp only [step, execOp]; rfl
-  -- Whatever binds only `res` keeps `%x` and `%y` agreeing.
-  have keep : ∀ c1 : Core, (∀ n, (∀ r ∈ res, r.name ≠ n) → c1.env[n]? = cm.env[n]?) →
-      Agree c1.env x y := by
-    intro c1 h
-    obtain ⟨v, hx, hy⟩ := hag
-    exact ⟨v, (h x fun r hr => (hres r hr).1).trans hx, (h y fun r hr => (hres r hr).2).trans hy⟩
+  let T0 : List Frame := .block (ss.map (substOp x y) ++ t) ids et :: ft
+  let S0 : List Frame := .block (ss ++ s) ids es :: fs
+  have hag0 : Agree S0 x y := by
+    obtain ⟨v, h1, h2⟩ := hxy; exact ⟨v, by rw [← h1]; rfl, by rw [← h2]; rfl⟩
+  have hops : operands T0 loc (args.map (substOperand x y)) = operands S0 loc args := by
+    refine operands_subst hag0 loc fun n hn => lookup_agree hb hDb hag fun hd => ?_
+    have := hargs n hd
+    simp_all
+  have hshape : (Machine.mk cm (.block (.mk k res args [] loc :: (ss ++ s)) ids es :: fs)).shape =
+      (Machine.mk cm (.block (substOp x y (.mk k res args [] loc) ::
+        (ss.map (substOp x y) ++ t)) ids et :: ft)).shape := by
+    simp only [Machine.shape]
+    exact (shape_cons rfl hb).symm
+  -- What binds only `res` keeps `%x` and `%y` agreeing.
+  have keep : ∀ (f : List Frame → List Frame),
+      (∀ n, (∀ r ∈ res, r.name ≠ n) → lookup n (f S0) = lookup n S0) → Agree (f S0) x y := by
+    intro f hf
+    obtain ⟨v, h1, h2⟩ := hag0
+    exact ⟨v, by rw [hf x fun r hr => (hres r hr).1, h1], by rw [hf y fun r hr => (hres r hr).2, h2]⟩
+  -- The new top blocks are related as in lockstep.
+  have mid : ∀ (f : List Frame → List Frame) ids' et' es',
+      f T0 = .block (ss.map (substOp x y) ++ t) ids' et' :: ft →
+      f S0 = .block (ss ++ s) ids' es' :: fs → EnvAgree D et' es' →
+      (∀ n, (∀ r ∈ res, r.name ≠ n) → lookup n (f S0) = lookup n S0) →
+      ∀ core, R ⟨core, f T0⟩ ⟨core, f S0⟩ := by
+    intro f ids' et' es' e1 e2 hag' hf core
+    exact .inr ⟨rfl, D, Db, x, y, ss, t, s, ids', et', es', ft, fs, hflat', e1, e2, hts, hb, hDb,
+      hag', hnr', keep f hf⟩
+  have stepT : step ⟨cm, .block (substOp x y (.mk k res args [] loc) ::
+      (ss.map (substOp x y) ++ t)) ids et :: ft⟩ =
+      execFlat ⟨cm, T0⟩ k res (args.map (substOperand x y)) loc := rfl
+  have stepS : step ⟨cm, .block (.mk k res args [] loc :: (ss ++ s)) ids es :: fs⟩ =
+      execFlat ⟨cm, S0⟩ k res args loc := rfl
   cases hsa : k.stackAlloc? with
   | some sa =>
     obtain ⟨size, align⟩ := sa
     let idOf (p : Ptr) : Nat := match p with | .rel a .. => a | _ => 0
-    refine step_same' (x := (newAlloc loc size align .stack >>= fun p =>
-        bindResults loc res [.ptr (some p)] >>= fun _ => pure p) cm)
-      (ft := fun p core => { core, stack := .block (ss.map (substOp x y) ++ t) (idOf p :: ids) :: rt })
-      (fs := fun p core => { core, stack := .block (ss ++ s) (idOf p :: ids) :: rs }) ?_ ?_ hshape ?_
+    refine step_same (x := (newAlloc loc size align .stack >>= fun p =>
+        checkResults loc res [.ptr (some p)] >>= fun _ => pure p) cm)
+      (ft := fun p core => ⟨core, bindTop res [.ptr (some p)] (addAllocId (idOf p) T0)⟩)
+      (fs := fun p core => ⟨core, bindTop res [.ptr (some p)] (addAllocId (idOf p) S0)⟩)
+      ?_ ?_ hshape ?_
     · rw [stepT]
-      simp only [execFlat, hcallee, hsa, Machine.exec, StateT.run, xt]
+      simp only [execFlat, hcallee, hsa, Machine.exec, StateT.run]
       cases (newAlloc loc size align .stack >>= fun p =>
-        bindResults loc res [.ptr (some p)] >>= fun _ => pure p) cm <;> rfl
+        checkResults loc res [.ptr (some p)] >>= fun _ => pure p) cm <;> rfl
     · rw [stepS]
-      simp only [execFlat, hcallee, hsa, Machine.exec, StateT.run, xs]
+      simp only [execFlat, hcallee, hsa, Machine.exec, StateT.run]
       cases (newAlloc loc size align .stack >>= fun p =>
-        bindResults loc res [.ptr (some p)] >>= fun _ => pure p) cm <;> rfl
-    · intro p core e
-      refine .inr ⟨rfl, x, y, ss, t, s, idOf p :: ids, rt, rs, hflat', rfl, rfl, hts, hrest, ?_⟩
-      obtain ⟨p', c2, e1, e2⟩ := bind_ok e
-      obtain ⟨_, c3, e3, e4⟩ := bind_ok e2
-      cases e4
-      have h2 : c2.env = cm.env := keepsEnv_newAlloc loc size align .stack cm _ rfl e1
-      obtain ⟨c', e5, h5⟩ := bindResults_bindAll e3
-      exact keep core fun n hn => by rw [h5, bindAll_other e5 hn, h2]
+        checkResults loc res [.ptr (some p)] >>= fun _ => pure p) cm <;> rfl
+    · intro p core _
+      exact mid (fun fs => bindTop res [.ptr (some p)] (addAllocId (idOf p) fs)) _ _ _ rfl rfl
+        ((hag.bindAll _ _)) (fun n hn => by
+          simp only [S0, addAllocId, lookup_bindTop hn]; rfl) core
   | none =>
   cases hterm : k.isTerminator with
   | true =>
-    have lock : Lockstep L (step mt) (step ms) := by
-      rw [stepT, stepS]
-      simp only [execFlat, hcallee, hsa, hterm, ite_true, xt, xs]
-      rw [exec_mapM_subst (m := ⟨cm, _⟩) hagT]
-      refine lockstep_exec rfl fun vs core => ?_
-      simp only [blockIds, List.append_nil]
-      refine lockstep_exec rfl fun _ core' => ?_
-      exact terminate_eq (mt := ⟨core', rt⟩) (ms := ⟨core', rs⟩) (MRel.mk' rfl hrest) loc k vs
-    exact (StepMatch.of_lockstep' hshape lock).mono fun _ _ _ _ h => .inl h
+    have lock : Lockstep L
+        (execFlat ⟨cm, T0⟩ k res (args.map (substOperand x y)) loc)
+        (execFlat ⟨cm, S0⟩ k res args loc) := by
+      simp only [execFlat, hcallee, hsa, hterm, ite_true, hops]
+      refine lockstep_bind fun vs => ?_
+      simp only [T0, S0, blockIds, List.append_nil]
+      refine lockstep_exec rfl fun _ core => ?_
+      exact terminate_eq hb loc k vs
+    rw [← stepT, ← stepS] at lock
+    exact (StepMatch.of_lockstep hshape lock).mono fun _ _ _ _ h => .inl h
   | false =>
-    refine step_same' (x := simpleOp loc k res args cm)
-      (ft := fun _ core => { core, stack := .block (ss.map (substOp x y) ++ t) ids :: rt })
-      (fs := fun _ core => { core, stack := .block (ss ++ s) ids :: rs }) ?_ ?_ hshape ?_
-    · rw [stepT]
-      simp only [execFlat, hcallee, hsa, hterm, Bool.false_eq_true, ite_false, Machine.exec,
-        StateT.run, xt, simpleOp_subst hag]
-      cases simpleOp loc k res args cm <;> rfl
-    · rw [stepS]
-      simp only [execFlat, hcallee, hsa, hterm, Bool.false_eq_true, ite_false, Machine.exec,
-        StateT.run, xs]
-      cases simpleOp loc k res args cm <;> rfl
-    · intro _ core e
-      exact .inr ⟨rfl, x, y, ss, t, s, ids, rt, rs, hflat', rfl, rfl, hts, hrest,
-        keep core fun n hn => simpleOp_other e hn⟩
-
-
-theorem opsRel_cons {ot : Op} {t s0 : List Op} (h : OpsRel L (ot :: t) s0) :
-    (∃ os s, s0 = os :: s ∧ OpRel L ot os ∧ OpsRel L t s) ∨
-    (∃ x y T facts loc ss t' s', ot = copyOp x y T facts loc ∧ t = ss.map (substOp x y) ++ t' ∧
-      s0 = copyOp x y T facts loc :: (ss ++ s') ∧ x ≠ y ∧ (∀ o ∈ ss, Flat x y o) ∧
-      OpsRel L t' s') := by
-  generalize hx : ot :: t = x at h
-  cases h with
-  | refl => subst hx; exact .inl ⟨_, _, rfl, .refl _, .refl _⟩
-  | cons ho hr =>
-    injection hx with h1 h2
-    subst h1 h2
-    exact .inl ⟨_, _, rfl, ho, hr⟩
-  | rw hl hr =>
-    obtain ⟨x, y, T, facts, loc, ss, hxy, hflat, rfl, rfl⟩ := hl
-    simp only [List.cons_append, List.cons.injEq] at hx
-    obtain ⟨rfl, rfl⟩ := hx
-    exact .inr ⟨x, y, T, facts, loc, ss, _, _, rfl, rfl, rfl, hxy, hflat, hr⟩
-
-theorem opsRel_nil {s0 : List Op} (h : OpsRel L [] s0) : s0 = [] := by
-  generalize hx : ([] : List Op) = x at h
-  cases h with
-  | refl => rfl
-  | cons => cases hx
-  | rw hl _ =>
-    obtain ⟨_, _, _, _, _, _, _, _, _, rfl⟩ := hl
-    cases hx
-
-/-- From states in lockstep: a lockstep step, or the copy at a rewritten spot. -/
-theorem sim_mrel {mt ms : Machine} (hc : mt.core = ms.core)
-    (hst : Forall2 (FrameRel L) mt.stack ms.stack) : StepMatch R mt ms := by
-  have lock : (∀ ot t ids rt, mt.stack = .block (ot :: t) ids :: rt →
-        ∃ os s rs, ms.stack = .block (os :: s) ids :: rs ∧ OpRel L ot os ∧ OpsRel L t s) →
-      (∀ ids rt, mt.stack = .block [] ids :: rt → ∃ rs, ms.stack = .block [] ids :: rs) →
-      StepMatch R mt ms := fun hh hn =>
-    (StepMatch.of_lockstep ⟨hc, hst⟩ (step_eq ⟨hc, hst⟩ hh hn)).mono fun _ _ _ _ h => .inl h
-  cases ht : mt.stack with
-  | nil =>
-    exact lock (fun _ _ _ _ e => by rw [ht] at e; cases e) (fun _ _ e => by rw [ht] at e; cases e)
-  | cons f rt =>
-    cases hs : ms.stack with
-    | nil => rw [ht, hs] at hst; exact hst.elim
-    | cons f' rs =>
-      have hst' := hst
-      rw [ht, hs] at hst'
-      obtain ⟨hf, hrest⟩ := hst'
-      cases hf with
-      | refl f =>
-        refine lock (fun ot t ids rt' e => ?_) (fun ids rt' e => ?_)
-        · rw [ht, List.cons.injEq] at e
-          obtain ⟨rfl, rfl⟩ := e
-          exact ⟨ot, t, rs, hs, .refl _, .refl _⟩
-        · rw [ht, List.cons.injEq] at e
-          obtain ⟨rfl, rfl⟩ := e
-          exact ⟨rs, hs⟩
-      | block hops =>
-        rename_i t0 s0 ids
-        cases t0 with
-        | nil =>
-          obtain rfl := opsRel_nil hops
-          refine lock (fun ot t ids' rt' e => ?_) (fun ids' rt' e => ?_)
-          · rw [ht] at e; simp at e
-          · rw [ht, List.cons.injEq, Frame.block.injEq] at e
-            obtain ⟨⟨-, rfl⟩, rfl⟩ := e
-            exact ⟨rs, hs⟩
-        | cons ot t =>
-          rcases opsRel_cons hops with ⟨os, s, rfl, ho, hts⟩ |
-            ⟨x, y, T, facts, loc, ss, t', s', rfl, rfl, rfl, hxy, hflat, hts⟩
-          · refine lock (fun ot' t' ids' rt' e => ?_) (fun ids' rt' e => ?_)
-            · rw [ht, List.cons.injEq, Frame.block.injEq, List.cons.injEq] at e
-              obtain ⟨⟨⟨rfl, rfl⟩, rfl⟩, rfl⟩ := e
-              exact ⟨os, s, rs, hs, ho, hts⟩
-            · rw [ht] at e; simp at e
-          · exact step_copy hc hxy hflat hts hrest ht hs
-      | loop hb =>
-        refine lock (fun _ _ _ _ e => ?_) (fun _ _ e => ?_) <;> (rw [ht] at e; simp at e)
+    refine step_same
+      (x := (operands S0 loc args).bind fun vs => simpleOp loc k res vs cm)
+      (ft := fun outs core => ⟨core, bindTop res outs T0⟩)
+      (fs := fun outs core => ⟨core, bindTop res outs S0⟩) ?_ ?_ hshape ?_
+    · rw [show substOp x y (.mk k res args [] loc) = .mk k res (args.map (substOperand x y)) [] loc
+        from rfl, step_simple hcallee hsa hterm, hops]
+    · rw [step_simple hcallee hsa hterm]
+    · intro outs core _
+      exact mid (bindTop res outs) _ _ _ rfl rfl (hag.bindAll _ _)
+        (fun n hn => lookup_bindTop hn) core
 
 theorem sim : Simulation R := by
   intro mt ms hR
-  rcases hR with ⟨hc, hst⟩ | ⟨hc, x, y, ss, t, s, ids, rt, rs, hflat, ht, hs, hts, hrest, hag⟩
-  · exact sim_mrel hc hst
+  rcases hR with hR | ⟨hc, D, Db, x, y, ss, t, s, ids, et, es, ft, fs, hflat, ht, hs, hts, hb, hDb,
+    hag, hnr, hxy⟩
+  · refine StepMatch.of_mrel hR (fun _ _ _ _ h => .inl h) ?_
+    intro D Db pt ps t s ids et es ft fs hl hts hb hDb hag hnr ht hs
+    obtain ⟨x, y, T, facts, loc, ss, hxy, hflat, rfl, rfl⟩ := hl
+    simp only [List.cons_append] at hnr ht hs
+    exact step_copy hR.1 hxy hflat hts hb hDb hag hnr ht hs
+  obtain ⟨cmt, stt⟩ := mt
+  obtain ⟨cms, sts⟩ := ms
+  dsimp only at hc ht hs hxy
+  subst hc ht hs
   cases ss with
   | nil =>
-    refine sim_mrel hc ?_
-    rw [ht, hs]
-    exact ⟨.block hts, hrest⟩
+    refine StepMatch.of_mrel ⟨rfl, D, .block hb hDb hts hag hnr⟩ (fun _ _ _ _ h => .inl h) ?_
+    intro D Db pt ps t' s' ids' et' es' ft' fs' hl hts' hb' hDb' hag' hnr' ht' hs'
+    obtain ⟨x, y, T, facts, loc, ss, hxy, hflat, rfl, rfl⟩ := hl
+    simp only [List.cons_append, List.nil_append] at hnr' ht' hs' ⊢
+    rw [ht', hs'] at *
+    exact step_copy rfl hxy hflat hts' hb' hDb' hag' hnr' rfl rfl
   | cons o ss =>
-    obtain ⟨cmt, stt⟩ := mt
-    obtain ⟨cms, sts⟩ := ms
-    dsimp only at hc ht hs hag
-    subst hc ht hs
-    simp only [List.map_cons, List.cons_append]
-    exact step_mid hflat hts hrest hag
-
-theorem init_match {mod : Module} {tgt src : Func} (hparams : tgt.params = src.params)
-    (hrets : tgt.rets = src.rets) (hops : OpsRel L tgt.body.ops src.body.ops)
-    (oracle : Nat → Int) (args : List RVal) :
-    InitMatch R (Machine.init oracle mod tgt args) (Machine.init oracle mod src args) := by
-  simp only [Machine.init, hparams, hrets, bind, Except.bind]
-  cases (enterCall none src.params args).run (Core.initial oracle mod) with
-  | error h =>
-    by_cases hamb : h.behavior = .ambiguous
-    · exact .inl ⟨h, rfl, .inr hamb⟩
-    · exact .inr (.inr ⟨h, h, rfl, rfl, Behavior.Refines.refl _ hamb⟩)
-  | ok r =>
-    exact .inr (.inl ⟨_, _, rfl, rfl, .inl (MRel.mk' rfl
-      (Forall2.cons' (.block hops) (Forall2.cons' (.refl _) trivial)))⟩)
+    simp only [List.map_cons, List.cons_append] at hnr hxy ⊢
+    exact step_mid hflat hts hb hDb hag hnr hxy
 
 /-- **Copy propagation is correct.** Making, anywhere in a function, the ops right after
 `%y = copy %x` in the same block read `%x` where they read `%y` gives a function that refines the
@@ -563,19 +305,20 @@ function, and bind neither `%x` nor `%y`; the run may end with a terminator. -/
 theorem refines {mod : Module} {tgt src : Func} (hparams : tgt.params = src.params)
     (hrets : tgt.rets = src.rets) (hops : OpsRel L tgt.body.ops src.body.ops)
     (dec : src.Decided mod) : tgt.Refines mod src :=
-  Simulation.refines sim (fun oracle args => ⟨oracle, init_match hparams hrets hops oracle args⟩)
-    dec
+  Simulation.refines sim
+    (fun oracle args => ⟨oracle, InitMatch.of_lockstep
+      (init_lockstep hparams hrets hops oracle args) fun _ _ h => .inl h⟩) dec
 
 /-! ## Look-alikes that are wrong -/
 
 /-- Reading `%x` for `%y` is wrong once the two hold different values, as they do after an op
 rebinds `%x`. This is why the ops crossed may bind neither. -/
 theorem subst_after_rebind_wrong :
-    ¬ ∀ (env : Env) (loc : Option Loc),
-      operandIn env loc (substOperand "x" "y" (.var "y")) = operandIn env loc (.var "y") := by
+    ¬ ∀ (fs : List Frame) (loc : Option Loc),
+      operandIn fs loc (substOperand "x" "y" (.var "y")) = operandIn fs loc (.var "y") := by
   intro h
-  have := h (((∅ : Env).insert "x" (.int 8 .poison)).insert "y" (.int 8 (.bits 1))) none
-  simp [substOperand, operandIn, Std.HashMap.getElem_insert,
-    pure, Except.pure] at this
+  have := h [.block [] [] (((∅ : Env).insert "x" (.int 8 .poison)).insert "y" (.int 8 (.bits 1)))]
+    none
+  simp [substOperand, operandIn, lookup, Std.HashMap.getElem_insert, pure, Except.pure] at this
 
 end Fir.CopyProp

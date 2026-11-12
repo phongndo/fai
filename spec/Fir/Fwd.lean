@@ -32,16 +32,12 @@ open Dse (Escape)
 
 /-! ## Unfolding ops -/
 
-theorem simpleOp_one (loc : Option Loc) (k : OpKind) (rs : List Result) (o : Operand) (c : Core) :
-    simpleOp loc k rs [o] c =
-      (operandIn c.env loc o).bind fun x =>
-      (evalSimple loc k rs [x] c).bind fun p => bindResults loc rs p.1 p.2 := by
-  simp only [simpleOp, List.mapM_cons, List.mapM_nil, bind, StateT.bind, pure, StateT.pure,
-    Except.bind, evalOperand]
-  cases operandIn c.env loc o with
-  | error h => rfl
-  | ok x =>
-    simp only [Except.map, Except.pure]
+/-- A simple op computes its results, then checks them. -/
+theorem simpleOp_eq (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVal) (c : Core) :
+    simpleOp loc k rs vs c =
+      (evalSimple loc k rs vs c).bind fun p =>
+      (checkResults loc rs p.1 p.2).bind fun q => .ok (p.1, q.2) := by
+  simp only [simpleOp, bind, StateT.bind, Except.bind, pure, StateT.pure, Except.pure]
 
 theorem evalSimple_copy (loc : Option Loc) (r : Result) (x : RVal) (c : Core) :
     evalSimple loc .copy [r] [x] c = .ok ([x], c) := rfl
@@ -197,22 +193,15 @@ theorem decodeAs_encode {loc : Option Loc} {v : RVal} {T : Ty} {c : Core} {cfg :
 /-! ## Forwarding -/
 
 /-- The heart of the proof: right after a store, a load of the stored type through the same
-pointer either fails (a misaligned load is UB) or does exactly what a copy of the stored value
-does. -/
-theorem load_after_store {loc1 loc2 : Option Loc} {T : Ty} {A1 A2 : Nat} {v op : Operand}
-    {r : Result} {c c1 : Core} (hr : r.ty = T) (hT : Exact T) (hsp : 0 < c.space.ptrBits / 8)
-    (e : simpleOp loc1 (.store T A1) [] [v, op] c = .ok ((), c1)) :
-    (∃ h, simpleOp loc2 (.load A2) [r] [op] c1 = .error h ∧ Escape h) ∨
-    simpleOp loc2 (.load A2) [r] [op] c1 = simpleOp loc2 .copy [r] [v] c1 := by
+pointer either fails (a misaligned load is UB) or computes exactly what a copy of the stored value
+computes. -/
+theorem load_after_store {loc1 loc2 : Option Loc} {T : Ty} {A1 A2 : Nat} {w pv : RVal}
+    {r : Result} {c c1 : Core} {outs : List RVal} (hr : r.ty = T) (hT : Exact T)
+    (hsp : 0 < c.space.ptrBits / 8)
+    (e : simpleOp loc1 (.store T A1) [] [w, pv] c = .ok (outs, c1)) :
+    (∃ h, evalSimple loc2 (.load A2) [r] [pv] c1 = .error h ∧ Escape h) ∨
+    evalSimple loc2 (.load A2) [r] [pv] c1 = evalSimple loc2 .copy [r] [w] c1 := by
   rw [Dse.simpleOp_store] at e
-  cases hv : operandIn c.env loc1 v with
-  | error h => rw [hv] at e; cases e
-  | ok w =>
-  cases hp : operandIn c.env loc1 op with
-  | error h => rw [hv, hp] at e; cases e
-  | ok pv =>
-  rw [hv, hp] at e
-  simp only [Except.bind] at e
   obtain ⟨pp, rfl⟩ : ∃ pp, pv = .ptr pp := by
     cases pv <;> first | exact ⟨_, rfl⟩ | cases e
   simp only at e
@@ -233,12 +222,9 @@ theorem load_after_store {loc1 loc2 : Option Loc} {T : Ty} {A1 A2 : Nat} {v op :
   | error h => rw [hm] at e; cases e
   | ok M =>
   rw [hm] at e
-  cases e
-  rw [simpleOp_one, simpleOp_one]
-  have henv : (Dse.written c M x.1 x.2.2 (w.encode c.space)).env = c.env := rfl
-  rw [henv, Dse.operandIn_loc (loc' := loc2) hp, Dse.operandIn_loc (loc' := loc2) hv]
-  simp only [Except.bind, evalSimple_load, evalSimple_copy, loadC_some, access_eq,
-    checkAccess_written, hr]
+  simp only [Except.ok.injEq, Prod.mk.injEq] at e
+  obtain ⟨rfl, rfl⟩ := e
+  simp only [evalSimple_load, evalSimple_copy, loadC_some, access_eq, checkAccess_written, hr]
   rw [show (Dse.written c M x.1 x.2.2 (w.encode c.space)).space = c.space from rfl]
   cases hc2 : checkAccess c loc2 p (T.size c.space) A2 with
   | error h => exact .inl ⟨h, rfl, Dse.checkAccess_error hc2⟩
@@ -248,7 +234,7 @@ theorem load_after_store {loc1 loc2 : Option Loc} {T : Ty} {A1 A2 : Nat} {v op :
   rw [show (Dse.written c M x.1 x.2.2 (w.encode c.space)).tags = c.tags from rfl,
     show (Dse.written c M x.1 x.2.2 (w.encode c.space)).scopes = c.scopes from rfl,
     show (Dse.written c M x.1 x.2.2 (w.encode c.space)).marks = M from rfl]
-  dsimp only
+  dsimp only [Except.bind]
   rw [markAll_read loc2 hm (Dse.nodup_scopes c)]
   dsimp only
   simp only [Dse.written, Std.ExtTreeMap.getD_insert_self, ← Dse.encode_length hty c.space,
@@ -269,19 +255,23 @@ def Pat (s l c : Op) : Prop :=
     r.ty = T ∧ Exact T
 
 /-- The rewrite: the target has `[s, c]` where the source has `[s, l]`. -/
-def L (pt ps : List Op) : Prop := ∃ s l c, pt = [s, c] ∧ ps = [s, l] ∧ Pat s l c
+def L (pt ps _ : List Op) : Prop := ∃ s l c, pt = [s, c] ∧ ps = [s, l] ∧ Pat s l c
 
-/-- On this core, the load `l` escapes, or does exactly what the copy `c` does. -/
-def Ready (c l : Op) (core : Core) : Prop :=
+/-- On this core, with operands from the frames `fs`, the load `l` escapes, or computes exactly
+what the copy `c` computes. -/
+def Ready (c l : Op) (fs : List Frame) (core : Core) : Prop :=
   ∃ A2 r op v loc, l = .mk (.load A2) [r] [op] [] loc ∧ c = .mk .copy [r] [v] [] loc ∧
-    ((∃ h, simpleOp loc (.load A2) [r] [op] core = .error h ∧ Escape h) ∨
-      simpleOp loc (.load A2) [r] [op] core = simpleOp loc .copy [r] [v] core)
+    ((∃ h, ((operands fs loc [op]).bind fun vs => simpleOp loc (.load A2) [r] vs core) = .error h ∧
+        Escape h) ∨
+      ((operands fs loc [op]).bind fun vs => simpleOp loc (.load A2) [r] vs core) =
+        ((operands fs loc [v]).bind fun vs => simpleOp loc .copy [r] vs core))
 
 /-- Between a store and the load after it: the target is about to copy, the source to load. -/
 def Mid (mt ms : Machine) : Prop :=
-  mt.core = ms.core ∧ ∃ c l t s ids rt rs,
-    mt.stack = .block (c :: t) ids :: rt ∧ ms.stack = .block (l :: s) ids :: rs ∧
-    OpsRel L t s ∧ Forall2 (FrameRel L) rt rs ∧ Ready c l ms.core
+  mt.core = ms.core ∧ ∃ D Db c l t s ids et es ft fs,
+    mt.stack = .block (c :: t) ids et :: ft ∧ ms.stack = .block (l :: s) ids es :: fs ∧
+    OpsRel L t s ∧ StackRel L Db ft fs ∧ (∀ n, Db n → D n) ∧ EnvAgree D et es ∧
+    NoReads D (c :: t) ∧ Ready c l (.block s ids es :: fs) ms.core
 
 /-- Related states: in lockstep, or between a store and its forwarded load. Pointers take at least
 one byte throughout. -/
@@ -289,145 +279,116 @@ def R (mt ms : Machine) : Prop := (MRel L mt ms ∨ Mid mt ms) ∧ 0 < ms.core.s
 
 /-! ## Steps -/
 
+theorem simpleOp_ok_space {loc : Option Loc} {k : OpKind} {rs : List Result} {vs : List RVal}
+    {c c' : Core} {outs : List RVal} (e : simpleOp loc k rs vs c = .ok (outs, c')) :
+    c'.space = c.space := keeps_simpleOp loc k rs vs c _ rfl e
+
 /-- At a rewritten spot, both run the store, and land between it and the load. -/
 theorem step_store {mt ms : Machine} {s l c : Op} {t s' : List Op} {ids : List Nat}
-    {rt rs : List Frame} (hc : mt.core = ms.core) (hp : Pat s l c) (hts : OpsRel L t s')
-    (hrest : Forall2 (FrameRel L) rt rs) (ht : mt.stack = .block (s :: c :: t) ids :: rt)
-    (hs : ms.stack = .block (s :: l :: s') ids :: rs) (hsp : 0 < ms.core.space.ptrBits / 8) :
+    {et es : Env} {ft fs : List Frame} {D Db : String → Prop} (hc : mt.core = ms.core)
+    (hp : Pat s l c) (hts : OpsRel L t s') (hb : StackRel L Db ft fs) (hDb : ∀ n, Db n → D n)
+    (hag : EnvAgree D et es) (hnr : NoReads D ([s, c] ++ t))
+    (ht : mt.stack = .block ([s, c] ++ t) ids et :: ft)
+    (hs : ms.stack = .block ([s, l] ++ s') ids es :: fs) (hsp : 0 < ms.core.space.ptrBits / 8) :
     StepMatch R mt ms := by
   obtain ⟨T, A1, v, op, loc1, A2, r, loc2, rfl, rfl, rfl, hr, hT⟩ := hp
-  refine step_same (x := simpleOp loc1 (.store T A1) [] [v, op] ms.core)
-    (mt'' := { mt with stack := .block (.mk .copy [r] [v] [] loc2 :: t) ids :: rt })
-    (ms'' := { ms with stack := .block (.mk (.load A2) [r] [op] [] loc2 :: s') ids :: rs })
-    ?_ ?_ ?_ ?_
-  · simp only [step, ht, Dse.execOp_store, hc]; cases simpleOp loc1 (.store T A1) [] [v, op] ms.core <;> rfl
-  · simp only [step, hs, Dse.execOp_store]; cases simpleOp loc1 (.store T A1) [] [v, op] ms.core <;> rfl
-  · simp only [Machine.shape, ht, hs]
-    exact (shape_cons rfl hrest).symm
-  · intro u core e
-    obtain ⟨⟩ := u
-    have hsp' : core.space = ms.core.space := keeps_simpleOp _ _ _ _ ms.core _ rfl e
-    refine ⟨.inr ⟨rfl, _, _, t, s', ids, rt, rs, rfl, rfl, hts, hrest, ?_⟩, hsp' ▸ hsp⟩
-    refine ⟨A2, r, op, v, loc2, rfl, rfl, ?_⟩
-    exact load_after_store hr hT hsp e
-
+  obtain ⟨core, stt⟩ := mt
+  obtain ⟨cs, sts⟩ := ms
+  dsimp only at hc ht hs hsp
+  subst hc ht hs
+  simp only [List.cons_append, List.nil_append] at hnr ⊢
+  obtain ⟨hrs, hnr1⟩ := NoReads.cons hnr
+  have rel : StackRel L D (.block t ids et :: ft) (.block s' ids es :: fs) :=
+    .block hb hDb hts hag hnr1.cons.2
+  have hargs := (Op.reads_mk hrs).1
+  let S1 : List Frame := .block (.mk (.load A2) [r] [op] [] loc2 :: s') ids es :: fs
+  refine step_same
+    (x := (operands S1 loc1 [v, op]).bind fun vs => simpleOp loc1 (.store T A1) [] vs core)
+    (ft := fun outs core => ⟨core, bindTop [] outs
+      (.block (.mk .copy [r] [v] [] loc2 :: t) ids et :: ft)⟩)
+    (fs := fun outs core => ⟨core, bindTop [] outs S1⟩) ?_ ?_ ?_ ?_
+  · rw [step_simple rfl rfl rfl, operands_ops _ t, rel.operands loc1 hargs, operands_ops s']
+  · rw [step_simple rfl rfl rfl]
+  · simp only [Machine.shape]
+    exact (shape_cons rfl hb).symm
+  · intro outs core' e
+    rw [operands_pair] at e
+    cases hv : operandIn S1 loc1 v with
+    | error h => rw [hv] at e; cases e
+    | ok w =>
+    cases hop : operandIn S1 loc1 op with
+    | error h => rw [hv, hop] at e; cases e
+    | ok pv =>
+    rw [hv, hop] at e
+    simp only [Except.bind] at e
+    have hsp' := simpleOp_ok_space e
+    simp only [bindTop_nil]
+    refine ⟨.inr ⟨rfl, D, Db, _, _, t, s', ids, et, es, ft, fs, rfl, rfl, hts, hb, hDb, hag,
+      hnr1, A2, r, op, v, loc2, rfl, rfl, ?_⟩, by simpa [hsp'] using hsp⟩
+    rw [operandIn_ops _ s'] at hv hop
+    rw [operands_one, operands_one, operandIn_loc (loc' := loc2) hv,
+      operandIn_loc (loc' := loc2) hop]
+    simp only [Except.bind]
+    rw [simpleOp_eq, simpleOp_eq]
+    rcases load_after_store (loc2 := loc2) (A2 := A2) hr hT hsp e with ⟨h, e1, hesc⟩ | heq
+    · exact .inl ⟨h, by rw [e1]; rfl, hesc⟩
+    · exact .inr (by rw [heq])
 
 /-- Between the store and the load: the target copies, the source loads the same value (or
 escapes), and the two are back in lockstep. -/
 theorem step_mid {mt ms : Machine} (hmid : Mid mt ms) (hsp : 0 < ms.core.space.ptrBits / 8) :
     StepMatch R mt ms := by
-  obtain ⟨hc, c, l, t, s, ids, rt, rs, ht, hs, hts, hrest, A2, r, op, v, loc, rfl, rfl, hready⟩ :=
-    hmid
-  have stepT : step mt = afterOp { mt with stack := .block t ids :: rt }
-      (simpleOp loc .copy [r] [v] ms.core) := by
-    simp only [step, ht, execOp_simple _ .copy _ _ _ rfl rfl rfl, hc]
-    cases simpleOp loc .copy [r] [v] ms.core <;> rfl
-  have stepS : step ms = afterOp { ms with stack := .block s ids :: rs }
-      (simpleOp loc (.load A2) [r] [op] ms.core) := by
-    simp only [step, hs, execOp_simple _ (.load A2) _ _ _ rfl rfl rfl]
-    cases simpleOp loc (.load A2) [r] [op] ms.core <;> rfl
+  obtain ⟨hc, D, Db, c, l, t, s, ids, et, es, ft, fs, ht, hs, hts, hb, hDb, hag, hnr, A2, r, op, v,
+    loc, rfl, rfl, hready⟩ := hmid
+  obtain ⟨core, stt⟩ := mt
+  obtain ⟨cs, sts⟩ := ms
+  dsimp only at hc ht hs hsp hready
+  subst hc ht hs
+  obtain ⟨hrc, hnr'⟩ := NoReads.cons hnr
+  have rel : StackRel L D (.block t ids et :: ft) (.block s ids es :: fs) :=
+    .block hb hDb hts hag hnr'
+  have stepS := step_simple (c := core) (k := .load A2) (res := [r]) (args := [op]) (loc := loc)
+    (t := s) (ids := ids) (env := es) (fs := fs) rfl rfl rfl
   rcases hready with ⟨h, e, hesc⟩ | heq
-  · have esc : Escapes ms := ⟨1, h, by rw [runSteps_one, stepS, e]; rfl, hesc⟩
+  · have esc : Escapes ⟨core, _⟩ := ⟨1, h, by rw [runSteps_one, stepS, e]; rfl, hesc⟩
     exact ⟨fun _ _ => .inl esc, fun _ _ => .inl esc⟩
-  refine step_same stepT (by rw [stepS, heq]) ?_ ?_
-  · simp only [Machine.shape, ht, hs]
-    exact (shape_cons rfl hrest).symm
-  · intro u core e
-    have hsp' : core.space = ms.core.space := keeps_simpleOp _ _ _ _ ms.core _ rfl e
-    exact ⟨.inl (MRel.mk' rfl (Forall2.cons' (.block hts) hrest)), hsp' ▸ hsp⟩
-
-theorem opsRel_cons {ot : Op} {t s0 : List Op} (h : OpsRel L (ot :: t) s0) :
-    (∃ os s, s0 = os :: s ∧ OpRel L ot os ∧ OpsRel L t s) ∨
-    (∃ l c t' s, t = c :: t' ∧ s0 = ot :: l :: s ∧ Pat ot l c ∧ OpsRel L t' s) := by
-  generalize hx : ot :: t = x at h
-  cases h with
-  | refl => subst hx; exact .inl ⟨_, _, rfl, .refl _, .refl _⟩
-  | cons ho hr =>
-    injection hx with h1 h2
-    subst h1 h2
-    exact .inl ⟨_, _, rfl, ho, hr⟩
-  | rw hl hr =>
-    obtain ⟨s1, l, c, rfl, rfl, hp⟩ := hl
-    simp only [List.cons_append, List.nil_append, List.cons.injEq] at hx
-    obtain ⟨rfl, rfl⟩ := hx
-    exact .inr ⟨l, c, _, _, rfl, rfl, hp, hr⟩
-
-theorem opsRel_nil {s0 : List Op} (h : OpsRel L [] s0) : s0 = [] := by
-  generalize hx : ([] : List Op) = x at h
-  cases h with
-  | refl => rfl
-  | cons => cases hx
-  | rw hl _ =>
-    obtain ⟨_, _, _, rfl, _, _⟩ := hl
-    cases hx
+  refine step_same
+    (x := (operands (.block s ids es :: fs) loc [v]).bind fun vs => simpleOp loc .copy [r] vs core)
+    (ft := fun outs core => ⟨core, bindTop [r] outs (.block t ids et :: ft)⟩)
+    (fs := fun outs core => ⟨core, bindTop [r] outs (.block s ids es :: fs)⟩) ?_ ?_ ?_ ?_
+  · rw [step_simple rfl rfl rfl, rel.operands loc (Op.reads_mk hrc).1]
+  · rw [stepS, heq]
+  · simp only [Machine.shape]
+    exact (shape_cons rfl hb).symm
+  · intro outs core' e
+    obtain ⟨vs, -, e'⟩ : ∃ vs, operands (.block s ids es :: fs) loc [v] = .ok vs ∧
+        simpleOp loc .copy [r] vs core = .ok (outs, core') := by
+      cases ho : operands (.block s ids es :: fs) loc [v] with
+      | error h => rw [ho] at e; cases e
+      | ok vs => rw [ho] at e; exact ⟨vs, rfl, e⟩
+    exact ⟨.inl ⟨rfl, D, rel.bindTop _ _⟩, by simpa [simpleOp_ok_space e'] using hsp⟩
 
 theorem sim : Simulation R := by
   intro mt ms ⟨hR, hsp⟩
-  rcases hR with ⟨hc, hst⟩ | hmid
+  rcases hR with hR | hmid
   case inr => exact step_mid hmid hsp
-  have lock : (∀ ot t ids rt, mt.stack = .block (ot :: t) ids :: rt →
-        ∃ os s rs, ms.stack = .block (os :: s) ids :: rs ∧ OpRel L ot os ∧ OpsRel L t s) →
-      (∀ ids rt, mt.stack = .block [] ids :: rt → ∃ rs, ms.stack = .block [] ids :: rs) →
-      StepMatch R mt ms := fun hh hn =>
-    (StepMatch.of_lockstep ⟨hc, hst⟩ (step_eq ⟨hc, hst⟩ hh hn)).mono
-      fun _ _ _ ek h => ⟨.inl h, by rw [runSteps_space ek]; exact hsp⟩
-  cases ht : mt.stack with
-  | nil =>
-    exact lock (fun _ _ _ _ e => by rw [ht] at e; cases e) (fun _ _ e => by rw [ht] at e; cases e)
-  | cons f rt =>
-    cases hs : ms.stack with
-    | nil => rw [ht, hs] at hst; exact hst.elim
-    | cons f' rs =>
-      have hst' := hst
-      rw [ht, hs] at hst'
-      obtain ⟨hf, hrest⟩ := hst'
-      cases hf with
-      | refl f =>
-        refine lock (fun ot t ids rt' e => ?_) (fun ids rt' e => ?_)
-        · rw [ht, List.cons.injEq] at e
-          obtain ⟨rfl, rfl⟩ := e
-          exact ⟨ot, t, rs, hs, .refl _, .refl _⟩
-        · rw [ht, List.cons.injEq] at e
-          obtain ⟨rfl, rfl⟩ := e
-          exact ⟨rs, hs⟩
-      | block hops =>
-        rename_i t0 s0 ids
-        cases t0 with
-        | nil =>
-          obtain rfl := opsRel_nil hops
-          refine lock (fun ot t ids' rt' e => ?_) (fun ids' rt' e => ?_)
-          · rw [ht] at e; simp at e
-          · rw [ht, List.cons.injEq, Frame.block.injEq] at e
-            obtain ⟨⟨-, rfl⟩, rfl⟩ := e
-            exact ⟨rs, hs⟩
-        | cons ot t =>
-          rcases opsRel_cons hops with ⟨os, s, rfl, ho, hts⟩ | ⟨l, c, t', s, rfl, rfl, hp, hts⟩
-          · refine lock (fun ot' t' ids' rt' e => ?_) (fun ids' rt' e => ?_)
-            · rw [ht, List.cons.injEq, Frame.block.injEq, List.cons.injEq] at e
-              obtain ⟨⟨⟨rfl, rfl⟩, rfl⟩, rfl⟩ := e
-              exact ⟨os, s, rs, hs, ho, hts⟩
-            · rw [ht] at e; simp at e
-          · exact step_store hc hp hts hrest ht hs hsp
-      | loop hb =>
-        refine lock (fun _ _ _ _ e => ?_) (fun _ _ e => ?_) <;> (rw [ht] at e; simp at e)
+  refine StepMatch.of_mrel hR (fun _ _ _ ek h => ⟨.inl h, by rw [runSteps_space ek]; exact hsp⟩) ?_
+  intro D Db pt ps t s ids et es ft fs hl hts hb hDb hag hnr ht hs
+  obtain ⟨s1, l, c, rfl, rfl, hp⟩ := hl
+  exact step_store hR.1 hp hts hb hDb hag hnr ht hs hsp
 
 theorem init_match {mod : Module} {tgt src : Func} (hsp : 0 < mod.space.ptrBits / 8)
     (hparams : tgt.params = src.params) (hrets : tgt.rets = src.rets)
     (hops : OpsRel L tgt.body.ops src.body.ops) (oracle : Nat → Int) (args : List RVal) :
     InitMatch R (Machine.init oracle mod tgt args) (Machine.init oracle mod src args) := by
-  have hinit := @init_space oracle mod src args
-  simp only [Machine.init, hparams, hrets, bind, Except.bind] at hinit ⊢
-  cases e : (enterCall none src.params args).run (Core.initial oracle mod) with
-  | error h =>
+  rcases init_lockstep (mod := mod) hparams hrets hops oracle args with ⟨h, e1, e2⟩ |
+    ⟨mt, ms, e1, e2, hR⟩
+  · rw [e1, e2]
     by_cases hamb : h.behavior = .ambiguous
     · exact .inl ⟨h, rfl, .inr hamb⟩
     · exact .inr (.inr ⟨h, h, rfl, rfl, Behavior.Refines.refl _ hamb⟩)
-  | ok r =>
-    rw [e] at hinit
-    refine .inr (.inl ⟨_, _, rfl, rfl, .inl (MRel.mk' rfl
-      (Forall2.cons' (.block hops) (Forall2.cons' (.refl _) trivial))), ?_⟩)
-    rw [hinit rfl]
-    exact hsp
+  · rw [e1, e2]
+    exact .inr (.inl ⟨mt, ms, rfl, rfl, .inl hR, by rw [init_space e2]; exact hsp⟩)
 
 /-- **Store-to-load forwarding is correct.** Replacing, anywhere in a function, a load right after
 a store of the same type through the same pointer with a copy of the stored value gives a function

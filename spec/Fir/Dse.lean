@@ -422,26 +422,22 @@ def Pat (s1 s2 : Op) : Prop :=
     ∀ cfg, T1.size cfg = T2.size cfg
 
 /-- The rewrite: the target has `[s2]` where the source has `[s1, s2]`. -/
-def L (pt ps : List Op) : Prop := ∃ s1 s2, pt = [s2] ∧ ps = [s1, s2] ∧ Pat s1 s2
+def L (pt ps _ : List Op) : Prop := ∃ s1 s2, pt = [s2] ∧ ps = [s1, s2] ∧ Pat s1 s2
 
-theorem simpleOp_store (loc : Option Loc) (T : Ty) (A : Nat) (ov op : Operand) (c : Core) :
-    simpleOp loc (.store T A) [] [ov, op] c =
-      (operandIn c.env loc ov).bind fun v =>
-      (operandIn c.env loc op).bind fun pv =>
+theorem checkResults_nil (loc : Option Loc) (vs : List RVal) (c : Core) :
+    checkResults loc [] vs c =
+      match vs with
+      | [] => .ok ((), c)
+      | _ => .error { behavior := .stuck "wrong number of values", loc := loc } := by
+  cases vs <;> rfl
+
+theorem simpleOp_store (loc : Option Loc) (T : Ty) (A : Nat) (v pv : RVal) (c : Core) :
+    simpleOp loc (.store T A) [] [v, pv] c =
       match pv with
-      | .ptr p => storeC loc T A v p c
+      | .ptr p => (storeC loc T A v p c).bind fun r => .ok ([], r.2)
       | _ => .error { behavior := .stuck "expected a ptr", loc := loc } := by
-  simp only [simpleOp, List.mapM_cons, List.mapM_nil, bind, StateT.bind, pure, StateT.pure,
-    Except.bind, evalOperand]
-  cases operandIn c.env loc ov with
-  | error h => rfl
-  | ok v =>
-  simp only [Except.map]
-  cases operandIn c.env loc op with
-  | error h => rfl
-  | ok pv =>
-  simp only [Except.pure, evalSimple, get, getThe, MonadStateOf.get, StateT.get,
-    bind, StateT.bind, pure, StateT.pure, Except.bind]
+  simp only [simpleOp, evalSimple, get, getThe, MonadStateOf.get, StateT.get, bind, StateT.bind,
+    pure, StateT.pure, Except.bind]
   cases pv with
   | ptr p =>
     simp only [asPtr, pure, StateT.pure, Except.pure]
@@ -450,68 +446,15 @@ theorem simpleOp_store (loc : Option Loc) (T : Ty) (A : Nat) (ov op : Operand) (
     | ok r => rfl
   | _ => rfl
 
-theorem execOp_store (m : Machine) (T : Ty) (A : Nat) (args : List Operand) (loc : Option Loc) :
-    execOp m (.mk (.store T A) [] args [] loc) =
-      match simpleOp loc (.store T A) [] args m.core with
-      | .ok (_, core) => .ok { m with core }
-      | .error h => .error h := by
-  simp only [execOp, execFlat, OpKind.callee?, OpKind.stackAlloc?, OpKind.isTerminator,
-    Machine.exec, StateT.run]
-  cases simpleOp loc (.store T A) [] args m.core with
-  | error h => rfl
-  | ok r => rfl
-
-theorem operandIn_var_error {env : Env} {loc : Option Loc} {x : String} {h : Halt}
-    (e : operandIn env loc (.var x) = .error h) : Escape h := by
-  simp only [operandIn] at e
-  split at e
-  · cases e
-  · cases e; exact .inl trivial
-
-theorem operandIn_loc {env : Env} {loc loc' : Option Loc} {o : Operand} {v : RVal}
-    (e : operandIn env loc o = .ok v) : operandIn env loc' o = .ok v := by
-  cases o with
-  | var x =>
-    simp only [operandIn] at e ⊢
-    split at e
-    · exact e
-    · cases e
-  | hole => cases e
-
-theorem storeC_env {loc : Option Loc} {T : Ty} {A : Nat} {v : RVal} {p : Option Ptr} {c c1 : Core}
-    (e : storeC loc T A v p c = .ok ((), c1)) : c1.env = c.env := by
-  cases p with
-  | none => cases e
-  | some p =>
-    cases hty : v.hasTy T with
-    | false => rw [storeC_ill_typed hty] at e; cases e
-    | true =>
-      rw [storeC_typed hty] at e
-      cases hc : checkAccess c loc p (T.size c.space) A with
-      | error h => rw [hc] at e; cases e
-      | ok r =>
-        rw [hc] at e
-        dsimp only [Except.bind] at e
-        cases hm : markAll c.tags loc r.1 r.2.1 r.2.2 (T.size c.space) true c.scopes.toList c.marks with
-        | error h => rw [hm] at e; cases e
-        | ok m => rw [hm] at e; cases e; rfl
-
 /-- Running the deleted store either escapes, or leaves a core on which the next store does
 exactly what it does without the deleted one. -/
-theorem dse_core {loc1 loc2 : Option Loc} {T1 T2 : Ty} {A1 A2 : Nat} {x1 xp : String}
-    {v2 : Operand} (hsz : ∀ cfg, T1.size cfg = T2.size cfg) (c : Core) :
-    (∃ h, simpleOp loc1 (.store T1 A1) [] [.var x1, .var xp] c = .error h ∧ Escape h) ∨
-    (∃ c1, simpleOp loc1 (.store T1 A1) [] [.var x1, .var xp] c = .ok ((), c1) ∧
-      simpleOp loc2 (.store T2 A2) [] [v2, .var xp] c1 =
-        simpleOp loc2 (.store T2 A2) [] [v2, .var xp] c) := by
+theorem dse_core {loc1 loc2 : Option Loc} {T1 T2 : Ty} {A1 A2 : Nat}
+    (hsz : ∀ cfg, T1.size cfg = T2.size cfg) (w1 pv : RVal) (c : Core) :
+    (∃ h, simpleOp loc1 (.store T1 A1) [] [w1, pv] c = .error h ∧ Escape h) ∨
+    (∃ c1, simpleOp loc1 (.store T1 A1) [] [w1, pv] c = .ok ([], c1) ∧
+      ∀ w2, simpleOp loc2 (.store T2 A2) [] [w2, pv] c1 =
+        simpleOp loc2 (.store T2 A2) [] [w2, pv] c) := by
   rw [simpleOp_store]
-  cases h1 : operandIn c.env loc1 (.var x1) with
-  | error h => exact .inl ⟨h, rfl, operandIn_var_error h1⟩
-  | ok w1 =>
-  cases hp : operandIn c.env loc1 (.var xp) with
-  | error h => exact .inl ⟨h, rfl, operandIn_var_error hp⟩
-  | ok pv =>
-  simp only [Except.bind]
   cases pv with
   | ptr p =>
     simp only
@@ -519,174 +462,85 @@ theorem dse_core {loc1 loc2 : Option Loc} {T1 T2 : Ty} {A1 A2 : Nat} {x1 xp : St
     | error h => exact .inl ⟨h, rfl, storeC_error hs⟩
     | ok r =>
       obtain ⟨⟨⟩, c1⟩ := r
-      refine .inr ⟨c1, rfl, ?_⟩
-      rw [simpleOp_store, simpleOp_store, storeC_env hs, operandIn_loc (loc' := loc2) hp]
-      cases operandIn c.env loc2 v2 with
-      | error h => rfl
-      | ok w2 =>
-        simp only [Except.bind]
-        cases p with
-        | none => rfl
-        | some p => exact store_twice hsz hs
+      refine .inr ⟨c1, rfl, fun w2 => ?_⟩
+      rw [simpleOp_store, simpleOp_store]
+      cases p with
+      | none => rfl
+      | some p => simp only [store_twice hsz hs]
   | _ => exact .inl ⟨_, rfl, .inl trivial⟩
 
 /-! ## Steps -/
 
-theorem shape_cons {f f' : Frame} {rt rs : List Frame} (h : f.isProgressLoop = f'.isProgressLoop)
-    (hrest : Forall2 (FrameRel L) rt rs) :
-    (f :: rt).map Frame.isProgressLoop = (f' :: rs).map Frame.isProgressLoop := by
-  simp [h, shape_eq hrest]
-
-/-- At a rewritten spot, the target's one step is matched by the source's two. -/
+/-- At a rewritten spot, the source runs the deleted store, then the target's one step is
+matched by the source's next. -/
 theorem step_dse {mt ms : Machine} {s1 s2 : Op} {t s : List Op} {ids : List Nat}
-    {rt rs : List Frame} (hc : mt.core = ms.core) (hp : Pat s1 s2) (hts : OpsRel L t s)
-    (hrest : Forall2 (FrameRel L) rt rs) (ht : mt.stack = .block (s2 :: t) ids :: rt)
-    (hs : ms.stack = .block (s1 :: s2 :: s) ids :: rs) : StepMatch (MRel L) mt ms := by
+    {et es : Env} {ft fs : List Frame} {D Db : String → Prop} (hc : mt.core = ms.core)
+    (hp : Pat s1 s2) (hts : OpsRel L t s) (hb : StackRel L Db ft fs) (hDb : ∀ n, Db n → D n)
+    (hag : EnvAgree D et es) (hnr : NoReads D ([s2] ++ t))
+    (ht : mt.stack = .block ([s2] ++ t) ids et :: ft)
+    (hs : ms.stack = .block ([s1, s2] ++ s) ids es :: fs) : StepMatch (MRel L) mt ms := by
   obtain ⟨T1, A1, x1, xp, loc1, T2, A2, v2, loc2, rfl, rfl, hsz⟩ := hp
-  have stepT : step mt = match simpleOp loc2 (.store T2 A2) [] [v2, .var xp] ms.core with
-      | .ok (_, core) => .ok { core, stack := .block t ids :: rt }
-      | .error h => .error h := by
-    simp only [step, ht, execOp_store, hc]
-  have stepS1 : step ms = match simpleOp loc1 (.store T1 A1) [] [.var x1, .var xp] ms.core with
-      | .ok (_, core) => .ok { core, stack := .block (.mk (.store T2 A2) [] [v2, .var xp] [] loc2 :: s) ids :: rs }
-      | .error h => .error h := by
-    simp only [step, hs, execOp_store]
-  have stepS2 : ∀ c1 : Core,
-      step { core := c1, stack := .block (.mk (.store T2 A2) [] [v2, .var xp] [] loc2 :: s) ids :: rs } =
-        match simpleOp loc2 (.store T2 A2) [] [v2, .var xp] c1 with
-        | .ok (_, core) => .ok { core, stack := .block s ids :: rs }
-        | .error h => .error h := by
-    intro c1
-    simp only [step, execOp_store]
-  rcases dse_core (A1 := A1) (A2 := A2) (x1 := x1) (v2 := v2) (loc1 := loc1) (loc2 := loc2) (xp := xp) hsz
-    ms.core with ⟨h, e1, hesc⟩ | ⟨c1, e1, e2⟩
-  · -- The deleted store fails: the source escapes.
-    have esc : Escapes ms := ⟨1, h, by rw [runSteps_one, stepS1, e1], hesc⟩
+  obtain ⟨c, stt⟩ := mt
+  obtain ⟨cs, sts⟩ := ms
+  dsimp only at hc ht hs
+  subst hc ht hs
+  obtain ⟨hr2, hnr'⟩ := NoReads.cons hnr
+  have rel : StackRel L D (.block t ids et :: ft) (.block s ids es :: fs) :=
+    .block hb hDb hts hag hnr'
+  have hargs := (Op.reads_mk hr2).1
+  -- The source runs the deleted store.
+  have step1 := step_simple (c := c) (k := .store T1 A1) (res := []) (args := [.var x1, .var xp])
+    (loc := loc1) (t := .mk (.store T2 A2) [] [v2, .var xp] [] loc2 :: s) (ids := ids) (env := es)
+    (fs := fs) rfl rfl rfl
+  simp only [List.cons_append, List.nil_append, bindTop_nil] at step1 ⊢
+  rw [operands_ops _ s] at step1
+  cases hx1 : operandIn (.block s ids es :: fs) loc1 (.var x1) with
+  | error h =>
+    have esc : Escapes ⟨c, _⟩ := ⟨1, h, by
+      rw [runSteps_one, step1, operands_pair, hx1]; rfl, .inl (operandIn_var_error hx1)⟩
     exact ⟨fun _ _ => .inl esc, fun _ _ => .inl esc⟩
-  have run1 : runSteps 1 ms = .ok {
-      core := c1, stack := .block (.mk (.store T2 A2) [] [v2, .var xp] [] loc2 :: s) ids :: rs } := by
-    rw [runSteps_one, stepS1, e1]
-  have run2 : runSteps 2 ms = match simpleOp loc2 (.store T2 A2) [] [v2, .var xp] ms.core with
-      | .ok (_, core) => .ok { core, stack := .block s ids :: rs }
-      | .error h => .error h := by
-    rw [show 2 = 1 + 1 from rfl, runSteps_add, run1, Except.ok_bind, runSteps_one, stepS2, e2]
-  constructor
-  · intro mt' e
-    rw [stepT] at e
-    cases h2 : simpleOp loc2 (.store T2 A2) [] [v2, .var xp] ms.core with
-    | error h => rw [h2] at e; cases e
-    | ok r =>
-      obtain ⟨u, c2⟩ := r
-      rw [h2] at e
-      cases e
-      refine .inr ⟨1, { core := c2, stack := .block s ids :: rs }, by rw [run2, h2],
-        MRel.mk' rfl (Forall2.cons' (.block hts) hrest), ?_⟩
-      intro j mj hj ej
-      rcases Nat.le_one_iff_eq_zero_or_eq_one.mp hj with rfl | rfl
-      · simp only [runSteps, Except.ok.injEq] at ej
-        subst ej
-        simp only [Machine.shape, ht, hs]
-        exact (shape_cons rfl hrest).symm
-      · rw [run1, Except.ok.injEq] at ej
-        subst ej
-        simp only [Machine.shape, ht]
-        exact (shape_cons rfl hrest).symm
-  · intro h e
-    rw [stepT] at e
-    cases h2 : simpleOp loc2 (.store T2 A2) [] [v2, .var xp] ms.core with
-    | ok r => rw [h2] at e; cases e
-    | error h' =>
-      rw [h2] at e
-      cases e
-      by_cases hamb : h.behavior = .ambiguous
-      · exact .inl ⟨2, h, by rw [run2, h2], .inr hamb⟩
-      · exact .inr ⟨2, h, by rw [run2, h2], Behavior.Refines.refl _ hamb⟩
-
-theorem opsRel_cons {ot : Op} {t s0 : List Op} (h : OpsRel L (ot :: t) s0) :
-    (∃ os s, s0 = os :: s ∧ OpRel L ot os ∧ OpsRel L t s) ∨
-    (∃ s1 s, s0 = s1 :: ot :: s ∧ Pat s1 ot ∧ OpsRel L t s) := by
-  generalize hx : ot :: t = x at h
-  cases h with
-  | refl => subst hx; exact .inl ⟨_, _, rfl, .refl _, .refl _⟩
-  | cons ho hr =>
-    injection hx with h1 h2
-    subst h1 h2
-    exact .inl ⟨_, _, rfl, ho, hr⟩
-  | rw hl hr =>
-    obtain ⟨s1, s2, rfl, rfl, hp⟩ := hl
-    simp only [List.cons_append, List.nil_append, List.cons.injEq] at hx
-    obtain ⟨rfl, rfl⟩ := hx
-    exact .inr ⟨s1, _, rfl, hp, hr⟩
-
-theorem opsRel_nil {s0 : List Op} (h : OpsRel L [] s0) : s0 = [] := by
-  generalize hx : ([] : List Op) = x at h
-  cases h with
-  | refl => rfl
-  | cons => cases hx
-  | rw hl _ =>
-    obtain ⟨_, _, rfl, _, _⟩ := hl
-    cases hx
+  | ok w1 =>
+  cases hxp : operandIn (.block s ids es :: fs) loc1 (.var xp) with
+  | error h =>
+    have esc : Escapes ⟨c, _⟩ := ⟨1, h, by
+      rw [runSteps_one, step1, operands_pair, hx1, hxp]; rfl, .inl (operandIn_var_error hxp)⟩
+    exact ⟨fun _ _ => .inl esc, fun _ _ => .inl esc⟩
+  | ok pv =>
+  rw [operands_pair, hx1, hxp] at step1
+  simp only [Except.bind] at step1
+  rcases dse_core (loc2 := loc2) (A2 := A2) hsz w1 pv c with ⟨h, e1, hesc⟩ | ⟨c1, e1, e2⟩
+  · have esc : Escapes ⟨c, _⟩ := ⟨1, h, by rw [runSteps_one, step1, e1], hesc⟩
+    exact ⟨fun _ _ => .inl esc, fun _ _ => .inl esc⟩
+  rw [e1] at step1
+  refine StepMatch.prepend step1 ?_ ?_
+  · simp only [Machine.shape]
+    exact (shape_cons rfl hb).symm
+  -- Then both run the second store, with the same operands, to the same core.
+  have hxp2 : operandIn (.block s ids es :: fs) loc2 (.var xp) = .ok pv := operandIn_loc hxp
+  refine step_same
+    (x := (operands (.block s ids es :: fs) loc2 [v2, .var xp]).bind fun vs =>
+      simpleOp loc2 (.store T2 A2) [] vs c)
+    (ft := fun outs core => ⟨core, bindTop [] outs (.block t ids et :: ft)⟩)
+    (fs := fun outs core => ⟨core, bindTop [] outs (.block s ids es :: fs)⟩) ?_ ?_ ?_ ?_
+  · rw [step_simple rfl rfl rfl, rel.operands loc2 hargs]
+  · rw [step_simple rfl rfl rfl]
+    congr 1
+    refine Except.bind_congr fun vs e => ?_
+    rw [operands_pair, hxp2] at e
+    cases hv : operandIn (.block s ids es :: fs) loc2 v2 with
+    | error h => rw [hv] at e; cases e
+    | ok w2 => rw [hv] at e; cases e; exact e2 w2
+  · simp only [Machine.shape]
+    exact (shape_cons rfl hb).symm
+  · intro _ core _
+    exact ⟨rfl, D, rel.bindTop _ _⟩
 
 theorem sim : Simulation (MRel L) := by
   intro mt ms hR
-  obtain ⟨hc, hst⟩ := hR
-  have lock : (∀ ot t ids rt, mt.stack = .block (ot :: t) ids :: rt →
-        ∃ os s rs, ms.stack = .block (os :: s) ids :: rs ∧ OpRel L ot os ∧ OpsRel L t s) →
-      (∀ ids rt, mt.stack = .block [] ids :: rt → ∃ rs, ms.stack = .block [] ids :: rs) →
-      StepMatch (MRel L) mt ms :=
-    fun hh hn => StepMatch.of_lockstep ⟨hc, hst⟩ (step_eq ⟨hc, hst⟩ hh hn)
-  cases ht : mt.stack with
-  | nil => exact lock (fun _ _ _ _ e => by rw [ht] at e; cases e) (fun _ _ e => by rw [ht] at e; cases e)
-  | cons f rt =>
-    cases hs : ms.stack with
-    | nil => rw [ht, hs] at hst; exact hst.elim
-    | cons f' rs =>
-      have hst' := hst
-      rw [ht, hs] at hst'
-      obtain ⟨hf, hrest⟩ := hst'
-      cases hf with
-      | refl f =>
-        refine lock (fun ot t ids rt' e => ?_) (fun ids rt' e => ?_)
-        · rw [ht, List.cons.injEq] at e
-          obtain ⟨rfl, rfl⟩ := e
-          exact ⟨ot, t, rs, hs, .refl _, .refl _⟩
-        · rw [ht, List.cons.injEq] at e
-          obtain ⟨rfl, rfl⟩ := e
-          exact ⟨rs, hs⟩
-      | block hops =>
-        rename_i t0 s0 ids
-        cases t0 with
-        | nil =>
-          obtain rfl := opsRel_nil hops
-          refine lock (fun ot t ids' rt' e => ?_) (fun ids' rt' e => ?_)
-          · rw [ht] at e; simp at e
-          · rw [ht, List.cons.injEq, Frame.block.injEq] at e
-            obtain ⟨⟨-, rfl⟩, rfl⟩ := e
-            exact ⟨rs, hs⟩
-        | cons ot t =>
-          rcases opsRel_cons hops with ⟨os, s, rfl, ho, hts⟩ | ⟨s1, s, rfl, hp, hts⟩
-          · refine lock (fun ot' t' ids' rt' e => ?_) (fun ids' rt' e => ?_)
-            · rw [ht, List.cons.injEq, Frame.block.injEq, List.cons.injEq] at e
-              obtain ⟨⟨⟨rfl, rfl⟩, rfl⟩, rfl⟩ := e
-              exact ⟨os, s, rs, hs, ho, hts⟩
-            · rw [ht] at e; simp at e
-          · exact step_dse hc hp hts hrest ht hs
-      | loop hb =>
-        refine lock (fun _ _ _ _ e => ?_) (fun _ _ e => ?_) <;> (rw [ht] at e; simp at e)
-
-theorem init_match {mod : Module} {tgt src : Func} (hparams : tgt.params = src.params)
-    (hrets : tgt.rets = src.rets) (hops : OpsRel L tgt.body.ops src.body.ops)
-    (oracle : Nat → Int) (args : List RVal) :
-    InitMatch (MRel L) (Machine.init oracle mod tgt args) (Machine.init oracle mod src args) := by
-  simp only [Machine.init, hparams, hrets, bind, Except.bind]
-  cases (enterCall none src.params args).run (Core.initial oracle mod) with
-  | error h =>
-    by_cases hamb : h.behavior = .ambiguous
-    · exact .inl ⟨h, rfl, .inr hamb⟩
-    · exact .inr (.inr ⟨h, h, rfl, rfl, Behavior.Refines.refl _ hamb⟩)
-  | ok r =>
-    exact .inr (.inl ⟨_, _, rfl, rfl, MRel.mk' rfl
-      (Forall2.cons' (.block hops) (Forall2.cons' (.refl _) trivial))⟩)
+  refine StepMatch.of_mrel hR (fun _ _ _ _ h => h) ?_
+  intro D Db pt ps t s ids et es ft fs hl hts hb hDb hag hnr ht hs
+  obtain ⟨s1, s2, rfl, rfl, hp⟩ := hl
+  exact step_dse hR.1 hp hts hb hDb hag hnr ht hs
 
 /-- **Dead store elimination is correct.** Deleting, anywhere in a function, a store that is
 immediately followed by a store of the same size through the same pointer gives a function that
@@ -694,6 +548,8 @@ refines the original, for every argument and every oracle. -/
 theorem refines {mod : Module} {tgt src : Func} (hparams : tgt.params = src.params)
     (hrets : tgt.rets = src.rets) (hops : OpsRel L tgt.body.ops src.body.ops)
     (dec : src.Decided mod) : tgt.Refines mod src :=
-  Simulation.refines sim (fun oracle args => ⟨oracle, init_match hparams hrets hops oracle args⟩) dec
+  Simulation.refines sim
+    (fun oracle args => ⟨oracle, InitMatch.of_lockstep
+      (init_lockstep hparams hrets hops oracle args) fun _ _ h => h⟩) dec
 
 end Fir.Dse

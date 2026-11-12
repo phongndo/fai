@@ -8,14 +8,22 @@ import Fir.Mem
 /-!
 # Reference interpreter
 
-A small-step machine: `step` runs one op. The machine is a *core* (the environment, memory,
-scopes, and the oracle) plus an explicit stack of frames, so every intermediate state can be
-inspected. `Fir.Behavior` uses that to define divergence and the `progress` rule precisely.
+A small-step machine: `step` runs one op. The machine is a *core* (memory, scopes, and the
+oracle) plus an explicit stack of frames, so every intermediate state can be inspected.
+`Fir.Behavior` uses that to define divergence and the `progress` rule precisely.
 
-The split is for proofs. Ops on values and memory are computations on the core alone (`CM`), so
-they can't depend on the stack. Only the control-flow layer (`step`, `execOp`, `terminate`)
-touches the stack, and it is written as plain functions on machines. Two machines that run
-different code over the same core then provably compute the same core.
+Values are bound in the frames, not the core. Each region's block frame holds the bindings its
+ops made, and they go when the frame is popped; a call starts a fresh environment holding only
+its parameters. A name is looked up in the current call's block frames, innermost first. So a
+value is visible exactly where the verifier allows it to be used, and a use of anything else
+gets stuck.
+
+The split is for proofs. Ops on values and memory are computations on the core alone (`CM`):
+they take their operands' values and return their results' values, and never see the stack or
+the environment. Only the control-flow layer (`step`, `execOp`, `terminate`) evaluates operands
+and binds results, and it is written as plain functions on machines. Two machines that run
+different code over the same core then provably compute the same core, and machines whose
+environments differ can be related name by name.
 
 Every free choice (what `freeze` of `poison` gives, allocation ids, tags, addresses, whether an
 allocation fails, comparisons of one-past-the-end pointers) comes from an *oracle*. The semantics
@@ -26,20 +34,21 @@ first-fit from `0x1000`.
 
 namespace Fir
 
+/-- The values bound in one region frame, by name. -/
 abbrev Env := Std.HashMap String RVal
 
 /-- A stack frame. The top of the stack is always a `block`. -/
 inductive Frame where
-  /-- The ops left to run in the current region, and the stack allocations it made. -/
-  | block (ops : List Op) (allocs : List Nat)
+  /-- The ops left to run in the current region, the stack allocations it made, and the values
+  it bound (its parameters and its ops' results). -/
+  | block (ops : List Op) (allocs : List Nat) (env : Env)
   /-- A `cf.if` waiting for its region to `cf.yield`. -/
   | ifJoin (results : List Result) (loc : Option Loc)
   /-- A running `cf.loop`. Its body runs in the frames above it. -/
   | loop (progress : Bool) (body : Region) (results : List Result) (loc : Option Loc)
-  /-- A function call: the caller's environment, where the results go, the return types, and
-  the `noalias` scopes the call opened. -/
-  | call (saved : Env) (results : List Result) (rets : List Ty) (scopes : List Nat)
-      (loc : Option Loc)
+  /-- A function call: where the results go, the return types, and the `noalias` scopes the
+  call opened. Lookups stop here: a callee sees only its own frames. -/
+  | call (results : List Result) (rets : List Ty) (scopes : List Nat) (loc : Option Loc)
 
 /-- An active `noalias` or `readonly` scope: one function parameter during one call. -/
 structure Scope where
@@ -56,7 +65,6 @@ abbrev Marks := Std.ExtTreeMap Nat Mark
 
 /-- Everything but the frame stack. -/
 structure Core where
-  env : Env
   funcs : Std.HashMap String Func
   space : SpaceCfg
   oracle : Nat → Int
@@ -119,17 +127,38 @@ def freshTag (parent : Option Nat) : CM Nat := do
   modify fun c => { c with tags := c.tags.insert t parent }
   pure t
 
-/-! ## Environment -/
+/-! ## Environments -/
 
-/-- An operand's value. Reads only the environment. -/
-def operandIn (env : Env) (loc : Option Loc) : Operand → Except Halt RVal
-  | .var n => match env[n]? with
+/-- A name's value: from the innermost block frame of the current call that binds it. Lookups
+stop at the call frame. -/
+def lookup (n : String) : List Frame → Option RVal
+  | [] => none
+  | .block _ _ env :: fs => match env[n]? with
+    | some v => some v
+    | none => lookup n fs
+  | .call .. :: _ => none
+  | _ :: fs => lookup n fs
+
+/-- An operand's value. Reads only the stack's environments. -/
+def operandIn (fs : List Frame) (loc : Option Loc) : Operand → Except Halt RVal
+  | .var n => match lookup n fs with
     | some v => pure v
     | none => halt (.stuck s!"%{n} is not defined") loc
   | .hole n _ => halt (.hole n) loc
 
-def evalOperand (loc : Option Loc) (o : Operand) : CM RVal :=
-  fun c => (operandIn c.env loc o).map (·, c)
+/-- The values of an op's operands. -/
+def operands (fs : List Frame) (loc : Option Loc) (args : List Operand) : Except Halt (List RVal) :=
+  args.mapM (operandIn fs loc)
+
+/-- Bind values to names; a later binding of a name replaces an earlier one. -/
+def Env.bindAll (env : Env) : List Result → List RVal → Env
+  | r :: rs, v :: vs => Env.bindAll (env.insert r.name v) rs vs
+  | _, _ => env
+
+/-- Bind values in the current region: the top frame, which is a block in a running machine. -/
+def bindTop (rs : List Result) (vs : List RVal) : List Frame → List Frame
+  | .block ops ids env :: fs => .block ops ids (env.bindAll rs vs) :: fs
+  | fs => fs
 
 def RVal.hasTy : RVal → Ty → Bool
   | .int w _, .int w' => w == w'
@@ -137,12 +166,12 @@ def RVal.hasTy : RVal → Ty → Bool
   | .bytes bs, .byte w => bs.length * 8 == w
   | _, _ => false
 
-def bindAll (loc : Option Loc) : List Result → List RVal → CM Unit
+/-- Check that there is one value per result, of the result's type. -/
+def checkTypes (loc : Option Loc) : List Result → List RVal → CM Unit
   | [], [] => pure ()
   | r :: rs, v :: vs => do
     unless v.hasTy r.ty do halt (.stuck s!"%{r.name} has type {r.ty} but got another type") loc
-    modify fun c => { c with env := c.env.insert r.name v }
-    bindAll loc rs vs
+    checkTypes loc rs vs
   | _, _ => halt (.stuck "wrong number of values") loc
 
 def allocIn (c : Core) (loc : Option Loc) (a : Nat) : Except Halt Alloc :=
@@ -446,9 +475,10 @@ def factHolds (loc : Option Loc) (f : Fact) : RVal → CM Bool
   | .ptr (some p) => ptrFactHolds loc f p
   | _ => pure true
 
-/-- Bind results, then check their facts: a violated fact is UB. -/
-def bindResults (loc : Option Loc) (rs : List Result) (vs : List RVal) : CM Unit := do
-  bindAll loc rs vs
+/-- Check values about to be bound to results: their types, then their facts (a violated fact is
+UB). Reads the core and changes nothing. -/
+def checkResults (loc : Option Loc) (rs : List Result) (vs : List RVal) : CM Unit := do
+  checkTypes loc rs vs
   for (r, v) in rs.zip vs do
     for f in r.facts do
       unless ← factHolds loc f.fact v do ub .fact loc s!"%{r.name} breaks a fact"
@@ -554,35 +584,39 @@ def evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVa
     pure [.int 1 (.bits (BitVec.ofBool (← cmpPtrs loc pred p q)))]
   | _, _, _ => halt (.stuck "malformed op") loc
 
-/-- Run an op without regions that doesn't touch the stack: evaluate its operands, compute, and
-bind its results. -/
-def simpleOp (loc : Option Loc) (k : OpKind) (results : List Result) (args : List Operand) :
-    CM Unit := do
-  let vs ← args.mapM (evalOperand loc)
-  bindResults loc results (← evalSimple loc k results vs)
+/-- Compute an op without regions that doesn't touch the stack, from its operands' values, and
+check its results. -/
+def simpleOp (loc : Option Loc) (k : OpKind) (results : List Result) (vs : List RVal) :
+    CM (List RVal) := do
+  let outs ← evalSimple loc k results vs
+  checkResults loc results outs
+  pure outs
 
-/-- Bind a callee's parameters and open its `noalias` and `readonly` scopes. A pointer
-parameter with either fact gets a fresh tag derived from the argument's. -/
-def enterCall (loc : Option Loc) (params : List Result) (vs : List RVal) : CM (List Nat) := do
-  bindResults loc params vs
-  let mut opened := []
-  for (r, v) in params.zip vs do
-    let noalias := r.facts.any (·.fact == .noalias)
-    let readonly := r.facts.any (·.fact == .readonly)
-    if !(noalias || readonly) then continue
-    let .ptr (some p) := v | continue
-    -- A pointer that can't access memory (null, dangling) opens no scope. An ambiguous one halts.
-    let some (a, t, off) ← tryCatch (some <$> resolve loc p 0)
-        (fun h => if h.behavior matches .ub _ then pure none else throw h) | continue
-    let t' ← freshTag (some t)
-    let c ← get
-    let id := c.nextScope
-    set { c with
-      env := c.env.insert r.name (.ptr (some (.rel a t' off))),
-      scopes := c.scopes.insert id { alloc := a, tag := t', noalias, readonly },
-      nextScope := id + 1 }
-    opened := id :: opened
-  pure opened
+/-- Open a parameter's `noalias` or `readonly` scope, if it has one: the pointer gets a fresh tag
+derived from the argument's. Gives the parameter's value and the scope opened. -/
+def openScope (loc : Option Loc) (r : Result) (v : RVal) : CM (RVal × Option Nat) := do
+  let noalias := r.facts.any (·.fact == .noalias)
+  let readonly := r.facts.any (·.fact == .readonly)
+  if !(noalias || readonly) then return (v, none)
+  let .ptr (some p) := v | return (v, none)
+  -- A pointer that can't access memory (null, dangling) opens no scope. An ambiguous one halts.
+  let some (a, t, off) ← tryCatch (some <$> resolve loc p 0)
+      (fun h => if h.behavior matches .ub _ then pure none else throw h) | return (v, none)
+  let t' ← freshTag (some t)
+  let c ← get
+  let id := c.nextScope
+  set { c with
+    scopes := c.scopes.insert id { alloc := a, tag := t', noalias, readonly },
+    nextScope := id + 1 }
+  pure (.ptr (some (.rel a t' off)), some id)
+
+/-- Check a callee's parameters and open their `noalias` and `readonly` scopes. Gives the values
+to bind to the parameters and the scopes opened. -/
+def enterCall (loc : Option Loc) (params : List Result) (vs : List RVal) :
+    CM (List RVal × List Nat) := do
+  checkResults loc params vs
+  let opened ← (params.zip vs).mapM fun (r, v) => openScope loc r v
+  pure (opened.map (·.1), (opened.filterMap (·.2)).reverse)
 
 /-- Close the scopes a call opened. -/
 def closeScopes (ids : List Nat) : CM Unit :=
@@ -604,13 +638,19 @@ def Machine.exec (m : Machine) (c : CM α) : Except Halt (α × Machine) :=
   | .ok (a, core) => .ok (a, { m with core })
   | .error h => .error h
 
+/-- Check values for results on the core, then bind them in the current region. -/
+def Machine.bindResults (m : Machine) (loc : Option Loc) (rs : List Result) (vs : List RVal) :
+    Except Halt Machine := do
+  let ((), m) ← m.exec (checkResults loc rs vs)
+  pure { m with stack := bindTop rs vs m.stack }
+
 def Frame.isCall : Frame → Bool
   | .call .. => true
   | _ => false
 
 /-- Record a new stack allocation in the top block. -/
 def addAllocId (id : Nat) : List Frame → List Frame
-  | .block ops ids :: rest => .block ops (id :: ids) :: rest
+  | .block ops ids env :: rest => .block ops (id :: ids) env :: rest
   | s => s
 
 /-- Split the stack at the first frame `pick` accepts: the frames above it, its answer, and the
@@ -628,21 +668,21 @@ def pickLoop : Frame → Option (Bool × Region × List Result × Option Loc)
   | .loop p body rs loc => some (p, body, rs, loc)
   | _ => none
 
-def pickCall : Frame → Option (Env × List Result × List Ty × List Nat × Option Loc)
-  | .call saved rs rets scopes loc => some (saved, rs, rets, scopes, loc)
+def pickCall : Frame → Option (List Result × List Ty × List Nat × Option Loc)
+  | .call rs rets scopes loc => some (rs, rets, scopes, loc)
   | _ => none
 
 /-- The stack allocations made by these frames' blocks. -/
 def blockIds : List Frame → List Nat
   | [] => []
-  | .block _ ids :: fs => ids ++ blockIds fs
+  | .block _ ids _ :: fs => ids ++ blockIds fs
   | _ :: fs => blockIds fs
 
-/-- Start a loop iteration: bind the loop state and push the body. -/
+/-- Start a loop iteration: push the body, with the loop state bound to its parameters. -/
 def enterBody (m : Machine) (loc : Option Loc) (body : Region) (vs : List RVal) :
     Except Halt Machine := do
-  let ((), m) ← m.exec (bindResults loc body.params vs)
-  pure { m with stack := .block body.ops [] :: m.stack }
+  let ((), m) ← m.exec (checkResults loc body.params vs)
+  pure { m with stack := .block body.ops [] (Env.bindAll {} body.params vs) :: m.stack }
 
 /-- Run a terminator. The current block has already been popped. -/
 def terminate (m : Machine) (loc : Option Loc) (k : OpKind) (vs : List RVal) :
@@ -650,17 +690,14 @@ def terminate (m : Machine) (loc : Option Loc) (k : OpKind) (vs : List RVal) :
   match k with
   | .yield =>
     match m.stack with
-    | .ifJoin rs loc' :: rest => do
-      let ((), m) ← { m with stack := rest }.exec (bindResults loc' rs vs)
-      pure m
+    | .ifJoin rs loc' :: rest => { m with stack := rest }.bindResults loc' rs vs
     | .loop .. :: _ => halt (.stuck "a loop body must end with cf.break or cf.continue") loc
     | _ => halt (.stuck "the function ended without func.ret") loc
   | .brk =>
     match splitStack pickLoop m.stack with
     | some (above, (_, _, rs, loc'), below) => do
-      let ((), m) ← { m with stack := below }.exec
-        (do releaseIds (blockIds above); bindResults loc' rs vs)
-      pure m
+      let ((), m) ← { m with stack := below }.exec (releaseIds (blockIds above))
+      m.bindResults loc' rs vs
     | none => halt (.stuck "cf.break outside a loop") loc
   | .cont =>
     match splitStack pickLoop m.stack with
@@ -671,16 +708,14 @@ def terminate (m : Machine) (loc : Option Loc) (k : OpKind) (vs : List RVal) :
     | none => halt (.stuck "cf.continue outside a loop") loc
   | .ret =>
     match splitStack pickCall m.stack with
-    | some (above, (saved, rs, rets, scopes, loc'), below) =>
+    | some (above, (rs, rets, scopes, loc'), below) =>
       if !(vs.length == rets.length && (vs.zip rets).all (fun (v, t) => v.hasTy t)) then
         halt (.stuck "func.ret values don't match the function's return types") loc
       else do
         let ((), m) ← m.exec (do releaseIds (blockIds above); closeScopes scopes)
         if below.isEmpty then
           throw { behavior := .ret vs, loc, leaks := leaks m.core }
-        let ((), m) ← { core := { m.core with env := saved }, stack := below : Machine }.exec
-          (bindResults loc' rs vs)
-        pure m
+        { m with stack := below }.bindResults loc' rs vs
     | none => halt (.stuck "func.ret outside a function") loc
   | _ => halt (.stuck "not a terminator") loc
 
@@ -705,31 +740,33 @@ def execFlat (m : Machine) (kind : OpKind) (results : List Result) (args : List 
     (loc : Option Loc) : Except Halt Machine :=
   match kind.callee? with
   | some callee => do
-    let (vs, m) ← m.exec (args.mapM (evalOperand loc))
+    let vs ← operands m.stack loc args
     let some f := m.core.funcs[callee]? | halt (.stuck s!"no function @{callee}") loc
-    let saved := m.core.env
-    let (scopes, m) ← { m with core := { m.core with env := {} } }.exec (enterCall loc f.params vs)
-    pure { m with stack := .block f.body.ops [] :: .call saved results f.rets scopes loc :: m.stack }
+    let ((vs, scopes), m) ← m.exec (enterCall loc f.params vs)
+    pure { m with
+      stack := .block f.body.ops [] (Env.bindAll {} f.params vs) ::
+        .call results f.rets scopes loc :: m.stack }
   | none =>
   match kind.stackAlloc? with
   | some (size, align) => do
     let (p, m) ← m.exec (do
       let p ← newAlloc loc size align .stack
-      bindResults loc results [.ptr (some p)]
+      checkResults loc results [.ptr (some p)]
       pure p)
     let id := match p with | .rel a .. => a | _ => 0
-    pure { m with stack := addAllocId id m.stack }
+    pure { m with stack := bindTop results [.ptr (some p)] (addAllocId id m.stack) }
   | none =>
   if kind.isTerminator then do
-    let (vs, m) ← m.exec (args.mapM (evalOperand loc))
+    let vs ← operands m.stack loc args
     match m.stack with
     | f :: rest => do
       let ((), m) ← { m with stack := rest }.exec (releaseIds (blockIds [f]))
       terminate m loc kind vs
     | [] => terminate m loc kind vs
   else do
-    let ((), m) ← m.exec (simpleOp loc kind results args)
-    pure m
+    let vs ← operands m.stack loc args
+    let (outs, m) ← m.exec (simpleOp loc kind results vs)
+    pure { m with stack := bindTop results outs m.stack }
 
 /-- Run one op. The current block, with the op removed, is on top of the stack. -/
 def execOp (m : Machine) : Op → Except Halt Machine
@@ -739,39 +776,41 @@ def execOp (m : Machine) : Op → Except Halt Machine
     | [body] =>
       match kind.loopProgress? with
       | some p => do
-        let (vs, m) ← m.exec (args.mapM (evalOperand loc))
+        let vs ← operands m.stack loc args
         enterBody { m with stack := .loop p body results loc :: m.stack } loc body vs
       | none => halt (.stuck "malformed op") loc
     | [thn, els] =>
       if kind.isIf then do
-        let (c, m) ← m.exec (do asInt loc 1 ((← args.mapM (evalOperand loc)).headD (.int 1 .poison)))
+        let vs ← operands m.stack loc args
+        let (c, m) ← m.exec (asInt loc 1 (vs.headD (.int 1 .poison)))
         match c with
         | .poison => ub .poison loc "branch on poison"
         | .bits b =>
-          pure { m with stack := .block (if b = 1 then thn else els).ops [] :: .ifJoin results loc :: m.stack }
+          pure { m with
+            stack := .block (if b = 1 then thn else els).ops [] {} :: .ifJoin results loc :: m.stack }
       else halt (.stuck "malformed op") loc
     | _ => halt (.stuck "malformed op") loc
 
 /-- One step of the machine. -/
 def step (m : Machine) : Except Halt Machine :=
   match m.stack with
-  | .block [] ids :: rest => do
+  | .block [] ids _ :: rest => do
     -- Falling off the end of a region is an implicit `cf.yield` with no values.
     let ((), m) ← { m with stack := rest }.exec (releaseIds ids)
     terminate m none .yield []
-  | .block (op :: ops) ids :: rest => execOp { m with stack := .block ops ids :: rest } op
+  | .block (op :: ops) ids env :: rest => execOp { m with stack := .block ops ids env :: rest } op
   | _ => halt (.stuck "no block to run") none
 
 /-- The core before a call from outside the module. -/
 def Core.initial (oracle : Nat → Int) (mod : Module) : Core :=
-  { env := {}, oracle, space := mod.space,
+  { oracle, space := mod.space,
     funcs := mod.funcs.foldl (fun acc g => acc.insert g.name g) {} }
 
 /-- The machine at the start of a call to `f`. -/
 def Machine.init (oracle : Nat → Int) (mod : Module) (f : Func) (args : List RVal) :
     Except Halt Machine := do
-  let (scopes, core) ← (enterCall none f.params args).run (Core.initial oracle mod)
-  pure { core, stack := [.block f.body.ops [], .call {} [] f.rets scopes none] }
+  let ((vs, scopes), core) ← (enterCall none f.params args).run (Core.initial oracle mod)
+  pure { core, stack := [.block f.body.ops [] (Env.bindAll {} f.params vs), .call [] f.rets scopes none] }
 
 /-- Run `n` steps. An `error` is a halted run. -/
 def runSteps : Nat → Machine → Except Halt Machine
