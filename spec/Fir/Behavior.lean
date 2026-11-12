@@ -23,39 +23,39 @@ same as the frames up to and including the loop never changing.) This is exactly
 `cf.loop progress` that runs forever, including one whose body never returns from a call, and a
 `cf.blocks progress` whose jumps never leave it. It makes a run UB only if the run has finitely
 many events: a loop that keeps calling external functions makes progress. -/
-def StuckInProgressLoop (oracle : Nat → Int) (world : World) (mod : Module) (f : Func)
+def StuckInProgressLoop (oracle : Oracle) (world : World) (mod : Module) (f : Func)
     (args : List RVal) : Prop :=
   ∃ N d, ∀ n, N ≤ n → ∃ m, stateAt oracle world mod f args n = .ok m ∧ m.inProgressLoopAt d
 
 /-- The run halts with outcome `o` after the events `es`: the call fails to start, or a step from
 a running state halts. -/
-def Halts (oracle : Nat → Int) (world : World) (mod : Module) (f : Func) (args : List RVal)
+def Halts (oracle : Oracle) (world : World) (mod : Module) (f : Func) (args : List RVal)
     (es : List Event) (o : Outcome) : Prop :=
   (∃ h, Machine.init oracle world mod f args = .error h ∧ es = [] ∧ h.outcome = o) ∨
   (∃ n m h, stateAt oracle world mod f args n = .ok m ∧ step m = .error h ∧
     es = m.core.trace ∧ h.outcome = o)
 
 /-- The run never halts. -/
-def RunsForever (oracle : Nat → Int) (world : World) (mod : Module) (f : Func) (args : List RVal) :
+def RunsForever (oracle : Oracle) (world : World) (mod : Module) (f : Func) (args : List RVal) :
     Prop :=
   ∀ n, ∃ m, stateAt oracle world mod f args n = .ok m
 
 /-- The run's events are exactly `es`: every state's trace is a prefix of `es`, and some state's
 is `es`. -/
-def FinalTrace (oracle : Nat → Int) (world : World) (mod : Module) (f : Func) (args : List RVal)
+def FinalTrace (oracle : Oracle) (world : World) (mod : Module) (f : Func) (args : List RVal)
     (es : List Event) : Prop :=
   (∀ n m, stateAt oracle world mod f args n = .ok m → m.core.trace <+: es) ∧
   ∃ n m, stateAt oracle world mod f args n = .ok m ∧ m.core.trace = es
 
 /-- Event `i` of the run is `e`. -/
-def EventAt (oracle : Nat → Int) (world : World) (mod : Module) (f : Func) (args : List RVal)
+def EventAt (oracle : Oracle) (world : World) (mod : Module) (f : Func) (args : List RVal)
     (i : Nat) (e : Event) : Prop :=
   ∃ n m, stateAt oracle world mod f args n = .ok m ∧ m.core.trace[i]? = some e
 
 /-- Calling `f` (in module `mod`) with `args`, in the world `world`, with the oracle `oracle`, has
 behavior `b`. A run either halts, or runs forever with finitely many events (diverging, or UB if it
 never leaves a `progress` loop), or runs forever with infinitely many. -/
-def BehavesWith (oracle : Nat → Int) (world : World) (mod : Module) (f : Func) (args : List RVal) :
+def BehavesWith (oracle : Oracle) (world : World) (mod : Module) (f : Func) (args : List RVal) :
     Behavior → Prop
   | .fin es o =>
     Halts oracle world mod f args es o ∨
@@ -67,7 +67,7 @@ def BehavesWith (oracle : Nat → Int) (world : World) (mod : Module) (f : Func)
 /-- `Behaves world mod f args b`: calling `f` (in module `mod`) with `args`, in the world `world`,
 can have behavior `b`, for some choice of the oracle's answers. -/
 def Behaves (world : World) (mod : Module) (f : Func) (args : List RVal) (b : Behavior) : Prop :=
-  ∃ oracle : Nat → Int, BehavesWith oracle world mod f args b
+  ∃ oracle : Oracle, BehavesWith oracle world mod f args b
 
 /-- `t.Refines s`: what an external function is shown, refined: the same function, arguments
 and memory that refine the source's. -/

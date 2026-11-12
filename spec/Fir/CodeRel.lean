@@ -960,7 +960,7 @@ theorem step_simple {c : Core} {k : OpKind} {res : List Result} {args : List Ope
 lockstep. -/
 theorem init_lockstep {mod : Module} {tgt src : Func} (hparams : tgt.params = src.params)
     (hrets : tgt.rets = src.rets) (hops : OpsRel L tgt.body.ops src.body.ops)
-    (oracle : Nat → Int) (world : World) (args : List RVal) :
+    (oracle : Oracle) (world : World) (args : List RVal) :
     Lockstep L (Machine.init oracle world mod tgt args) (Machine.init oracle world mod src args) := by
   simp only [Machine.init, hparams, hrets, bind, Except.bind]
   cases (enterCall none src.params args).run (Core.initial oracle world mod) with

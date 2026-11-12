@@ -409,7 +409,7 @@ theorem sim : Simulation R := by
 
 theorem init_match {mod : Module} {tgt src : Func} (hsp : 0 < mod.space.ptrBits / 8)
     (hparams : tgt.params = src.params) (hrets : tgt.rets = src.rets)
-    (hops : OpsRel L tgt.body.ops src.body.ops) (oracle : Nat → Int) (world : World)
+    (hops : OpsRel L tgt.body.ops src.body.ops) (oracle : Oracle) (world : World)
     (args : List RVal) :
     InitMatch R (Machine.init oracle world mod tgt args) (Machine.init oracle world mod src args) := by
   rcases init_lockstep (mod := mod) hparams hrets hops oracle world args with ⟨h, e1, e2⟩ |

@@ -36,10 +36,10 @@ different code over the same core then provably compute the same core, and machi
 environments differ can be related name by name.
 
 Every free choice (what `freeze` of `poison` gives, allocation ids, tags, addresses, whether an
-allocation fails, comparisons of one-past-the-end pointers) comes from an *oracle*. The semantics
-quantifies over every oracle; the command-line tool uses one that always answers `0`, which
-means: `freeze` gives `0`, allocations succeed, ids count up from 1, and addresses are assigned
-first-fit from `0x1000`.
+allocation fails, comparisons of one-past-the-end pointers, NaN results) comes from an *oracle*
+(`Oracle`). The semantics quantifies over every oracle; the command-line tool uses one that
+always answers `0`, which means: `freeze` gives `0`, allocations succeed, ids count up from 1,
+addresses are assigned first-fit from `0x1000`, and NaN results are canonical.
 
 A call to an external function is an *event*: the core keeps the trace of events so far. The
 *world* answers each call (`World`), from the events so far, what the callee is shown, and one
@@ -137,12 +137,30 @@ def Ty.zero : Ty → RVal
 /-- The environment `fir-ref run` uses: every external call returns zeros and changes nothing. -/
 def World.zero : World := { answer := fun _ call _ => .ret (call.rets.map Ty.zero) [] [] [] }
 
+/-- The oracle: the answer to every free choice of a run (decisions: NaN determinism, NaN
+choice). The semantics quantifies over every oracle.
+
+* `next` answers the choices a run makes one after another (`choose`): what `freeze` of `poison`
+  gives, allocation ids, tags, and addresses, whether an allocation fails, comparisons of
+  one-past-the-end pointers, an external call's answer.
+* `nan` picks the NaN result of a float op (`Float.nanResult`'s answer) from the op and its
+  operands alone. Within a run a float op is then a function of its operands, independent of
+  every other choice: it only reads the core (`Dce.float_pure`), and two evaluations of the same
+  op on the same operands agree (`evalFloat_oracle`), as a CPU's fixed NaN rules do. -/
+structure Oracle where
+  next : Nat → Int
+  nan : OpKind → List RVal → Int
+
+/-- The oracle `fir-ref run` uses: every answer is 0, so `freeze` gives 0, allocations succeed
+with ids from 1 and first-fit addresses, and every NaN result is the canonical NaN. -/
+def Oracle.zero : Oracle := ⟨fun _ => 0, fun _ _ => 0⟩
+
 /-- Everything but the frame stack. -/
 structure Core where
   funcs : Std.HashMap String Func
   externs : Std.HashMap String Extern := {}
   space : SpaceCfg
-  oracle : Nat → Int
+  oracle : Oracle
   world : World
   /-- The events so far, oldest first. Only the control layer adds to it (`Machine.record`). -/
   trace : List Event := []
@@ -193,7 +211,7 @@ def renderLoc : Option Loc → String
 def choose : CM Int := do
   let c ← get
   set { c with choices := c.choices + 1 }
-  pure (c.oracle c.choices)
+  pure (c.oracle.next c.choices)
 
 /-- A fresh id: the oracle's answer if it is positive and unused, otherwise the next one up. -/
 def freshId (used : Nat → Bool) (keys : List Nat) : CM Nat := do
@@ -741,26 +759,27 @@ def sliceElem (loc : Option Loc) (trap : Bool) (ty : Ty) (s i : RVal) : CM (Opti
     | some p => offsetBy loc true p (x * BitVec.ofInt aw (ty.stride c.space)).toInt
   | _, _ => ub .poison loc "slice index or length is poison"
 
-/-- Evaluate a float op (decisions: Floats, Float ops). A NaN result is the choice of the
-oracle's next answer, read without using it up, so these ops only read the core (decision: NaN
-determinism). -/
+/-- Evaluate a float op (decisions: Floats, Float ops). A NaN result is the oracle's choice
+from the op and its operands (`Oracle.nan`), so these ops only read the core (decision: NaN
+choice). -/
 def evalFloat (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVal) :
     CM (List RVal) := do
   let c ← get
+  let o := c.oracle.nan k vs
   match k, rs, vs with
   | .floatConst bits, [r], [] =>
     match r.ty with
     | .float f => pure [.float f (.bits (BitVec.ofNat _ bits))]
     | t => halt (.stuck s!"float.const of {t}") loc
   | .floatBin op, [_], [.float f a, b] =>
-    pure [.float f (Sem.floatBin f.fmt op (c.oracle c.choices) a (← asFloat loc f b))]
-  | .floatUn op, [_], [.float f a] => pure [.float f (Sem.floatUn f.fmt op (c.oracle c.choices) a)]
+    pure [.float f (Sem.floatBin f.fmt op o a (← asFloat loc f b))]
+  | .floatUn op, [_], [.float f a] => pure [.float f (Sem.floatUn f.fmt op o a)]
   | .floatFma, [_], [.float f a, b, d] =>
-    pure [.float f (Sem.floatFma f.fmt (c.oracle c.choices) a (← asFloat loc f b) (← asFloat loc f d))]
+    pure [.float f (Sem.floatFma f.fmt o a (← asFloat loc f b) (← asFloat loc f d))]
   | .floatCmp p, [_], [.float f a, b] => pure [.int 1 (Sem.floatCmp f.fmt p a (← asFloat loc f b))]
   | .floatExt, [r], [.float f a] | .floatTrunc, [r], [.float f a] =>
     match r.ty with
-    | .float g => pure [.float g (Sem.floatCvt f.fmt g.fmt (c.oracle c.choices) a)]
+    | .float g => pure [.float g (Sem.floatCvt f.fmt g.fmt o a)]
     | t => halt (.stuck s!"expected a float result but got {t}") loc
   | .floatToInt signed edge, [r], [.float f a] =>
     pure [.int _ (← fromOut loc (Sem.floatToInt f.fmt signed edge r.ty.width a))]
@@ -1483,7 +1502,7 @@ end
 each with its first tag numbered like it; next come the functions that initializers take the
 address of, in the order they are first named (other functions get an allocation when `func.addr`
 first names them). A `const` global gets a `readonly` scope for the whole run. -/
-def Core.initial (oracle : Nat → Int) (world : World) (mod : Module) : Core :=
+def Core.initial (oracle : Oracle) (world : World) (mod : Module) : Core :=
   let sp := mod.space
   let gs : List (Global × Nat) := mod.globals.zipIdx.map fun (g, i) => (g, i + 1)
   let fs : List (String × Nat) :=
@@ -1509,7 +1528,7 @@ def Core.initial (oracle : Nat → Int) (world : World) (mod : Module) : Core :=
     addrs }
 
 /-- The machine at the start of a call to `f`. -/
-def Machine.init (oracle : Nat → Int) (world : World) (mod : Module) (f : Func) (args : List RVal) :
+def Machine.init (oracle : Oracle) (world : World) (mod : Module) (f : Func) (args : List RVal) :
     Except Halt Machine := do
   let ((vs, scopes), core) ← (enterCall none f.params args).run (Core.initial oracle world mod)
   let top := Frame.block f.body.ops [] (Env.bindAll {} f.params vs)
@@ -1524,7 +1543,7 @@ def runSteps : Nat → Machine → Except Halt Machine
     | .error h => .error h
 
 /-- The state after `n` steps of a call. -/
-def stateAt (oracle : Nat → Int) (world : World) (mod : Module) (f : Func) (args : List RVal)
+def stateAt (oracle : Oracle) (world : World) (mod : Module) (f : Func) (args : List RVal)
     (n : Nat) : Except Halt Machine :=
   (Machine.init oracle world mod f args).bind (runSteps n)
 

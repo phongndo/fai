@@ -19,8 +19,9 @@
 //! ops that can't trap: `float.const`, `float.add`/`sub`/`mul`/`div`/`copysign`,
 //! `float.neg`/`abs`/`sqrt`, `float.fma`, `float.cmp`, `float.ext`, `float.trunc`,
 //! `int.to_float`, `float.from_bits`, `float.to_bits`, and `float.to_int` unless it traps
-//! (`.trap`; `.ub` is UB, which a deletion may remove). A NaN result reads the oracle's next
-//! answer without using it up, so these only read the core. For the other ops below it is read
+//! (`.trap`; `.ub` is UB, which a deletion may remove). A NaN result is the oracle's choice from
+//! the op and its operands (`Oracle.nan`), so these only read the core; `Dce.evalFloat_oracle`
+//! shows every float op is a function of the oracle alone. For the other ops below it is read
 //! off Lean's `evalSimple` (no `choose`, no allocation, no address taken, no memory or scope
 //! touched, no trap), not proved:
 //!

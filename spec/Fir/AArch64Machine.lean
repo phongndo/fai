@@ -509,7 +509,7 @@ partial def drive (m : LMachine) (steps limit : Nat) : String :=
 
 /-- Run `f` with `args` (for the oracle that answers `0` and the world that answers zeros). -/
 def run (mod : Module) (f : Func) (args : List RVal) (fuel : Nat) : String :=
-  let m : LMachine := { core := Core.initial (fun _ => 0) World.zero mod }
+  let m : LMachine := { core := Core.initial Oracle.zero World.zero mod }
   match (start f args).run m with
   | .ok ((), m) => drive m 0 fuel
   | .error h => renderHalt h

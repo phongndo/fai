@@ -538,7 +538,7 @@ theorem runSteps_trace {n : Nat} {m m' : Machine} (e : runSteps n m = .ok m') :
     | ok m1 => rw [es] at e; exact (step_trace es).trans (ih e)
 
 /-- A call starts in the module's memory space, with no events. -/
-theorem init_fixed {oracle : Nat → Int} {world : World} {mod : Module} {f : Func}
+theorem init_fixed {oracle : Oracle} {world : World} {mod : Module} {f : Func}
     {args : List RVal} {m : Machine} (e : Machine.init oracle world mod f args = .ok m) :
     m.core.space = mod.space ∧ m.core.trace = [] := by
   simp only [Machine.init, bind, Except.bind] at e
@@ -551,7 +551,7 @@ theorem init_fixed {oracle : Nat → Int} {world : World} {mod : Module} {f : Fu
     simp only [Core.fixed, Prod.mk.injEq] at this
     exact ⟨this.1, this.2⟩
 
-theorem init_space {oracle : Nat → Int} {world : World} {mod : Module} {f : Func}
+theorem init_space {oracle : Oracle} {world : World} {mod : Module} {f : Func}
     {args : List RVal} {m : Machine} (e : Machine.init oracle world mod f args = .ok m) :
     m.core.space = mod.space := (init_fixed e).1
 

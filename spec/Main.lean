@@ -87,7 +87,7 @@ def runFuncR (m : Module) (name : String) (args : List String) (fuel : Nat)
     | .ret vs => if lowerRets then
         { h with outcome := .ret (Lower.lowerValues m.space.addrBits f.rets vs) } else h
     | _ => h
-  match Machine.init (fun _ => 0) World.zero m f vals with
+  match Machine.init Oracle.zero World.zero m f vals with
   | .error h => pure (.ofHalt [] h)
   | .ok mach => pure (drive mach 0 fuel lowerHalt)
 

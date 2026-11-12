@@ -8,7 +8,7 @@
 //! nearest, ties to even, exactly as Lean's one rounding function does; `sqrt` follows Lean's
 //! integer square root and `round` on big integers, comparisons compare bits as integers. Every
 //! NaN an arithmetic op produces is replaced by the canonical NaN, the choice of the oracle that
-//! always answers 0 (`Float.nanResult`). The ops that only copy bits (`neg`, `abs`, `copysign`)
+//! always answers 0 (`Float.nanResult`, `Oracle.zero`). The ops that only copy bits (`neg`, `abs`, `copysign`)
 //! keep payloads. Conversions from integers wider than 128 bits, and the reading and writing of
 //! decimals, follow Lean's `round` and `shortest` on big integers.
 

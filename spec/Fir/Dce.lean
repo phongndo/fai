@@ -169,8 +169,10 @@ theorem poison_pure (r : Result) (loc : Option Loc) : Pure (.mk .poison [r] [] [
 /-! ## Floats
 
 The float ops are pure but for `float.to_int.*.trap`, which may trap: `evalFloat` only reads the
-core, since a NaN result reads the oracle's next answer without using it up (decision: NaN
-determinism). The pass reads its list of pure kinds off this (`crates/fir/src/passes/dce.rs`). -/
+core, since a NaN result is the oracle's choice from the op and its operands (`Oracle.nan`;
+decision: NaN choice). More: every float op, `.trap` included, is a function of the oracle alone
+(`evalFloat_oracle`), so within a run two evaluations of an op on the same operands agree. The
+pass reads its list of pure kinds off this (`crates/fir/src/passes/dce.rs`). -/
 
 /-- The float ops dead code elimination deletes: all but `float.to_int` with `.trap`. -/
 def floatPure : OpKind → Bool
@@ -235,7 +237,7 @@ theorem evalSimple_float {k : OpKind} (hk : floatPure k = true) (loc : Option Lo
   cases k <;> simp only [floatPure, reduceCtorEq] at hk <;> rfl
 
 /-- **The float ops that can't trap are pure**: every one but `float.to_int` with `.trap`. A NaN
-result reads the oracle's next answer without using it up, so computing one only reads the
+result is the oracle's choice from the op and its operands, so computing one only reads the
 core. -/
 theorem float_pure {k : OpKind} (hk : floatPure k = true) (res : List Result) (args : List Operand)
     (hargs : ∀ a ∈ args, ∃ n, a = .var n) (loc : Option Loc) : Pure (.mk k res args [] loc) := by
@@ -245,6 +247,81 @@ theorem float_pure {k : OpKind} (hk : floatPure k = true) (res : List Result) (a
   · cases k <;> simp only [floatPure, reduceCtorEq] at hk <;> rfl
   · rw [evalSimple_float hk]
     exact ReadOnly.bind' ReadOnly.get' fun _ => readOnly_evalFloat loc k res vs hk
+
+/-! ## Float ops are functions of the oracle
+
+`OracleOnly x`: running `x` gives a result that depends on the core only through its oracle, and
+leaves the core as it was. Every float op is such a computation (`evalFloat_oracle`), traps
+included: within a run, where the oracle is fixed, a float op is a function of its operands, so
+evaluating it twice on the same operands gives the same result (common subexpressions can be
+shared) and a NaN choice is independent of every other choice the run makes. -/
+
+def OracleOnly (x : CM α) : Prop :=
+  ∃ r : Oracle → Except Halt α, ∀ c, x c = (r c.oracle).map (·, c)
+
+namespace OracleOnly
+
+theorem pure' (a : α) : OracleOnly (pure a : CM α) := ⟨fun _ => .ok a, fun _ => rfl⟩
+
+theorem halt' (b : Outcome) (loc : Option Loc) (note : String) :
+    OracleOnly (halt b loc note : CM α) := ⟨fun _ => .error { outcome := b, loc, note }, fun _ => rfl⟩
+
+theorem ub' (k : UBKind) (loc : Option Loc) (note : String) : OracleOnly (ub k loc note : CM α) :=
+  halt' _ _ _
+
+theorem bind' {x : CM α} {f : α → CM β} (hx : OracleOnly x) (hf : ∀ a, OracleOnly (f a)) :
+    OracleOnly (x >>= f) := by
+  obtain ⟨rx, ex⟩ := hx
+  have ef := fun a => Classical.choose_spec (hf a)
+  refine ⟨fun o => (rx o).bind fun a => Classical.choose (hf a) o, fun c => ?_⟩
+  simp only [bind, StateT.bind, ex]
+  cases rx c.oracle with
+  | error h => rfl
+  | ok a => simp only [Except.map, Except.bind]; exact ef a c
+
+/-- Some core with oracle `o`. -/
+def coreWith (o : Oracle) : Core :=
+  { funcs := {}, space := {}, oracle := o, world := ⟨fun _ _ _ => .never⟩ }
+
+/-- A computation that reads the core only for its oracle. -/
+theorem get_bind {f : Core → CM α} (hf : ∀ c, OracleOnly (f c))
+    (h : ∀ c c', c.oracle = c'.oracle → f c = f c') : OracleOnly (get >>= f) := by
+  refine ⟨fun o => Classical.choose (hf (coreWith o)) o, fun c => ?_⟩
+  have e : (get >>= f) c = f c c := rfl
+  rw [e, h c (coreWith c.oracle) rfl]
+  exact Classical.choose_spec (hf (coreWith c.oracle)) c
+
+end OracleOnly
+
+theorem oracleOnly_asFloat (loc : Option Loc) (f : FloatTy) (v : RVal) :
+    OracleOnly (asFloat loc f v) := by
+  unfold asFloat
+  split
+  · split
+    · exact OracleOnly.pure' _
+    · exact OracleOnly.halt' _ _ _
+  · exact OracleOnly.halt' _ _ _
+
+theorem oracleOnly_fromOut (loc : Option Loc) (o : OpOut w) : OracleOnly (fromOut loc o) := by
+  unfold fromOut
+  cases o with
+  | ok v => exact OracleOnly.pure' _
+  | trap r => exact OracleOnly.halt' _ _ _
+  | ub k => exact OracleOnly.ub' _ _ _
+
+/-- **Every float op is a function of the oracle**: its result depends on the core only through
+the oracle, which the run fixes, and it leaves the core as it was. -/
+theorem evalFloat_oracle (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVal) :
+    OracleOnly (evalFloat loc k rs vs) := by
+  unfold evalFloat
+  refine OracleOnly.get_bind (fun c => ?_) (fun c c' h => by simp only [h])
+  repeat' (first
+    | exact OracleOnly.pure' _
+    | exact OracleOnly.halt' _ _ _
+    | exact oracleOnly_asFloat _ _ _
+    | refine OracleOnly.bind' (oracleOnly_fromOut _ _) fun _ => ?_
+    | refine OracleOnly.bind' (oracleOnly_asFloat _ _ _) fun _ => ?_
+    | split)
 
 /-! ## Steps -/
 
