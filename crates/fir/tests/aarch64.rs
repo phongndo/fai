@@ -268,8 +268,96 @@ fn c_arg(t: Ty, s: &str) -> String {
     }
 }
 
+/// A variadic argument as a run line writes it (`i32 5`): its type and value.
+fn typed_arg(s: &str) -> (Ty, &str) {
+    let (t, v) = s.split_once(' ').unwrap_or(("i64", s));
+    let ty = match t {
+        "ptr" => Ty::Ptr,
+        "f32" => Ty::Float(fir::FloatTy::F32),
+        "f64" => Ty::Float(fir::FloatTy::F64),
+        _ => match t.as_bytes()[0] {
+            b'b' => Ty::Byte(t[1..].parse().unwrap_or(64)),
+            _ => Ty::Int(t[1..].parse().unwrap_or(64)),
+        },
+    };
+    (ty, v.trim())
+}
+
+/// The argument types of each call of each variadic external function, by name: the call
+/// sites' operand types (a call through a variadic signature may reach any variadic external
+/// function of that signature whose address is taken).
+fn vararg_sites(m: &Module) -> std::collections::BTreeMap<String, Vec<Vec<Ty>>> {
+    use fir::OpKind as K;
+    let mut out: std::collections::BTreeMap<String, Vec<Vec<Ty>>> = Default::default();
+    let mut taken = Vec::new();
+    for g in 0..m.globals.len() {
+        m.globals.syms(m.globals.init(g), &mut taken);
+    }
+    let mut taken: Vec<String> = taken.into_iter().map(str::to_owned).collect();
+    for f in &m.funcs {
+        let b = &f.body;
+        let mut stack = vec![b.entry()];
+        while let Some(r) = stack.pop() {
+            for op in b.ops(r) {
+                if let K::FuncAddr { callee } = b.kind(op) {
+                    taken.push(b.str(callee).to_owned());
+                }
+                stack.extend_from_slice(b.regions(op));
+            }
+        }
+    }
+    for f in &m.funcs {
+        let b = &f.body;
+        let mut stack = vec![b.entry()];
+        while let Some(r) = stack.pop() {
+            for op in b.ops(r) {
+                let tys = |skip: usize| -> Vec<Ty> {
+                    b.operands(op)[skip..]
+                        .iter()
+                        .map(|o| match o.get() {
+                            fir::OperandKind::Value(v) => b.ty(v),
+                            fir::OperandKind::Hole(h) => b.hole_ty(h),
+                        })
+                        .collect()
+                };
+                let mut add = |name: &str, site: Vec<Ty>| {
+                    let sites = out.entry(name.to_owned()).or_default();
+                    if !sites.contains(&site) {
+                        sites.push(site);
+                    }
+                };
+                match b.kind(op) {
+                    K::Call { callee } | K::Invoke { callee, .. } => {
+                        let name = b.str(callee);
+                        if m.externs.iter().any(|x| x.name == name && x.variadic) {
+                            add(name, tys(0));
+                        }
+                    }
+                    K::CallIndirect(sig) | K::InvokeIndirect { sig, .. } => {
+                        if let Some(fir::Shape::Func(ps, rs, true)) = b.types().shape_of(sig) {
+                            for x in m.externs.iter().filter(|x| {
+                                x.variadic
+                                    && taken.contains(&x.name)
+                                    && x.params.as_slice() == ps
+                                    && x.rets.as_slice() == rs
+                            }) {
+                                add(&x.name, tys(1));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                stack.extend_from_slice(b.regions(op));
+            }
+        }
+    }
+    out
+}
+
 /// The C side of a program: stubs for the external functions, and a `main` that performs run
-/// `argv[1]`.
+/// `argv[1]`. A variadic external function's stub takes the one argument list its calls pass
+/// (on Linux, AAPCS64 passes variadic arguments as fixed ones); a variadic FIR function is
+/// called through a prototype of the run's argument types, as FIR calls one.
 fn harness(m: &Module, runs: &[(String, Vec<String>)], darwin: bool) -> String {
     let us = if darwin { "_" } else { "" };
     let mut c = String::from(
@@ -293,8 +381,13 @@ fn harness(m: &Module, runs: &[(String, Vec<String>)], darwin: bool) -> String {
                 .join(", ")
         }
     };
+    let sites = vararg_sites(m);
     for (i, x) in m.externs.iter().enumerate() {
-        let ps = params(&x.params);
+        let site = match sites.get(&x.name).map(Vec::as_slice) {
+            Some([site]) if x.variadic => site.clone(),
+            _ => x.params.clone(),
+        };
+        let ps = params(&site);
         let ret = c_ret(&x.rets, &mut defs);
         writeln!(
             body,
@@ -305,6 +398,12 @@ fn harness(m: &Module, runs: &[(String, Vec<String>)], darwin: bool) -> String {
         writeln!(body, "{ret} ext{i}({ps}) {{").unwrap();
         writeln!(body, "  printf(\"@{}(\");", x.name).unwrap();
         for (k, &t) in x.params.iter().enumerate() {
+            if k > 0 {
+                body.push_str("  printf(\", \");\n");
+            }
+            writeln!(body, "  {}", c_print(t, &format!("a{k}"))).unwrap();
+        }
+        for (k, &t) in site.iter().enumerate().skip(x.params.len()) {
             if k > 0 {
                 body.push_str("  printf(\", \");\n");
             }
@@ -332,23 +431,40 @@ fn harness(m: &Module, runs: &[(String, Vec<String>)], darwin: bool) -> String {
         let b = &f.body;
         let ps: Vec<Ty> = b.params(b.entry()).map(|v| b.ty(v)).collect();
         let ret = c_ret(&f.rets, &mut defs);
-        writeln!(
-            body,
-            "{ret} fn{i}({}) __asm__(\"{us}fir_{}\");",
-            params(&ps),
-            f.name
-        )
-        .unwrap();
+        let mut ps = params(&ps);
+        if f.variadic {
+            ps = if ps == "void" {
+                "...".to_owned()
+            } else {
+                ps + ", ..."
+            };
+        }
+        writeln!(body, "{ret} fn{i}({ps}) __asm__(\"{us}fir_{}\");", f.name).unwrap();
     }
     body.push_str("int main(int argc, char **argv) {\n  (void)argc;\n  switch (atoi(argv[1])) {\n");
     for (k, (name, args)) in runs.iter().enumerate() {
         let i = m.funcs.iter().position(|f| &f.name == name).unwrap();
         let f = &m.funcs[i];
         let b = &f.body;
-        let tys: Vec<Ty> = b.params(b.entry()).map(|v| b.ty(v)).collect();
-        let args: Vec<String> = tys.iter().zip(args).map(|(&t, a)| c_arg(t, a)).collect();
-        let call = format!("fn{i}({})", args.join(", "));
+        let mut tys: Vec<Ty> = b.params(b.entry()).map(|v| b.ty(v)).collect();
+        let mut cargs: Vec<String> = tys.iter().zip(args).map(|(&t, a)| c_arg(t, a)).collect();
+        for a in &args[tys.len()..] {
+            let (t, v) = typed_arg(a);
+            cargs.push(c_arg(t, v));
+            tys.push(t);
+        }
         let ret = c_ret(&f.rets, &mut defs);
+        let call = if f.variadic {
+            let ps: Vec<&str> = tys.iter().map(|&t| c_ty(t)).collect();
+            let ps = if ps.is_empty() {
+                "void".to_owned()
+            } else {
+                ps.join(", ")
+            };
+            format!("(({ret} (*)({ps}))fn{i})({})", cargs.join(", "))
+        } else {
+            format!("fn{i}({})", cargs.join(", "))
+        };
         writeln!(body, "  case {k}: {{").unwrap();
         // An exception that leaves the function is pending in `__fir_exn` when it returns.
         let threw = "if (__fir_exn.flag) {\n      printf(\"threw \");\n      fir_print('p', 64, (uint64_t)(uintptr_t)__fir_exn.value);\n    } else ";
@@ -658,6 +774,7 @@ fn check_module(
     let blocks = blocks_used(src);
     let text = src.render(false);
     let floats = text.contains("float.") || text.contains(": f32") || text.contains(": f64");
+    let varargs = text.contains("...");
     {
         let mut t = tally.lock().unwrap();
         if lowered {
@@ -665,6 +782,9 @@ fn check_module(
         }
         if floats {
             t.count("(modules with floats)");
+        }
+        if varargs {
+            t.count("(modules with variadic functions)");
         }
         for b in &blocks {
             t.count(format!("(modules using {b})"));
@@ -801,6 +921,14 @@ fn check_module(
         }
     }
     let Some(tc) = tc else { return ok };
+    // A variadic external function's stub takes one argument list (see `harness`).
+    if vararg_sites(m).values().any(|sites| sites.len() > 1) {
+        tally
+            .lock()
+            .unwrap()
+            .count("native skipped: a variadic external function called with several signatures");
+        return ok;
+    }
     let runs: Vec<(String, Vec<String>)> = comparable
         .iter()
         .map(|(f, a, _, _)| (f.clone(), a.clone()))
@@ -839,6 +967,9 @@ fn check_module(
                 t.count(format!("{what} matches"));
                 if floats {
                     t.count(format!("{what} matches (floats)"));
+                }
+                if varargs {
+                    t.count(format!("{what} matches (varargs)"));
                 }
                 if want.contains("nan") {
                     t.count(format!("{what} matches (NaN results)"));
