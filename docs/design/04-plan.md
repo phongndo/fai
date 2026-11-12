@@ -246,6 +246,51 @@ Instruction selection, Register allocation, Backend testing, Globals, Floats.
   by value (track A); macOS's argument packing; a four-register `fmadd`; a proof that isel
   refines its source.
 
+### Track F2a: floats in fai-cc (done)
+
+Decisions: C frontend (float mapping, no contraction), C frontend testing.
+
+- **Mapping:** `float` and `double` are `f32` and `f64` in values, memory, signatures (direct
+  and indirect calls, AAPCS64 through FIR's calling convention), struct fields, arrays, unions,
+  and globals. Literals are Clang's exact bits; `+ - * /` one `float.*` op each, never fused
+  (`-ffp-contract=off`'s meaning; only `fma` fuses); unary minus `float.neg`; `< <= > >= ==` the
+  ordered predicates and `!=` `une`; a float's truth `une` against 0.0; float→integer
+  `float.to_int.*.ub`, integer→float `int.to_float` (a constant integer folds to the same
+  rounded constant), `float.ext`/`float.trunc`; compound assignment and `++`/`--` through C's
+  computation type. Global initializers (scalars, arrays, struct fields, union and bitfield byte
+  images) take Clang's evaluated floats through `fir_init_f32`/`fir_init_f64`. Builtins with a
+  FIR op are that op: the constants behind `INFINITY`, `HUGE_VAL`, `NAN` (`__builtin_nan("0x15")`
+  keeps its payload), `__builtin_fabs`/`sqrt`/`copysign`/`fma`, `<math.h>`'s classifications
+  (`isnan`, `isinf`, `__builtin_isinf_sign`, `isfinite`, `isnormal`, `signbit`, `fpclassify`
+  as compares and `select`s), and `__builtin_isgreater` and friends; libm's functions are
+  external calls. `long double` (binary128 on AArch64), `_Complex`, and the other formats stay
+  diagnosed where used (`tests/errors/floats.c`).
+- **Tests:** nine new corpus programs (55 in all): `float_arith` (every operator and
+  comparison on pairs of edge values at both widths: signed zeros, infinities, subnormals, the
+  limits, NaNs with payloads and signaling ones; ties to even; no contraction; compound
+  assignment and increments; 51 NaN results checked bit for bit), `float_conversions` (every
+  integer width to and from both formats at the edges of the range, rounding ties, overflow
+  and underflow to `float`, NaNs through `ext`/`trunc`, `_Bool`), `float_aggregates`,
+  `float_libm` (29 libm functions, the classification macros, the builtins), `float_calls` (ten
+  float arguments, twenty mixed ones, function pointers to float functions), and the kernels
+  `newton`, `float_matrix` (products, Gaussian elimination, power iteration), `integration`
+  (trapezoid, Simpson, Kahan), and `mandelbrot`. All 55 match the reference natively without
+  and with `-O`; 53 match in `fir run` under Arm's NaN choice (`float_libm` and `libc_calls`
+  call other externals); 13 error tests.
+- **Harness:** the reference compiles with `-ffp-contract=off` (GCC contracts across statements
+  at `-O1` by default), every build links libm, and `fir run` picks NaNs by `NanRule::Arm`, so a
+  printed NaN's payload must be the hardware's. Programs avoid two things C leaves open that GCC
+  uses: the payload of an op on two different NaNs (GCC commutes `+` and `*`), and quieting by
+  an op GCC folds away (`x * 1.0`). `fai_test.h` prints floats as bits and a rounded decimal.
+- **API friction:** `fir_init_f32`/`fir_init_f64` take a host `float`/`double` while
+  `fir_float_const` takes bits, so `fai-cc` copies Clang's bits into a host float to initialize
+  a global; a signaling NaN survives that on AArch64 and x86-64 (no conversion in passing), but
+  a bits-based initializer would make it exact by construction. Otherwise `fir.h` had every op
+  the mapping needed.
+- **Not yet:** `printf` with floats (track V); glibc's `isgreater` macros (statement
+  expressions under Clang); float builtins without a FIR op (`__builtin_fmin`, …); rounding
+  modes and exception flags (`FENV_ACCESS`).
+
 ## Not in this round
 
 - Proofs beyond the float semantics and the purity of the new pure ops: scalarizing, lowering
