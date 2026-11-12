@@ -7,28 +7,32 @@
 //!
 //! The pattern is `Dse.Pat` exactly: the second store is the op right after the first in the
 //! same region (at any depth), both store through the same pointer *variable* `%p`, the first
-//! stores a variable `%x` (the second may store a hole), and the two types have the same size in
-//! *every* data layout (`∀ cfg, T1.size cfg = T2.size cfg`). With Lean's `Ty.size`, that holds
-//! when the types are equal, or both are `iN`/`bN` with the same `N / 8`. A `ptr` and an `i64`
-//! have the same size in the default layout but not in every layout, so they don't match.
+//! stores a variable `%x` (the second may store a hole), both types are scalars (`iN`, `ptr`, or
+//! `bN`: `Ty.isValue`), and they have the same size in *every* data layout
+//! (`∀ cfg, T1.size cfg = T2.size cfg`). With Lean's `Ty.size`, that holds when the types are
+//! equal, or both are `iN`/`bN` with the same `N / 8`. A `ptr` and an `i64` have the same size in
+//! the default layout but not in every layout, so they don't match.
 //!
 //! A run of stores through the same pointer leaves only the last: each deletion is one instance
 //! of the theorem on the program the previous one left.
 //!
-//! Skipped: two aggregate types of equal size in every layout but different ids; the verifier
-//! rejects aggregate stores anyway.
+//! Not covered by the theorem, so skipped: stores of struct, array, or slice types (HFIR). They
+//! write only their leaves and leave padding as it was, so a later aggregate store doesn't hide
+//! all of an earlier store's bytes (decision: Aggregate values).
 
 use crate::body::{Body, OperandKind};
 use crate::ir::{OpKind, Ty};
 
 use super::{Remarks, at, walk};
 
-/// Whether two types take the same number of bytes in every data layout (Lean's `Ty.size`:
-/// `iN` and `bN` take `N / 8`, a pointer its layout's size).
+/// Whether two scalar types take the same number of bytes in every data layout (Lean's
+/// `Ty.size`: `iN` and `bN` take `N / 8`, a pointer its layout's size). False if either isn't a
+/// scalar (`Dse.Pat` asks for `Ty.isValue` of both).
 pub fn same_size(a: Ty, b: Ty) -> bool {
     match (a, b) {
         (Ty::Int(m) | Ty::Byte(m), Ty::Int(n) | Ty::Byte(n)) => m / 8 == n / 8,
-        _ => a == b,
+        (Ty::Ptr, Ty::Ptr) => true,
+        _ => false,
     }
 }
 
@@ -153,5 +157,22 @@ mod tests {
         assert!(same_size(Ty::Ptr, Ty::Ptr));
         assert!(!same_size(Ty::Ptr, Ty::Int(64)));
         assert!(!same_size(Ty::Int(16), Ty::Int(32)));
+        assert!(!same_size(Ty::Slice, Ty::Slice));
+    }
+
+    /// Aggregate stores leave padding unchanged, so the theorem is for scalar stores only.
+    #[test]
+    fn keeps_aggregate_stores() {
+        let src = "func @f(%s: struct<C>{i8, i32}, %t: slice, %p: ptr) {
+  mem.store struct<C>{i8, i32} %s, %p, align 4
+  mem.store struct<C>{i8, i32} %s, %p, align 4
+  mem.store slice %t, %p, align 8
+  mem.store slice %t, %p, align 8
+  func.ret
+}
+";
+        let (n, out, _) = apply(src, run);
+        assert_eq!(n, 0);
+        assert_eq!(out, canon(src));
     }
 }

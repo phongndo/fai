@@ -23,12 +23,18 @@
 //!   `int.add`/`sub`/`mul`, divisions, and shifts unless a modifier traps (`.trap`, a `.trap`
 //!   edge);
 //! * `ptr.null`, `ptr.offset`, `ptr.field`, `ptr.index` (`offsetBy` only reads the allocation);
-//! * `ty.size`, `ty.align`, `ty.offset`, and `mem.global`.
+//! * `ty.size`, `ty.align`, `ty.offset`, and `mem.global`;
+//! * HFIR's building blocks that only build or take apart values: `agg.make`, `agg.extract`,
+//!   `agg.insert`, `int.add`/`sub`/`mul.overflow.s`/`.u` (both results; `poison` in, `poison` out,
+//!   never a trap), `union.make`, `union.tag`, `union.get.ub` (a wrong variant is UB, which a
+//!   deletion may remove), `slice.make`, `slice.ptr`, and `slice.len`.
 //!
 //! Not pure: `freeze`, `ptr.cmp`, `ptr.addr`, `ptr.with_addr`, `ptr.from_exposed` (they ask the
 //! oracle or give an allocation its address), `ptr.expose`, `func.addr` (it may create the
 //! function object), loads (they record reads in `noalias` scopes and may expose pointers:
-//! decision Pointer bytes as integers), and every op with an effect on memory or control.
+//! decision Pointer bytes as integers), and every op with an effect on memory or control. Of the
+//! building blocks: `union.get.trap` (a wrong variant traps), `slice.get.ub`/`.trap` (a load,
+//! and the `.trap` form traps out of bounds), `slice.set.*` (a store), and `cf.check.*` (a trap).
 
 use crate::body::{Body, OpId, OperandKind, ValueDef};
 use crate::ir::{Edge, OpKind, Ovf, ShiftEdge};
@@ -56,7 +62,17 @@ pub fn pure_kind(k: OpKind) -> bool {
         | OpKind::TySize(_)
         | OpKind::TyAlign(_)
         | OpKind::TyOffset { .. }
-        | OpKind::MemGlobal { .. } => true,
+        | OpKind::MemGlobal { .. }
+        | OpKind::AggMake
+        | OpKind::AggExtract { .. }
+        | OpKind::AggInsert { .. }
+        | OpKind::Overflow { .. }
+        | OpKind::UnionMake { .. }
+        | OpKind::UnionTag
+        | OpKind::SliceMake
+        | OpKind::SlicePtr
+        | OpKind::SliceLen => true,
+        OpKind::UnionGet { trap, .. } => !trap,
         OpKind::Arith(_, ovf) => !matches!(ovf, Ovf::Trap(_)),
         OpKind::Div(_, zero, ovf) => zero != Edge::Trap && ovf != Edge::Trap,
         OpKind::Shift(_, edge) => edge != ShiftEdge::Trap,
@@ -190,6 +206,43 @@ mod tests {
   } else {
     cf.yield %x
   }
+  func.ret
+}
+";
+        let (n, out, _) = apply(src, run);
+        assert_eq!(n, 0);
+        assert_eq!(out, canon(src));
+    }
+
+    /// HFIR's value building blocks are pure; the accesses and checks that can trap or touch
+    /// memory are not.
+    #[test]
+    fn building_blocks() {
+        let src = "func @f(%x: i32, %p: ptr, %n: i64, %ok: i1) {
+  %s: struct<C>{i32, i32} = agg.make %x, %x
+  %y: i32 = agg.extract %s, 1
+  %t: struct<C>{i32, i32} = agg.insert %s, %y, 0
+  %r: i32, %o: i1 = int.mul.overflow.s %x, %x
+  %u: union<i32, ptr> = union.make %x, 0
+  %g: i32 = union.tag %u
+  %h: i32 = union.get.ub %u, 0
+  %sl: slice = slice.make %p, %n
+  %sp: ptr = slice.ptr %sl
+  %sn: i64 = slice.len %sl
+  func.ret
+}
+";
+        let (n, out, _) = apply(src, run);
+        assert_eq!(n, 10);
+        assert!(!out.contains(" = "), "{out}");
+        let src = "func @f(%x: i32, %p: ptr, %n: i64, %ok: i1) {
+  %u: union<i32, ptr> = union.make %x, 0
+  %h: i32 = union.get.trap %u, 0
+  %sl: slice = slice.make %p, %n
+  %v: i32 = slice.get.ub %sl, %n, align 4
+  %w: i32 = slice.get.trap %sl, %n, align 4
+  slice.set.ub i32 %x, %sl, %n, align 4
+  cf.check.bounds %ok
   func.ret
 }
 ";
