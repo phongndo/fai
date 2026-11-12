@@ -160,13 +160,53 @@ def Ty.isHValue : Ty → Bool
   | .func .. | .vaList => false
   | _ => true
 
+mutual
+  /-- The aggregates calls pass whole outside HFIR, as the C ABI's unit (decision: C ABI for
+  aggregates): structs and arrays whose parts are scalars or such aggregates (no unions or
+  slices). The verifier checks that the parts have a layout. -/
+  def Ty.isComposite : Ty → Bool
+    | .struct _ fs => Ty.compositeParts fs
+    | .array _ e => e.isValue || e.isComposite
+    | _ => false
+  def Ty.compositeParts : List Ty → Bool
+    | [] => true
+    | t :: ts => (t.isValue || t.isComposite) && Ty.compositeParts ts
+end
+
+mutual
+  /-- The composites a variadic argument can be (decision: Varargs): nonempty `struct<C>` and
+  arrays of scalars and of such composites. A value's shape gives their layout (an array is laid
+  out as the `struct<C>` of its elements), so `va.arg` can match a type against an argument's
+  value (`Ty.canon`). -/
+  def Ty.isCComposite : Ty → Bool
+    | .struct .c fs => !fs.isEmpty && Ty.cParts fs
+    | .array n e => n > 0 && (e.isValue || e.isCComposite)
+    | _ => false
+  def Ty.cParts : List Ty → Bool
+    | [] => true
+    | t :: ts => (t.isValue || t.isCComposite) && Ty.cParts ts
+end
+
+mutual
+  /-- A composite as the `struct<C>` with its layout: arrays become structs of their elements.
+  Two C composites with the same canonical form are laid out alike, leaf for leaf. -/
+  def Ty.canon : Ty → Ty
+    | .struct p fs => .struct p (Ty.canonList fs)
+    | .array n e => .struct .c (List.replicate n e.canon)
+    | t => t
+  def Ty.canonList : List Ty → List Ty
+    | [] => []
+    | t :: ts => t.canon :: Ty.canonList ts
+end
+
 /-- The types a variadic argument can have (decision: Varargs): `iN` and `bN` of 8 to 64 bits in
-whole bytes, `ptr`, `f32`, and `f64`. Each takes one register or one 8-byte stack slot, so a
-pointer must also fit one (`SpaceCfg.isVararg`). -/
+whole bytes, `ptr`, `f32`, and `f64`, each in one register or 8-byte stack slot, so a pointer
+must also fit one (`SpaceCfg.isVararg`), and C composites (`Ty.isCComposite`), passed as fixed
+arguments of their type are and given a slot of their size (decision: C ABI for aggregates). -/
 def Ty.isVararg : Ty → Bool
   | .int w | .byte w => w % 8 == 0 && 8 ≤ w && w ≤ 64
   | .ptr | .float _ => true
-  | _ => false
+  | t => t.isCComposite
 
 /-- A variadic argument's class: `true` for a float, which travels in an FP register, `false`
 for an integer, bytes, or a pointer. `va.arg` must ask for the argument's class. -/
@@ -995,13 +1035,11 @@ fir_ops
       floats a
       ints t
       sameWidth a t
-  -- HFIR building blocks, lowered by `Fir.Lower`.
   /-- `agg.make %a, %b`: a struct value from its fields, or an array value from its elements;
   the result type says which. -/
   op aggMake
     name "agg.make"
     format "%*"
-    layers hfir
     rule
       results t "agg.make has one result"
       parts t
@@ -1009,7 +1047,6 @@ fir_ops
   op aggExtract (index : Index)
     name "agg.extract"
     format "%, {index}"
-    layers hfir
     rule
       operands a "agg.extract takes one operand"
       results t "agg.extract has one result"
@@ -1018,11 +1055,11 @@ fir_ops
   op aggInsert (index : Index)
     name "agg.insert"
     format "%, %, {index}"
-    layers hfir
     rule
       operands a v "agg.insert takes two operands"
       part a index v
       results [a]
+  -- HFIR building blocks, lowered by `Fir.Lower`.
   /-- `int.add.overflow.s %a, %b`: the wrapped result and whether the operation overflowed
   (signed, or unsigned with `.u`), as `int.add.s.trap` would trap; `int.sub` and `int.mul` too.
   `poison` in, `poison` out (both results). -/
@@ -1507,10 +1544,11 @@ def Layer.kind : Layer → LayerKind
   | .lfir _ => .lfir
 
 /-- The types values can have in a layer: HFIR's include aggregates, unions, and slices
-(decision: Aggregate values); MFIR's and LFIR's are the scalars. -/
+(decision: Aggregate values); MFIR's and LFIR's are the scalars and the composites that calls pass
+whole (decision: C ABI for aggregates). -/
 def Layer.valueTy : Layer → Ty → Bool
   | .hfir, t => t.isHValue
-  | _, t => t.isValue
+  | _, t => t.isValue || t.isComposite
 
 def Layer.render : Layer → String
   | .lfir t => s!"lfir {t}"

@@ -29,6 +29,7 @@ import Fir.DceCheck
 import Fir.AArch64Syntax
 import Fir.AArch64
 import Fir.AArch64Proofs
+import Fir.AArch64Abi
 import Fir.AArch64Machine
 import Fir.Lower
 import Fir.LowerBits

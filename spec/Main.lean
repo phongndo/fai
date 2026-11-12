@@ -95,8 +95,9 @@ partial def drive (m : Machine) (steps limit : Nat) (post : Halt → Halt := id)
     | .ok m' => drive m' (steps + 1) limit post
     | .error h => .ofHalt m.core.trace (post h)
 
-/-- Run a function. With `lowerRets`, returned values are shown as the scalars the lowering
-returns instead (`Lower.lowerValue`). -/
+/-- Run a function. With `lowerRets`, returned values are shown as the lowering returns them
+instead: as their scalars (`Lower.lowerValue`), unless the one result is a composite, which calls
+pass whole (`Lower.wholeRets`). -/
 def runFuncR (m : Module) (name : String) (args : List String) (fuel : Nat)
     (lowerRets := false) : Except String RunResult := do
   let some f := m.find? name | throw s!"no function @{name}"
@@ -110,7 +111,8 @@ def runFuncR (m : Module) (name : String) (args : List String) (fuel : Nat)
   if m.layer matches .lfir _ then return { ending := AArch64.run m f vals fuel }
   let lowerHalt (h : Halt) : Halt := match h.outcome with
     | .ret vs => if lowerRets then
-        { h with outcome := .ret (Lower.lowerValues m.space.addrBits f.rets vs) } else h
+        { h with outcome := .ret (if Lower.wholeRets f.rets then vs
+            else Lower.lowerValues m.space.addrBits f.rets vs) } else h
     | _ => h
   match Machine.init Oracle.zero World.zero m f vals with
   | .error h => pure (.ofHalt [] h)

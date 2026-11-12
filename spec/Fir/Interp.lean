@@ -126,13 +126,20 @@ is never given (`Answer.valid`); the call returns zeros instead. -/
 structure World where
   answer : List Event → Call → Int → Answer
 
-/-- The zero value of a value type. -/
-def Ty.zero : Ty → RVal
-  | .int w => .int w (.bits 0)
-  | .ptr => .ptr (some .null)
-  | .byte w => .bytes (List.replicate (w / 8) (.bits 0))
-  | .float f => .float f (.bits 0)
-  | _ => .bytes []
+mutual
+  /-- The zero value of a value type: a struct's or array's parts' zeros for a composite. -/
+  def Ty.zero : Ty → RVal
+    | .int w => .int w (.bits 0)
+    | .ptr => .ptr (some .null)
+    | .byte w => .bytes (List.replicate (w / 8) (.bits 0))
+    | .float f => .float f (.bits 0)
+    | .struct _ fs => .agg (Ty.zeros fs)
+    | .array n e => .agg (List.replicate n e.zero)
+    | _ => .bytes []
+  def Ty.zeros : List Ty → List RVal
+    | [] => []
+    | t :: ts => t.zero :: Ty.zeros ts
+end
 
 /-- The environment `fir-ref run` uses: every external call returns zeros and changes nothing. -/
 def World.zero : World := { answer := fun _ call _ => .ret (call.rets.map Ty.zero) [] [] [] }
@@ -593,7 +600,8 @@ def freePtr (loc : Option Loc) (family : String) : Option Ptr → CM Unit
 /-! ## Variadic arguments
 
 A call of a variadic function puts its variadic arguments in an allocation of their own
-(`AllocKind.va`), each in an 8-byte slot as a store of its type writes it. The allocation is one of
+(`AllocKind.va`), each in a slot of its size rounded up to 8 bytes as a store of its type writes
+it (a struct or array leaf by leaf, decision: C ABI for aggregates). The allocation is one of
 the call's stack allocations, so it ends when the call returns (decision: Varargs). A `va_list`
 holds a *cursor* over it: `va.start` fills the object with `Byte.va` bytes naming the allocation
 and position 0, `va.arg` reads the argument at the cursor's position and moves it on, and
@@ -609,24 +617,50 @@ def RVal.scalarTy : RVal → Ty
   | .float f _ => .float f
   | .agg _ => .slice
 
+mutual
+  /-- The type a variadic argument is passed as: a scalar's own, and for an aggregate the
+  `struct<C>` of its parts' (`Ty.canon` of a C composite of its shape, decision: Varargs). -/
+  def RVal.argTy : RVal → Ty
+    | .agg vs => .struct .c (RVal.argTys vs)
+    | v => v.scalarTy
+  def RVal.argTys : List RVal → List Ty
+    | [] => []
+    | v :: vs => v.argTy :: RVal.argTys vs
+end
+
 /-- Whether values fit parameters of types `ps`: one of each type, then, if `variadic`, any
 number of variadic arguments of the types `Ty.isVararg` allows. -/
 def argsFit (ps : List Ty) (variadic : Bool) (vs : List RVal) : Bool :=
   (if variadic then ps.length ≤ vs.length else ps.length == vs.length) &&
     ((vs.take ps.length).zip ps).all (fun (v, t) => v.hasTy t) &&
-    (vs.drop ps.length).all (·.scalarTy.isVararg)
+    (vs.drop ps.length).all (·.argTy.isVararg)
 
-/-- Make the allocation that holds a call's variadic arguments: 8-byte slots, aligned to 8, each
-holding one argument (`SpaceCfg.isVararg`). -/
+/-- The bytes of a variadic argument's slot: a slot of its type's size rounded up to 8. -/
+def vaSlot (sp : SpaceCfg) (t : Ty) : Nat := alignUp (t.size sp) 8
+
+/-- Where variadic argument `k` of arguments of types `tys` starts in their allocation. -/
+def vaOffset (sp : SpaceCfg) (tys : List Ty) (k : Nat) : Nat := ((tys.take k).map (vaSlot sp)).sum
+
+/-- A value's bytes at its leaves' offsets, as a store of its type `t` writes them: a scalar's
+encoding at 0, an aggregate's leaves at theirs (padding isn't written). -/
+def RVal.pieces (sp : SpaceCfg) (t : Ty) (v : RVal) : List (Nat × List Byte) :=
+  if t.isValue then [(0, v.encode sp)]
+  else ((t.leaves sp).zip v.leaves).map fun ((o, _), l) => (o, l.encode sp)
+
+/-- Make the allocation that holds a call's variadic arguments: one slot each, of its size
+rounded up to 8 bytes, aligned to 8, holding the argument's bytes as a store writes them; a
+scalar takes one 8-byte slot (`SpaceCfg.isVararg`). -/
 def newVaArea (loc : Option Loc) (vs : List RVal) : CM Nat := do
-  unless vs.all ((← get).space.isVararg ·.scalarTy) do
-    halt (.stuck "a variadic argument must be an iN or bN of 8 to 64 bits, a ptr of at most 64 bits, or a float") loc
-  let p ← newAlloc loc (8 * vs.length) 8 (.va 0 [])
+  let sp := (← get).space
+  unless vs.all (sp.isVararg ·.argTy) do
+    halt (.stuck "a variadic argument must be an iN or bN of 8 to 64 bits, a ptr of at most 64 bits, a float, or a C struct or array") loc
+  let tys := vs.map RVal.argTy
+  let p ← newAlloc loc (vaOffset sp tys tys.length) 8 (.va 0 [])
   let .rel a t _ := p | halt (.stuck "malformed allocation") loc
   let al ← getAlloc loc a
-  setAlloc a { al with kind := .va t (vs.map RVal.scalarTy) }
-  let sp := (← get).space
-  let bytes := vs.zipIdx.foldl (fun m (v, i) => writeBytes m (8 * i) (v.encode sp)) ∅
+  setAlloc a { al with kind := .va t tys }
+  let bytes := (vs.zip tys).zipIdx.foldl (fun m ((v, ty), i) =>
+    (v.pieces sp ty).foldl (fun m (o, bs) => writeBytes m (vaOffset sp tys i + o) bs) m) ∅
   modify fun c => { c with mem := c.mem.insert a bytes }
   pure a
 
@@ -661,8 +695,8 @@ def vaStartC (loc : Option Loc) (ids : List Nat) : List RVal → CM Unit
   | _ => halt (.stuck "malformed op") loc
 
 /-- `va.arg`: the variadic argument at the cursor in the `va_list` at `p`, read as a `ty` (which
-must be of its class: integer and pointer, or float), as a load of `ty` reads the argument's
-bytes; the cursor moves to the next. -/
+must be of its class: integer and pointer, or float; a composite exactly its type, up to
+`Ty.canon`), as a load of `ty` reads the argument's bytes; the cursor moves to the next. -/
 def vaArgC (loc : Option Loc) (ty : Ty) : List RVal → CM RVal
   | [.ptr (some p)] => do
     let sp := (← get).space
@@ -673,9 +707,18 @@ def vaArgC (loc : Option Loc) (ty : Ty) : List RVal → CM RVal
     let .va _ tys := al.kind | ub .vaArg loc "the va_list holds no cursor from va.start"
     unless al.live do ub .useAfterFree loc (deadNote al)
     let some u := tys[k]? | ub .vaArg loc s!"no variadic argument is left: the call passed {tys.length}"
-    unless u.isFpClass == ty.isFpClass do
+    if ty.isComposite || u.isComposite then
+      unless ty.canon == u do ub .vaArg loc s!"variadic argument {k} has type {u}, not {ty}"
+    else unless u.isFpClass == ty.isFpClass do
       ub .vaArg loc s!"variadic argument {k} has type {u}, of the other class than {ty}"
-    let v ← decodeAs loc ty (readBytes ((← get).mem.getD a ∅) (8 * k) (ty.size sp))
+    let base := vaOffset sp tys k
+    let mem := (← get).mem.getD a ∅
+    let v ← if ty.isValue then decodeAs loc ty (readBytes mem base (ty.size sp))
+      else do
+        let ls ← (ty.leaves sp).mapM fun (o, l) => decodeAs loc l (readBytes mem (base + o) (l.size sp))
+        match ty.build ls with
+        | some (v, []) => pure v
+        | _ => halt (.stuck s!"{ty} has no value of its leaves") loc
     writeVaList loc p (cursorBytes sp a t (k + 1))
     pure v
   | [.ptr none] => ub .poison loc "va.arg through a poison pointer"
@@ -1099,13 +1142,19 @@ def Ptr.pairs : Ptr → List (Nat × Nat)
   | .rel a t _ => [(a, t)]
   | .abs _ cands => cands
 
-def RVal.pairs : RVal → List (Nat × Nat)
-  | .ptr (some p) => p.pairs
-  | _ => []
-
 def Byte.pairs : Byte → List (Nat × Nat)
   | .frag p _ => p.pairs
   | .va a t _ _ => [(a, t)]
+  | _ => []
+
+/-- The pairs a value carries: a pointer's, and those of the pointers in a composite's leaves
+(pointer leaves, and the fragments in byte leaves), which a C callee gets in its registers. -/
+def RVal.pairs : RVal → List (Nat × Nat)
+  | .ptr (some p) => p.pairs
+  | .agg vs => (RVal.leavesList vs).flatMap fun
+    | .ptr (some p) => p.pairs
+    | .bytes bs => bs.flatMap Byte.pairs
+    | _ => []
   | _ => []
 
 /-- `xs`, then the elements of `ys` it doesn't have yet, in order. -/
@@ -1170,6 +1219,10 @@ no provenance. -/
 def RVal.okIn (reach : List (Nat × Nat)) : RVal → Bool
   | .ptr (some p) => p.okIn reach
   | .bytes bs => bs.all (Byte.okIn reach)
+  | .agg vs => (RVal.leavesList vs).all fun
+    | .ptr (some p) => p.okIn reach
+    | .bytes bs => bs.all (Byte.okIn reach)
+    | _ => true
   | _ => true
 
 /-- Whether an answer stays within the callee's declared effects: results of its types, writes

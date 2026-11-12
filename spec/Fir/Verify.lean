@@ -11,8 +11,8 @@ interpreter.
 
 * Types: `iN` has `N ≥ 1`; `bN` has `N` a positive multiple of 8. Values (results, parameters,
   function results, holes) have the layer's value types (`Layer.valueTy`): `iN`, `ptr`, `bN`,
-  `f32`, `f64`,
-  and in HFIR also structs, arrays, unions, and slices. Struct fields and array elements have a
+  `f32`, `f64`, and structs and arrays of them,
+  and in HFIR also unions, slices, and aggregates holding them. Struct fields and array elements have a
   layout (no function types, unions, or integers whose size isn't whole bytes); a union has at
   least one variant, each a value type; function types take value types; a struct's or array's
   size is below `2^addrBits`. Memory spaces have
@@ -49,8 +49,13 @@ interpreter.
   `readonly` only to pointer parameters of functions.
 * Varargs: a variadic function, external function, or function type takes variadic arguments
   after its parameters, each an `iN` or `bN` of 8 to 64 bits in whole bytes, a `ptr` (if the
-  memory space's pointers take at most 64 bits), or a float (`SpaceCfg.isVararg`), which is also
-  what `va.arg` reads; `va.start` is only in a variadic function.
+  memory space's pointers take at most 64 bits), a float, or a nonempty `struct<C>` or array of
+  such scalars and composites (`SpaceCfg.isVararg`), which is also what `va.arg` reads;
+  `va.start` is only in a variadic function.
+* Composites (decision: C ABI for aggregates): outside HFIR, values may also be structs and
+  arrays of scalars and composites (`Ty.isComposite`), which calls pass whole; a function,
+  external function, or function type with such a result has no other. Loads and stores of them
+  are HFIR only. External functions take and give scalars and composites in every layer.
   `va_list` is a memory type: no value, parameter, or part of a value has it.
 * Signatures: every function's parameter and result types are value types. This is checked
   for all functions before any body, so calls only ever compare value types.
@@ -106,6 +111,15 @@ partial def Ty.hasVaList : Ty → Bool
   | .array _ e => e.hasVaList
   | _ => false
 
+/-- A composite among several results, which only HFIR allows: outside it, calls pass a struct
+or array result whole, as C returns one, so it is a function's only result (decision: C ABI for
+aggregates). -/
+def sharedComposite (rs : List Ty) : Option Ty :=
+  if rs.length > 1 then rs.find? Ty.isComposite else none
+
+def sharedCompositeMsg (t : Ty) : String :=
+  s!"{t} can't be one of several results: outside HFIR, a struct or array result is the only one"
+
 /-- Check that a type is well formed: valid widths, parts with a layout, function types of
 value types, and sizes that fit the address space. -/
 partial def checkTy (loc : Option Loc) : Ty → VM Unit
@@ -126,6 +140,8 @@ partial def checkTy (loc : Option Loc) : Ty → VM Unit
     for x in ps ++ rs do
       checkTy loc x
       unless l.valueTy x && !x.hasVaList do verr loc s!"{x} can't be a parameter or result of {t}"
+    if l != .hfir then
+      if let some x := sharedComposite rs then verr loc (sharedCompositeMsg x)
   | .slice => pure ()
   | t@(.union vs) => do
     if vs.isEmpty then verr loc s!"{t} needs at least one variant"
@@ -248,6 +264,8 @@ def checkSimple (loc : Option Loc) (k : OpKind) (ins outs : List Ty) : VM Unit :
     | .loadable t verb =>
       let t := ty t
       unless st.layer.valueTy t do verr loc s!"{t} can't be {verb}: it is not a value type"
+      unless t.isValue || st.layer == .hfir do
+        verr loc s!"{t} can't be {verb}: outside HFIR, memory is accessed by scalars"
       unless t.isValue || t.hasLayout do verr loc s!"{t} can't be {verb}: it has no layout"
       unless isLoadable st.space t do verr loc s!"{t} can't be {verb}: its size isn't whole bytes"
     | .deny names msg => if names.contains k.name then verr loc msg
@@ -596,7 +614,11 @@ def verifyModule (m : Module) : Except String (Array Hole) := do
   -- External functions.
   for x in m.externs do
     for t in x.params ++ x.rets do
-      unless t.isValue do throw s!"extern @{x.name}: {t} is not a value type"
+      if let .error e := (checkTy none t).run st then
+        throw s!"extern @{x.name}: {(e.dropPrefix? "@?: ").map (·.toString) |>.getD e}"
+      unless (t.isValue || t.isComposite) && !t.hasVaList do
+        throw s!"extern @{x.name}: {t} is not a value type"
+    if let some t := sharedComposite x.rets then throw s!"extern @{x.name}: {sharedCompositeMsg t}"
     let mut seen : List ExtEffect := []
     for e in x.effects do
       if seen.contains e then throw s!"extern @{x.name}: {e.render} is listed twice"
@@ -609,6 +631,8 @@ def verifyModule (m : Module) : Except String (Array Hole) := do
   for f in m.funcs do
     for t in f.params.map (·.ty) ++ f.rets do
       unless m.layer.valueTy t do throw s!"in @{f.name}: @?: {t} is not a value type"
+    if m.layer != .hfir then
+      if let some t := sharedComposite f.rets then throw s!"in @{f.name}: @?: {sharedCompositeMsg t}"
   let (_, st) ← (m.funcs.forM fun f =>
     tryCatch (verifyFunc f) fun e => throw s!"in @{f.name}: {e}").run st
   pure st.holes

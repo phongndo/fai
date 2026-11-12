@@ -13,9 +13,14 @@ HFIR lowering). It runs three passes over each function.
 (`scalars`): a value `%s` of type `struct<C>{i32, ptr}` becomes `%s.0: i32` and `%s.1: ptr`. A
 union becomes its `i32` tag and the scalars of every variant, in order; the variants it doesn't
 hold are `poison`. A slice becomes its pointer and its length. Scalar values keep their names.
-Function parameters and results, region parameters, op results, and the operands of branches,
-`cf.yield`, `cf.break`, `cf.continue`, `func.ret`, and calls are replaced by their scalars too, so
-the calling convention passes an aggregate as its scalars. The building-block ops become:
+Region parameters, op results, and the operands of branches, `cf.yield`, `cf.break`, and
+`cf.continue` are replaced by their scalars too, and so are function parameters and results,
+`func.ret`'s operands, and call arguments and results, except composites (structs and arrays of
+scalars, `Ty.isComposite`), which calls pass whole as the C ABI's unit (decision: C ABI for
+aggregates): a composite parameter, call argument, call or `va.arg` result, or a function's only
+result stays one value, made with `agg.make` from its scalars where it is passed and taken apart
+with `agg.extract` where it arrives (`makeWhole`, `extractWhole`); several results, unions, and
+slices still pass as their scalars. The building-block ops become:
 
 * `agg.make`, `agg.extract`, `agg.insert`, `copy`, `union.make`, `union.tag`, `slice.make`,
   `slice.ptr`, `slice.len`: copies of scalars (and `int.const` for a union's tag, `poison` for
@@ -127,9 +132,27 @@ mutual
         lowerVariants aw tag (j + 1) v ts
 end
 
-/-- A function type with each parameter and result replaced by its scalars. -/
+/-- The parameters a signature's parameters become: a composite stays whole (calls pass it as
+the C ABI says, decision: C ABI for aggregates), anything else becomes its scalars. -/
+def sigParams (aw : Nat) (ps : List Ty) : List Ty :=
+  ps.flatMap fun t => if t.isComposite then [t] else scalars aw t
+
+/-- The results a signature's results become: a composite that is the only result stays whole,
+anything else becomes its scalars. -/
+def sigRets (aw : Nat) (rs : List Ty) : List Ty :=
+  match rs with
+  | [t] => if t.isComposite then [t] else scalars aw t
+  | rs => scalarsList aw rs
+
+/-- Whether results of these types stay whole: one composite. -/
+def wholeRets (rs : List Ty) : Bool :=
+  match rs with
+  | [t] => t.isComposite
+  | _ => false
+
+/-- A function type with each parameter and result replaced as `sigParams` and `sigRets` say. -/
 def flatSig (aw : Nat) : Ty → Ty
-  | .func ps rs v => .func (scalarsList aw ps) (scalarsList aw rs) v
+  | .func ps rs v => .func (sigParams aw ps) (sigRets aw rs) v
   | t => t
 
 /-! ## Types of values -/
@@ -144,10 +167,12 @@ mutual
     | .mk ps ops _ :: rs => ps.map (fun r => (r.name, r.ty)) ++ typesOps ops ++ typesRegions rs
 end
 
-/-- What scalarizing reads: the memory space and each value's type. -/
+/-- What scalarizing reads: the memory space, each value's type, and whether the function's
+result stays whole (`wholeRets`). -/
 structure Ctx where
   sp : SpaceCfg
   types : Std.HashMap String Ty
+  wholeRet : Bool := false
 
 def Ctx.aw (cx : Ctx) : Nat := cx.sp.addrBits
 
@@ -202,6 +227,79 @@ def fixSuccs (cx : Ctx) (k : OpKind) (args : List Operand) : OpKind × List Oper
     (.switch { d with nargs := da.length } cs', v :: da ++ ca)
   | .callIndirect sig, _ => (.callIndirect (flatSig cx.aw sig), cx.explodeAll args)
   | _, _ => (k, cx.explodeAll args)
+
+/-! ### Composites at call boundaries
+
+Calls pass composites whole (decision: C ABI for aggregates): a composite argument is made from
+its scalars with `agg.make` (its nested parts first), and a composite parameter, call result, or
+`va.arg` result is taken apart into its scalars with `agg.extract` (each part, then its parts), so
+the body works on scalars as before. Nested parts are temporaries. -/
+
+mutual
+  /-- Make a composite of type `t` from the front of `ls`, its scalars: the ops, the value, and
+  the scalars left over. A scalar part is its scalar. -/
+  partial def makeWhole (loc : Option Loc) (t : Ty) (ls : List Operand) :
+      M (List Op × Operand × List Operand) :=
+    match t with
+    | .struct _ fs => do
+      let (ops, parts, rest) ← makeParts loc fs ls
+      let n ← fresh "s"
+      pure (ops ++ [.mk .aggMake [res n t] parts [] loc], .var n, rest)
+    | .array k e => do
+      let (ops, parts, rest) ← makeParts loc (List.replicate k e) ls
+      let n ← fresh "s"
+      pure (ops ++ [.mk .aggMake [res n t] parts [] loc], .var n, rest)
+    | _ => match ls with
+      | l :: rest => pure ([], l, rest)
+      | [] => throw "a composite has fewer scalars than its type"
+  partial def makeParts (loc : Option Loc) (ts : List Ty) (ls : List Operand) :
+      M (List Op × List Operand × List Operand) :=
+    match ts with
+    | [] => pure ([], [], ls)
+    | t :: ts => do
+      let (o1, p, ls) ← makeWhole loc t ls
+      let (o2, ps, ls) ← makeParts loc ts ls
+      pure (o1 ++ o2, p :: ps, ls)
+end
+
+/-- The operands of a call, each composite one made whole from its scalars. -/
+def makeArgs (cx : Ctx) (loc : Option Loc) (args : List Operand) : M (List Op × List Operand) := do
+  let mut ops := []
+  let mut out := []
+  for a in args do
+    let t := cx.tyOf a
+    if t.isComposite then
+      let (o, v, _) ← makeWhole loc t (cx.explode a)
+      ops := ops ++ o
+      out := out ++ [v]
+    else out := out ++ cx.explode a
+  pure (ops, out)
+
+mutual
+  /-- Take the composite `v` of type `t` apart into the results `rs`, its scalars in order: the
+  ops, and the results left over. -/
+  partial def extractWhole (loc : Option Loc) (t : Ty) (v : Operand) (rs : List Result) :
+      M (List Op × List Result) :=
+    match t with
+    | .struct _ fs => extractParts loc v 0 fs rs
+    | .array k e => extractParts loc v 0 (List.replicate k e) rs
+    | _ => pure ([], rs)
+  partial def extractParts (loc : Option Loc) (v : Operand) (i : Nat) (ts : List Ty)
+      (rs : List Result) : M (List Op × List Result) :=
+    match ts with
+    | [] => pure ([], rs)
+    | t :: ts => do
+      let (o1, rs) ← if t.isValue then
+          match rs with
+          | r :: rest => pure ([.mk (.aggExtract i) [r] [v] [] loc], rest)
+          | [] => throw "a composite has fewer scalars than its type"
+        else do
+          let n ← fresh "s"
+          let (o, rest) ← extractWhole loc t (.var n) rs
+          pure (.mk (.aggExtract i) [res n t] [v] [] loc :: o, rest)
+      let (o2, rs) ← extractParts loc v (i + 1) ts rs
+      pure (o1 ++ o2, rs)
+end
 
 /-- The address of the leaf at offset `off` of an aggregate at `p`, and the ops computing it. -/
 def leafAddr (cx : Ctx) (p : Operand) (off : Nat) (loc : Option Loc) : M (List Op × Operand) :=
@@ -305,6 +403,30 @@ def scalarizeFlat (cx : Ctx) (k : OpKind) (rs : List Result) (args : List Operan
     pure (pre ++ (← storeFrom cx T A (cx.explode v) q loc))
   | .load A, [r], [p] => loadTo cx r A p loc
   | .store T A, [], [v, p] => storeFrom cx T A (cx.explode v) p loc
+  | .call _, _, _ | .callIndirect _, _, _ => do
+    let skip := if k matches .callIndirect _ then 1 else 0
+    let k' := match k with
+      | .callIndirect sig => .callIndirect (flatSig aw sig)
+      | k => k
+    let (pre, args') ← makeArgs cx loc (args.drop skip)
+    let args' := cx.explodeAll (args.take skip) ++ args'
+    match rs with
+    | [r] =>
+      if r.ty.isComposite then
+        let (post, _) ← extractWhole loc r.ty (.var r.name) (explodeResult aw r)
+        pure (pre ++ [.mk k' [r] args' [] loc] ++ post)
+      else pure (pre ++ [.mk k' rs' args' [] loc])
+    | _ => pure (pre ++ [.mk k' rs' args' [] loc])
+  | .vaArg, [r], _ =>
+    if r.ty.isComposite then do
+      let (post, _) ← extractWhole loc r.ty (.var r.name) (explodeResult aw r)
+      pure ([.mk k [r] (cx.explodeAll args) [] loc] ++ post)
+    else keep
+  | .ret, [], _ =>
+    if cx.wholeRet then do
+      let (pre, args') ← makeArgs cx loc args
+      pure (pre ++ [.mk .ret [] args' [] loc])
+    else keep
   | _, _, _ => keep
 
 mutual
@@ -331,15 +453,33 @@ end
 /-- The context for scalarizing a function: the type of each value it defines. -/
 def Ctx.ofFunc (sp : SpaceCfg) (f : Func) : Ctx :=
   { sp, types := (f.params.map (fun r => (r.name, r.ty)) ++ typesOps f.body.ops).foldl
-      (fun m (n, t) => m.insert n t) {} }
+      (fun m (n, t) => m.insert n t) {}
+    wholeRet := wholeRets f.rets }
 
-/-- Replace a function's aggregate, union, and slice values by their scalars. -/
+/-- The parameters a function's parameters become (a composite stays whole), and the ops that
+take its composite parameters apart. -/
+def scalarizeParams (cx : Ctx) (ps : List Result) : M (List Result × List Op) := do
+  let mut out := []
+  let mut ops := []
+  for p in ps do
+    if p.ty.isComposite then
+      let (o, _) ← extractWhole none p.ty (.var p.name) (explodeResult cx.aw p)
+      out := out ++ [p]
+      ops := ops ++ o
+    else out := out ++ explodeResult cx.aw p
+  pure (out, ops)
+
+/-- Replace a function's aggregate, union, and slice values by their scalars, except where calls
+pass composites whole: parameters, a single result, call arguments and results. -/
 def scalarize (sp : SpaceCfg) (f : Func) : Except String Func := do
   let cx := Ctx.ofFunc sp f
-  let (ops, _) ← (scalarizeOps cx f.body.ops).run 0
+  let ((params, pre, ops), _) ← (do
+      let (params, pre) ← scalarizeParams cx f.params
+      let ops ← scalarizeOps cx f.body.ops
+      pure (params, pre, ops)).run 0
   pure { f with
-    rets := scalarsList sp.addrBits f.rets
-    body := .mk (f.params.flatMap (explodeResult sp.addrBits)) ops f.body.label }
+    rets := sigRets sp.addrBits f.rets
+    body := .mk params (pre ++ ops) f.body.label }
 
 /-! ## Expanding -/
 

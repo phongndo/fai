@@ -1,4 +1,5 @@
 import Fir.AArch64
+import Fir.AArch64Abi
 import Fir.Interp
 import Fir.Layout
 import Fir.Print
@@ -28,13 +29,18 @@ classes. The instructions' bit-level meaning is
 * **Registers have classes**: an instruction that names a register of the wrong class (an FP
   register in `add`, a general-purpose one in `fadd`) is stuck; `fmov`, `ldr`, and `str` take
   either for the register they move.
-* **Calls** follow AAPCS64 (decision: Calling convention): integer and pointer arguments in
-  `x0`…`x7` and float arguments in `d0`…`d7`, counted separately, then 8-byte stack slots from
-  `sp` in order (`argLocs`), variadic arguments as fixed ones on Linux (decision: Varargs; `blr`
-  names the call's argument types, which an external callee's event reads); one or two results in `d0`, `d1` when all are floats of one format,
-  otherwise in `x0`, `x1` (a float as its bits), more in 8-byte slots at the address the caller
-  passes in `x8` (`resRegs`). A narrow integer or an `f32` travels in the low bits of its
-  register. `bl` enters an LFIR function, which must leave `x19`…`x29`, `sp`, and `d8`…`d15` as
+* **Calls** follow AAPCS64 as `Fir.AArch64Abi` lays it out (decisions: Calling convention, C
+  ABI for aggregates): integer and pointer arguments in `x0`…`x7` and float arguments in
+  `d0`…`d7`, counted separately, then 8-byte stack slots from `sp` in order; a struct or array
+  as its HFA members in FP registers, its bytes in one or two `x` registers, or on the stack, or
+  a pointer to a copy (`argLocs`); variadic arguments as fixed ones on Linux (decision: Varargs;
+  `blr` names the call's argument types, which an external callee's event reads); one or two
+  scalar results in `d0`, `d1` when all are floats of one format, otherwise in `x0`, `x1` (a
+  float as its bits), more in 8-byte slots at the address the caller passes in `x8`, and a
+  composite result where it would be passed first, or at `x8` (`resRegs`). A narrow integer or
+  an `f32` travels in the low bits of its register; a composite's bytes in registers are read
+  and written as `ldr` and `str` move them (`wordOfBytes`, `bytesOfWord`), so a pointer in a
+  whole word keeps its provenance. `bl` enters an LFIR function, which must leave `x19`…`x29`, `sp`, and `d8`…`d15` as
   it found them, or calls an external function: one event, its results placed as above, and the
   caller-saved registers (`x0`…`x18`, `x30`, `d0`…`d7`, `d16`…`d31`) and flags then hold oracle
   choices. `ret` returns to the frame below,
@@ -52,12 +58,6 @@ values where the calling convention puts results.
 -/
 
 namespace Fir.AArch64
-
-/-- What a register holds. -/
-inductive Word where
-  | bits (b : BitVec 64)
-  | ptr (p : Ptr)
-  deriving DecidableEq, Repr, Inhabited
 
 /-- One running function: its blocks, the rest of the current block, its virtual registers (`vN`
 and `fvN`), and what the callee-saved registers held on entry. -/
@@ -268,63 +268,93 @@ def wordOfVal (loc : Option Loc) : RVal → LM Word
   | .float _ (.bits b) => pure (.bits (b.setWidth 64))
   | .float _ .poison => do pure (.bits (← chooseBits))
 
-/-- Where AAPCS64 puts the arguments of a call with parameter types `ps` (decision: Calling
-convention): integers and pointers in `x0`…`x7` and floats in `d0`…`d7`, counted separately and
-in order, and the rest in 8-byte stack slots from `sp` (`.inr` with the slot's offset), in
-order. -/
-def argLocs (ps : List Ty) : List (Reg ⊕ Nat) := go ps 0 0 0
-where
-  go : List Ty → Nat → Nat → Nat → List (Reg ⊕ Nat)
-    | [], _, _, _ => []
-    | .float _ :: ts, g, f, s =>
-      if f < 8 then .inl (.d f) :: go ts g (f + 1) s else .inr (8 * s) :: go ts g f (s + 1)
-    | _ :: ts, g, f, s =>
-      if g < 8 then .inl (.x g) :: go ts (g + 1) f s else .inr (8 * s) :: go ts g f (s + 1)
-
-/-- How many stack slots a call's arguments take. -/
-def stackSlots (ps : List Ty) : Nat := ((argLocs ps).filter (·.isRight)).length
-
-#guard argLocs [.int 32, .float .f64, .ptr] == [.inl (.x 0), .inl (.d 0), .inl (.x 1)]
-#guard (argLocs ((List.replicate 9 (.float .f32)) ++ [.int 8])).getLast? == some (.inl (.x 0))
-#guard stackSlots ((List.replicate 9 (.float .f32)) ++ (List.replicate 10 (.int 8))) == 3
-
-/-- The registers one or two results go in: `d0`, `d1` (`s0`, `s1`) when all are floats of one
-format, otherwise `x0`, `x1`, a float as its bits; `none` for three or more, which go in 8-byte
-slots at the address the caller passes in `x8`. This is how C returns a struct of the results,
-each an 8-byte field (`double`, `float`, or a 64-bit integer): a homogeneous float aggregate in
-FP registers, any other 16 bytes in `x0` and `x1`. -/
-def resRegs (rets : List Ty) : Option (List Reg) :=
-  if rets.length > 2 then none
-  else
-    let fp := match rets with
-      | .float f :: rest => rest.all (· == .float f)
-      | _ => false
-    some ((List.range rets.length).map fun i => if fp = true then .d i else .x i)
-
-#guard resRegs [.float .f32, .float .f32] == some [.d 0, .d 1]
-#guard resRegs [.float .f32, .float .f64] == some [.x 0, .x 1]
-#guard resRegs [.int 8, .float .f64] == some [.x 0, .x 1]
-
 /-- A word in a stack slot `off` bytes above `sp`. -/
 def slotWord (loc : Option Loc) (off : Nat) : LM Word := do
   loadWord loc 8 (← offsetWord loc (← get).sp off)
 
-/-- The arguments of a call with parameter types `ps`, from where `argLocs` puts them. -/
-def argVals (loc : Option Loc) (ps : List Ty) : LM (List RVal) :=
-  (ps.zip (argLocs ps)).mapM fun (t, l) => do
-    let w ← match l with
-      | .inl r => readAny loc r
-      | .inr off => slotWord loc off
-    valOfWord loc t w
+def space : LM SpaceCfg := do pure (← get).core.space
 
-/-- Place a call's results where `resRegs` says: in registers, or in 8-byte slots at `x8`. -/
+/-- `n` bytes of memory at `w`. -/
+def loadBytes (loc : Option Loc) (w : Word) (n : Nat) : LM (List Byte) := do
+  let (a, off) ← locate loc w n
+  pure (readBytes ((← get).core.mem.getD a ∅) off n)
+
+/-- Write bytes to memory at `w`. -/
+def storeBytes (loc : Option Loc) (w : Word) (bs : List Byte) : LM Unit := do
+  let (a, off) ← locate loc w bs.length
+  modify fun m => { m with core := { m.core with
+    mem := m.core.mem.insert a (writeBytes (m.core.mem.getD a ∅) off bs) } }
+
+/-- A composite of type `t` from its bytes: each leaf as a load of its type reads it. -/
+def valOfBytes (loc : Option Loc) (t : Ty) (bs : List Byte) : LM RVal := do
+  let sp ← space
+  let ls ← (t.leaves sp).mapM fun (o, l) => liftCM (decodeAs loc l ((bs.drop o).take (l.size sp)))
+  match t.build ls with
+  | some (v, []) => pure v
+  | _ => stuckL loc s!"{t} has no value of its leaves"
+
+/-- A composite value's bytes (`compositeBytes`): its leaves', `poison` in the padding. -/
+def bytesOfVal (sp : SpaceCfg) (t : Ty) (v : RVal) : List Byte :=
+  compositeBytes sp t (v.pieces sp t)
+
+/-- The bytes a composite of kind `k` has in registers `rs`: eight per `x` register, a member's
+per FP register. -/
+def regBytes (loc : Option Loc) (k : PassKind) (rs : List Reg) : LM (List Byte) := do
+  let mut out := []
+  for r in rs do
+    match k with
+    | .hfa f _ =>
+      let b ← readF loc r
+      out := out ++ (digits f.bytes b.toNat).map fun d => .bits (BitVec.ofNat 8 d)
+    | _ => out := out ++ (← bytesOfWord loc 8 (← readReg loc r))
+  pure out
+
+/-- Put a composite of kind `k`'s bytes in registers `rs`, a piece each (`pieces`). -/
+def placeBytes (loc : Option Loc) (k : PassKind) (rs : List Reg) (bs : List Byte) : LM Unit := do
+  for (pc, r) in (pieces k bs).zip rs do
+    writeAny loc r (← wordOfBytes loc pc)
+
+/-- An argument of type `t` from where `argLocs` put it. -/
+def argVal (loc : Option Loc) (t : Ty) : ArgLoc → LM RVal
+  | .reg r => do valOfWord loc t (← readAny loc r)
+  | .stack off => do valOfWord loc t (← slotWord loc off)
+  | .regs rs => do
+    let sp ← space
+    valOfBytes loc t ((← regBytes loc (passKind sp t) rs).take (t.size sp))
+  | .mem off => do
+    valOfBytes loc t (← loadBytes loc (← offsetWord loc (← get).sp off) (t.size (← space)))
+  | .ref l => do
+    let p ← match l with
+      | .inl r => readReg loc r
+      | .inr off => slotWord loc off
+    valOfBytes loc t (← loadBytes loc p (t.size (← space)))
+  | .none => valOfBytes loc t []
+
+/-- The arguments of a call with parameter types `ps`, from where `argLocs` puts them. -/
+def argVals (loc : Option Loc) (ps : List Ty) : LM (List RVal) := do
+  (ps.zip (argLocs (← space) ps)).mapM fun (t, l) => argVal loc t l
+
+/-- Place a call's results where `resRegs` says: in registers (a composite's pieces), or at
+`x8` (a composite's bytes, or 8-byte slots). -/
 def setResults (loc : Option Loc) (rets : List Ty) (vs : List RVal) : LM Unit := do
-  match resRegs rets with
-  | some rs => for (v, r) in vs.zip rs do writeAny loc r (← wordOfVal loc v)
-  | none =>
-    let area ← readReg loc (.x 8)
-    for (v, i) in vs.zipIdx do
-      storeWord loc 8 (← offsetWord loc area (8 * i)) (← wordOfVal loc v)
+  let sp ← space
+  match rets, vs with
+  | [t], [v] =>
+    if t.isComposite then
+      let bs := bytesOfVal sp t v
+      match resRegs sp rets with
+      | some rs => placeBytes loc (passKind sp t) rs bs
+      | none => storeBytes loc (← readReg loc (.x 8)) bs
+    else scalars sp
+  | _, _ => scalars sp
+where
+  scalars (sp : SpaceCfg) : LM Unit := do
+    match resRegs sp rets with
+    | some rs => for (v, r) in vs.zip rs do writeAny loc r (← wordOfVal loc v)
+    | none =>
+      let area ← readReg loc (.x 8)
+      for (v, i) in vs.zipIdx do
+        storeWord loc 8 (← offsetWord loc area (8 * i)) (← wordOfVal loc v)
 
 /-- The FP registers a call may change: `d0`…`d7` and `d16`…`d31` (of `d8`…`d15`, only the high
 64 bits, which the machine doesn't hold). -/
@@ -354,12 +384,23 @@ leaks. -/
 def finish (loc : Option Loc) (f : Func) : LM Unit := do
   if let some w := (← get).exn then
     throw { outcome := .threw (← valOfWord loc .ptr w), loc, leaks := leaks (← get).core }
-  let ws ← match resRegs f.rets with
-    | some rs => rs.mapM (readAny loc)
-    | none => (List.range f.rets.length).mapM fun i => do
-      loadWord loc 8 (← offsetWord loc (← get).resArea (8 * i : Nat))
-  let vs ← (f.rets.zip ws).mapM fun (t, w) => valOfWord loc t w
+  let sp ← space
+  let vs ← match f.rets with
+    | [t] =>
+      if t.isComposite then do
+        match resRegs sp f.rets with
+        | some rs => pure [← argVal loc t (.regs rs)]
+        | none => pure [← valOfBytes loc t (← loadBytes loc (← get).resArea (t.size sp))]
+      else scalars sp
+    | _ => scalars sp
   throw { outcome := .ret vs, loc, leaks := leaks (← get).core }
+where
+  scalars (sp : SpaceCfg) : LM (List RVal) := do
+    let ws ← match resRegs sp f.rets with
+      | some rs => rs.mapM (readAny loc)
+      | none => (List.range f.rets.length).mapM fun i => do
+        loadWord loc 8 (← offsetWord loc (← get).resArea (8 * i : Nat))
+    (f.rets.zip ws).mapM fun (t, w) => valOfWord loc t w
 
 /-- Start running `f`: push a frame for its code, or, for a `func.ret` of its parameters, place
 those values as results at once. -/
@@ -391,7 +432,7 @@ def callExt (loc : Option Loc) (x : Extern) (ps : List Ty) : LM Unit := do
   | none => modify fun m => { m with hung := true }
   | some rs =>
     setResults loc x.rets rs
-    clobber ((resRegs x.rets).getD [])
+    clobber ((resRegs (← space) x.rets).getD [])
 
 /-- Call a function by name. An external one reads its arguments by `site`, the call's argument
 types, if given (`blr`: a variadic callee's variadic arguments are in them), else by its
@@ -649,21 +690,36 @@ def start (f : Func) (args : List RVal) : LM Unit := do
   let down (n : Nat) : LM Unit := do
     let sp ← offsetWord none (← get).sp (-(((n + 15) / 16 * 16 : Nat) : Int))
     modify fun m => { m with sp }
-  if f.rets.length > 2 then
-    down (8 * f.rets.length)
+  let sp ← space
+  if (resRegs sp f.rets).isNone then
+    down (match f.rets with
+      | [t] => if t.isComposite then t.size sp else 8
+      | rs => 8 * rs.length)
     modify fun m => { m with resArea := m.sp }
     writeReg (.x 8) (← get).sp
   -- A variadic function's variadic arguments go where fixed ones of their types would.
-  let tys := if f.variadic then args.map RVal.scalarTy else f.params.map (·.ty)
-  let locs := argLocs tys
-  let slots := stackSlots tys
-  if slots > 0 then
-    down (8 * slots)
-    for (v, l) in args.zip locs do
-      if let .inr off := l then
-        storeWord none 8 (← offsetWord none (← get).sp off) (← wordOfVal none v)
-  for (v, l) in args.zip locs do
-    if let .inl r := l then writeAny none r (← wordOfVal none v)
+  let tys := (f.params.map (·.ty)) ++ ((args.drop f.params.length).map RVal.argTy)
+  -- Copies of the composites passed by reference.
+  let mut refs : List Word := []
+  for (v, t) in args.zip tys do
+    if passKind sp t == .ref then
+      down (t.size sp)
+      storeBytes none (← get).sp (bytesOfVal sp t v)
+      refs := refs ++ [(← get).sp]
+    else refs := refs ++ [.bits 0]
+  let locs := argLocs sp tys
+  let n := argStack sp tys
+  if n > 0 then down n
+  for ((v, t), (l, p)) in (args.zip tys).zip (locs.zip refs) do
+    let slot (off : Nat) : LM Word := do offsetWord none (← get).sp off
+    match l with
+    | .reg r => writeAny none r (← wordOfVal none v)
+    | .stack off => storeWord none 8 (← slot off) (← wordOfVal none v)
+    | .regs rs => placeBytes none (passKind sp t) rs (bytesOfVal sp t v)
+    | .mem off => storeBytes none (← slot off) (bytesOfVal sp t v)
+    | .ref (.inl r) => writeReg r p
+    | .ref (.inr off) => storeWord none 8 (← slot off) p
+    | .none => pure ()
   enter none f
   if (← get).frames.isEmpty then finish none f
 

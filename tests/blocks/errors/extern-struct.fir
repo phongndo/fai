@@ -1,6 +1,6 @@
-// External functions take scalars, even in HFIR: their ABI is not decided yet.
-// error: extern @x: struct<C>{i8} is not a value type
-extern func @x(struct<C>{i8}) effects[] assume
+// External functions take scalars and C ABI composites (structs and arrays), not slices.
+// error: extern @x: slice is not a value type
+extern func @x(slice) effects[] assume
 func @f() {
   func.ret
 }
