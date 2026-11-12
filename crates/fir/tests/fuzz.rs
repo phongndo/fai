@@ -2,6 +2,12 @@
 //! this crate's interpreter and by `fir-ref run`, with random arguments and fuel limits, and the
 //! outcomes must be identical, events included.
 //!
+//! HFIR programs are also lowered to MFIR (`fir::lower_checked`): the printed lowering must be
+//! what `fir-ref lower` prints, both interpreters must run it alike, and each run of the
+//! lowering must agree with the run of the HFIR program (`RunOutput::lowers_to`: the same
+//! outcome, or the same events first where the HFIR run is UB), with 16 times the fuel. Runs of
+//! the HFIR program that run out of fuel are not compared.
+//!
 //! By default 200 programs run. `FIR_FUZZ=N` runs N, and `FIR_FUZZ_SEED=S` picks another seed;
 //! program `k` of seed `S` is always the same, so a failure names the program to replay. Failing
 //! programs are written to `target/tmp/fuzz/`. `FIR_FUZZ_SHOW=PREFIX` also prints the runs whose
@@ -29,6 +35,16 @@ fn ours(m: &fir::Module, args: &[String], fuel: u64) -> Printed {
     match fir::interp::run(m, "f0", &args, fuel) {
         Ok(s) => (format!("{s}\n"), String::new(), 0),
         Err(e) => (String::new(), format!("{e}\n"), 1),
+    }
+}
+
+/// `fir-ref lower FILE`'s stdout, or its stderr.
+fn their_lowering(tool: &Path, file: &Path) -> String {
+    let out = Command::new(tool).arg("lower").arg(file).output().unwrap();
+    if out.status.success() {
+        String::from_utf8(out.stdout).unwrap()
+    } else {
+        String::from_utf8(out.stderr).unwrap()
     }
 }
 
@@ -108,6 +124,37 @@ fn interpreter_matches_reference_on_random_programs() {
                         });
                     let show = std::env::var("FIR_FUZZ_SHOW").ok();
                     let mut keep = false;
+                    // The lowering, for HFIR programs.
+                    let lowered = if m.layer == fir::Layer::Hfir {
+                        let lfile = dir.join(format!("s{seed}-p{k}-lowered.fir"));
+                        match fir::lower_checked(&m) {
+                            Ok(l) => {
+                                let text = l.render(true);
+                                std::fs::write(&lfile, &text).unwrap();
+                                let theirs = their_lowering(&tool, &file);
+                                if theirs != text {
+                                    keep = true;
+                                    fails.lock().unwrap().push(format!(
+                                        "{}: fir-ref lower printed\n{theirs}\nfir lower printed\n{text}",
+                                        file.display()
+                                    ));
+                                }
+                                *stats.lock().unwrap().entry("(lowered)".to_owned()).or_default() +=
+                                    1;
+                                Some((l, lfile))
+                            }
+                            Err(e) => {
+                                keep = true;
+                                fails
+                                    .lock()
+                                    .unwrap()
+                                    .push(format!("{}: lowering failed: {e}", file.display()));
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     for (args, fuel) in &prog.runs {
                         let (a, b) = (ours(&m, args, *fuel), theirs(&tool, &file, args, *fuel));
                         let mut st = stats.lock().unwrap();
@@ -137,9 +184,51 @@ fn interpreter_matches_reference_on_random_programs() {
                                 a
                             ));
                         }
+                        let Some((l, lfile)) = &lowered else { continue };
+                        let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+                        // A run out of fuel says nothing about the lowering, and the lowering's
+                        // longer runs can be slow, so only finished runs are compared.
+                        let Ok(src) = fir::interp::run_detail(&m, "f0", &strs, *fuel, true) else {
+                            continue;
+                        };
+                        if src.out_of_fuel {
+                            continue;
+                        }
+                        let Ok(tgt) = fir::interp::run_detail(l, "f0", &strs, 16 * fuel, false)
+                        else {
+                            continue;
+                        };
+                        if !src.lowers_to(&tgt) {
+                            keep = true;
+                            fails.lock().unwrap().push(format!(
+                                "{} @f0 {} --fuel {fuel}\n  HFIR:    {}\n  lowered: {}",
+                                file.display(),
+                                args.join(" "),
+                                src.line,
+                                tgt.line
+                            ));
+                        }
+                        let (a, b) = (
+                            ours(l, args, 16 * fuel),
+                            theirs(&tool, lfile, args, 16 * fuel),
+                        );
+                        if a != b {
+                            keep = true;
+                            fails.lock().unwrap().push(format!(
+                                "{} @f0 {} --fuel {}\n  reference: {:?}\n  fir:       {:?}",
+                                lfile.display(),
+                                args.join(" "),
+                                16 * fuel,
+                                b,
+                                a
+                            ));
+                        }
                     }
                     if !keep {
                         std::fs::remove_file(&file).unwrap();
+                        if let Some((_, lfile)) = &lowered {
+                            std::fs::remove_file(lfile).unwrap();
+                        }
                     }
                 }
             });

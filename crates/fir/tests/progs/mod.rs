@@ -85,16 +85,119 @@ enum T {
     I(u32),
     P,
     B(u32),
+    /// An HFIR aggregate, union, or slice type: an index into the program's `VTYS`.
+    V(u8),
+}
+
+/// An HFIR value type that isn't a scalar.
+#[derive(Clone, Debug)]
+enum VTy {
+    Struct(&'static str, Vec<T>),
+    Array(u64, T),
+    Union(Vec<T>),
+    Slice,
+}
+
+thread_local! {
+    /// The value types of the program being generated, so that `T` stays `Copy` and prints
+    /// itself.
+    static VTYS: std::cell::RefCell<Vec<VTy>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn vty(i: u8) -> VTy {
+    VTYS.with(|v| v.borrow()[i as usize].clone())
+}
+
+fn num_vtys() -> usize {
+    VTYS.with(|v| v.borrow().len())
+}
+
+impl T {
+    /// Whether memory can hold the type, so it can be a struct field or array element.
+    fn has_layout(self) -> bool {
+        match self {
+            T::I(w) => w % 8 == 0,
+            T::P | T::B(_) => true,
+            T::V(i) => !matches!(vty(i), VTy::Union(_)),
+        }
+    }
 }
 
 impl std::fmt::Display for T {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let list = |f: &mut std::fmt::Formatter<'_>, ts: &[T]| -> std::fmt::Result {
+            for (i, t) in ts.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{t}")?;
+            }
+            Ok(())
+        };
         match self {
             T::I(w) => write!(f, "i{w}"),
             T::P => f.write_str("ptr"),
             T::B(w) => write!(f, "b{w}"),
+            T::V(i) => match vty(*i) {
+                VTy::Struct(p, fs) => {
+                    write!(f, "struct<{p}>{{")?;
+                    list(f, &fs)?;
+                    f.write_str("}")
+                }
+                VTy::Array(n, e) => write!(f, "array<{n} x {e}>"),
+                VTy::Union(vs) => {
+                    f.write_str("union<")?;
+                    list(f, &vs)?;
+                    f.write_str(">")
+                }
+                VTy::Slice => f.write_str("slice"),
+            },
         }
     }
+}
+
+/// The HFIR value types of a program: a few structs, arrays, unions, and slices, which may
+/// nest the earlier ones.
+fn make_vtys(rng: &mut Rng) {
+    let mut out: Vec<VTy> = Vec::new();
+    let n = 2 + rng.below(4);
+    for _ in 0..n {
+        let earlier: Vec<T> = (0..out.len() as u8).map(T::V).collect();
+        let part = |rng: &mut Rng, layout: bool| -> T {
+            let nested: Vec<T> = earlier
+                .iter()
+                .copied()
+                .filter(|&t| match t {
+                    T::V(i) => !(layout && matches!(out[i as usize], VTy::Union(_))),
+                    _ => true,
+                })
+                .collect();
+            if !nested.is_empty() && rng.chance(25) {
+                return rng.pick(&nested);
+            }
+            match rng.below(10) {
+                0..=1 => T::P,
+                2 if !layout => T::I(rng.pick(&[1, 7, 65])),
+                3 => T::B(32),
+                _ => T::I(rng.pick(&[8, 16, 32, 64])),
+            }
+        };
+        let t = match rng.below(10) {
+            0..=3 => {
+                let p = rng.pick(&["C", "C", "packed", "auto"]);
+                let k = 1 + rng.below(3);
+                VTy::Struct(p, (0..k).map(|_| part(rng, true)).collect())
+            }
+            4..=5 => VTy::Array(1 + rng.below(3), part(rng, true)),
+            6..=8 => {
+                let k = 1 + rng.below(3);
+                VTy::Union((0..k).map(|_| part(rng, false)).collect())
+            }
+            _ => VTy::Slice,
+        };
+        out.push(t);
+    }
+    VTYS.with(|v| *v.borrow_mut() = out);
 }
 
 /// A generated program, with the arguments and fuel to run its entry `@f0` with.
@@ -175,6 +278,7 @@ impl Layout {
                 let (s, a) = self.dims(e);
                 (n * align_up(s, a), a)
             }
+            Agg::Scalar(T::V(_)) => unreachable!("memory aggregates hold scalars"),
         }
     }
 
@@ -491,7 +595,7 @@ impl Gen<'_> {
                     f => f.to_owned(),
                 }
             }
-            T::B(_) => return String::new(),
+            T::B(_) | T::V(_) => return String::new(),
         };
         format!(" [{f} {trust}]")
     }
@@ -512,6 +616,7 @@ impl Gen<'_> {
         match t {
             T::I(w) | T::B(w) => u64::from(w / 8),
             T::P => u64::from(self.ptr_size / 8),
+            T::V(_) => unreachable!("aggregates are not memory types here"),
         }
     }
 
@@ -538,6 +643,7 @@ impl Gen<'_> {
                 let (p, a) = self.access(u64::from(w / 8), false);
                 self.def(t, &format!("mem.load {p}, align {a}"))
             }
+            T::V(i) => self.build(i),
         };
         format!("%{n}")
     }
@@ -672,9 +778,15 @@ impl Gen<'_> {
     /// One random op (possibly with regions).
     fn stmt(&mut self) {
         self.ops_left = self.ops_left.saturating_sub(1);
-        match self.rng.below(124) {
+        let blocks = !self.mfir && num_vtys() > 0;
+        match self.rng.below(if blocks { 138 } else { 124 }) {
             118..=120 => self.store_pair(),
             121..=123 => self.copies(),
+            124..=127 => self.overflow_op(),
+            128..=130 => self.agg_op(),
+            131..=132 => self.union_op(),
+            133..=135 => self.slice_op(),
+            136..=137 => self.agg_mem_op(),
             100..=101 => self.layout_query(),
             102..=104 => self.stack_of(),
             105..=107 => self.field_addr(),
@@ -1009,6 +1121,9 @@ impl Gen<'_> {
     }
 
     fn state_type(&mut self) -> T {
+        if !self.mfir && num_vtys() > 0 && self.rng.chance(15) {
+            return T::V(self.rng.below(num_vtys() as u64) as u8);
+        }
         if self.rng.chance(25) {
             T::P
         } else {
@@ -1772,6 +1887,7 @@ impl Gen<'_> {
                 let items: Vec<String> = (0..*k).map(|_| self.init(e, n)).collect();
                 format!("{{{}}}", items.join(", "))
             }
+            Agg::Scalar(T::V(_)) => unreachable!("memory aggregates hold scalars"),
         }
     }
 
@@ -1823,6 +1939,163 @@ impl Gen<'_> {
         if n > 0 {
             self.newline();
         }
+    }
+
+    /// A value of HFIR type `V(i)`, built from operands.
+    fn build(&mut self, i: u8) -> String {
+        let t = T::V(i);
+        match vty(i) {
+            VTy::Struct(_, fs) => {
+                let vs: Vec<String> = fs.iter().map(|f| self.operand(*f)).collect();
+                self.def(t, &format!("agg.make {}", vs.join(", ")))
+            }
+            VTy::Array(n, e) => {
+                let vs: Vec<String> = (0..n).map(|_| self.operand(e)).collect();
+                self.def(t, &format!("agg.make {}", vs.join(", ")))
+            }
+            VTy::Union(vs) => {
+                let k = self.rng.below(vs.len() as u64) as usize;
+                let v = self.operand(vs[k]);
+                self.def(t, &format!("union.make {v}, {k}"))
+            }
+            VTy::Slice => {
+                let (p, n) = if !self.mems.is_empty() && self.rng.chance(85) {
+                    let m = self.mems[self.rng.below(self.mems.len() as u64) as usize].clone();
+                    let n = (m.size / 4) as i64 + self.rng.below(2) as i64;
+                    (format!("%{}", m.name), self.small(self.addr, n, n))
+                } else {
+                    (self.operand(T::P), self.operand(T::I(self.addr)))
+                };
+                self.def(t, &format!("slice.make {p}, {n}"))
+            }
+        }
+    }
+
+    /// A random HFIR value type matching `pick`, if the program has one.
+    fn pick_vty(&mut self, pick: impl Fn(&VTy) -> bool) -> Option<u8> {
+        let ok: Vec<u8> = (0..num_vtys() as u8).filter(|&i| pick(&vty(i))).collect();
+        if ok.is_empty() {
+            None
+        } else {
+            Some(self.rng.pick(&ok))
+        }
+    }
+
+    /// `int.add.overflow.s` and friends.
+    fn overflow_op(&mut self) {
+        let t = self.int_type();
+        let op = self.rng.pick(&["add", "sub", "mul"]);
+        let sign = self.rng.pick(&["s", "u"]);
+        let (a, b) = (self.operand(t), self.operand(t));
+        let (r, o) = (self.fresh(), self.fresh());
+        let facts = if self.rng.chance(3) {
+            self.fact(t, false)
+        } else {
+            String::new()
+        };
+        self.op(
+            &[(r, t, facts), (o, T::I(1), String::new())],
+            &format!("int.{op}.overflow.{sign} {a}, {b}"),
+        );
+    }
+
+    /// `agg.extract`, `agg.insert`, or `copy` of a struct or array value.
+    fn agg_op(&mut self) {
+        let Some(i) = self.pick_vty(|v| matches!(v, VTy::Struct(..) | VTy::Array(..))) else {
+            return;
+        };
+        let parts: Vec<T> = match vty(i) {
+            VTy::Struct(_, fs) => fs,
+            VTy::Array(n, e) => vec![e; n as usize],
+            _ => unreachable!(),
+        };
+        let a = self.operand(T::V(i));
+        let k = self.rng.below(parts.len() as u64) as usize;
+        match self.rng.below(5) {
+            0..=2 => {
+                self.def(parts[k], &format!("agg.extract {a}, {k}"));
+            }
+            3 => {
+                let v = self.operand(parts[k]);
+                self.def(T::V(i), &format!("agg.insert {a}, {v}, {k}"));
+            }
+            _ => {
+                self.def(T::V(i), &format!("copy {a}"));
+            }
+        }
+    }
+
+    /// `union.tag` or `union.get` of a union value, sometimes of the variant it holds.
+    fn union_op(&mut self) {
+        let Some(i) = self.pick_vty(|v| matches!(v, VTy::Union(_))) else {
+            return;
+        };
+        let VTy::Union(vs) = vty(i) else {
+            unreachable!()
+        };
+        let u = self.operand(T::V(i));
+        if self.rng.chance(30) {
+            self.def(T::I(32), &format!("union.tag {u}"));
+            return;
+        }
+        let k = self.rng.below(vs.len() as u64) as usize;
+        let mode = self.rng.pick(&["trap", "trap", "ub"]);
+        self.def(vs[k], &format!("union.get.{mode} {u}, {k}"));
+    }
+
+    /// `slice.len`, `slice.ptr`, `slice.get`, or `slice.set` of a slice value: indices are
+    /// usually in bounds, for elements of four bytes, or of a struct.
+    fn slice_op(&mut self) {
+        let Some(i) = self.pick_vty(|v| matches!(v, VTy::Slice)) else {
+            return;
+        };
+        let s = self.operand(T::V(i));
+        let aw = self.addr;
+        match self.rng.below(6) {
+            0 => {
+                self.def(T::I(aw), &format!("slice.len {s}"));
+            }
+            1 => {
+                self.def(T::P, &format!("slice.ptr {s}"));
+            }
+            k => {
+                let elem = match self.pick_vty(|v| matches!(v, VTy::Struct(..))) {
+                    Some(j) if self.rng.chance(20) && T::V(j).has_layout() => T::V(j),
+                    _ => self.rng.pick(&[T::I(32), T::I(32), T::B(32), T::I(8)]),
+                };
+                let idx = if self.rng.chance(85) {
+                    self.small(aw, 0, 3)
+                } else {
+                    self.operand(T::I(aw))
+                };
+                let mode = self.rng.pick(&["trap", "trap", "ub"]);
+                let align = self.rng.pick(&[1, 1, 2, 4]);
+                if k < 4 {
+                    self.def(elem, &format!("slice.get.{mode} {s}, {idx}, align {align}"));
+                } else {
+                    let v = self.operand(elem);
+                    self.op(
+                        &[],
+                        &format!("slice.set.{mode} {elem} {v}, {s}, {idx}, align {align}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// A store and load of a struct, array, or slice value, through stack memory for it.
+    fn agg_mem_op(&mut self) {
+        let Some(i) = self.pick_vty(|v| !matches!(v, VTy::Union(_))) else {
+            return;
+        };
+        let t = T::V(i);
+        let align = self.rng.pick(&[1, 2, 4, 8]);
+        let p = self.def(T::P, &format!("mem.stack.of {t}, align {align}"));
+        if self.rng.chance(70) {
+            let v = self.operand(t);
+            self.op(&[], &format!("mem.store {t} {v}, %{p}, align {align}"));
+        }
+        self.def(t, &format!("mem.load %{p}, align {align}"));
     }
 
     fn call_op(&mut self) {
@@ -1951,7 +2224,7 @@ fn arg(rng: &mut Rng, t: T) -> String {
             }
         }
         T::P => if rng.chance(85) { "null" } else { "poison" }.to_owned(),
-        T::B(_) => unreachable!("byte parameters are not generated"),
+        T::B(_) | T::V(_) => unreachable!("byte and aggregate parameters are not generated"),
     }
 }
 
@@ -1968,12 +2241,30 @@ pub fn program(rng: &mut Rng) -> Program {
         _ => (8, 8),
     };
     let nfuncs = 1 + rng.below(3) as usize;
+    let layer = match rng.below(8) {
+        0 => Some("hfir"),
+        1..=3 => Some("mfir"),
+        _ => None,
+    };
+    if layer == Some("mfir") {
+        VTYS.with(|v| v.borrow_mut().clear());
+    } else {
+        make_vtys(rng);
+    }
+    let pick_v = |rng: &mut Rng, p: u64| -> Option<T> {
+        let n = num_vtys() as u64;
+        (n > 0 && rng.chance(p)).then(|| T::V(rng.below(n) as u8))
+    };
     let mut sigs = Vec::new();
     for i in 0..nfuncs {
         let np = rng.below(if i == 0 { 3 } else { 4 });
         let params: Vec<T> = (0..np)
             .map(|_| {
-                if rng.chance(if i == 0 { 15 } else { 55 }) {
+                if i > 0
+                    && let Some(t) = pick_v(rng, 20)
+                {
+                    t
+                } else if rng.chance(if i == 0 { 15 } else { 55 }) {
                     T::P
                 } else {
                     T::I(rng.width(&[1, 8, 32, 64, 7, 128]))
@@ -1981,10 +2272,13 @@ pub fn program(rng: &mut Rng) -> Program {
             })
             .collect();
         let rets: Vec<T> = (0..rng.below(3))
-            .map(|_| match rng.below(10) {
-                0..=1 => T::P,
-                2 => T::B(rng.pick(&[8, 32])),
-                _ => T::I(rng.width(&[1, 8, 32, 64, 65, 128])),
+            .map(|_| match pick_v(rng, 15) {
+                Some(t) => t,
+                None => match rng.below(10) {
+                    0..=1 => T::P,
+                    2 => T::B(rng.pick(&[8, 32])),
+                    _ => T::I(rng.width(&[1, 8, 32, 64, 65, 128])),
+                },
             })
             .collect();
         sigs.push(Sig { params, rets });
@@ -2025,11 +2319,6 @@ pub fn program(rng: &mut Rng) -> Program {
         _ => vec![(8, 1), (16, 2), (32, 4), (64, 8), (128, 16)],
     };
     let custom_ints = ints.len() != 5 || ints[4].1 != 16;
-    let layer = match rng.below(8) {
-        0 => Some("hfir"),
-        1..=3 => Some("mfir"),
-        _ => None,
-    };
     let layout = Layout {
         ptr_size: u64::from(ptr_size / 8),
         ptr_align,
