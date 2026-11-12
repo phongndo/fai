@@ -242,7 +242,7 @@ fn low(fs: FSize, b: u64) -> u64 {
 }
 
 /// ASL's `VFPExpandImm` (Lean's `vfpExpandImm`): the float an 8-bit `fmov` immediate encodes.
-pub fn vfp_expand_imm(fs: FSize, imm8: u32) -> u64 {
+pub(crate) fn vfp_expand_imm(fs: FSize, imm8: u32) -> u64 {
     let (e, m) = match fs {
         FSize::S => (8, 23),
         FSize::D => (11, 52),

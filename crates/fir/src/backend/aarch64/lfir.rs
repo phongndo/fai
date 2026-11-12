@@ -161,6 +161,43 @@ fn func(m: &Module, mm: &MModule, f: &MFunc) -> Func {
                     let e = succ(&mut body, e);
                     OpKind::A64BExn { t, f: e }
                 }
+                Inst::Falu { op, fs, d, n, m } => OpKind::A64Falu { op, fs, d, n, m },
+                Inst::Funary { op, fs, d, n } => OpKind::A64Funary { op, fs, d, n },
+                Inst::Fmadd { fs, d, n, m } => OpKind::A64Fmadd { fs, d, n, m },
+                Inst::FmovImm { fs, d, imm } => OpKind::A64FmovImm {
+                    fs,
+                    d,
+                    imm: imm.into(),
+                },
+                Inst::Fcmp { fs, n, m } => OpKind::A64Fcmp { fs, n, m },
+                Inst::Fcsel { c, fs, d, n, m } => OpKind::A64Fcsel { c, fs, d, n, m },
+                Inst::Fcvt { dst, src, d, n } => OpKind::A64Fcvt { dst, src, d, n },
+                Inst::Cvtf {
+                    signed,
+                    fs,
+                    sf,
+                    d,
+                    n,
+                } => OpKind::A64Cvtf {
+                    signed,
+                    fs,
+                    sf,
+                    d,
+                    n,
+                },
+                Inst::Fcvtz {
+                    signed,
+                    sf,
+                    fs,
+                    d,
+                    n,
+                } => OpKind::A64Fcvtz {
+                    signed,
+                    sf,
+                    fs,
+                    d,
+                    n,
+                },
             };
             body.append_op(region, kind, [], [], [], f.locs[i]);
         }

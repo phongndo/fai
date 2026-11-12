@@ -7,7 +7,8 @@
 //! [`super::emit`] into assembly. A function's blocks are runs of `insts`, in layout order.
 
 use crate::ir::{
-    AluImmOp, AluOp, Cond, CselOp, Loc, MemSize, MovOp, Reg, Sf, ShiftImmOp, TrapReason, Ty,
+    AluImmOp, AluOp, Cond, CselOp, FAluOp, FSize, FUnaryOp, Loc, MemSize, MovOp, Reg, Sf,
+    ShiftImmOp, TrapReason, Ty,
 };
 
 /// One instruction: an `aarch64.*` op of LFIR. Blocks are indices into [`MFunc::blocks`];
@@ -122,6 +123,64 @@ pub enum Inst {
         t: u32,
         f: u32,
     },
+    Falu {
+        op: FAluOp,
+        fs: FSize,
+        d: Reg,
+        n: Reg,
+        m: Reg,
+    },
+    /// `fmov` (also between classes), `fabs`, `fneg`, `fsqrt`.
+    Funary {
+        op: FUnaryOp,
+        fs: FSize,
+        d: Reg,
+        n: Reg,
+    },
+    /// `d := n * m + d`.
+    Fmadd {
+        fs: FSize,
+        d: Reg,
+        n: Reg,
+        m: Reg,
+    },
+    FmovImm {
+        fs: FSize,
+        d: Reg,
+        imm: u8,
+    },
+    Fcmp {
+        fs: FSize,
+        n: Reg,
+        m: Reg,
+    },
+    Fcsel {
+        c: Cond,
+        fs: FSize,
+        d: Reg,
+        n: Reg,
+        m: Reg,
+    },
+    Fcvt {
+        dst: FSize,
+        src: FSize,
+        d: Reg,
+        n: Reg,
+    },
+    Cvtf {
+        signed: bool,
+        fs: FSize,
+        sf: Sf,
+        d: Reg,
+        n: Reg,
+    },
+    Fcvtz {
+        signed: bool,
+        sf: Sf,
+        fs: FSize,
+        d: Reg,
+        n: Reg,
+    },
 }
 
 impl Inst {
@@ -147,10 +206,26 @@ impl Inst {
         defs.clear();
         uses.clear();
         match self {
-            Inst::Alu { d, n, m, .. } | Inst::Csel { d, n, m, .. } => {
+            Inst::Alu { d, n, m, .. }
+            | Inst::Csel { d, n, m, .. }
+            | Inst::Falu { d, n, m, .. }
+            | Inst::Fcsel { d, n, m, .. } => {
                 defs.push(d);
                 uses.extend([n, m]);
             }
+            Inst::Fmadd { d, n, m, .. } => {
+                defs.push(d);
+                uses.extend([n, m, d]);
+            }
+            Inst::Funary { d, n, .. }
+            | Inst::Fcvt { d, n, .. }
+            | Inst::Cvtf { d, n, .. }
+            | Inst::Fcvtz { d, n, .. } => {
+                defs.push(d);
+                uses.push(n);
+            }
+            Inst::FmovImm { d, .. } => defs.push(d),
+            Inst::Fcmp { n, m, .. } => uses.extend([n, m]),
             Inst::AluImm { d, n, .. }
             | Inst::ShiftImm { d, n, .. }
             | Inst::Ext { d, n, .. }
@@ -185,8 +260,77 @@ impl Inst {
 
     /// The instruction with every register renamed by `f`.
     pub fn map_regs(self, mut f: impl FnMut(Reg, bool) -> Reg) -> Inst {
-        // `f(r, is_def)`; a `movk`'s destination is both, and is renamed once, as a def.
+        // `f(r, is_def)`; a `movk`'s or `fmadd`'s destination is both, and is renamed once, as
+        // a def.
         match self {
+            Inst::Falu { op, fs, d, n, m } => Inst::Falu {
+                op,
+                fs,
+                n: f(n, false),
+                m: f(m, false),
+                d: f(d, true),
+            },
+            Inst::Fcsel { c, fs, d, n, m } => Inst::Fcsel {
+                c,
+                fs,
+                n: f(n, false),
+                m: f(m, false),
+                d: f(d, true),
+            },
+            Inst::Fmadd { fs, d, n, m } => Inst::Fmadd {
+                fs,
+                n: f(n, false),
+                m: f(m, false),
+                d: f(d, true),
+            },
+            Inst::Funary { op, fs, d, n } => Inst::Funary {
+                op,
+                fs,
+                n: f(n, false),
+                d: f(d, true),
+            },
+            Inst::Fcvt { dst, src, d, n } => Inst::Fcvt {
+                dst,
+                src,
+                n: f(n, false),
+                d: f(d, true),
+            },
+            Inst::Cvtf {
+                signed,
+                fs,
+                sf,
+                d,
+                n,
+            } => Inst::Cvtf {
+                signed,
+                fs,
+                sf,
+                n: f(n, false),
+                d: f(d, true),
+            },
+            Inst::Fcvtz {
+                signed,
+                sf,
+                fs,
+                d,
+                n,
+            } => Inst::Fcvtz {
+                signed,
+                sf,
+                fs,
+                n: f(n, false),
+                d: f(d, true),
+            },
+            Inst::FmovImm { fs, d, imm } => Inst::FmovImm {
+                fs,
+                d: f(d, true),
+                imm,
+            },
+            Inst::Fcmp { fs, n, m } => Inst::Fcmp {
+                fs,
+                n: f(n, false),
+                m: f(m, false),
+            },
             Inst::Alu { op, sf, d, n, m } => Inst::Alu {
                 op,
                 sf,
@@ -307,8 +451,11 @@ pub struct Frame {
     pub align: u32,
     /// The spill slots' size, right above the locals (set by the register allocator).
     pub spills: u32,
-    /// The callee-saved registers the code uses (set by the register allocator).
+    /// The callee-saved registers the code uses (set by the register allocator): bit `r` for
+    /// `xr`.
     pub saved: u32,
+    /// The callee-saved FP registers the code uses: bit `r` for `dr`.
+    pub saved_fp: u32,
     /// Where the prologue's `sub sp, sp, N` is (an index into `insts`): the instruction the
     /// frame lowering replaces.
     pub alloc_at: u32,
@@ -335,7 +482,8 @@ pub struct MModule {
     pub families: Vec<String>,
 }
 
-/// The registers a call may change: `x0`…`x18` and `x30`.
+/// The general-purpose registers a call may change: `x0`…`x18` and `x30` (the FP ones are
+/// `super::abi::FP_CALLER_SAVED`).
 pub const CALLER_SAVED: [u32; 20] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 30,
 ];

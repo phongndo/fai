@@ -21,6 +21,16 @@
 //! values it allows. `cf.check.R %ok` tests bit 0 of `%ok` and branches to a trap block with
 //! reason `R` (`bounds`, `tag`, …) when it is clear.
 //!
+//! **Floats** live in FP registers (`fvN`), an `f32` in the low 32 bits. Each float op is one
+//! instruction or a few (decision: Instruction selection): `fadd`…`fdiv`, `fneg`, `fabs`,
+//! `fsqrt`; `fmadd` for `float.fma` (its addend copied to the destination first); `copysign`
+//! through general-purpose registers; `fcmp` and `cset` (two instructions for `ueq` and `one`);
+//! `fcvt`; `scvtf`/`ucvtf` after extending the integer; `fcvtzs`/`fcvtzu` at 64 bits, then
+//! clamped for `.sat` below 64 bits, with NaN and range checks before them for `.trap`; `fmov`
+//! for `from_bits`, `to_bits`, `poison` (from `xzr`), and constants (an 8-bit immediate when one
+//! encodes the value, else through a general-purpose register); `fcsel` for `select`. The
+//! instructions' NaN results are Arm's, which the source allows (`Fir.AArch64Proofs`).
+//!
 //! **HFIR.** The building blocks (aggregate, union, and slice values, `int.*.overflow.*`) are
 //! rejected with a message to lower first: drivers compile HFIR through `fir::backend::prepare`,
 //! which lowers it to MFIR (`fir lower`). The lowering checks overflow at one more bit (twice
@@ -31,7 +41,9 @@
 //! iteration's, which is dead by then); heap allocation calls the family's allocator; loads and
 //! stores of odd sizes split into 4-, 2-, and 1-byte accesses; `mem.copy` copies up to 64 bytes
 //! through registers and larger sizes in a loop whose direction depends on the addresses, so
-//! overlap is fine. **Calls** follow AAPCS64 (see `super::abi`).
+//! overlap is fine. **Calls** follow AAPCS64 (see `super::abi`): integers and floats in their own
+//! registers, then stack slots; results in `d0`/`d1` when all are floats of one format,
+//! otherwise in `x0`/`x1` (a float moved there by `fmov`) or memory at `x8`.
 //!
 //! **Exceptions** use an error-return convention (decision: Exceptions at run time):
 //! `exn.throw` makes its value the pending exception (`aarch64.exn.set`) and returns through
@@ -41,6 +53,7 @@
 
 use rustc_hash::FxHashMap;
 
+use super::abi::{self, ArgLoc};
 use super::mir::{Frame, Inst, MFunc};
 use crate::body::{Body, OpId, OperandKind, RegionId, ValueId};
 use crate::ir::*;
@@ -215,10 +228,6 @@ fn check_ty(loc: Option<Loc>, t: Ty) -> Result<()> {
             "{}{t} is wider than 64 bits, which the AArch64 backend doesn't support yet",
             at(loc)
         )),
-        Ty::Float(_) => Err(format!(
-            "{}{t} is a float, which the AArch64 backend doesn't support yet",
-            at(loc)
-        )),
         _ => Ok(()),
     }
 }
@@ -329,6 +338,34 @@ pub fn is_logical_imm(x: u64, sf: Sf) -> bool {
     })
 }
 
+/// The size of a value's 8-byte stack slot access (an argument or a result in memory): 4 bytes
+/// for an `f32`, 8 for the rest.
+fn slot_size(t: Ty) -> MemSize {
+    if t == Ty::Float(FloatTy::F32) {
+        MemSize::W
+    } else {
+        MemSize::X
+    }
+}
+
+/// The format of a float type (`d` for anything else).
+fn fsize(t: Ty) -> FSize {
+    match t {
+        Ty::Float(f) => FSize::of(f),
+        _ => FSize::D,
+    }
+}
+
+/// The 8-bit `fmov` immediate that encodes these bits, if one does.
+fn fmov_imm8(fs: FSize, bits: u64) -> Option<u8> {
+    (0..=255u8).find(|&i| super::machine_imm(fs, i) == bits)
+}
+
+/// The bits of the float of format `fs` nearest to `v` (exact for the bounds used here).
+fn float_bits(fs: FSize, v: i128) -> u64 {
+    crate::float::from_int(fs.fty(), true, 128, &crate::sem::Bits::of_i128(128, v))
+}
+
 /// Whether `off` can address a `size`-byte access directly: a scaled unsigned 12-bit offset,
 /// or an unscaled signed 9-bit one.
 pub fn is_mem_off(off: i64, size: MemSize) -> bool {
@@ -433,12 +470,40 @@ impl Sel<'_, '_> {
         Reg::virt(self.nv - 1)
     }
 
+    fn fresh_fp(&mut self) -> Reg {
+        self.nv += 1;
+        Reg::fvirt(self.nv - 1)
+    }
+
+    /// A fresh register of `r`'s class.
+    fn fresh_like(&mut self, r: Reg) -> Reg {
+        if r.is_fp() {
+            self.fresh_fp()
+        } else {
+            self.fresh()
+        }
+    }
+
+    /// A value's register: an FP one for a float.
     fn val(&mut self, v: ValueId) -> Reg {
         if self.vreg[v.index()] == NONE {
-            let r = self.fresh();
-            self.vreg[v.index()] = r.virt_index();
+            self.nv += 1;
+            self.vreg[v.index()] = self.nv - 1;
         }
-        Reg::virt(self.vreg[v.index()])
+        let i = self.vreg[v.index()];
+        if self.body.ty(v).is_float() {
+            Reg::fvirt(i)
+        } else {
+            Reg::virt(i)
+        }
+    }
+
+    /// The format of an op's `i`th operand.
+    fn fs_of(&self, op: OpId, i: usize) -> FSize {
+        match self.body.operands(op)[i].get() {
+            OperandKind::Value(v) => fsize(self.body.ty(v)),
+            OperandKind::Hole(h) => fsize(self.body.hole_ty(h)),
+        }
     }
 
     fn operand(&mut self, op: OpId, i: usize) -> Result<Reg> {
@@ -477,9 +542,45 @@ impl Sel<'_, '_> {
         }
     }
 
+    /// Copy a register of either class (all 64 bits).
     fn mov(&mut self, d: Reg, n: Reg) {
-        if d != n {
+        if d == n {
+        } else if d.is_fp() || n.is_fp() {
+            self.fmov(FSize::D, d, n);
+        } else {
             self.emit(Inst::Mov { sf: Sf::X, d, n });
+        }
+    }
+
+    fn fmov(&mut self, fs: FSize, d: Reg, n: Reg) {
+        self.emit(Inst::Funary {
+            op: FUnaryOp::Fmov,
+            fs,
+            d,
+            n,
+        });
+    }
+
+    /// `n` in a register of the class `fp` says, moved by `fmov` if it isn't (a float of
+    /// format `fs`).
+    fn in_class(&mut self, n: Reg, fp: bool, fs: FSize) -> Reg {
+        if n.is_fp() == fp {
+            return n;
+        }
+        let t = if fp { self.fresh_fp() } else { self.fresh() };
+        self.fmov(fs, t, n);
+        t
+    }
+
+    /// Put the float of format `fs` with these bits in `d`.
+    fn fconst(&mut self, d: Reg, fs: FSize, bits: u64) {
+        if bits == 0 {
+            self.fmov(FSize::D, d, Reg::XZR);
+        } else if let Some(imm) = fmov_imm8(fs, bits) {
+            self.emit(Inst::FmovImm { fs, d, imm });
+        } else {
+            let t = self.konst(bits);
+            self.fmov(fs, d, t);
         }
     }
 
@@ -665,7 +766,7 @@ impl Sel<'_, '_> {
             let tmps: Vec<Reg> = srcs
                 .iter()
                 .map(|&s| {
-                    let t = self.fresh();
+                    let t = self.fresh_like(s);
                     self.mov(t, s);
                     t
                 })
@@ -768,16 +869,14 @@ impl Sel<'_, '_> {
         while let Some(r) = stack.pop() {
             for op in body.ops(r) {
                 match body.kind(op) {
-                    OpKind::Call { .. }
-                    | OpKind::CallIndirect(_)
-                    | OpKind::Invoke { .. }
-                    | OpKind::InvokeIndirect { .. } => {
-                        let n = body.operands(op).len()
-                            - usize::from(matches!(
-                                body.kind(op),
-                                OpKind::CallIndirect(_) | OpKind::InvokeIndirect { .. }
-                            ));
-                        outgoing = outgoing.max(8 * n.saturating_sub(8) as u64);
+                    OpKind::Call { callee } | OpKind::Invoke { callee, .. } => {
+                        let (ps, _) = self.cx.sig(self.cx.funcs[body.str(callee)]);
+                        outgoing = outgoing.max(8 * u64::from(abi::stack_slots(&ps)));
+                    }
+                    OpKind::CallIndirect(sig) | OpKind::InvokeIndirect { sig, .. } => {
+                        if let Some(Shape::Func(ps, _)) = body.types().shape_of(sig) {
+                            outgoing = outgoing.max(8 * u64::from(abi::stack_slots(ps)));
+                        }
                     }
                     OpKind::MemStack { align: a, .. } => align = align.max(u64::from(a)),
                     OpKind::MemStackOf { ty, align: a } => {
@@ -796,7 +895,6 @@ impl Sel<'_, '_> {
         let entry = self.new_block(false);
         self.exit = self.new_block(true);
         self.switch_to(entry);
-        let x = Reg::x;
         self.emit(Inst::AluImm {
             op: AluImmOp::Sub,
             sf: Sf::X,
@@ -830,18 +928,18 @@ impl Sel<'_, '_> {
         });
         // Parameters, from where the convention puts them.
         let params: Vec<ValueId> = body.params(body.entry()).collect();
-        for (i, &p) in params.iter().enumerate() {
-            check_ty(None, body.ty(p))?;
+        let ps: Vec<Ty> = params.iter().map(|&p| body.ty(p)).collect();
+        for ((&p, &t), l) in params.iter().zip(&ps).zip(abi::arg_locs(&ps)) {
+            check_ty(None, t)?;
             let r = self.val(p);
-            if i < 8 {
-                self.mov(r, x(i as u32));
-            } else {
-                self.ldr(MemSize::X, r, Reg::FP, 16 + 8 * (i as i64 - 8));
+            match l {
+                ArgLoc::Reg(a) => self.mov(r, a),
+                ArgLoc::Stack(off) => self.ldr(slot_size(t), r, Reg::FP, 16 + i64::from(off)),
             }
         }
-        if self.rets.len() > 2 {
+        if abi::res_regs(self.rets).is_none() {
             let r = self.fresh();
-            self.mov(r, x(8));
+            self.mov(r, Reg::x(8));
             self.res_ptr = Some(r);
         }
         self.region(body.entry())?;
@@ -1032,15 +1130,15 @@ impl Sel<'_, '_> {
         let kind = body.kind(op);
         self.loc = body.loc(op);
         let (wide_results, wide_operands) = low_bits_only(kind);
-        // Floats are rejected everywhere, wide integers where their high bits matter.
+        // Wide integers are rejected where their high bits matter.
         for v in body.results(op) {
-            if !wide_results || body.ty(v).is_float() {
+            if !wide_results {
                 check_ty(self.loc, body.ty(v))?;
             }
         }
         for o in body.operands(op) {
             if let OperandKind::Value(v) = o.get()
-                && (!wide_operands || body.ty(v).is_float())
+                && !wide_operands
             {
                 check_ty(self.loc, body.ty(v))?;
             }
@@ -1054,7 +1152,11 @@ impl Sel<'_, '_> {
             }
             OpKind::Poison | OpKind::PtrNull => {
                 let d = self.result(op, 0);
-                self.mov_imm(d, 0);
+                if d.is_fp() {
+                    self.fmov(FSize::D, d, Reg::XZR);
+                } else {
+                    self.mov_imm(d, 0);
+                }
             }
             OpKind::Freeze
             | OpKind::Copy
@@ -1087,14 +1189,24 @@ impl Sel<'_, '_> {
                     n: c,
                     imm: 1,
                 });
-                self.emit(Inst::Csel {
-                    op: CselOp::Csel,
-                    c: Cond::Ne,
-                    sf: Sf::X,
-                    d,
-                    n: a,
-                    m: b,
-                });
+                if d.is_fp() {
+                    self.emit(Inst::Fcsel {
+                        c: Cond::Ne,
+                        fs: FSize::D,
+                        d,
+                        n: a,
+                        m: b,
+                    });
+                } else {
+                    self.emit(Inst::Csel {
+                        op: CselOp::Csel,
+                        c: Cond::Ne,
+                        sf: Sf::X,
+                        d,
+                        n: a,
+                        m: b,
+                    });
+                }
             }
             OpKind::Arith(aop, ovf) => {
                 let w = self.width_of(op, 0);
@@ -1193,12 +1305,20 @@ impl Sel<'_, '_> {
                 let v = body.results(op).next().unwrap();
                 let size = self.type_size(body.ty(v));
                 let d = self.val(v);
-                self.load(d, p, 0, size);
+                if d.is_fp() {
+                    self.ldr(MemSize::of_bytes(size).unwrap(), d, p, 0);
+                } else {
+                    self.load(d, p, 0, size);
+                }
             }
             OpKind::Store { ty, .. } => {
                 let (v, p) = (self.operand(op, 0)?, self.operand(op, 1)?);
                 let size = self.type_size(ty);
-                self.store(v, p, 0, size);
+                if v.is_fp() {
+                    self.str_(MemSize::of_bytes(size).unwrap(), v, p, 0);
+                } else {
+                    self.store(v, p, 0, size);
+                }
             }
             OpKind::MemCopy { ty, .. } => {
                 let (d, s) = (self.operand(op, 0)?, self.operand(op, 1)?);
@@ -1264,8 +1384,8 @@ impl Sel<'_, '_> {
             OpKind::Call { callee } | OpKind::Invoke { callee, .. } => {
                 let func = self.cx.funcs[body.str(callee)];
                 let args = self.operands(op)?;
-                let (_, rs) = self.cx.sig(func);
-                self.call(op, &args, rs.len(), |s| {
+                let (ps, rs) = self.cx.sig(func);
+                self.call(op, &args, &ps, rs, |s| {
                     s.emit(Inst::Bl { func });
                 });
                 let throws = self.cx.throws.get(func as usize).copied().unwrap_or(false);
@@ -1277,11 +1397,10 @@ impl Sel<'_, '_> {
                     return Err(format!("{}not a function type", at(self.loc)));
                 };
                 let (ps, rs) = (ps.to_vec(), rs.to_vec());
-                let nr = rs.len();
-                self.sigs.push((ps, rs));
+                self.sigs.push((ps.clone(), rs.clone()));
                 let sig = (self.sigs.len() - 1) as u32;
                 let target = args[0];
-                self.call(op, &args[1..], nr, |s| {
+                self.call(op, &args[1..], &ps, &rs, |s| {
                     s.emit(Inst::Blr { n: target, sig });
                 });
                 let throws = self.cx.throws.iter().any(|&t| t);
@@ -1381,14 +1500,21 @@ impl Sel<'_, '_> {
             }
             OpKind::Ret => {
                 let vals = self.operands(op)?;
+                let rets = self.rets;
                 match self.res_ptr {
                     None => {
-                        let dsts: Vec<Reg> = (0..vals.len() as u32).map(Reg::x).collect();
-                        self.moves(&dsts, &vals);
+                        let dsts = abi::res_regs(rets).unwrap_or_default();
+                        let srcs: Vec<Reg> = vals
+                            .iter()
+                            .zip(&dsts)
+                            .zip(rets)
+                            .map(|((&v, &r), &t)| self.in_class(v, r.is_fp(), fsize(t)))
+                            .collect();
+                        self.moves(&dsts, &srcs);
                     }
                     Some(area) => {
-                        for (i, &v) in vals.iter().enumerate() {
-                            self.str_(MemSize::X, v, area, 8 * i as i64);
+                        for (i, (&v, &t)) in vals.iter().zip(rets).enumerate() {
+                            self.str_(slot_size(t), v, area, 8 * i as i64);
                         }
                     }
                 }
@@ -1428,6 +1554,103 @@ impl Sel<'_, '_> {
                 targets.sort_by_key(|t| t.0);
                 self.switch_tree(v, &targets, dblock);
             }
+            OpKind::FloatConst { value } => {
+                let d = self.result(op, 0);
+                let fs = fsize(body.ty(body.results(op).next().unwrap()));
+                self.fconst(d, fs, value);
+            }
+            OpKind::FloatBin(fop) => {
+                let (a, b) = (self.operand(op, 0)?, self.operand(op, 1)?);
+                let fs = self.fs_of(op, 0);
+                let d = self.result(op, 0);
+                let op = match fop {
+                    FBinOp::Add => FAluOp::Fadd,
+                    FBinOp::Sub => FAluOp::Fsub,
+                    FBinOp::Mul => FAluOp::Fmul,
+                    FBinOp::Div => FAluOp::Fdiv,
+                    FBinOp::Copysign => {
+                        self.copysign(fs, d, a, b);
+                        return Ok(());
+                    }
+                };
+                self.emit(Inst::Falu {
+                    op,
+                    fs,
+                    d,
+                    n: a,
+                    m: b,
+                });
+            }
+            OpKind::FloatUn(fop) => {
+                let a = self.operand(op, 0)?;
+                let fs = self.fs_of(op, 0);
+                let d = self.result(op, 0);
+                let op = match fop {
+                    FUnOp::Neg => FUnaryOp::Fneg,
+                    FUnOp::Abs => FUnaryOp::Fabs,
+                    FUnOp::Sqrt => FUnaryOp::Fsqrt,
+                };
+                self.emit(Inst::Funary { op, fs, d, n: a });
+            }
+            OpKind::FloatFma => {
+                // `fmadd` adds to its destination: `d = c`, then `d += a * b`.
+                let (a, b, c) = (
+                    self.operand(op, 0)?,
+                    self.operand(op, 1)?,
+                    self.operand(op, 2)?,
+                );
+                let fs = self.fs_of(op, 0);
+                let d = self.result(op, 0);
+                self.mov(d, c);
+                self.emit(Inst::Fmadd { fs, d, n: a, m: b });
+            }
+            OpKind::FloatCmp(p) => {
+                let (a, b) = (self.operand(op, 0)?, self.operand(op, 1)?);
+                let fs = self.fs_of(op, 0);
+                let d = self.result(op, 0);
+                self.emit(Inst::Fcmp { fs, n: a, m: b });
+                self.fcset(d, p);
+            }
+            OpKind::FloatExt | OpKind::FloatTrunc => {
+                let a = self.operand(op, 0)?;
+                let src = self.fs_of(op, 0);
+                let d = self.result(op, 0);
+                let dst = fsize(body.ty(body.results(op).next().unwrap()));
+                self.emit(Inst::Fcvt { dst, src, d, n: a });
+            }
+            OpKind::FloatToInt { signed, edge } => {
+                let a = self.operand(op, 0)?;
+                let fs = self.fs_of(op, 0);
+                let d = self.result(op, 0);
+                let w = width_bits(body.ty(body.results(op).next().unwrap()));
+                self.float_to_int(signed, edge, w, fs, d, a);
+            }
+            OpKind::IntToFloat { signed } => {
+                let w = self.width_of(op, 0);
+                let a = self.operand(op, 0)?;
+                let d = self.result(op, 0);
+                let fs = fsize(body.ty(body.results(op).next().unwrap()));
+                let x = if signed { self.sx(a, w) } else { self.zx(a, w) };
+                self.emit(Inst::Cvtf {
+                    signed,
+                    fs,
+                    sf: Sf::X,
+                    d,
+                    n: x,
+                });
+            }
+            OpKind::FloatFromBits => {
+                let a = self.operand(op, 0)?;
+                let d = self.result(op, 0);
+                let fs = fsize(body.ty(body.results(op).next().unwrap()));
+                self.fmov(fs, d, a);
+            }
+            OpKind::FloatToBits => {
+                let a = self.operand(op, 0)?;
+                let fs = self.fs_of(op, 0);
+                let d = self.result(op, 0);
+                self.fmov(fs, d, a);
+            }
             OpKind::Check(reason) => {
                 // Bit 0 holds the `i1`; a `poison` one (UB) may trap or not.
                 let c = self.operand(op, 0)?;
@@ -1459,6 +1682,145 @@ impl Sel<'_, '_> {
         Ok(())
     }
 
+    /// `float.copysign`: `a`'s magnitude and `b`'s sign, on their bits.
+    fn copysign(&mut self, fs: FSize, d: Reg, a: Reg, b: Reg) {
+        let sign = 1u64 << (fs.bits() - 1);
+        let (ta, tb) = (self.fresh(), self.fresh());
+        self.fmov(fs, ta, a);
+        self.fmov(fs, tb, b);
+        let (ma, mb) = (self.fresh(), self.fresh());
+        self.emit(Inst::AluImm {
+            op: AluImmOp::And,
+            sf: Sf::X,
+            d: ma,
+            n: ta,
+            imm: (sign - 1) as i64,
+        });
+        self.emit(Inst::AluImm {
+            op: AluImmOp::And,
+            sf: Sf::X,
+            d: mb,
+            n: tb,
+            imm: sign as i64,
+        });
+        let t = self.alu_new(AluOp::Orr, ma, mb);
+        self.fmov(fs, d, t);
+    }
+
+    /// `d` = whether float predicate `p` holds, after `fcmp`: one condition on the flags, or
+    /// two for `ueq` (equal or unordered) and `one` (less or greater).
+    fn fcset(&mut self, d: Reg, p: FPred) {
+        let c = match p {
+            FPred::Oeq => Cond::Eq,
+            FPred::Olt => Cond::Mi,
+            FPred::Ole => Cond::Ls,
+            FPred::Ogt => Cond::Gt,
+            FPred::Oge => Cond::Ge,
+            FPred::Ord => Cond::Vc,
+            FPred::Uno => Cond::Vs,
+            FPred::Une => Cond::Ne,
+            FPred::Ult => Cond::Lt,
+            FPred::Ule => Cond::Le,
+            FPred::Ugt => Cond::Hi,
+            FPred::Uge => Cond::Hs,
+            FPred::Ueq | FPred::One => {
+                // `csinc d, t, xzr, c`: `t` if `c` holds, else 1.
+                let (first, c) = if p == FPred::Ueq {
+                    (Cond::Eq, Cond::Vc)
+                } else {
+                    (Cond::Mi, Cond::Le)
+                };
+                let t = self.fresh();
+                self.cset(t, first);
+                self.emit(Inst::Csel {
+                    op: CselOp::Csinc,
+                    c,
+                    sf: Sf::X,
+                    d,
+                    n: t,
+                    m: Reg::XZR,
+                });
+                return;
+            }
+        };
+        self.cset(d, c);
+    }
+
+    /// `float.to_int` into `w` bits: `fcvtzs`/`fcvtzu` at 64 bits, which saturate and give 0 for
+    /// NaN, then a clamp to `w` bits for `.sat`; `.trap` first traps on NaN and on values whose
+    /// integer part is out of range (compared with exactly representable bounds); `.ub` needs
+    /// neither.
+    fn float_to_int(&mut self, signed: bool, edge: CvtEdge, w: u32, fs: FSize, d: Reg, a: Reg) {
+        if edge == CvtEdge::Trap {
+            self.emit(Inst::Fcmp { fs, n: a, m: a });
+            self.trap_if(Cond::Vs, TrapReason::Convert);
+            // The integer part is at least `lo` when `a > lo - 1`, or, where `lo - 1` doesn't
+            // fit the format (no float lies between it and `lo`), when `a ≥ lo`.
+            let m = if fs == FSize::S { 23 } else { 52 };
+            let (lo, hi): (i128, i128) = if signed {
+                (-(1i128 << (w - 1)), 1i128 << (w - 1))
+            } else {
+                (0, 1i128 << w)
+            };
+            let exact = !signed || w <= m + 1;
+            let lb = self.fresh_fp();
+            self.fconst(lb, fs, float_bits(fs, if exact { lo - 1 } else { lo }));
+            self.emit(Inst::Fcmp { fs, n: a, m: lb });
+            self.trap_if(if exact { Cond::Ls } else { Cond::Mi }, TrapReason::Convert);
+            let hb = self.fresh_fp();
+            self.fconst(hb, fs, float_bits(fs, hi));
+            self.emit(Inst::Fcmp { fs, n: a, m: hb });
+            self.trap_if(Cond::Ge, TrapReason::Convert);
+        }
+        let r = self.fresh();
+        self.emit(Inst::Fcvtz {
+            signed,
+            sf: Sf::X,
+            fs,
+            d: r,
+            n: a,
+        });
+        if edge != CvtEdge::Sat || w >= 64 {
+            self.mov(d, r);
+            return;
+        }
+        // Clamp the 64-bit result to `w` bits.
+        let hi = if signed { mask(w - 1) } else { mask(w) };
+        let h = self.konst(hi);
+        self.alu(AluOp::Subs, Reg::XZR, r, h);
+        let c = if signed { Cond::Gt } else { Cond::Hi };
+        if !signed {
+            self.emit(Inst::Csel {
+                op: CselOp::Csel,
+                c,
+                sf: Sf::X,
+                d,
+                n: h,
+                m: r,
+            });
+            return;
+        }
+        let t = self.fresh();
+        self.emit(Inst::Csel {
+            op: CselOp::Csel,
+            c,
+            sf: Sf::X,
+            d: t,
+            n: h,
+            m: r,
+        });
+        let l = self.konst(!mask(w - 1));
+        self.alu(AluOp::Subs, Reg::XZR, t, l);
+        self.emit(Inst::Csel {
+            op: CselOp::Csel,
+            c: Cond::Lt,
+            sf: Sf::X,
+            d,
+            n: l,
+            m: t,
+        });
+    }
+
     fn family(&mut self, name: &str) -> u32 {
         match self.families.iter().position(|f| f == name) {
             Some(i) => i as u32,
@@ -1470,29 +1832,49 @@ impl Sel<'_, '_> {
     }
 
     /// A call: arguments where the convention puts them, the call, then the results.
-    fn call(&mut self, op: OpId, args: &[Reg], nrets: usize, emit: impl FnOnce(&mut Self)) {
-        for (i, &a) in args.iter().enumerate().skip(8) {
-            self.str_(MemSize::X, a, Reg::SP, 8 * (i as i64 - 8));
+    fn call(
+        &mut self,
+        op: OpId,
+        args: &[Reg],
+        ps: &[Ty],
+        rets: &[Ty],
+        emit: impl FnOnce(&mut Self),
+    ) {
+        let locs = abi::arg_locs(ps);
+        let (mut dsts, mut srcs) = (Vec::new(), Vec::new());
+        for ((&a, &t), &l) in args.iter().zip(ps).zip(&locs) {
+            match l {
+                ArgLoc::Stack(off) => self.str_(slot_size(t), a, Reg::SP, i64::from(off)),
+                ArgLoc::Reg(r) => {
+                    dsts.push(r);
+                    srcs.push(a);
+                }
+            }
         }
-        let area = (nrets > 2).then(|| self.local(8 * nrets as u64, 8));
+        let rr = abi::res_regs(rets);
+        let area = rr.is_none().then(|| self.local(8 * rets.len() as u64, 8));
         if let Some(off) = area {
             self.add_imm(Reg::x(8), Reg::SP, off);
         }
-        let regs: Vec<Reg> = (0..args.len().min(8) as u32).map(Reg::x).collect();
-        self.moves(&regs, &args[..regs.len()]);
+        self.moves(&dsts, &srcs);
         emit(self);
-        let results: Vec<Reg> = (0..nrets).map(|i| self.result(op, i)).collect();
-        match area {
-            None => {
-                for (i, &r) in results.iter().enumerate() {
-                    self.mov(r, Reg::x(i as u32));
+        let results: Vec<Reg> = (0..rets.len()).map(|i| self.result(op, i)).collect();
+        match (rr, area) {
+            (Some(rs), _) => {
+                for ((&r, &t), &s) in results.iter().zip(rets).zip(&rs) {
+                    if r.is_fp() == s.is_fp() {
+                        self.mov(r, s);
+                    } else {
+                        self.fmov(fsize(t), r, s);
+                    }
                 }
             }
-            Some(off) => {
-                for (i, &r) in results.iter().enumerate() {
-                    self.ldr(MemSize::X, r, Reg::SP, off + 8 * i as i64);
+            (None, Some(off)) => {
+                for (i, (&r, &t)) in results.iter().zip(rets).enumerate() {
+                    self.ldr(slot_size(t), r, Reg::SP, off + 8 * i as i64);
                 }
             }
+            (None, None) => unreachable!(),
         }
     }
 

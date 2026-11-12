@@ -10,13 +10,18 @@
 //! values live across a call out of caller-saved registers and arguments from being clobbered
 //! while the others are set up.
 //!
-//! **Allocation.** Intervals in order of their start take a free register, preferring one a
-//! move to or from a physical register suggests, then caller-saved ones for intervals that
-//! cross no call. With none free, the active interval that ends last and whose register suits
-//! is spilled if it ends after the new one; otherwise the new one is. A spilled register lives
-//! in its own 8-byte slot: each read loads it into a scratch register (`x15`, then `x17`) just
-//! before, each write stores it just after. `x16` computes far slot addresses; `x18` (the
-//! platform register), `x29`, and `x30` are never allocated.
+//! **Allocation.** There are two register classes, general-purpose (`x`) and FP/SIMD (`d`), and
+//! a virtual register's class is its name's (`vN` or `fvN`); each takes registers of its own
+//! class. Intervals in order of their start take a free register, preferring one a move to or
+//! from a physical register suggests, then caller-saved ones for intervals that cross no call.
+//! With none free, the active interval of the same class that ends last and whose register
+//! suits is spilled if it ends after the new one; otherwise the new one is. A spilled register
+//! lives in its own 8-byte slot: each read loads it into a scratch register of its class (`x15`,
+//! then `x17`; `d29`, `d30`, then `d31`) just before, each write stores it just after. `x16`
+//! computes far slot addresses; `x18` (the platform register), `x29`, `x30`, and the FP scratch
+//! registers are never allocated. Calls clobber AAPCS64's caller-saved registers: `x0`…`x18`,
+//! `x30`, `d0`…`d7`, and `d16`…`d31` (FIR keeps only 64 bits in an FP register, so `d8`…`d15`
+//! survive calls).
 //!
 //! **The certificate** a checker would validate is the assignment ([`Assignment`]: each
 //! virtual register's physical register or spill slot) with the code before allocation. The
@@ -29,21 +34,51 @@
 //!
 //! **Frame lowering** then fills in the prologue's frame size (the callee-saved registers the
 //! allocation used, the spill slots, the locals, and the outgoing arguments), realigns `sp` when
-//! a local needs more than 16 bytes, and saves and restores the callee-saved registers.
+//! a local needs more than 16 bytes, and saves and restores the callee-saved registers
+//! (`x19`…`x28`, and the low 64 bits of `d8`…`d15`).
 
+use super::abi::{CallShape, FP_CALLER_SAVED};
 use super::mir::{CALLER_SAVED, Inst, MFunc};
-use crate::ir::{AluImmOp, AluOp, MemSize, MovOp, Reg, Sf};
+use crate::ir::{AluImmOp, AluOp, FSize, FUnaryOp, MemSize, MovOp, Reg, Sf};
 
-/// The registers allocation may use, caller-saved first.
+/// The general-purpose registers allocation may use, caller-saved first.
 const ALLOCATABLE: [u32; 25] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
 ];
+/// The FP registers allocation may use, caller-saved first.
+const ALLOCATABLE_FP: [u32; 29] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 8, 9, 10, 11, 12,
+    13, 14, 15,
+];
 /// Scratch registers for spilled values, and for far slot addresses.
 const SCRATCH: [u32; 2] = [15, 17];
+const SCRATCH_FP: [u32; 3] = [29, 30, 31];
 const ADDR: u32 = 16;
 
-fn is_callee_saved(r: u32) -> bool {
-    (19..=28).contains(&r)
+/// Physical registers by index: `x0`…`x30` are 0…30, `d0`…`d31` are 31…62.
+const FP_BASE: u32 = 31;
+
+fn phys_reg(p: u32) -> Reg {
+    if p < FP_BASE {
+        Reg::x(p)
+    } else {
+        Reg::d(p - FP_BASE)
+    }
+}
+
+/// A physical register's index, if it is one allocation tracks.
+fn phys(r: Reg) -> Option<u32> {
+    if r.is_gpr() {
+        Some(r.0)
+    } else if r.is_fpr() {
+        Some(FP_BASE + r.fpr_index())
+    } else {
+        None
+    }
+}
+
+fn is_callee_saved(p: u32) -> bool {
+    (19..=28).contains(&p) || (FP_BASE + 8..=FP_BASE + 15).contains(&p)
 }
 
 /// Where each virtual register lives after allocation.
@@ -61,17 +96,15 @@ pub struct Assignment {
     pub slots: u32,
 }
 
-/// The number of physical registers tracked (`x0`…`x30`).
-const NPHYS: usize = 31;
+/// The number of physical registers tracked (`x0`…`x30`, `d0`…`d31`).
+const NPHYS: usize = 63;
 
 /// A register's index in the liveness sets: physical registers first, then virtual ones.
 fn key(r: Reg) -> Option<u32> {
     if r.is_virtual() {
         Some(NPHYS as u32 + r.virt_index())
-    } else if r.is_gpr() {
-        Some(r.0)
     } else {
-        None
+        phys(r)
     }
 }
 
@@ -81,35 +114,53 @@ struct Effects {
     uses: Vec<Reg>,
 }
 
-fn effects(f: &MFunc, shapes: &[(u32, u32)], i: Inst, out: &mut Effects) {
+/// The calls the code makes and the function's own results: what [`effects`] needs.
+struct Shapes<'a> {
+    callees: &'a [CallShape],
+    own: &'a CallShape,
+}
+
+fn effects(f: &MFunc, sh: &Shapes<'_>, i: Inst, out: &mut Effects) {
     i.regs(&mut out.defs, &mut out.uses);
-    let (nargs, nrets) = match i {
-        Inst::Bl { func } => shapes[func as usize],
+    let indirect;
+    let shape = match i {
+        Inst::Bl { func } => &sh.callees[func as usize],
         Inst::Blr { sig, .. } => {
             let (p, r) = &f.sigs[sig as usize];
-            (p.len() as u32, r.len() as u32)
+            indirect = CallShape::of(p, r);
+            &indirect
         }
-        Inst::BlAlloc { .. } | Inst::BlFree { .. } => (1, 0),
+        Inst::BlAlloc { .. } | Inst::BlFree { .. } => {
+            out.uses.push(Reg::x(0));
+            out.defs.extend(CALLER_SAVED.iter().map(|&r| Reg::x(r)));
+            out.defs.extend(FP_CALLER_SAVED.iter().map(|&r| Reg::d(r)));
+            return;
+        }
         Inst::Ret => {
             // `ret` reads the result registers; the frame lowering keeps the rest.
+            out.uses.extend_from_slice(&sh.own.rets);
             return;
         }
         _ => return,
     };
-    out.uses.extend(
-        (0..nargs.min(8))
-            .map(Reg::x)
-            .chain((nrets > 2).then_some(Reg::x(8))),
-    );
+    out.uses.extend_from_slice(&shape.args);
+    if shape.area {
+        out.uses.push(Reg::x(8));
+    }
     out.defs.extend(CALLER_SAVED.iter().map(|&r| Reg::x(r)));
+    out.defs.extend(FP_CALLER_SAVED.iter().map(|&r| Reg::d(r)));
 }
 
 /// Allocate registers for `f`, rewriting it in place, then lower its frame. `shapes` gives each
-/// callee's parameter and result counts; `nrets` is the function's own result count.
-pub fn allocate(f: &mut MFunc, shapes: &[(u32, u32)], nrets: usize) -> Assignment {
-    let a = assign(f, shapes, nrets);
+/// callee's argument and result registers; `own` the function's own.
+pub fn allocate(f: &mut MFunc, shapes: &[CallShape], own: &CallShape) -> Assignment {
+    let sh = Shapes {
+        callees: shapes,
+        own,
+    };
+    let a = assign(f, &sh);
     if cfg!(debug_assertions)
-        && let Err(e) = check(f, shapes, nrets, &a)
+        && let Err(e) = check(f, &sh, &a)
     {
         panic!("register allocation of function {} is wrong: {e}", f.index);
     }
@@ -190,7 +241,7 @@ fn postorder(succ: &[Vec<u32>]) -> Vec<usize> {
 
 /// Live-in and live-out sets per block (sorted keys): a backward dataflow, iterated in
 /// postorder so that it settles in a few rounds.
-fn liveness(f: &MFunc, shapes: &[(u32, u32)], nrets: usize) -> (Vec<Vec<u32>>, Vec<Vec<u32>>) {
+fn liveness(f: &MFunc, sh: &Shapes<'_>) -> (Vec<Vec<u32>>, Vec<Vec<u32>>) {
     let nb = f.blocks.len();
     let succ = successors(f);
     let mut gen_: Vec<Vec<u32>> = vec![Vec::new(); nb];
@@ -207,10 +258,7 @@ fn liveness(f: &MFunc, shapes: &[(u32, u32)], nrets: usize) -> (Vec<Vec<u32>>, V
         let stamp = b as u32 + 1;
         let (g, k) = (&mut gen_[b], &mut kill[b]);
         for i in f.block_range(b) {
-            effects(f, shapes, f.insts[i], &mut fx);
-            if f.insts[i] == Inst::Ret {
-                fx.uses.extend((0..nrets.min(2) as u32).map(Reg::x));
-            }
+            effects(f, sh, f.insts[i], &mut fx);
             for &u in &fx.uses {
                 if let Some(x) = key(u)
                     && wrote[x as usize] != stamp
@@ -270,14 +318,26 @@ struct Interval {
     start: u32,
     end: u32,
     calls: bool,
+    fp: bool,
 }
 
-fn assign(f: &MFunc, shapes: &[(u32, u32)], nrets: usize) -> Assignment {
+fn assign(f: &MFunc, sh: &Shapes<'_>) -> Assignment {
     let nv = f.nvregs as usize;
-    let (live_in, live_out) = liveness(f, shapes, nrets);
+    let (live_in, live_out) = liveness(f, sh);
     let mut start = vec![u32::MAX; nv];
     let mut end = vec![0u32; nv];
     let mut hint = vec![u32::MAX; nv];
+    // Each virtual register's class.
+    let mut fp = vec![false; nv];
+    for &i in &f.insts {
+        let mut note = |r: Reg, _| {
+            if r.is_virtual() {
+                fp[r.virt_index() as usize] = r.is_fp();
+            }
+            r
+        };
+        i.map_regs(&mut note);
+    }
     // Physical segments: per register, (from, to) position pairs.
     let mut segs: Vec<Vec<(u32, u32)>> = vec![Vec::new(); NPHYS];
     let mut calls: Vec<u32> = Vec::new();
@@ -301,17 +361,14 @@ fn assign(f: &MFunc, shapes: &[(u32, u32)], nrets: usize) -> Assignment {
         }
         for i in r.clone().rev() {
             let inst = f.insts[i];
-            effects(f, shapes, inst, &mut fx);
-            if inst == Inst::Ret {
-                fx.uses.extend((0..nrets.min(2) as u32).map(Reg::x));
-            }
+            effects(f, sh, inst, &mut fx);
             if inst.is_call() {
                 calls.push(2 * i as u32 + 1);
             }
             let (u, d) = (2 * i as u32, 2 * i as u32 + 1);
             for &reg in &fx.defs {
-                if reg.is_gpr() {
-                    let x = reg.0 as usize;
+                if let Some(x) = phys(reg) {
+                    let x = x as usize;
                     let to = live_until[x];
                     segs[x].push((d, if to == u32::MAX { d } else { to }));
                     live_until[x] = u32::MAX;
@@ -320,8 +377,8 @@ fn assign(f: &MFunc, shapes: &[(u32, u32)], nrets: usize) -> Assignment {
                 }
             }
             for &reg in &fx.uses {
-                if reg.is_gpr() {
-                    let x = reg.0 as usize;
+                if let Some(x) = phys(reg) {
+                    let x = x as usize;
                     if live_until[x] == u32::MAX {
                         live_until[x] = u;
                     }
@@ -329,11 +386,21 @@ fn assign(f: &MFunc, shapes: &[(u32, u32)], nrets: usize) -> Assignment {
                     touch(reg.virt_index() as usize, u, &mut start, &mut end);
                 }
             }
-            if let Inst::Mov { d, n, .. } = inst {
-                if d.is_virtual() && n.is_gpr() {
-                    hint[d.virt_index() as usize] = n.0;
-                } else if n.is_virtual() && d.is_gpr() {
-                    hint[n.virt_index() as usize] = d.0;
+            let moved = match inst {
+                Inst::Mov { d, n, .. } => Some((d, n)),
+                Inst::Funary {
+                    op: FUnaryOp::Fmov,
+                    d,
+                    n,
+                    ..
+                } if d.is_fp() && n.is_fp() => Some((d, n)),
+                _ => None,
+            };
+            if let Some((d, n)) = moved {
+                if let (true, Some(p)) = (d.is_virtual(), phys(n)) {
+                    hint[d.virt_index() as usize] = p;
+                } else if let (true, Some(p)) = (n.is_virtual(), phys(d)) {
+                    hint[n.virt_index() as usize] = p;
                 }
             }
         }
@@ -368,6 +435,7 @@ fn assign(f: &MFunc, shapes: &[(u32, u32)], nrets: usize) -> Assignment {
             start: start[v],
             end: end[v],
             calls: crosses(start[v], end[v]),
+            fp: fp[v],
         })
         .collect();
     intervals.sort_by_key(|i| (i.start, i.vreg));
@@ -404,30 +472,37 @@ fn assign(f: &MFunc, shapes: &[(u32, u32)], nrets: usize) -> Assignment {
             }
         });
         let ok = |r: u32| !busy[r as usize] && fits(r, cur.start, cur.end);
+        // The class's registers, as physical indices.
+        let base = if cur.fp { FP_BASE } else { 0 };
+        let class: &[u32] = if cur.fp {
+            &ALLOCATABLE_FP
+        } else {
+            &ALLOCATABLE
+        };
+        let regs = || class.iter().map(|&r| base + r);
         let h = hint[cur.vreg as usize];
-        let pick = if h != u32::MAX && ALLOCATABLE.contains(&h) && ok(h) {
+        let pick = if h != u32::MAX && regs().any(|r| r == h) && ok(h) {
             Some(h)
         } else if cur.calls {
-            ALLOCATABLE
-                .iter()
-                .copied()
-                .filter(|&r| is_callee_saved(r))
-                .find(|&r| ok(r))
+            regs().filter(|&r| is_callee_saved(r)).find(|&r| ok(r))
         } else {
-            ALLOCATABLE.iter().copied().find(|&r| ok(r))
+            regs().find(|&r| ok(r))
         };
         match pick {
             Some(r) => {
                 busy[r as usize] = true;
-                homes[cur.vreg as usize] = Home::Reg(Reg::x(r));
+                homes[cur.vreg as usize] = Home::Reg(phys_reg(r));
                 active.push((cur, r));
             }
             None => {
-                // Steal from the active interval that ends last, if its register suits.
+                // Steal from the active interval of the class that ends last, if its register
+                // suits.
                 let victim = active
                     .iter()
                     .enumerate()
-                    .filter(|(_, (a, r))| a.end > cur.end && fits(*r, cur.start, cur.end))
+                    .filter(|(_, (a, r))| {
+                        a.fp == cur.fp && a.end > cur.end && fits(*r, cur.start, cur.end)
+                    })
                     .max_by_key(|(_, (a, _))| a.end)
                     .map(|(i, _)| i);
                 match victim {
@@ -435,7 +510,7 @@ fn assign(f: &MFunc, shapes: &[(u32, u32)], nrets: usize) -> Assignment {
                         let (v, r) = active.swap_remove(i);
                         homes[v.vreg as usize] = Home::Slot(slots);
                         slots += 1;
-                        homes[cur.vreg as usize] = Home::Reg(Reg::x(r));
+                        homes[cur.vreg as usize] = Home::Reg(phys_reg(r));
                         active.push((cur, r));
                     }
                     None => {
@@ -450,7 +525,7 @@ fn assign(f: &MFunc, shapes: &[(u32, u32)], nrets: usize) -> Assignment {
 }
 
 /// Check an assignment against the code before allocation (see the module documentation).
-pub fn check(f: &MFunc, shapes: &[(u32, u32)], nrets: usize, a: &Assignment) -> Result<(), String> {
+fn check(f: &MFunc, sh: &Shapes<'_>, a: &Assignment) -> Result<(), String> {
     const UNKNOWN: u32 = u32::MAX;
     const PHYS: u32 = u32::MAX - 1;
     let nb = f.blocks.len();
@@ -467,14 +542,11 @@ pub fn check(f: &MFunc, shapes: &[(u32, u32)], nrets: usize, a: &Assignment) -> 
         let mut st = at_start[b].unwrap();
         for i in f.block_range(b) {
             let inst = f.insts[i];
-            effects(f, shapes, inst, &mut fx);
-            if inst == Inst::Ret {
-                fx.uses.extend((0..nrets.min(2) as u32).map(Reg::x));
-            }
+            effects(f, sh, inst, &mut fx);
             for &u in &fx.uses {
                 if u.is_virtual()
                     && let Home::Reg(r) = a.homes[u.virt_index() as usize]
-                    && st[r.0 as usize] != u.virt_index()
+                    && st[phys(r).unwrap() as usize] != u.virt_index()
                 {
                     return Err(format!(
                         "instruction {i} reads {u} from {r}, which holds something else"
@@ -484,10 +556,10 @@ pub fn check(f: &MFunc, shapes: &[(u32, u32)], nrets: usize, a: &Assignment) -> 
             for &d in &fx.defs {
                 if d.is_virtual() {
                     if let Home::Reg(r) = a.homes[d.virt_index() as usize] {
-                        st[r.0 as usize] = d.virt_index();
+                        st[phys(r).unwrap() as usize] = d.virt_index();
                     }
-                } else if d.is_gpr() {
-                    st[d.0 as usize] = PHYS;
+                } else if let Some(p) = phys(d) {
+                    st[p as usize] = PHYS;
                 }
             }
         }
@@ -518,15 +590,21 @@ pub fn check(f: &MFunc, shapes: &[(u32, u32)], nrets: usize, a: &Assignment) -> 
 fn rewrite(f: &mut MFunc, a: &Assignment) {
     let spill_base = i64::from(f.frame.outgoing) + i64::from(f.frame.locals);
     f.frame.spills = (a.slots * 8).div_ceil(16) * 16;
-    let mut saved = 0u32;
+    let (mut saved, mut saved_fp) = (0u32, 0u32);
     for h in &a.homes {
-        if let Home::Reg(r) = *h
-            && is_callee_saved(r.0)
-        {
-            saved |= 1 << r.0;
+        if let Home::Reg(r) = *h {
+            let p = phys(r).unwrap();
+            if is_callee_saved(p) {
+                if r.is_fp() {
+                    saved_fp |= 1 << r.fpr_index();
+                } else {
+                    saved |= 1 << r.0;
+                }
+            }
         }
     }
     f.frame.saved = saved;
+    f.frame.saved_fp = saved_fp;
     let mut out = Out::new(f);
     let mut defs = Vec::new();
     let mut uses = Vec::new();
@@ -535,14 +613,22 @@ fn rewrite(f: &mut MFunc, a: &Assignment) {
         for i in f.block_range(b) {
             let (inst, loc) = (f.insts[i], f.locs[i]);
             inst.regs(&mut defs, &mut uses);
-            // Scratch registers for spilled reads; a register both read and written keeps one.
+            // Scratch registers for spilled reads, by class; a register both read and written
+            // keeps one.
             let mut scratch: Vec<(Reg, Reg)> = Vec::new();
+            let (mut ng, mut nf) = (0, 0);
             for &u in &uses {
                 if u.is_virtual()
                     && let Home::Slot(s) = a.homes[u.virt_index() as usize]
                     && !scratch.iter().any(|&(v, _)| v == u)
                 {
-                    let t = Reg::x(SCRATCH[scratch.len()]);
+                    let t = if u.is_fp() {
+                        nf += 1;
+                        Reg::d(SCRATCH_FP[nf - 1])
+                    } else {
+                        ng += 1;
+                        Reg::x(SCRATCH[ng - 1])
+                    };
                     out.slot_access(true, t, spill_base + 8 * i64::from(s), loc);
                     scratch.push((u, t));
                 }
@@ -555,10 +641,15 @@ fn rewrite(f: &mut MFunc, a: &Assignment) {
                 match a.homes[r.virt_index() as usize] {
                     Home::Reg(p) => p,
                     Home::Slot(s) => {
+                        let first = if r.is_fp() {
+                            Reg::d(SCRATCH_FP[0])
+                        } else {
+                            Reg::x(SCRATCH[0])
+                        };
                         let t = scratch
                             .iter()
                             .find(|&&(v, _)| v == r)
-                            .map_or(Reg::x(SCRATCH[0]), |&(_, t)| t);
+                            .map_or(first, |&(_, t)| t);
                         if is_def {
                             stores.push((t, s));
                         }
@@ -566,7 +657,17 @@ fn rewrite(f: &mut MFunc, a: &Assignment) {
                     }
                 }
             });
-            if !matches!(renamed, Inst::Mov { sf: Sf::X, d, n } if d == n) {
+            let same = match renamed {
+                Inst::Mov { sf: Sf::X, d, n } => d == n,
+                Inst::Funary {
+                    op: FUnaryOp::Fmov,
+                    fs: FSize::D,
+                    d,
+                    n,
+                } => d == n,
+                _ => false,
+            };
+            if !same {
                 out.push(renamed, loc);
             }
             for (t, s) in stores {
@@ -670,10 +771,17 @@ impl Out {
 }
 
 /// Fill in the frame: its size, `sp`'s realignment, and the callee-saved registers' saves and
-/// restores (at `x29 - 8`, `x29 - 16`, …).
+/// restores (at `x29 - 8`, `x29 - 16`, …: the general-purpose ones, then the FP ones' low 64
+/// bits).
 fn lower_frame(f: &mut MFunc) {
-    let saved: Vec<u32> = (19..=28)
+    let saved: Vec<Reg> = (19..=28)
         .filter(|r| f.frame.saved & (1 << r) != 0)
+        .map(Reg::x)
+        .chain(
+            (8..=15)
+                .filter(|r| f.frame.saved_fp & (1 << r) != 0)
+                .map(Reg::d),
+        )
         .collect();
     let csr = (8 * saved.len() as u32).div_ceil(16) * 16;
     let fr = f.frame;
@@ -696,7 +804,7 @@ fn lower_frame(f: &mut MFunc) {
                 out.push(
                     Inst::Ldr {
                         size: MemSize::X,
-                        d: Reg::x(r),
+                        d: r,
                         base: Reg::FP,
                         off: -8 * (k as i64 + 1),
                     },
@@ -769,7 +877,7 @@ fn lower_frame(f: &mut MFunc) {
             out.push(
                 Inst::Str {
                     size: MemSize::X,
-                    s: Reg::x(r),
+                    s: r,
                     base: Reg::FP,
                     off: -8 * (k as i64 + 1),
                 },

@@ -127,6 +127,34 @@ fn x(r: Reg) -> &'static str {
     reg(r, Sf::X)
 }
 
+/// An FP register at a format: `s3` or `d3`.
+fn freg(r: Reg, fs: FSize) -> String {
+    assert!(r.is_fpr(), "{r} is not an FP register after allocation");
+    let c = match fs {
+        FSize::S => 's',
+        FSize::D => 'd',
+    };
+    format!("{c}{}", r.fpr_index())
+}
+
+/// A register of either class at the size of an `fs` value: `w`/`s` or `x`/`d`.
+fn any_reg(r: Reg, fs: FSize) -> String {
+    if r.is_fp() {
+        freg(r, fs)
+    } else {
+        reg(r, if fs == FSize::S { Sf::W } else { Sf::X }).to_owned()
+    }
+}
+
+/// The float an `fmov` immediate encodes, as the assembler reads it (`#1.5`).
+fn fmov_imm_text(fs: FSize, imm: u8) -> String {
+    let bits = super::machine_imm(fs, imm);
+    match fs {
+        FSize::S => format!("#{:?}", f32::from_bits(bits as u32)),
+        FSize::D => format!("#{:?}", f64::from_bits(bits)),
+    }
+}
+
 /// A block's label: `.LBB<f>_<b>` (ELF) or `LBB<f>_<b>` (Mach-O).
 struct Label(bool, u32, u32);
 
@@ -254,6 +282,18 @@ impl Emitter<'_> {
             MemSize::W => ("", Sf::W),
             MemSize::X => ("", Sf::X),
         };
+        // An FP register's name says the size: `ldr s0`, `str d1`.
+        let (stem, name) = if r.is_fp() {
+            let c = match size {
+                MemSize::B => 'b',
+                MemSize::H => 'h',
+                MemSize::W => 's',
+                MemSize::X => 'd',
+            };
+            ("", format!("{c}{}", r.fpr_index()))
+        } else {
+            (stem, reg(r, sf).to_owned())
+        };
         let op = match (load, scaled) {
             (true, true) => "ldr",
             (true, false) => "ldur",
@@ -265,7 +305,7 @@ impl Emitter<'_> {
         } else {
             format!("[{}, #{off}]", x(base))
         };
-        self.linef(format_args!("{op}{stem} {}, {addr}", reg(r, sf)));
+        self.linef(format_args!("{op}{stem} {name}, {addr}"));
     }
 
     fn inst(&mut self, f: &MFunc, i: usize, next: Option<u32>) {
@@ -448,6 +488,84 @@ impl Emitter<'_> {
                 self.adrl(Reg::x(16), &s, false);
                 self.linef(format_args!("ldr {}, [x16, #8]", x(d)));
                 self.line("str xzr, [x16]");
+            }
+            Inst::Falu { op, fs, d, n, m } => {
+                let name = match op {
+                    FAluOp::Fadd => "fadd",
+                    FAluOp::Fsub => "fsub",
+                    FAluOp::Fmul => "fmul",
+                    FAluOp::Fdiv => "fdiv",
+                };
+                self.linef(format_args!(
+                    "{name} {}, {}, {}",
+                    freg(d, fs),
+                    freg(n, fs),
+                    freg(m, fs)
+                ));
+            }
+            Inst::Funary { op, fs, d, n } => {
+                let name = match op {
+                    FUnaryOp::Fmov => {
+                        if d != n {
+                            self.linef(format_args!("fmov {}, {}", any_reg(d, fs), any_reg(n, fs)));
+                        }
+                        return;
+                    }
+                    FUnaryOp::Fabs => "fabs",
+                    FUnaryOp::Fneg => "fneg",
+                    FUnaryOp::Fsqrt => "fsqrt",
+                };
+                self.linef(format_args!("{name} {}, {}", freg(d, fs), freg(n, fs)));
+            }
+            Inst::Fmadd { fs, d, n, m } => {
+                let d = freg(d, fs);
+                self.linef(format_args!(
+                    "fmadd {d}, {}, {}, {d}",
+                    freg(n, fs),
+                    freg(m, fs)
+                ));
+            }
+            Inst::FmovImm { fs, d, imm } => {
+                self.linef(format_args!(
+                    "fmov {}, {}",
+                    freg(d, fs),
+                    fmov_imm_text(fs, imm)
+                ));
+            }
+            Inst::Fcmp { fs, n, m } => {
+                self.linef(format_args!("fcmp {}, {}", freg(n, fs), freg(m, fs)));
+            }
+            Inst::Fcsel { c, fs, d, n, m } => {
+                self.linef(format_args!(
+                    "fcsel {}, {}, {}, {}",
+                    freg(d, fs),
+                    freg(n, fs),
+                    freg(m, fs),
+                    c.name()
+                ));
+            }
+            Inst::Fcvt { dst, src, d, n } => {
+                self.linef(format_args!("fcvt {}, {}", freg(d, dst), freg(n, src)));
+            }
+            Inst::Cvtf {
+                signed,
+                fs,
+                sf,
+                d,
+                n,
+            } => {
+                let name = if signed { "scvtf" } else { "ucvtf" };
+                self.linef(format_args!("{name} {}, {}", freg(d, fs), reg(n, sf)));
+            }
+            Inst::Fcvtz {
+                signed,
+                sf,
+                fs,
+                d,
+                n,
+            } => {
+                let name = if signed { "fcvtzs" } else { "fcvtzu" };
+                self.linef(format_args!("{name} {}, {}", reg(d, sf), freg(n, fs)));
             }
             Inst::BExn { t, f: e } => {
                 let s = self.sym("__fir_exn", false);

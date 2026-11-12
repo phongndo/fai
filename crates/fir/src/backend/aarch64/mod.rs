@@ -20,24 +20,30 @@ pub mod syntax;
 
 pub use emit::{Options, Os};
 
+/// The bits of the float an `fmov` immediate encodes (ASL's `VFPExpandImm`).
+pub fn machine_imm(fs: crate::ir::FSize, imm: u8) -> u64 {
+    crate::interp::vfp_expand_imm(fs, u32::from(imm))
+}
+
 use crate::ir::Module;
 use mir::MModule;
 
-/// Each callee's parameter and result counts, by callee index (functions, then external
+/// Each callee's argument and result registers, by callee index (functions, then external
 /// functions).
-fn shapes(m: &Module) -> Vec<(u32, u32)> {
-    let mut out: Vec<(u32, u32)> = m
+fn shapes(m: &Module) -> Vec<abi::CallShape> {
+    let mut out: Vec<abi::CallShape> = m
         .funcs
         .iter()
         .map(|f| {
             let b = &f.body;
-            (b.params(b.entry()).len() as u32, f.rets.len() as u32)
+            let ps: Vec<crate::ir::Ty> = b.params(b.entry()).map(|v| b.ty(v)).collect();
+            abi::CallShape::of(&ps, &f.rets)
         })
         .collect();
     out.extend(
         m.externs
             .iter()
-            .map(|x| (x.params.len() as u32, x.rets.len() as u32)),
+            .map(|x| abi::CallShape::of(&x.params, &x.rets)),
     );
     out
 }
@@ -65,8 +71,8 @@ pub fn allocate(m: &Module, mm: &mut MModule) {
             let shapes = &shapes;
             s.spawn(move || {
                 for f in part {
-                    let nrets = m.funcs[f.index as usize].rets.len();
-                    regalloc::allocate(f, shapes, nrets);
+                    let own = &shapes[f.index as usize];
+                    regalloc::allocate(f, shapes, own);
                 }
             });
         }

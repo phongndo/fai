@@ -59,6 +59,42 @@ pub fn res_regs(rets: &[Ty]) -> Option<Vec<Reg>> {
     )
 }
 
+/// The registers a call reads for its arguments and writes for its results.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CallShape {
+    /// The argument registers.
+    pub args: Vec<Reg>,
+    /// The result registers (none when the results go through memory).
+    pub rets: Vec<Reg>,
+    /// Whether the results go in the area `x8` points to.
+    pub area: bool,
+}
+
+impl CallShape {
+    /// A call with these parameter and result types.
+    pub fn of(ps: &[Ty], rets: &[Ty]) -> CallShape {
+        let args = arg_locs(ps)
+            .into_iter()
+            .filter_map(|l| match l {
+                ArgLoc::Reg(r) => Some(r),
+                ArgLoc::Stack(_) => None,
+            })
+            .collect();
+        match res_regs(rets) {
+            Some(rets) => CallShape {
+                args,
+                rets,
+                area: false,
+            },
+            None => CallShape {
+                args,
+                rets: Vec::new(),
+                area: true,
+            },
+        }
+    }
+}
+
 /// The FP registers a call may change: `d0`…`d7` and `d16`…`d31` (of `d8`…`d15` only the high
 /// 64 bits, which FIR never holds anything in).
 pub const FP_CALLER_SAVED: [u32; 24] = [

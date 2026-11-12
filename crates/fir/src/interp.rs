@@ -46,6 +46,7 @@ use crate::types::Shape;
 // The machine that runs LFIR modules for AArch64; a child module, so it shares the memory model.
 #[path = "backend/aarch64/machine.rs"]
 mod lfir;
+pub(crate) use lfir::vfp_expand_imm;
 
 /// The alignment a leaf at offset `off` of an access aligned to `align` keeps (Lean's
 /// `Nat.gcd align off`).
