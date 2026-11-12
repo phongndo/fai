@@ -4,7 +4,10 @@
 //! ones after it, so there is no recursion. Bodies mix integer ops of every width class (1, 8,
 //! 16, 32, 64, odd, and over 128 bits) with every edge-case modifier; `cf.if` (sometimes leaving
 //! an enclosing loop) and counted `cf.loop`s (sometimes `progress`, sometimes with a bound from
-//! an argument); and memory. The generator tracks the allocations in scope, so most loads and
+//! an argument); `cf.blocks` (sometimes `progress`) whose blocks jump to each other with `cf.br`,
+//! `cf.cond_br`, and `cf.switch` (on any width, with keys written signed or unsigned), forward
+//! (fall-through), backward (loops bounded by a counter, except sometimes), and out of nested
+//! `cf.if` regions, or leave by `cf.yield`, a loop exit, or `func.ret`; and memory. The generator tracks the allocations in scope, so most loads and
 //! stores go to valid, aligned offsets and runs get far; the rest are out of bounds, misaligned,
 //! through null, dangling, or freed pointers. Memory ops cover stack and heap allocations,
 //! loads and stores of integers, pointers, and bytes (so pointers are read back as integers and
@@ -89,6 +92,17 @@ struct Mem {
 
 const WIDTHS: &[u32] = &[1, 8, 8, 16, 32, 32, 32, 64, 64, 7, 65, 128, 200];
 
+/// A `cf.blocks` being generated. Every block after the entry starts with a counter, the number
+/// of jumps so far, and usually jumps to the exit block once it reaches a limit, so back edges
+/// end; the exit block yields the op's results.
+struct Blocks {
+    /// Each block's label and parameter types (the counter first, except for the entry and the
+    /// exit).
+    labels: Vec<(String, Vec<T>)>,
+    /// What a jump from the current block passes as the counter.
+    next: String,
+}
+
 /// A constant of width `w`, biased toward edge cases. Written signed or unsigned.
 fn interesting(rng: &mut Rng, w: u32) -> BigInt {
     let one = BigInt::from(1);
@@ -134,6 +148,8 @@ struct Gen<'r> {
     depth: usize,
     /// The enclosing loops' parameter and result types, innermost last.
     loops: Vec<(Vec<T>, Vec<T>)>,
+    /// The enclosing `cf.blocks`, innermost last.
+    blocks: Vec<Blocks>,
     addr: u32,
     ptr_size: u32,
     ops_left: u32,
@@ -610,8 +626,9 @@ impl Gen<'_> {
                 };
                 self.op(&[], &format!("mem.free {family} {p}"));
             }
-            83..=88 if self.depth < 3 => self.if_op(),
-            89..=93 if self.depth < 3 => self.loop_op(),
+            83..=85 if self.depth < 3 => self.if_op(),
+            86..=88 if self.depth < 3 => self.loop_op(),
+            89..=93 if self.depth < 3 => self.blocks_op(),
             94..=98 if self.func + 1 < self.sigs.len() => self.call_op(),
             _ => {
                 let w = self.rng.pick(WIDTHS);
@@ -720,8 +737,11 @@ impl Gen<'_> {
             let n = self.rng.below(5) as u32;
             let rets = rets.clone();
             self.region(n, |g| {
-                // A branch without results may leave the enclosing loop instead.
-                if rets.is_empty() && !g.loops.is_empty() && g.rng.chance(30) {
+                // A branch without results may leave the enclosing loop, or jump to a block of
+                // the enclosing cf.blocks, instead.
+                if rets.is_empty() && !g.blocks.is_empty() && g.rng.chance(25) {
+                    g.jump();
+                } else if rets.is_empty() && !g.loops.is_empty() && g.rng.chance(30) {
                     g.loop_exit();
                 } else if !rets.is_empty() || g.rng.chance(50) {
                     let vs: Vec<String> = rets.iter().map(|t| g.operand(*t)).collect();
@@ -825,6 +845,185 @@ impl Gen<'_> {
         self.scope.extend(names);
     }
 
+    /// The arguments for a jump to block `i` of the innermost `cf.blocks`.
+    fn jump_args(&mut self, i: usize) -> String {
+        let b = self.blocks.last().unwrap();
+        let (label, params) = b.labels[i].clone();
+        let exit = i + 1 == b.labels.len();
+        let next = b.next.clone();
+        let mut args = Vec::new();
+        for (j, t) in params.iter().enumerate() {
+            args.push(if j == 0 && !exit && i > 0 {
+                format!("%{next}")
+            } else {
+                self.operand(*t)
+            });
+        }
+        if args.is_empty() {
+            format!("^{label}")
+        } else {
+            format!("^{label}({})", args.join(", "))
+        }
+    }
+
+    /// A target block for a jump from block `from`: usually not the entry (which has no
+    /// counter), often the next one (C's fall-through).
+    fn target(&mut self, from: usize) -> usize {
+        let n = self.blocks.last().unwrap().labels.len();
+        if from + 1 < n && self.rng.chance(35) {
+            from + 1
+        } else if self.rng.chance(3) {
+            0
+        } else {
+            1 + self.rng.below((n - 1) as u64) as usize
+        }
+    }
+
+    /// A jump to a block of the innermost `cf.blocks`, from inside a block or a region nested
+    /// in one.
+    fn jump(&mut self) {
+        let n = self.blocks.last().unwrap().labels.len();
+        let to = 1 + self.rng.below((n - 1) as u64) as usize;
+        let t = self.jump_args(to);
+        self.op(&[], &format!("cf.br {t}"));
+    }
+
+    /// `cf.switch` on a random integer: distinct keys modulo `2^w`, written signed or unsigned.
+    fn switch(&mut self, from: usize) {
+        let w = self.rng.pick(&[1, 8, 8, 32, 32, 64, 7, 65, 128]);
+        let v = self.operand(T::I(w));
+        let d = self.target(from);
+        let d = self.jump_args(d);
+        let modulus = BigInt::from(1) << w;
+        let mut seen: Vec<BigInt> = Vec::new();
+        let mut cases = Vec::new();
+        for _ in 0..self.rng.below(5) {
+            let k = if self.rng.chance(60) {
+                BigInt::from(self.rng.below(6) as i64 - 1)
+            } else {
+                interesting(self.rng, w)
+            };
+            let norm = ((&k % &modulus) + &modulus) % &modulus;
+            if seen.contains(&norm) || !(fits(&k, w)) {
+                continue;
+            }
+            seen.push(norm);
+            let to = self.target(from);
+            let t = self.jump_args(to);
+            cases.push(format!("{k}: {t}"));
+        }
+        self.op(
+            &[],
+            &format!("cf.switch {v}, default {d}, [{}]", cases.join(", ")),
+        );
+    }
+
+    /// `cf.blocks`: an entry block, blocks with a counter parameter and maybe more, and an exit
+    /// block that yields the results.
+    fn blocks_op(&mut self) {
+        let rets: Vec<T> = (0..self.rng.below(3)).map(|_| self.state_type()).collect();
+        let limit = self.small(32, 0, 4);
+        let one = self.small(32, 1, 1);
+        let zero = self.small(32, 0, 0);
+        let n = 2 + self.rng.below(4) as usize;
+        let mut labels = vec![("entry".to_owned(), Vec::new())];
+        for k in 1..n {
+            let mut ps = vec![T::I(32)];
+            ps.extend((0..self.rng.below(3)).map(|_| self.state_type()));
+            labels.push((format!("b{k}"), ps));
+        }
+        labels.push(("exit".to_owned(), rets.clone()));
+        let names: Vec<(String, T)> = rets.iter().map(|t| (self.fresh(), *t)).collect();
+        self.results_prefix(&names);
+        let progress = if self.rng.chance(30) { " progress" } else { "" };
+        let loc = self.loc();
+        write!(self.out, "cf.blocks{progress}{loc} {{").unwrap();
+        self.newline();
+        self.blocks.push(Blocks {
+            labels: labels.clone(),
+            next: zero.trim_start_matches('%').to_owned(),
+        });
+        let mark = self.mark();
+        let exit = labels.len() - 1;
+        for (k, (label, params)) in labels.iter().enumerate() {
+            self.restore(mark);
+            let ps: Vec<(String, T)> = params.iter().map(|t| (self.fresh(), *t)).collect();
+            self.indent();
+            if ps.is_empty() {
+                write!(self.out, "^{label}:").unwrap();
+            } else {
+                let items: Vec<String> = ps.iter().map(|(n, t)| format!("%{n}: {t}")).collect();
+                write!(self.out, "^{label}({}):", items.join(", ")).unwrap();
+            }
+            self.newline();
+            self.depth += 1;
+            self.scope.extend(ps.iter().cloned());
+            if k == exit {
+                let vs: Vec<String> = ps.iter().map(|(n, _)| format!("%{n}")).collect();
+                self.op(&[], format!("cf.yield {}", vs.join(", ")).trim_end());
+                self.depth -= 1;
+                continue;
+            }
+            if k > 0 {
+                // Count the jump; at the limit, usually leave.
+                let c = &ps[0].0;
+                let next = self.def(T::I(32), &format!("int.add.wrap %{c}, {one}"));
+                self.blocks.last_mut().unwrap().next = next;
+                if self.rng.chance(95) {
+                    let stop = self.def(T::I(1), &format!("int.cmp.sge %{c}, {limit}"));
+                    self.indent();
+                    let loc = self.loc();
+                    write!(self.out, "cf.if %{stop}{loc} {{").unwrap();
+                    self.newline();
+                    self.depth += 1;
+                    let inner = self.mark();
+                    let t = self.jump_args(exit);
+                    self.op(&[], &format!("cf.br {t}"));
+                    self.restore(inner);
+                    self.depth -= 1;
+                    self.close();
+                    self.newline();
+                }
+            }
+            for _ in 0..self.rng.below(5) {
+                if self.ops_left == 0 {
+                    break;
+                }
+                self.stmt();
+            }
+            match self.rng.below(100) {
+                0..=29 => {
+                    let to = self.target(k);
+                    let t = self.jump_args(to);
+                    self.op(&[], &format!("cf.br {t}"));
+                }
+                30..=59 => {
+                    let c = self.operand(T::I(1));
+                    let (a, b) = (self.target(k), self.target(k));
+                    let (a, b) = (self.jump_args(a), self.jump_args(b));
+                    self.op(&[], &format!("cf.cond_br {c}, {a}, {b}"));
+                }
+                60..=79 => self.switch(k),
+                80..=89 => {
+                    let vs: Vec<String> = rets.iter().map(|t| self.operand(*t)).collect();
+                    self.op(&[], format!("cf.yield {}", vs.join(", ")).trim_end());
+                }
+                90..=94 if !self.loops.is_empty() => self.loop_exit(),
+                _ => {
+                    let rets = self.sigs[self.func].rets.clone();
+                    let vs: Vec<String> = rets.iter().map(|t| self.operand(*t)).collect();
+                    self.op(&[], format!("func.ret {}", vs.join(", ")).trim_end());
+                }
+            }
+            self.depth -= 1;
+        }
+        self.restore(mark);
+        self.blocks.pop();
+        self.close();
+        self.newline();
+        self.scope.extend(names);
+    }
+
     fn call_op(&mut self) {
         let callee =
             self.func + 1 + self.rng.below((self.sigs.len() - self.func - 1) as u64) as usize;
@@ -904,6 +1103,12 @@ impl Gen<'_> {
     }
 }
 
+/// Whether `k` fits in `w` bits, signed or unsigned.
+fn fits(k: &BigInt, w: u32) -> bool {
+    let one = BigInt::from(1);
+    (-(&one << (w - 1)) <= *k && *k < (&one << w)) || (*k >= BigInt::from(0) && *k < (one << w))
+}
+
 fn arg(rng: &mut Rng, t: T) -> String {
     match t {
         T::I(w) => {
@@ -965,6 +1170,7 @@ pub fn program(rng: &mut Rng) -> Program {
         next: 0,
         depth: 0,
         loops: Vec::new(),
+        blocks: Vec::new(),
         addr,
         ptr_size,
         ops_left: 0,
