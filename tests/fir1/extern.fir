@@ -18,6 +18,10 @@
 // run: @wrong_sig() -> ub bad-call @2:3 (@puts has type func<(ptr) -> i32>)
 // A loop of calls: one event per call.
 // run: @loop(3) -> @srand(i32 0) -> (); @srand(i32 1) -> (); @srand(i32 2) -> (); returned
+// Results are zero of every type; a dangling or poison pointer argument passes as it is.
+// run: @zeros() -> @wide() -> i128 0, b32 (0x0, 0x0, 0x0, 0x0), ptr null; returned
+// run: @dangling() -> @free_like(ptr #4) -> (); returned
+// run: @poison_ptr(poison) -> @free_like(ptr poison) -> (); returned
 global const @msg: array<6 x i8> = bytes "68656c6c6f00"
 global const @table: array<1 x ptr> = {@srand}
 
@@ -25,6 +29,8 @@ extern func @puts(ptr) -> i32 effects[read(args)] assume
 extern func @srand(i32) effects[] assume
 extern func @divmod(i64, i64) -> (i64, i64) effects[] check
 extern func @getenv(ptr) -> ptr effects[read(args), read(exposed), trap] assume
+extern func @wide() -> (i128, b32, ptr) effects[alloc] assume
+extern func @free_like(ptr) effects[write(args), free] assume
 
 func @hello() -> i32 {
   %p: ptr = mem.global @msg
@@ -99,5 +105,28 @@ func @loop(%n: i32) {
     %next: i32 = int.add.nsw %i, %one
     cf.continue %next
   }
+  func.ret
+}
+
+func @zeros() {
+  %a: i128, %b: b32, %c: ptr = func.call @wide()
+  func.ret
+}
+
+func @dangling() {
+  %t: i1 = int.const 1
+  %p: ptr = cf.if %t {
+    %s: ptr = mem.stack 4, align 4
+    cf.yield %s
+  } else {
+    %n: ptr = ptr.null
+    cf.yield %n
+  }
+  func.call @free_like(%p)
+  func.ret
+}
+
+func @poison_ptr(%p: ptr) {
+  func.call @free_like(%p)
   func.ret
 }

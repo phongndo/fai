@@ -341,6 +341,35 @@ theorem Behavior.Refines.of_prefix {t : Behavior} {es : List Event} {o : Outcome
   | fin et ot => exact .inr ⟨ho, h⟩
   | inf et => exact ⟨ho, h⟩
 
+/-- UB is not time travel: a target that skips an event the source performed before its UB does
+not refine it. -/
+theorem Behavior.not_refines_skipped_event (e : Event) (o : Outcome) (k : UBKind) :
+    ¬ (Behavior.fin [] o).Refines (.fin [e] (.ub k)) := by
+  rintro (⟨h, -⟩ | ⟨-, pre, post, hpp, h⟩)
+  · exact h
+  · obtain ⟨rfl, -⟩ := List.append_eq_nil_iff.mp hpp.symm
+    exact h
+
+/-- After the source's events, UB lets the target do anything, even run forever with events. -/
+theorem Behavior.refines_after_ub (es : List Event) (k : UBKind) (t : Behavior)
+    (h : match t with
+      | .fin et _ => es <+: et
+      | .inf et => ∀ i e, es[i]? = some e → et i = e) :
+    t.Refines (.fin es (.ub k)) := by
+  cases t with
+  | fin et ot =>
+    obtain ⟨post, rfl⟩ := h
+    exact .inr ⟨trivial, es, post, rfl, Events.Refines.refl es⟩
+  | inf et => exact ⟨trivial, fun i e he => by rw [h i e he]; exact Event.Refines.refl e⟩
+
+/-- A run with infinitely many events never refines one that diverges silently, and the other
+way around. -/
+theorem Behavior.inf_not_refines_diverge (et : Nat → Event) (es : List Event) :
+    ¬ (Behavior.inf et).Refines (.fin es .diverge) := fun h => h.1
+
+theorem Behavior.fin_not_refines_inf (es : List Event) (o : Outcome) (et : Nat → Event) :
+    ¬ (Behavior.fin es o).Refines (.inf et) := id
+
 theorem Behavior.Refines.trans {a b c : Behavior} :
     a.Refines b → b.Refines c → a.Refines c := by
   intro hab hbc

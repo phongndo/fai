@@ -81,6 +81,10 @@ so the worlds programs run in are monotone. -/
 def World.Monotone (w : World) : Prop :=
   ∀ ht hs ct cs k, Events.Refines ht hs → ct.Refines cs → ∃ k', w.answer ht ct k = w.answer hs cs k'
 
+/-- The world `fir-ref run` uses is monotone: its answer depends only on the result types. -/
+theorem World.zero_monotone : World.zero.Monotone :=
+  fun _ _ _ _ k _ hc => ⟨k, by simp only [World.zero, hc.2.1]⟩
+
 /-- `tgt.Refines src`: `tgt` correctly replaces `src` in module `mod`. In every monotone world, for
 all arguments (including `poison`), every behavior of `tgt` refines some behavior of `src`.
 Allocation ids, tags, and addresses are oracle choices, so `src` can match the ones `tgt` picks
