@@ -1320,9 +1320,10 @@ impl Gen<'_> {
         write!(self.out, "cf.blocks{progress}{loc} {{").unwrap();
         self.newline();
         let handler = (self.mfir && self.rng.chance(40)).then(|| "h".to_owned());
+        let first = zero.trim_start_matches('%').to_owned();
         self.blocks.push(Blocks {
             labels: labels.clone(),
-            next: zero.trim_start_matches('%').to_owned(),
+            next: first.clone(),
             handler: handler.clone(),
         });
         let mark = self.mark();
@@ -1401,8 +1402,10 @@ impl Gen<'_> {
             self.depth -= 1;
         }
         if let Some(h) = handler {
-            // The handler block: it gets what calls naming it throw.
+            // The handler block: it gets what calls naming it throw. Its jumps pass the counter
+            // the entry's do (the blocks' own counters are out of scope here).
             self.restore(mark);
+            self.blocks.last_mut().unwrap().next = first;
             let e = self.fresh();
             self.indent();
             write!(self.out, "^{h}(%{e}: ptr):").unwrap();
