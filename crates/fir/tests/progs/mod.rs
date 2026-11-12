@@ -14,7 +14,16 @@
 //! integers as pointers), frees (sometimes twice, or of the wrong family), pointer offsets,
 //! address observation, exposure and `ptr.from_exposed` of nearby addresses, `ptr.with_addr`,
 //! comparisons, facts on results and parameters, and calls passing possibly aliasing pointers to
-//! `noalias` and `readonly` parameters. Each program comes with argument lists and fuel limits.
+//! `noalias` and `readonly` parameters.
+//!
+//! Structs (all three layouts) and arrays appear as typed stack slots, globals, and copies, with
+//! `ty.size`/`ty.align`/`ty.offset` and field and element addresses (usually valid, sometimes
+//! out of bounds or overflowing); programs declare globals of scalar and aggregate types with
+//! every kind of initializer, some `const` (and sometimes written anyway), and sometimes a data
+//! layout of their own. Functions' addresses are taken, stored, compared, exposed, and called
+//! through, usually with the right signature and sometimes with another, or through a data, null,
+//! offset, or poison pointer; globals hold function tables that calls dispatch through. Each
+//! program comes with argument lists and fuel limits.
 
 use std::fmt::Write;
 
@@ -79,6 +88,120 @@ struct Sig {
     rets: Vec<T>,
 }
 
+/// A struct or array type, or a value type inside one.
+#[derive(Clone, PartialEq, Debug)]
+enum Agg {
+    Scalar(T),
+    Struct(&'static str, Vec<Agg>),
+    Array(u64, Box<Agg>),
+}
+
+impl std::fmt::Display for Agg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Agg::Scalar(t) => write!(f, "{t}"),
+            Agg::Struct(p, fs) => {
+                write!(f, "struct<{p}>{{")?;
+                for (i, x) in fs.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{x}")?;
+                }
+                f.write_str("}")
+            }
+            Agg::Array(n, e) => write!(f, "array<{n} x {e}>"),
+        }
+    }
+}
+
+/// The program's data layout, for the generator's own layout computations.
+#[derive(Clone)]
+struct Layout {
+    ptr_size: u64,
+    ptr_align: u64,
+    /// `(width, alignment)` by increasing width.
+    ints: Vec<(u32, u64)>,
+}
+
+/// The largest power of two at most `x` (and at least 1).
+fn floor_pow2(x: u64) -> u64 {
+    1 << x.max(1).ilog2()
+}
+
+fn align_up(x: u64, a: u64) -> u64 {
+    x.div_ceil(a.max(1)) * a.max(1)
+}
+
+impl Layout {
+    fn int_align(&self, w: u32) -> u64 {
+        match self.ints.iter().find(|e| e.0 >= w) {
+            Some(e) => e.1,
+            None => self.ints.last().map_or(1, |e| e.1),
+        }
+    }
+
+    /// Size and alignment.
+    fn dims(&self, a: &Agg) -> (u64, u64) {
+        match a {
+            Agg::Scalar(T::I(w) | T::B(w)) => (u64::from(*w / 8), self.int_align(*w)),
+            Agg::Scalar(T::P) => (self.ptr_size, self.ptr_align),
+            Agg::Struct(p, fs) => {
+                let (offs, size, align) = self.place(p, fs);
+                let _ = offs;
+                (size, align)
+            }
+            Agg::Array(n, e) => {
+                let (s, a) = self.dims(e);
+                (n * align_up(s, a), a)
+            }
+        }
+    }
+
+    fn stride(&self, a: &Agg) -> u64 {
+        let (s, al) = self.dims(a);
+        align_up(s, al)
+    }
+
+    /// Field offsets in declared order, size, and alignment.
+    fn place(&self, p: &str, fs: &[Agg]) -> (Vec<u64>, u64, u64) {
+        let mut ds: Vec<(usize, u64, u64)> = fs
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (i, self.stride(f), self.dims(f).1))
+            .collect();
+        let align = ds.iter().map(|d| d.2).max().unwrap_or(1).max(1);
+        if p == "auto" {
+            ds.sort_by_key(|d| std::cmp::Reverse(d.2));
+        }
+        let mut offs = vec![0; fs.len()];
+        let mut o = 0;
+        for &(i, s, a) in &ds {
+            if p != "packed" {
+                o = align_up(o, a);
+            }
+            offs[i] = o;
+            o += s;
+        }
+        if p == "packed" {
+            (offs, o, 1)
+        } else {
+            (offs, align_up(o, align), align)
+        }
+    }
+}
+
+/// A global: its name, type, and whether it is `const`; and, for a table of function pointers
+/// (an array of `ptr`), the function each element points at.
+#[derive(Clone)]
+struct GlobalInfo {
+    name: String,
+    agg: Agg,
+    constant: bool,
+    align: u64,
+    table: Option<Vec<usize>>,
+}
+
 /// A pointer in scope known to point at the start of an allocation (or assumed to, for pointer
 /// parameters).
 #[derive(Clone)]
@@ -88,6 +211,10 @@ struct Mem {
     align: u64,
     /// The heap family, for frees.
     family: Option<&'static str>,
+    /// What it holds, when it was allocated or found with a type.
+    agg: Option<Agg>,
+    /// A `const` global: writing it is UB.
+    constant: bool,
 }
 
 const WIDTHS: &[u32] = &[1, 8, 8, 16, 32, 32, 32, 64, 64, 7, 65, 128, 200];
@@ -153,6 +280,10 @@ struct Gen<'r> {
     addr: u32,
     ptr_size: u32,
     ops_left: u32,
+    layout: Layout,
+    globals: Vec<GlobalInfo>,
+    /// Visible pointers to functions, with the function they point at.
+    fnptrs: Vec<(String, usize)>,
 }
 
 impl Gen<'_> {
@@ -181,14 +312,20 @@ impl Gen<'_> {
     }
 
     /// What is visible, to restore when a region ends.
-    fn mark(&self) -> (usize, usize, usize) {
-        (self.scope.len(), self.mems.len(), self.exposed.len())
+    fn mark(&self) -> (usize, usize, usize, usize) {
+        (
+            self.scope.len(),
+            self.mems.len(),
+            self.exposed.len(),
+            self.fnptrs.len(),
+        )
     }
 
-    fn restore(&mut self, m: (usize, usize, usize)) {
+    fn restore(&mut self, m: (usize, usize, usize, usize)) {
         self.scope.truncate(m.0);
         self.mems.truncate(m.1);
         self.exposed.truncate(m.2);
+        self.fnptrs.truncate(m.3);
     }
 
     /// Emit `results = body @loc` and define the results.
@@ -312,7 +449,7 @@ impl Gen<'_> {
                 self.new_ptr()
             }
             T::B(w) => {
-                let (p, a) = self.access(u64::from(w / 8));
+                let (p, a) = self.access(u64::from(w / 8), false);
                 self.def(t, &format!("mem.load {p}, align {a}"))
             }
         };
@@ -363,6 +500,8 @@ impl Gen<'_> {
                     size: size as u64,
                     align,
                     family: Some(family),
+                    agg: None,
+                    constant: false,
                 });
                 name
             }
@@ -374,6 +513,8 @@ impl Gen<'_> {
                     size,
                     align,
                     family: None,
+                    agg: None,
+                    constant: false,
                 });
                 name
             }
@@ -382,11 +523,13 @@ impl Gen<'_> {
 
     /// A pointer to access `size` bytes through, and the alignment to access with: usually a
     /// valid, aligned offset into an allocation in scope.
-    fn access(&mut self, size: u64) -> (String, u64) {
+    fn access(&mut self, size: u64, write: bool) -> (String, u64) {
+        // Writes to `const` globals are UB: rarely aim them there.
+        let allow_const = !write || self.rng.chance(10);
         let fits: Vec<Mem> = self
             .mems
             .iter()
-            .filter(|m| m.size >= size)
+            .filter(|m| m.size >= size && (allow_const || !m.constant))
             .cloned()
             .collect();
         if fits.is_empty() || self.rng.chance(12) {
@@ -400,8 +543,10 @@ impl Gen<'_> {
                     size: total,
                     align,
                     family: None,
+                    agg: None,
+                    constant: false,
                 });
-                return (format!("%{name}"), align.min(size.max(1)));
+                return (format!("%{name}"), align.min(floor_pow2(size)));
             }
             let p = self.operand(T::P);
             return (p, self.align());
@@ -409,7 +554,7 @@ impl Gen<'_> {
         let m = fits[self.rng.below(fits.len() as u64) as usize].clone();
         // Usually the largest alignment both the allocation and the access allow; sometimes a
         // smaller one, sometimes one too large.
-        let max = m.align.min(size.max(1));
+        let max = m.align.min(floor_pow2(size));
         let smaller: Vec<u64> = [1, 2, 4, 8, 16].into_iter().filter(|&a| a <= max).collect();
         let align = if self.rng.chance(60) {
             max
@@ -441,7 +586,16 @@ impl Gen<'_> {
     /// One random op (possibly with regions).
     fn stmt(&mut self) {
         self.ops_left = self.ops_left.saturating_sub(1);
-        match self.rng.below(100) {
+        match self.rng.below(118) {
+            100..=101 => self.layout_query(),
+            102..=104 => self.stack_of(),
+            105..=107 => self.field_addr(),
+            108..=109 => self.elem_addr(),
+            110 => self.copy(),
+            111..=112 => self.global_addr(),
+            113..=114 => self.func_addr(),
+            115..=116 => self.indirect_call(),
+            117 => self.table_dispatch(),
             0..=3 => {
                 let w = self.rng.pick(WIDTHS);
                 self.konst(w);
@@ -556,13 +710,13 @@ impl Gen<'_> {
             }
             50..=58 => {
                 let t = self.mem_type();
-                let (p, a) = self.access(self.size_of(t));
+                let (p, a) = self.access(self.size_of(t), false);
                 self.def(t, &format!("mem.load {p}, align {a}"));
             }
             59..=66 => {
                 let t = self.mem_type();
                 let v = self.operand(t);
-                let (p, a) = self.access(self.size_of(t));
+                let (p, a) = self.access(self.size_of(t), true);
                 self.op(&[], &format!("mem.store {t} {v}, {p}, align {a}"));
             }
             67..=69 => {
@@ -656,6 +810,8 @@ impl Gen<'_> {
                 size,
                 align,
                 family: None,
+                agg: None,
+                constant: false,
             });
         }
     }
@@ -687,6 +843,8 @@ impl Gen<'_> {
                     size: 4,
                     align: 1,
                     family: None,
+                    agg: None,
+                    constant: false,
                 });
             }
         } else {
@@ -1024,6 +1182,457 @@ impl Gen<'_> {
         self.scope.extend(names);
     }
 
+    /// A value type for a field or element.
+    fn field_type(&mut self) -> T {
+        match self.rng.below(12) {
+            0..=1 => T::I(8),
+            2 => T::I(16),
+            3..=4 => T::I(32),
+            5 => T::I(64),
+            6 => T::I(self.rng.pick(&[24, 128])),
+            7..=9 => T::P,
+            _ => T::B(self.rng.pick(&[8, 32])),
+        }
+    }
+
+    fn agg_once(&mut self, depth: u32) -> Agg {
+        match self.rng.below(10) {
+            0..=4 if depth < 2 => {
+                let p = self.rng.pick(&["C", "C", "C", "packed", "auto"]);
+                let n = self.rng.pick(&[0, 1, 2, 2, 3, 3, 4]);
+                let fs = (0..n)
+                    .map(|_| {
+                        if self.rng.chance(25) {
+                            self.agg_once(depth + 1)
+                        } else {
+                            Agg::Scalar(self.field_type())
+                        }
+                    })
+                    .collect();
+                Agg::Struct(p, fs)
+            }
+            5..=7 if depth < 2 => {
+                let n = self.rng.pick(&[0, 1, 2, 3, 4, 4]);
+                let e = if self.rng.chance(25) {
+                    self.agg_once(depth + 1)
+                } else {
+                    Agg::Scalar(self.field_type())
+                };
+                Agg::Array(n, Box::new(e))
+            }
+            _ => Agg::Scalar(self.field_type()),
+        }
+    }
+
+    /// A struct, array, or value type of at most 160 bytes.
+    fn agg(&mut self) -> Agg {
+        loop {
+            let a = self.agg_once(0);
+            if self.layout.dims(&a).0 <= 160 {
+                return a;
+            }
+        }
+    }
+
+    /// A struct with at least one field.
+    fn struct_agg(&mut self) -> Agg {
+        loop {
+            let a = self.agg_once(0);
+            if matches!(&a, Agg::Struct(_, fs) if !fs.is_empty()) && self.layout.dims(&a).0 <= 160 {
+                return a;
+            }
+        }
+    }
+
+    /// `ty.size`, `ty.align`, or `ty.offset`.
+    fn layout_query(&mut self) {
+        let aw = T::I(self.addr);
+        match self.rng.below(3) {
+            0 => {
+                let a = self.agg();
+                self.def(aw, &format!("ty.size {a}"));
+            }
+            1 => {
+                let a = self.agg();
+                self.def(aw, &format!("ty.align {a}"));
+            }
+            _ => {
+                let a = self.struct_agg();
+                let Agg::Struct(_, fs) = &a else {
+                    unreachable!()
+                };
+                let i = self.rng.below(fs.len() as u64);
+                self.def(aw, &format!("ty.offset {a}, {i}"));
+            }
+        }
+    }
+
+    /// A typed stack slot.
+    fn stack_of(&mut self) {
+        let a = self.agg();
+        let align = self.rng.pick(&[1, 1, 1, 2, 4, 8, 16]);
+        let (size, natural) = self.layout.dims(&a);
+        let name = self.def(T::P, &format!("mem.stack.of {a}, align {align}"));
+        self.mems.push(Mem {
+            name,
+            size,
+            align: align.max(natural),
+            family: None,
+            agg: Some(a),
+            constant: false,
+        });
+    }
+
+    /// A pointer to a field or element of a known allocation: track it, and sometimes load or
+    /// store its value right away.
+    fn sub_mem(&mut self, name: String, base: &Mem, off: u64, part: Agg, align: u64) {
+        let size = self.layout.dims(&part).0;
+        if off + size > base.size {
+            return;
+        }
+        // The address is aligned to the base's alignment and to the offset's.
+        let off_align = if off == 0 {
+            base.align
+        } else {
+            1 << off.trailing_zeros().min(16)
+        };
+        let align = align.min(base.align).min(off_align).max(1);
+        let m = Mem {
+            name: name.clone(),
+            size,
+            align,
+            family: None,
+            agg: Some(part.clone()),
+            constant: base.constant,
+        };
+        self.mems.push(m);
+        if let Agg::Scalar(t) = part
+            && self.rng.chance(50)
+        {
+            let a = align.min(floor_pow2(size));
+            if self.rng.chance(50) && (!base.constant || self.rng.chance(5)) {
+                let v = self.operand(t);
+                self.op(&[], &format!("mem.store {t} {v}, %{name}, align {a}"));
+            } else {
+                self.def(t, &format!("mem.load %{name}, align {a}"));
+            }
+        }
+    }
+
+    /// `ptr.field`: usually of a struct in a known allocation, with a valid index.
+    fn field_addr(&mut self) {
+        let mode = if self.rng.chance(80) {
+            "inbounds"
+        } else {
+            "wrap"
+        };
+        let typed: Vec<Mem> = self
+            .mems
+            .iter()
+            .filter(|m| matches!(&m.agg, Some(Agg::Struct(_, fs)) if !fs.is_empty()))
+            .cloned()
+            .collect();
+        if !typed.is_empty() && self.rng.chance(80) {
+            let m = typed[self.rng.below(typed.len() as u64) as usize].clone();
+            let Some(a @ Agg::Struct(p, fs)) = &m.agg else {
+                unreachable!()
+            };
+            let i = self.rng.below(fs.len() as u64) as usize;
+            let name = self.def(T::P, &format!("ptr.field.{mode} {a} %{}, {i}", m.name));
+            let (offs, _, _) = self.layout.place(p, fs);
+            let align = if *p == "packed" {
+                1
+            } else {
+                self.layout.dims(&fs[i]).1
+            };
+            self.sub_mem(name, &m, offs[i], fs[i].clone(), align);
+        } else {
+            // Another struct over whatever the pointer points at.
+            let a = self.struct_agg();
+            let Agg::Struct(_, fs) = &a else {
+                unreachable!()
+            };
+            let i = self.rng.below(fs.len() as u64 + 1).min(fs.len() as u64 - 1);
+            let p = self.operand(T::P);
+            self.def(T::P, &format!("ptr.field.{mode} {a} {p}, {i}"));
+        }
+    }
+
+    /// `ptr.index`: usually of an array in a known allocation, usually in range.
+    fn elem_addr(&mut self) {
+        let mode = if self.rng.chance(80) {
+            "inbounds"
+        } else {
+            "wrap"
+        };
+        let typed: Vec<Mem> = self
+            .mems
+            .iter()
+            .filter(|m| matches!(&m.agg, Some(Agg::Array(n, _)) if *n > 0))
+            .cloned()
+            .collect();
+        let (base, elem, n) = if !typed.is_empty() && self.rng.chance(80) {
+            let m = typed[self.rng.below(typed.len() as u64) as usize].clone();
+            let Some(Agg::Array(n, e)) = m.agg.clone() else {
+                unreachable!()
+            };
+            (Some(m), *e, n)
+        } else {
+            let e = if self.rng.chance(60) {
+                Agg::Scalar(self.field_type())
+            } else {
+                self.agg()
+            };
+            (None, e, 4)
+        };
+        let i: i64 = match self.rng.below(10) {
+            0 => -1,
+            1 => n as i64,
+            2 => n as i64 + 1,
+            _ => self.rng.below(n) as i64,
+        };
+        let idx = if self.rng.chance(5) {
+            self.operand(T::I(self.addr))
+        } else if self.rng.chance(3) {
+            // Large enough that the product overflows.
+            let k = format!("%{}", self.konst(self.addr));
+            k
+        } else {
+            self.small(self.addr, i, i)
+        };
+        let p = match &base {
+            Some(m) => format!("%{}", m.name),
+            None => self.operand(T::P),
+        };
+        let name = self.def(T::P, &format!("ptr.index.{mode} {elem} {p}, {idx}"));
+        if let Some(m) = base
+            && i >= 0
+            && (i as u64) < n
+        {
+            let stride = self.layout.stride(&elem);
+            let align = self.layout.dims(&elem).1;
+            self.sub_mem(name, &m, i as u64 * stride, elem, align);
+        }
+    }
+
+    /// `mem.copy` between two allocations that usually hold the type.
+    fn copy(&mut self) {
+        let a = self.agg();
+        let size = self.layout.dims(&a).0;
+        let (d, da) = self.access(size, true);
+        let (s, sa) = self.access(size, false);
+        let align = da.min(sa);
+        self.op(&[], &format!("mem.copy {a} {d}, {s}, align {align}"));
+    }
+
+    /// `mem.global`, tracked like an allocation.
+    fn global_addr(&mut self) {
+        if self.globals.is_empty() {
+            return self.stack_of();
+        }
+        let g = self.globals[self.rng.below(self.globals.len() as u64) as usize].clone();
+        let name = self.def(T::P, &format!("mem.global @{}", g.name));
+        let (size, natural) = self.layout.dims(&g.agg);
+        // Sometimes write a `const` one anyway, through a byte.
+        if g.constant && size > 0 && self.rng.chance(15) {
+            let v = self.operand(T::I(8));
+            self.op(&[], &format!("mem.store i8 {v}, %{name}, align 1"));
+        }
+        self.mems.push(Mem {
+            name,
+            size,
+            align: g.align.max(natural),
+            family: None,
+            agg: Some(g.agg),
+            constant: g.constant,
+        });
+    }
+
+    /// `func.addr` of any function; sometimes its address goes through an integer and back.
+    fn func_addr(&mut self) {
+        let k = self.rng.below(self.sigs.len() as u64) as usize;
+        let mut name = self.def(T::P, &format!("func.addr @f{k}"));
+        match self.rng.below(10) {
+            0..=1 => {
+                let a = self.def(T::I(self.addr), &format!("ptr.expose %{name}"));
+                self.exposed.push(a.clone());
+                name = self.def(T::P, &format!("ptr.from_exposed %{a}"));
+            }
+            2 if !self.fnptrs.is_empty() => {
+                let i = self.rng.below(self.fnptrs.len() as u64) as usize;
+                let other = self.fnptrs[i].0.clone();
+                let p = self.rng.pick(&["eq", "ne"]);
+                self.def(T::I(1), &format!("ptr.cmp.{p} %{name}, %{other}"));
+            }
+            _ => {}
+        }
+        self.fnptrs.push((name, k));
+    }
+
+    /// The text of function `k`'s type.
+    fn sig_text(&self, k: usize) -> String {
+        let sig = &self.sigs[k];
+        let ps: Vec<String> = sig.params.iter().map(T::to_string).collect();
+        let rs: Vec<String> = sig.rets.iter().map(T::to_string).collect();
+        let rets = match rs.len() {
+            0 => String::new(),
+            1 => format!(" -> {}", rs[0]),
+            _ => format!(" -> ({})", rs.join(", ")),
+        };
+        format!("func<({}){rets}>", ps.join(", "))
+    }
+
+    /// `func.call.indirect`: usually through a known function pointer with its signature;
+    /// sometimes with another signature, or through some other pointer. Calls to the current
+    /// function or earlier ones recurse until the fuel runs out.
+    fn indirect_call(&mut self) {
+        let later = self.func + 1 < self.sigs.len();
+        let (p, k) = if !self.fnptrs.is_empty() && self.rng.chance(70) {
+            let (p, k) = self.fnptrs[self.rng.below(self.fnptrs.len() as u64) as usize].clone();
+            (format!("%{p}"), k)
+        } else if self.rng.chance(85) {
+            let k = if later && self.rng.chance(85) {
+                self.func + 1 + self.rng.below((self.sigs.len() - self.func - 1) as u64) as usize
+            } else {
+                self.rng.below(self.sigs.len() as u64) as usize
+            };
+            (
+                format!("%{}", self.def(T::P, &format!("func.addr @f{k}"))),
+                k,
+            )
+        } else {
+            (
+                self.operand(T::P),
+                self.rng.below(self.sigs.len() as u64) as usize,
+            )
+        };
+        // The signature: usually the callee's own.
+        let k = if self.rng.chance(8) {
+            self.rng.below(self.sigs.len() as u64) as usize
+        } else {
+            k
+        };
+        let sig = self.sig_text(k);
+        let params = self.sigs[k].params.clone();
+        let rets = self.sigs[k].rets.clone();
+        let args: Vec<String> = params.iter().map(|t| self.operand(*t)).collect();
+        let results: Vec<(String, T, String)> = rets
+            .iter()
+            .map(|t| (self.fresh(), *t, String::new()))
+            .collect();
+        self.op(
+            &results,
+            &format!("func.call.indirect {sig} {p}({})", args.join(", ")),
+        );
+    }
+
+    /// Load a function pointer from a global table, then sometimes call it.
+    fn table_dispatch(&mut self) {
+        let tables: Vec<GlobalInfo> = self
+            .globals
+            .iter()
+            .filter(|g| g.table.is_some())
+            .cloned()
+            .collect();
+        if tables.is_empty() {
+            return self.func_addr();
+        }
+        let g = tables[self.rng.below(tables.len() as u64) as usize].clone();
+        let table = g.table.clone().unwrap();
+        let t = self.def(T::P, &format!("mem.global @{}", g.name));
+        let i = self.rng.below(table.len() as u64 + 1);
+        let idx = self.small(self.addr, i as i64, i as i64);
+        let e = self.def(T::P, &format!("ptr.index.inbounds ptr %{t}, {idx}"));
+        let align = self
+            .layout
+            .ptr_align
+            .min(g.align.max(self.layout.ptr_align));
+        let f = self.def(T::P, &format!("mem.load %{e}, align {align}"));
+        if let Some(&k) = table.get(i as usize) {
+            self.fnptrs.push((f, k));
+            if self.rng.chance(50) {
+                self.indirect_call();
+            }
+        }
+    }
+
+    /// An initializer for a value of type `a` in a module whose globals are `g0..gn`.
+    fn init(&mut self, a: &Agg, n: usize) -> String {
+        if self.rng.chance(10) {
+            return "zero".to_owned();
+        }
+        if self.rng.chance(6) {
+            let size = self.layout.dims(a).0;
+            let hex: String = (0..size)
+                .map(|_| format!("{:02x}", self.rng.below(256)))
+                .collect();
+            return format!("bytes \"{hex}\"");
+        }
+        match a {
+            Agg::Scalar(T::I(w) | T::B(w)) => interesting(self.rng, *w).to_string(),
+            Agg::Scalar(T::P) => match self.rng.below(3) {
+                0 => "null".to_owned(),
+                1 if n > 0 => format!("@g{}", self.rng.below(n as u64)),
+                _ => format!("@f{}", self.rng.below(self.sigs.len() as u64)),
+            },
+            Agg::Struct(_, fs) => {
+                let items: Vec<String> = fs.iter().map(|f| self.init(f, n)).collect();
+                format!("{{{}}}", items.join(", "))
+            }
+            Agg::Array(k, e) => {
+                let items: Vec<String> = (0..*k).map(|_| self.init(e, n)).collect();
+                format!("{{{}}}", items.join(", "))
+            }
+        }
+    }
+
+    /// Up to three globals, some of them tables of function pointers.
+    fn declare_globals(&mut self) {
+        let n = self.rng.pick(&[0, 0, 1, 1, 2, 3]);
+        for i in 0..n {
+            let constant = self.rng.chance(30);
+            let align = if self.rng.chance(70) {
+                1
+            } else {
+                self.rng.pick(&[2, 4, 8, 16, 32])
+            };
+            let (agg, init, table) = if self.rng.chance(15) {
+                let ks: Vec<usize> = (0..1 + self.rng.below(3))
+                    .map(|_| self.rng.below(self.sigs.len() as u64) as usize)
+                    .collect();
+                let items: Vec<String> = ks.iter().map(|k| format!("@f{k}")).collect();
+                let agg = Agg::Array(ks.len() as u64, Box::new(Agg::Scalar(T::P)));
+                (agg, format!("{{{}}}", items.join(", ")), Some(ks))
+            } else {
+                let agg = if self.rng.chance(40) {
+                    Agg::Scalar(self.field_type())
+                } else {
+                    self.agg()
+                };
+                let init = self.init(&agg, n);
+                (agg, init, None)
+            };
+            let c = if constant { "const " } else { "" };
+            let al = if align == 1 {
+                String::new()
+            } else {
+                format!(" align {align}")
+            };
+            write!(self.out, "global {c}@g{i}: {agg}{al} = {init}").unwrap();
+            self.newline();
+            self.globals.push(GlobalInfo {
+                name: format!("g{i}"),
+                agg,
+                constant,
+                align,
+                table,
+            });
+        }
+        if n > 0 {
+            self.newline();
+        }
+    }
+
     fn call_op(&mut self) {
         let callee =
             self.func + 1 + self.rng.below((self.sigs.len() - self.func - 1) as u64) as usize;
@@ -1045,6 +1654,7 @@ impl Gen<'_> {
         self.scope.clear();
         self.mems.clear();
         self.exposed.clear();
+        self.fnptrs.clear();
         self.ops_left = 45;
         let (params, rets) = (self.sigs[idx].params.clone(), self.sigs[idx].rets.clone());
         let mut ps = Vec::new();
@@ -1069,6 +1679,8 @@ impl Gen<'_> {
                     size: 8,
                     align: 1,
                     family: None,
+                    agg: None,
+                    constant: false,
                 });
             }
             self.scope.push((n, *t));
@@ -1158,6 +1770,24 @@ pub fn program(rng: &mut Rng) -> Program {
         sigs.push(Sig { params, rets });
     }
     let entry_params = sigs[0].params.clone();
+    // The data layout: usually the default alignments, sometimes others.
+    let natural = 1u64 << (u64::from(ptr_size) / 8).max(1).ilog2();
+    let ptr_align = match rng.below(12) {
+        0 => natural * 2,
+        1 if natural > 1 => natural / 2,
+        _ => natural,
+    };
+    let ints: Vec<(u32, u64)> = match rng.below(12) {
+        0 => vec![(8, 1), (16, 2), (32, 4), (64, 4)],
+        1 => vec![(8, 1), (16, 1), (32, 2), (64, 2), (128, 8)],
+        _ => vec![(8, 1), (16, 2), (32, 4), (64, 8), (128, 16)],
+    };
+    let custom_ints = ints.len() != 5 || ints[4].1 != 16;
+    let layout = Layout {
+        ptr_size: u64::from(ptr_size / 8),
+        ptr_align,
+        ints: ints.clone(),
+    };
     let mut g = Gen {
         rng,
         out: String::new(),
@@ -1174,12 +1804,25 @@ pub fn program(rng: &mut Rng) -> Program {
         addr,
         ptr_size,
         ops_left: 0,
+        layout,
+        globals: Vec::new(),
+        fnptrs: Vec::new(),
     };
-    if (ptr_size, addr) != (64, 64) {
+    if (ptr_size, addr) != (64, 64) || ptr_align != natural || custom_ints {
         write!(g.out, "memspace default ptr {ptr_size} addr {addr}").unwrap();
+        if ptr_align != natural || g.rng.chance(10) {
+            write!(g.out, " align {ptr_align}").unwrap();
+        }
+        if custom_ints {
+            g.out.push_str(" int");
+            for (w, a) in &ints {
+                write!(g.out, " {w}:{a}").unwrap();
+            }
+        }
         g.newline();
         g.newline();
     }
+    g.declare_globals();
     for i in 0..nfuncs {
         g.func(i);
     }
