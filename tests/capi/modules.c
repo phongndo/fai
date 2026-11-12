@@ -1069,6 +1069,144 @@ static void layout(void) {
   fir_module_free(m32);
 }
 
+/* Floats: f32 and f64 values, every kind of float op, constants from C floats, doubles, and bit
+ * patterns (NaN payloads included), run in the interpreter; the backend doesn't compile them yet. */
+static void floats(void) {
+  FirModule *m = cur = fir_module_new();
+  FirType f32 = FIR_TYPE_F32, f64 = FIR_TYPE_F64, i1 = fir_type_int(1), i32 = fir_type_int(32),
+          i64 = fir_type_int(64);
+
+  /* @hypot(%a, %b) = sqrt(fma(a, a, b * b)), and whether it is below 10. */
+  FirType two[2] = {f64, f64};
+  FirType rets[2] = {f64, i1};
+  FirBuilder *b = fir_func_begin(m, ID(fir_func_declare(m, "hypot", two, 2, rets, 2)));
+  FirValue a = ID(fir_builder_param(b, 0)), bb = ID(fir_builder_param(b, 1));
+  OK(fir_value_set_name(b, a, "a"));
+  OK(fir_value_set_name(b, bb, "b"));
+  FirValue sq = ID(fir_float_bin(b, FIR_FBIN_OP_MUL, bb, bb));
+  FirValue sum = ID(fir_float_fma(b, a, a, sq));
+  FirValue h = ID(fir_float_un(b, FIR_FUN_OP_SQRT, sum));
+  FirValue ten = ID(fir_float_const_f64(b, 10.0));
+  FirValue small = ID(fir_float_cmp(b, FIR_FPRED_OLT, h, ten));
+  FirValue out[2] = {h, small};
+  ID(fir_func_ret(b, out, 2));
+  OK(fir_func_end(b));
+
+  /* @conv(%x: f64): conversions to integers and f32, and back. */
+  FirType crets[5] = {i32, i64, f32, f64, i32};
+  b = fir_func_begin(m, ID(fir_func_declare(m, "conv", &f64, 1, crets, 5)));
+  FirValue x = ID(fir_builder_param(b, 0));
+  OK(fir_value_set_name(b, x, "x"));
+  FirValue s32 = ID(fir_float_to_int(b, i32, true, FIR_CVT_EDGE_SAT, x));
+  FirValue u64 = ID(fir_float_to_int(b, i64, false, FIR_CVT_EDGE_SAT, x));
+  FirValue t = ID(fir_float_trunc(b, f32, x));
+  FirValue e = ID(fir_float_ext(b, f64, t));
+  FirValue back = ID(fir_int_to_float(b, f64, true, s32));
+  FirValue diff = ID(fir_float_bin(b, FIR_FBIN_OP_SUB, e, back));
+  FirValue bits = ID(fir_float_to_bits(b, i32, t));
+  FirValue cout[5] = {s32, u64, t, diff, bits};
+  ID(fir_func_ret(b, cout, 5));
+  OK(fir_func_end(b));
+
+  /* @consts(): constants from a float, a double, and bit patterns; sign ops keep payloads. */
+  FirType krets[6] = {f32, f64, f64, f64, f32, f64};
+  b = fir_func_begin(m, ID(fir_func_declare(m, "consts", NULL, 0, krets, 6)));
+  FirValue tenth = ID(fir_float_const_f32(b, 0.1f));
+  FirValue nan = ID(fir_float_const(b, f64, 0x7ff0000000000001ull));
+  FirValue neg = ID(fir_float_un(b, FIR_FUN_OP_NEG, nan));
+  FirValue abs = ID(fir_float_un(b, FIR_FUN_OP_ABS, neg));
+  FirValue one = ID(fir_float_const_f64(b, 1.0));
+  FirValue cs = ID(fir_float_bin(b, FIR_FBIN_OP_COPYSIGN, one, neg));
+  FirValue big = ID(fir_int_const(b, i32, 0x7f800000));
+  FirValue inf = ID(fir_float_from_bits(b, f32, big));
+  FirValue quo = ID(fir_float_bin(b, FIR_FBIN_OP_DIV, cs, ID(fir_float_const_f64(b, 0.0))));
+  FirValue add = ID(fir_float_bin(b, FIR_FBIN_OP_ADD, quo, ID(fir_float_bin(b, FIR_FBIN_OP_SUB,
+                                                                            nan, one))));
+  FirValue kout[6] = {tenth, neg, abs, cs, inf, add};
+  ID(fir_func_ret(b, kout, 6));
+  OK(fir_func_end(b));
+  OK(fir_module_verify(m));
+
+  expect_text(m, false,
+              "func @hypot(%a: f64, %b: f64) -> (f64, i1) {\n"
+              "  %2: f64 = float.mul %b, %b\n"
+              "  %3: f64 = float.fma %a, %a, %2\n"
+              "  %4: f64 = float.sqrt %3\n"
+              "  %5: f64 = float.const 10.0\n"
+              "  %6: i1 = float.cmp.olt %4, %5\n"
+              "  func.ret %4, %6\n"
+              "}\n"
+              "\n"
+              "func @conv(%x: f64) -> (i32, i64, f32, f64, i32) {\n"
+              "  %1: i32 = float.to_int.s.sat %x\n"
+              "  %2: i64 = float.to_int.u.sat %x\n"
+              "  %3: f32 = float.trunc %x\n"
+              "  %4: f64 = float.ext %3\n"
+              "  %5: f64 = int.to_float.s %1\n"
+              "  %6: f64 = float.sub %4, %5\n"
+              "  %7: i32 = float.to_bits %3\n"
+              "  func.ret %1, %2, %3, %6, %7\n"
+              "}\n"
+              "\n"
+              "func @consts() -> (f32, f64, f64, f64, f32, f64) {\n"
+              "  %0: f32 = float.const 0.1\n"
+              "  %1: f64 = float.const nan(0x1)\n"
+              "  %2: f64 = float.neg %1\n"
+              "  %3: f64 = float.abs %2\n"
+              "  %4: f64 = float.const 1.0\n"
+              "  %5: f64 = float.copysign %4, %2\n"
+              "  %6: i32 = int.const 2139095040\n"
+              "  %7: f32 = float.from_bits %6\n"
+              "  %8: f64 = float.const 0.0\n"
+              "  %9: f64 = float.div %5, %8\n"
+              "  %10: f64 = float.sub %1, %4\n"
+              "  %11: f64 = float.add %9, %10\n"
+              "  func.ret %0, %2, %3, %5, %7, %11\n"
+              "}\n");
+  const char *hargs[] = {"3.0", "4.0"};
+  expect_run(m, "hypot", hargs, 2, "returned f64 5.0, i1 1");
+  /* b * b underflows to 0, and so does a * a + 0, rounded once. */
+  const char *hargs2[] = {"5e-324", "5e-324"};
+  expect_run(m, "hypot", hargs2, 2, "returned f64 0.0, i1 1");
+  /* b * b overflows on its own. */
+  const char *hargs3[] = {"1.0", "1e200"};
+  expect_run(m, "hypot", hargs3, 2, "returned f64 inf, i1 0");
+  const char *cargs[] = {"-2.5"};
+  expect_run(m, "conv", cargs, 1, "returned i32 -2, i64 0, f32 -2.5, f64 -0.5, i32 -1071644672");
+  const char *cargs2[] = {"1e10"};
+  expect_run(m, "conv", cargs2, 1,
+             "returned i32 2147483647, i64 10000000000, f32 10000000000.0, f64 7852516353.0, "
+             "i32 1343554297");
+  const char *cargs3[] = {"nan(0x5)"};
+  expect_run(m, "conv", cargs3, 1, "returned i32 0, i64 0, f32 nan, f64 nan, i32 2143289344");
+  expect_run(m, "consts", NULL, 0,
+             "returned f32 0.1, f64 -nan(0x1), f64 nan(0x1), f64 -1.0, f32 inf, f64 nan");
+
+  /* The backend doesn't compile floats yet: a compile error, not a crash. */
+  char *as = NULL;
+  CHECK(fir_module_compile(m, "aarch64", false, FIR_OS_LINUX, &as) == FIR_ERR_COMPILE &&
+        as == NULL);
+  expect_error("@hypot: f64 is a float, which the AArch64 backend doesn't support yet", __LINE__);
+
+  /* Errors: bits that don't fit, operands that aren't floats, bad enum values. */
+  b = fir_func_begin(m, ID(fir_func_declare(m, "bad", &i32, 1, NULL, 0)));
+  FirValue n = ID(fir_builder_param(b, 0));
+  CHECK(fir_float_const(b, f32, 1ull << 40) == FIR_INVALID);
+  expect_error("float.const: 1099511627776 is not the bits of a f32", __LINE__);
+  CHECK(fir_float_const(b, i32, 0) == FIR_INVALID);
+  expect_error("float.const: expected floats but got (i32)", __LINE__);
+  CHECK(fir_float_bin(b, FIR_FBIN_OP_ADD, n, n) == FIR_INVALID);
+  expect_error("float.add: expected floats but got (i32)", __LINE__);
+  CHECK(fir_float_cmp(b, 99, n, n) == FIR_INVALID);
+  expect_error("99 is not a FirFPred", __LINE__);
+  CHECK(fir_float_to_int(b, i32, true, 3, n) == FIR_INVALID);
+  expect_error("3 is not a FirCvtEdge", __LINE__);
+  CHECK(fir_float_from_bits(b, f64, n) == FIR_INVALID);
+  expect_error("float.from_bits: i32 and f64 have different widths", __LINE__);
+  fir_func_abandon(b);
+  fir_module_free(m);
+}
+
 int main(void) {
   CHECK(fir_api_version() == FIR_API_VERSION);
   blocks_loop();
@@ -1080,6 +1218,7 @@ int main(void) {
   building_blocks();
   exceptions();
   layout();
+  floats();
   if (failures > 0) {
     fprintf(stderr, "%d checks failed\n", failures);
     return 1;

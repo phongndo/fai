@@ -38,6 +38,15 @@
 //! a global, null, or any pointer. MFIR programs give some `cf.blocks` a handler block, which
 //! direct and indirect calls in it name (`func.invoke`). Each program comes with argument lists
 //! and fuel limits.
+//!
+//! Floats (`f32`, `f64`; not in the narrow mode, whose programs the AArch64 backend compiles):
+//! every `float.*` op and `int.to_float`, with constants biased toward the edge cases (zeros of
+//! both signs, subnormals, the largest values, infinities, NaNs with payloads, integers at the
+//! conversions' limits, halfway cases), conversions to and from integers of every width class
+//! with every edge-case modifier, `float.from_bits` of interesting integers, `select`,
+//! `freeze`, `poison`, and `copy` of floats, and floats as parameters, results, loop and block
+//! state, parts of aggregates and unions, globals, and values loaded and stored (and read back as
+//! integers and bytes).
 
 use std::fmt::Write;
 
@@ -93,6 +102,8 @@ enum T {
     I(u32),
     P,
     B(u32),
+    /// `f32` or `f64`, by width.
+    F(u32),
     /// An HFIR aggregate, union, or slice type: an index into the program's `VTYS`.
     V(u8),
 }
@@ -125,7 +136,7 @@ impl T {
     fn has_layout(self) -> bool {
         match self {
             T::I(w) => w % 8 == 0,
-            T::P | T::B(_) => true,
+            T::P | T::B(_) | T::F(_) => true,
             T::V(i) => !matches!(vty(i), VTy::Union(_)),
         }
     }
@@ -146,6 +157,7 @@ impl std::fmt::Display for T {
             T::I(w) => write!(f, "i{w}"),
             T::P => f.write_str("ptr"),
             T::B(w) => write!(f, "b{w}"),
+            T::F(w) => write!(f, "f{w}"),
             T::V(i) => match vty(*i) {
                 VTy::Struct(p, fs) => {
                     write!(f, "struct<{p}>{{")?;
@@ -182,6 +194,9 @@ fn make_vtys(rng: &mut Rng) {
                 .collect();
             if !nested.is_empty() && rng.chance(25) {
                 return rng.pick(&nested);
+            }
+            if !rng.1 && rng.chance(15) {
+                return T::F(rng.pick(&[32, 64]));
             }
             match rng.below(10) {
                 0..=1 => T::P,
@@ -275,7 +290,7 @@ impl Layout {
     /// Size and alignment.
     fn dims(&self, a: &Agg) -> (u64, u64) {
         match a {
-            Agg::Scalar(T::I(w) | T::B(w)) => (u64::from(*w / 8), self.int_align(*w)),
+            Agg::Scalar(T::I(w) | T::B(w) | T::F(w)) => (u64::from(*w / 8), self.int_align(*w)),
             Agg::Scalar(T::P) => (self.ptr_size, self.ptr_align),
             Agg::Struct(p, fs) => {
                 let (offs, size, align) = self.place(p, fs);
@@ -605,7 +620,7 @@ impl Gen<'_> {
                     f => f.to_owned(),
                 }
             }
-            T::B(_) | T::V(_) => return String::new(),
+            T::B(_) | T::V(_) | T::F(_) => return String::new(),
         };
         format!(" [{f} {trust}]")
     }
@@ -624,7 +639,7 @@ impl Gen<'_> {
 
     fn size_of(&self, t: T) -> u64 {
         match t {
-            T::I(w) | T::B(w) => u64::from(w / 8),
+            T::I(w) | T::B(w) | T::F(w) => u64::from(w / 8),
             T::P => u64::from(self.ptr_size / 8),
             T::V(_) => unreachable!("aggregates are not memory types here"),
         }
@@ -653,9 +668,103 @@ impl Gen<'_> {
                 let (p, a) = self.access(u64::from(w / 8), false);
                 self.def(t, &format!("mem.load {p}, align {a}"))
             }
+            T::F(w) => self.fconst(w),
             T::V(i) => self.build(i),
         };
         format!("%{n}")
+    }
+
+    /// A float constant, biased toward the edge cases; sometimes the bits of an interesting
+    /// integer.
+    fn fconst(&mut self, w: u32) -> String {
+        if self.rng.chance(15) {
+            let n = interesting(self.rng, w);
+            let i = self.def(T::I(w), &format!("int.const {n}"));
+            return self.def(T::F(w), &format!("float.from_bits %{i}"));
+        }
+        let lit = float_lit(self.rng);
+        self.def(T::F(w), &format!("float.const {lit}"))
+    }
+
+    /// One float op.
+    fn float_op(&mut self) {
+        let w = self.rng.pick(&[32, 64, 64]);
+        let t = T::F(w);
+        match self.rng.below(24) {
+            0..=4 => {
+                let op = self.rng.pick(&["add", "sub", "mul", "div", "copysign"]);
+                let (a, b) = (self.operand(t), self.operand(t));
+                self.def(t, &format!("float.{op} {a}, {b}"));
+            }
+            5..=6 => {
+                let op = self.rng.pick(&["neg", "abs", "sqrt"]);
+                let a = self.operand(t);
+                self.def(t, &format!("float.{op} {a}"));
+            }
+            7 => {
+                let (a, b, c) = (self.operand(t), self.operand(t), self.operand(t));
+                self.def(t, &format!("float.fma {a}, {b}, {c}"));
+            }
+            8..=10 => {
+                let p = self.rng.pick(&[
+                    "oeq", "one", "olt", "ole", "ogt", "oge", "ord", "ueq", "une", "ult", "ule",
+                    "ugt", "uge", "uno",
+                ]);
+                let (a, b) = (self.operand(t), self.operand(t));
+                self.def(T::I(1), &format!("float.cmp.{p} {a}, {b}"));
+            }
+            11..=12 => {
+                if self.rng.chance(50) {
+                    let a = self.operand(T::F(32));
+                    self.def(T::F(64), &format!("float.ext {a}"));
+                } else {
+                    let a = self.operand(T::F(64));
+                    self.def(T::F(32), &format!("float.trunc {a}"));
+                }
+            }
+            13..=15 => {
+                let iw = self.rng.width(WIDTHS);
+                let s = self.rng.pick(&["s", "u"]);
+                let e = self.rng.pick(&["sat", "sat", "trap", "ub"]);
+                let a = self.operand(t);
+                self.def(T::I(iw), &format!("float.to_int.{s}.{e} {a}"));
+            }
+            16..=17 => {
+                let iw = self.rng.width(WIDTHS);
+                let s = self.rng.pick(&["s", "u"]);
+                let a = self.operand(T::I(iw));
+                self.def(t, &format!("int.to_float.{s} {a}"));
+            }
+            18 => {
+                let a = self.operand(T::I(w));
+                self.def(t, &format!("float.from_bits {a}"));
+            }
+            19 => {
+                let a = self.operand(t);
+                self.def(T::I(w), &format!("float.to_bits {a}"));
+            }
+            20 => {
+                let c = self.operand(T::I(1));
+                let (a, b) = (self.operand(t), self.operand(t));
+                self.def(t, &format!("select {c}, {a}, {b}"));
+            }
+            21 => match self.rng.below(3) {
+                0 => {
+                    self.def(t, "poison");
+                }
+                1 => {
+                    let a = self.operand(t);
+                    self.def(t, &format!("freeze {a}"));
+                }
+                _ => {
+                    let a = self.operand(t);
+                    self.def(t, &format!("copy {a}"));
+                }
+            },
+            _ => {
+                self.fconst(w);
+            }
+        }
     }
 
     fn konst(&mut self, w: u32) -> String {
@@ -778,6 +887,9 @@ impl Gen<'_> {
     }
 
     fn mem_type(&mut self) -> T {
+        if !self.rng.1 && self.rng.chance(12) {
+            return T::F(self.rng.pick(&[32, 64]));
+        }
         match self.rng.below(10) {
             0..=4 => T::I(self.rng.width(&[8, 16, 32, 32, 64, 64, 128])),
             5..=7 => T::P,
@@ -788,6 +900,9 @@ impl Gen<'_> {
     /// One random op (possibly with regions).
     fn stmt(&mut self) {
         self.ops_left = self.ops_left.saturating_sub(1);
+        if !self.rng.1 && self.rng.chance(14) {
+            return self.float_op();
+        }
         if !self.mfir && self.depth < 3 && self.rng.chance(4) {
             return self.try_op();
         }
@@ -1138,6 +1253,9 @@ impl Gen<'_> {
     fn state_type(&mut self) -> T {
         if !self.mfir && num_vtys() > 0 && self.rng.chance(15) {
             return T::V(self.rng.below(num_vtys() as u64) as u8);
+        }
+        if !self.rng.1 && self.rng.chance(12) {
+            return T::F(self.rng.pick(&[32, 64]));
         }
         if self.rng.chance(25) {
             T::P
@@ -1546,6 +1664,9 @@ impl Gen<'_> {
 
     /// A value type for a field or element.
     fn field_type(&mut self) -> T {
+        if !self.rng.1 && self.rng.chance(10) {
+            return T::F(self.rng.pick(&[32, 64]));
+        }
         match self.rng.below(12) {
             0..=1 => T::I(8),
             2 => T::I(16),
@@ -2030,6 +2151,8 @@ impl Gen<'_> {
         }
         match a {
             Agg::Scalar(T::I(w) | T::B(w)) => interesting(self.rng, *w).to_string(),
+            // A float's initializer is `zero` or its bytes.
+            Agg::Scalar(T::F(_)) => "zero".to_owned(),
             Agg::Scalar(T::P) => match self.rng.below(3) {
                 0 => "null".to_owned(),
                 1 if n > 0 => format!("@g{}", self.rng.below(n as u64)),
@@ -2398,8 +2521,61 @@ fn arg(rng: &mut Rng, t: T) -> String {
             }
         }
         T::P => if rng.chance(85) { "null" } else { "poison" }.to_owned(),
+        T::F(_) => {
+            if rng.chance(6) {
+                "poison".to_owned()
+            } else {
+                float_lit(rng).to_owned()
+            }
+        }
         T::B(_) | T::V(_) => unreachable!("byte and aggregate parameters are not generated"),
     }
+}
+
+/// A float literal, biased toward the edge cases (read in either format, rounded).
+fn float_lit(rng: &mut Rng) -> &'static str {
+    rng.pick(&[
+        "0.0",
+        "-0.0",
+        "1.0",
+        "-1.0",
+        "0.5",
+        "1.5",
+        "2.5",
+        "-2.5",
+        "0.1",
+        "3.0",
+        "100.0",
+        "1e-7",
+        "inf",
+        "-inf",
+        "nan",
+        "-nan",
+        "nan(0x1)",
+        "-nan(0x2a)",
+        "nan(0x400001)",
+        "5e-324",
+        "1e-310",
+        "2.2250738585072014e-308",
+        "1.7976931348623157e308",
+        "1e-45",
+        "1.1754944e-38",
+        "3.4028235e38",
+        "16777217.0",
+        "9007199254740993.0",
+        "2147483647.5",
+        "-2147483648.0",
+        "4294967296.0",
+        "9223372036854775807.0",
+        "-9223372036854775808.0",
+        "18446744073709551616.0",
+        "127.5",
+        "-128.5",
+        "255.5",
+        "-0.75",
+        "1e300",
+        "1e30",
+    ])
 }
 
 /// A random program.
@@ -2440,6 +2616,8 @@ pub fn program(rng: &mut Rng) -> Program {
                     t
                 } else if rng.chance(if i == 0 { 15 } else { 55 }) {
                     T::P
+                } else if !narrow && rng.chance(15) {
+                    T::F(rng.pick(&[32, 64]))
                 } else {
                     T::I(rng.width(&[1, 8, 32, 64, 7, 128]))
                 }
@@ -2448,6 +2626,7 @@ pub fn program(rng: &mut Rng) -> Program {
         let rets: Vec<T> = (0..rng.below(3))
             .map(|_| match pick_v(rng, 15) {
                 Some(t) => t,
+                None if !narrow && rng.chance(15) => T::F(rng.pick(&[32, 64])),
                 None => match rng.below(10) {
                     0..=1 => T::P,
                     2 => T::B(rng.pick(&[8, 32])),
@@ -2463,6 +2642,8 @@ pub fn program(rng: &mut Rng) -> Program {
             .map(|_| {
                 if rng.chance(55) {
                     T::P
+                } else if !narrow && rng.chance(10) {
+                    T::F(rng.pick(&[32, 64]))
                 } else {
                     T::I(rng.width(&[1, 8, 32, 64, 128]))
                 }
@@ -2470,6 +2651,7 @@ pub fn program(rng: &mut Rng) -> Program {
             .collect();
         let rets: Vec<T> = (0..rng.below(3))
             .map(|_| match rng.below(10) {
+                _ if !narrow && rng.chance(8) => T::F(rng.pick(&[32, 64])),
                 0..=2 => T::P,
                 3 => T::B(rng.pick(&[8, 32])),
                 _ => T::I(rng.width(&[1, 8, 32, 64, 65, 128])),

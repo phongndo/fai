@@ -418,6 +418,19 @@ impl<'a> Replay<'a> {
                 made = None;
                 new_op = Some(f.cf_check(reason, ops[0])?);
             }
+            OpKind::FloatConst { value } => made = one(f.float_const(res[0], value)?),
+            OpKind::FloatBin(o) => made = one(f.float_bin(o, ops[0], ops[1])?),
+            OpKind::FloatUn(o) => made = one(f.float_un(o, ops[0])?),
+            OpKind::FloatFma => made = one(f.float_fma(ops[0], ops[1], ops[2])?),
+            OpKind::FloatCmp(p) => made = one(f.float_cmp(p, ops[0], ops[1])?),
+            OpKind::FloatExt => made = one(f.float_ext(res[0], ops[0])?),
+            OpKind::FloatTrunc => made = one(f.float_trunc(res[0], ops[0])?),
+            OpKind::FloatToInt { signed, edge } => {
+                made = one(f.float_to_int(res[0], signed, edge, ops[0])?)
+            }
+            OpKind::IntToFloat { signed } => made = one(f.int_to_float(res[0], signed, ops[0])?),
+            OpKind::FloatFromBits => made = one(f.float_from_bits(res[0], ops[0])?),
+            OpKind::FloatToBits => made = one(f.float_to_bits(res[0], ops[0])?),
             OpKind::Try => {
                 // The `_begin` form, positioned by hand, as the C API builds it; the builder makes
                 // the catch region's parameter.
@@ -627,8 +640,12 @@ fn check_rebuilds(name: &str, m: &Module, fails: &mut Vec<String>) {
 #[test]
 fn builder_rebuilds_random_programs() {
     let mut fails = Vec::new();
-    for k in 0..300 {
-        let mut rng = progs::Rng::new(0x5eed ^ (k << 20));
+    // `FIR_FUZZ=N` rebuilds N programs, and `FIR_FUZZ_SEED=S` picks other ones.
+    let count = std::env::var("FIR_FUZZ").map_or(300, |s| s.parse().expect("FIR_FUZZ"));
+    let seed: u64 =
+        std::env::var("FIR_FUZZ_SEED").map_or(0x5eed, |s| s.parse().expect("FIR_FUZZ_SEED"));
+    for k in 0..count {
+        let mut rng = progs::Rng::new(seed ^ (k << 20));
         let prog = progs::program(&mut rng);
         let m = parse_module(&prog.text).unwrap();
         verify_module(&m).unwrap();

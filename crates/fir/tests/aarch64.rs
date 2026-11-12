@@ -7,8 +7,9 @@
 //! AArch64, under `qemu-aarch64` elsewhere), and compared with `fir run`:
 //!
 //! * A fixture is compiled with only the functions its runs reach; a run whose functions the
-//!   backend can't compile (holes, integers wider than 64 bits, other data layouts) is skipped
-//!   and counted, and the rest of its file still runs.
+//!   backend can't compile (holes, integers wider than 64 bits, other data layouts, floats until
+//!   floats on AArch64 land) is skipped and counted, and the rest of its file still runs. The
+//!   backend rejects every float with a compile error; those runs are counted on their own.
 //! * External functions are stubs that print the event and return zeros, as `fir run`'s world
 //!   does. Traps reach the test runtime's `__fir_trap`, which prints the reason and location.
 //!   An exception that leaves the called function is pending in the runtime's `__fir_exn` when
@@ -916,6 +917,12 @@ fn fixtures_run_natively() {
         for (f, a) in runs {
             match compiles(&prune(&m, &[&f])) {
                 Ok(()) => kept.push((f, a)),
+                Err(e) if e.contains("is a float, which the AArch64 backend doesn't support") => {
+                    tally
+                        .lock()
+                        .unwrap()
+                        .count("run skipped: floats (not compiled yet)");
+                }
                 Err(e) => {
                     eprintln!("  {name}: @{f}: not compiled: {e}");
                     tally.lock().unwrap().count("run skipped: not compiled");
