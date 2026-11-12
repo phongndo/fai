@@ -33,7 +33,11 @@
 //! physical register by name takes it from any virtual one), met by intersection at joins:
 //! every read of a virtual register must find its physical register holding it. Spill slots
 //! belong to one virtual register each, so they always do.
-//! It runs on every allocation in debug builds; proving it in Lean is the trust round's.
+//! It runs on every allocation in debug builds, and checks the assignment only: it says nothing
+//! about the spill code, the rewriting, or the frame. The required check is
+//! [`super::regcheck::validate`], which runs in every build on the code this module actually
+//! produces (after rewriting, spilling, and frame lowering), given nothing but the code before
+//! and after; [`apply_assignment`] commits only what it approves. Neither is proved in Lean.
 //!
 //! **Frame lowering** then fills in the prologue's frame size (the callee-saved registers the
 //! allocation used, the spill slots, the locals, and the outgoing arguments), realigns `sp` when
@@ -112,18 +116,18 @@ fn key(r: Reg) -> Option<u32> {
 }
 
 /// The registers each instruction reads and writes, calls included.
-struct Effects {
-    defs: Vec<Reg>,
-    uses: Vec<Reg>,
+pub(super) struct Effects {
+    pub(super) defs: Vec<Reg>,
+    pub(super) uses: Vec<Reg>,
 }
 
 /// The calls the code makes and the function's own results: what [`effects`] needs.
-struct Shapes<'a> {
-    callees: &'a [CallShape],
-    own: &'a CallShape,
+pub(super) struct Shapes<'a> {
+    pub(super) callees: &'a [CallShape],
+    pub(super) own: &'a CallShape,
 }
 
-fn effects(f: &MFunc, sh: &Shapes<'_>, i: Inst, out: &mut Effects) {
+pub(super) fn effects(f: &MFunc, sh: &Shapes<'_>, i: Inst, out: &mut Effects) {
     i.regs(&mut out.defs, &mut out.uses);
     let indirect;
     let shape = match i {
@@ -154,22 +158,101 @@ fn effects(f: &MFunc, sh: &Shapes<'_>, i: Inst, out: &mut Effects) {
     out.defs.extend(FP_CALLER_SAVED.iter().map(|&r| Reg::d(r)));
 }
 
-/// Allocate registers for `f`, rewriting it in place, then lower its frame. `shapes` gives each
-/// callee's argument and result registers; `own` the function's own.
-pub fn allocate(f: &mut MFunc, shapes: &[CallShape], own: &CallShape) -> Assignment {
+/// Allocate registers for `f`, rewriting it in place, then lower its frame, and validate the
+/// result against the code before ([`super::regcheck::validate`], in every build). `shapes`
+/// gives each callee's argument and result registers; `own` the function's own. On an error `f`
+/// is left as it was.
+pub fn allocate(
+    f: &mut MFunc,
+    shapes: &[CallShape],
+    own: &CallShape,
+) -> Result<Assignment, String> {
     let sh = Shapes {
         callees: shapes,
         own,
     };
     let a = assign(f, &sh);
-    if cfg!(debug_assertions)
-        && let Err(e) = check(f, &sh, &a)
-    {
-        panic!("register allocation of function {} is wrong: {e}", f.index);
+    if cfg!(debug_assertions) {
+        check(f, &sh, &a)
+            .map_err(|e| format!("register allocation of function {} is wrong: {e}", f.index))?;
     }
-    rewrite(f, &a);
-    lower_frame(f);
-    a
+    apply_assignment(f, shapes, own, &a)?;
+    Ok(a)
+}
+
+/// The assignment linear scan picks for `f` (no rewriting). Public for the validator's tests.
+pub fn assignment(f: &MFunc, shapes: &[CallShape], own: &CallShape) -> Assignment {
+    assign(
+        f,
+        &Shapes {
+            callees: shapes,
+            own,
+        },
+    )
+}
+
+/// Rewrite `f` with assignment `a`, lower its frame, and validate the result; on an error `f`
+/// stays as it was. [`allocate`] uses it with its own assignment; tests use it with corrupted
+/// ones, to see the validator refuse them. The assignment is a proposal, not an approval: its
+/// homes are checked first (`check_homes`: each virtual register's home suits its class, and no
+/// two share a slot), then the code it produces is validated against `f` as it is, and only the
+/// validator's approval, which owns that code and borrows `f`, can commit it.
+pub fn apply_assignment(
+    f: &mut MFunc,
+    shapes: &[CallShape],
+    own: &CallShape,
+    a: &Assignment,
+) -> Result<(), String> {
+    if a.homes.len() != f.nvregs as usize {
+        return Err(format!(
+            "assignment has {} homes for {} virtual registers",
+            a.homes.len(),
+            f.nvregs
+        ));
+    }
+    // Each slot belongs to one virtual register: more slots than registers is no allocation
+    // (and would size the checks' tables by an untrusted number).
+    if a.slots > f.nvregs {
+        return Err(format!(
+            "assignment has {} slots for {} virtual registers",
+            a.slots, f.nvregs
+        ));
+    }
+    check_homes(f, a)?;
+    let spills = a
+        .slots
+        .checked_mul(8)
+        .and_then(|n| n.checked_add(15))
+        .map(|n| n / 16 * 16);
+    if spills
+        .and_then(|n| n.checked_add(f.frame.outgoing))
+        .and_then(|n| n.checked_add(f.frame.locals))
+        .and_then(|n| n.checked_add(160))
+        .is_none()
+    {
+        return Err("assignment's frame size overflows".to_owned());
+    }
+    let mut out = f.clone();
+    rewrite(&mut out, a);
+    lower_frame(&mut out);
+    super::regcheck::validate(f, out, shapes, own)
+        .map_err(|e| format!("register allocation and frame lowering failed validation: {e}"))?
+        .apply();
+    Ok(())
+}
+
+/// Whether the instructions after the prologue's placeholder are instruction selection's
+/// realignment of `sp` (`mov x16, sp`; `and sp, x16, #-align`), which the frame lowering replaces.
+pub(super) fn placeholder_realign(f: &MFunc) -> bool {
+    let at = f.frame.alloc_at as usize;
+    let x16 = Reg::x(16);
+    matches!(
+        f.insts.get(at + 1..at + 3),
+        Some(&[
+            Inst::Mov { sf: Sf::X, d, n: Reg::SP },
+            Inst::AluImm { op: AluImmOp::And, sf: Sf::X, d: Reg::SP, n, imm },
+        ]) if d == x16 && n == x16 && imm == -i64::from(f.frame.align)
+    )
 }
 
 /// Each block's successors.
@@ -882,6 +965,10 @@ fn lower_frame(f: &mut MFunc) {
                     None,
                 );
             }
+        }
+        // Instruction selection's own realignment, right after the placeholder: replaced below.
+        if fr.align > 16 && (i == alloc_at + 1 || i == alloc_at + 2) && placeholder_realign(f) {
+            continue;
         }
         if i != alloc_at {
             out.push(f.insts[i], f.locs[i]);

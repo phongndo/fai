@@ -722,7 +722,10 @@ fn builder_rebuilds_backend_lfir() {
         let m = &m;
         let Ok(mut mm) = a64::select(m) else { return };
         let before = a64::lfir::to_module(m, &mm);
-        a64::allocate(m, &mut mm);
+        if let Err(e) = a64::allocate(m, &mut mm) {
+            fails.push(format!("{name}: {e}"));
+            return;
+        }
         let after = a64::lfir::to_module(m, &mm);
         for (stage, l) in [("vregs", before), ("allocated", after)] {
             if let Err(e) = verify_module(&l) {

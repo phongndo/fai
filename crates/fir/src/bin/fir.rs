@@ -204,7 +204,7 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     if emit == Some("lfir-vregs") {
         return write(a64::lfir::to_module(&m, &mm).render(true));
     }
-    a64::allocate(&m, &mut mm);
+    a64::allocate(&m, &mut mm).map_err(fail)?;
     match emit {
         Some("lfir") => return write(a64::lfir::to_module(&m, &mm).render(true)),
         Some("asm") => return write(a64::emit::emit(&m, &mm, &o)),

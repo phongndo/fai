@@ -1232,6 +1232,31 @@ impl Sel<'_, '_> {
             n: Reg::SP,
             imm: i64::from(out.frame.outgoing + out.frame.locals),
         };
+        // A local aligned beyond 16 needs `sp` realigned, before allocation too, so that the
+        // code that runs as it is puts such a local where its alignment says (`ptr.addr` shows
+        // it). The frame lowering replaces this pair with its own.
+        if out.frame.align > 16 {
+            let x16 = Reg::x(16);
+            let realign = [
+                Inst::Mov {
+                    sf: Sf::X,
+                    d: x16,
+                    n: Reg::SP,
+                },
+                Inst::AluImm {
+                    op: AluImmOp::And,
+                    sf: Sf::X,
+                    d: Reg::SP,
+                    n: x16,
+                    imm: -i64::from(out.frame.align),
+                },
+            ];
+            out.insts.splice(5..5, realign);
+            out.locs.splice(5..5, [None, None]);
+            for b in out.blocks.iter_mut().filter(|b| **b > 4) {
+                *b += 2;
+            }
+        }
         out
     }
 

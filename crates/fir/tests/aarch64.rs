@@ -686,7 +686,7 @@ fn lfir_modules(m: &Module) -> Result<[Module; 2], String> {
     let before = a64::lfir::to_module(m, &mm);
     fir::verify_module(&before)
         .map_err(|e| format!("LFIR before allocation doesn't verify: {e}"))?;
-    a64::allocate(m, &mut mm);
+    a64::allocate(m, &mut mm)?;
     let after = a64::lfir::to_module(m, &mm);
     fir::verify_module(&after).map_err(|e| format!("LFIR after allocation doesn't verify: {e}"))?;
     Ok([before, after])

@@ -16,6 +16,7 @@ pub mod isel;
 pub mod lfir;
 pub mod mir;
 pub mod regalloc;
+pub mod regcheck;
 pub mod syntax;
 
 pub use emit::{Options, Os};
@@ -30,7 +31,7 @@ use mir::MModule;
 
 /// Each callee's argument and result registers, by callee index (functions, then external
 /// functions).
-fn shapes(m: &Module) -> Vec<abi::CallShape> {
+pub fn shapes(m: &Module) -> Vec<abi::CallShape> {
     let mut out: Vec<abi::CallShape> = m
         .funcs
         .iter()
@@ -61,22 +62,31 @@ pub fn select(m: &Module) -> Result<MModule, String> {
     Ok(mm)
 }
 
-/// Allocate registers and lay out the frames of every function, in parallel.
-pub fn allocate(m: &Module, mm: &mut MModule) {
+/// Allocate registers and lay out the frames of every function, in parallel, validating each
+/// function's result ([`regcheck::validate`]). The first function that fails validation is the
+/// error.
+pub fn allocate(m: &Module, mm: &mut MModule) -> Result<(), String> {
     let shapes = shapes(m);
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let chunk = mm.funcs.len().div_ceil(threads).max(16);
-    std::thread::scope(|s| {
-        for part in mm.funcs.chunks_mut(chunk) {
-            let shapes = &shapes;
-            s.spawn(move || {
-                for f in part {
-                    let own = &shapes[f.index as usize];
-                    regalloc::allocate(f, shapes, own);
-                }
-            });
-        }
+    let results: Vec<Result<(), String>> = std::thread::scope(|s| {
+        let handles: Vec<_> = mm
+            .funcs
+            .chunks_mut(chunk)
+            .map(|part| {
+                let shapes = &shapes;
+                s.spawn(move || {
+                    for f in part {
+                        let own = &shapes[f.index as usize];
+                        regalloc::allocate(f, shapes, own)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    results.into_iter().collect()
 }
 
 /// A variadic function, external function, or call through a variadic signature of the module,
@@ -122,6 +132,6 @@ pub fn compile(m: &Module, o: &Options) -> Result<String, String> {
         ));
     }
     let mut mm = select(m)?;
-    allocate(m, &mut mm);
+    allocate(m, &mut mm)?;
     Ok(emit::emit(m, &mm, o))
 }
