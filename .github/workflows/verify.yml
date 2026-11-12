@@ -1,0 +1,33 @@
+# The required checks: the dev shell builds on every platform (`nix flake check`), and the full
+# verification passes on Linux (`cargo xtask verify full`: Lean from scratch, generated files,
+# the proof audit, formatting and lints, every Rust suite in debug and release with the Lean
+# reference and qemu required, the C API under AddressSanitizer, and the evidence that the work
+# ran). Its report is uploaded whether it passes or not.
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v16
+      - uses: DeterminateSystems/magic-nix-cache-action@v8
+      - name: Dev shell builds
+        run: nix flake check
+      - name: Full verification
+        run: nix develop -c cargo xtask verify full
+      - name: Upload the verification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-report
+          path: |
+            target/verify/report.json
+            target/verify/report.md
+            target/verify/proofs.md
