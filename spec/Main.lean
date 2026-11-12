@@ -6,7 +6,7 @@ import Fir
 ```
 fir-ref run FILE [@FUNC] [ARG...] [--fuel N]   run a function (default @main)
 fir-ref check FILE                             verify; list holes
-fir-ref fmt FILE [--no-locs]                   print canonical text
+fir-ref fmt FILE [--no-locs] [--unverified]    print canonical text (--unverified: parse only)
 fir-ref test PATH...                           run the test files (.fir) under PATH
 ```
 
@@ -150,7 +150,7 @@ def withModule (file : String) (k : Module → Array Hole → IO UInt32) : IO UI
 def usage : String := "usage:
   fir-ref run FILE [@FUNC] [ARG...] [--fuel N]
   fir-ref check FILE
-  fir-ref fmt FILE [--no-locs]
+  fir-ref fmt FILE [--no-locs] [--unverified]
   fir-ref test PATH..."
 
 def main (args : List String) : IO UInt32 := do
@@ -174,8 +174,13 @@ def main (args : List String) : IO UInt32 := do
           IO.println s!"hole ?{h.name}: {h.ty} {Loc.render h.loc}"
       pure 0
   | "fmt" :: file :: opts =>
-    withModule file fun m _ => do
+    let print (m : Module) : IO UInt32 := do
       IO.print (m.render (showLocs := !opts.contains "--no-locs"))
       pure 0
+    if opts.contains "--unverified" then
+      match parseModule (← IO.FS.readFile file) with
+      | .error e => IO.eprintln s!"{file}: {e}"; pure 1
+      | .ok m => print m
+    else withModule file fun m _ => print m
   | "test" :: paths@(_ :: _) => cmdTest paths
   | _ => IO.eprintln usage; pure 2

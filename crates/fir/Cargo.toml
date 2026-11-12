@@ -1,0 +1,9 @@
+[package]
+name = "fir"
+version = "0.1.0"
+description = "FIR: the compiler IR, checked against the Lean semantics in spec/"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+num-bigint = "0.4"
