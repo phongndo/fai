@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 // The API's version: the major version times 65536, plus the minor version.
-#define FIR_API_VERSION (1 << 16)
+#define FIR_API_VERSION ((1 << 16) | 1)
 
 // No id: what a call returns when it fails.
 #define FIR_INVALID UINT32_MAX
@@ -574,6 +574,14 @@ FirType fir_type_func(struct FirModule *m,
                       size_t nparams,
                       const FirType *rets,
                       size_t nrets);
+
+// A type's size and alignment in bytes, in the module's memory space (its data layout), as
+// `ty.size` and `ty.align` give them: what a frontend checks its own layout against. Scalars,
+// structs, and arrays have a layout; function and union types don't.
+FirStatus fir_type_layout(struct FirModule *m, FirType t, uint64_t *size, uint32_t *align);
+
+// The offset in bytes of field `index` of the struct type `t`, as `ty.offset` gives it.
+FirStatus fir_type_field_offset(struct FirModule *m, FirType t, uint32_t index, uint64_t *offset);
 
 // Declare a function `@name(params) -> rets`, to call it or take its address, and define it
 // with `fir_func_begin`.

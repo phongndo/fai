@@ -83,7 +83,7 @@ mod ops;
 pub use ops::*;
 
 /// The API's version: the major version times 65536, plus the minor version.
-pub const FIR_API_VERSION: u32 = 1 << 16;
+pub const FIR_API_VERSION: u32 = (1 << 16) | 1;
 
 /// No id: what a call returns when it fails.
 pub const FIR_INVALID: u32 = u32::MAX;
@@ -1083,6 +1083,90 @@ pub unsafe extern "C" fn fir_type_func(
         module_id(m, FIR_INVALID, |m| {
             let (ps, rs) = (tys(params, nparams)?, tys(rets, nrets)?);
             Ok(ty_to_c(m.mb.func_ty(&ps, &rs)?))
+        })
+    }
+}
+
+// Layout.
+
+/// A type of the module that has a layout in memory: a scalar, a struct, or an array.
+fn layout_ty(m: &FirModule, t: FirType) -> Result<Ty, Fail> {
+    let t = ty(t)?;
+    match t {
+        Ty::Agg(id) if id.index() >= m.mb.types().len() => fail(
+            FIR_ERR_INVALID,
+            format!("type {} is not a type of this module", id.index()),
+        ),
+        Ty::Agg(id) => match m.mb.types().shape(id) {
+            fir::Shape::Func(..) | fir::Shape::Union(_) => fail(
+                FIR_ERR_INVALID,
+                format!("{} has no layout in memory", m.mb.types().show(t)),
+            ),
+            _ => Ok(t),
+        },
+        _ => Ok(t),
+    }
+}
+
+/// A type's size and alignment in bytes, in the module's memory space (its data layout), as
+/// `ty.size` and `ty.align` give them: what a frontend checks its own layout against. Scalars,
+/// structs, and arrays have a layout; function and union types don't.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_type_layout(
+    m: *mut FirModule,
+    t: FirType,
+    size: *mut u64,
+    align: *mut u32,
+) -> FirStatus {
+    unsafe {
+        module_status(m, |m| {
+            let t = layout_ty(m, t)?;
+            let (s, a) = m.mb.types().dims(&m.mb.module().space, t);
+            let Ok(s) = u64::try_from(s) else {
+                return fail(
+                    FIR_ERR_INVALID,
+                    "the type is too large for the address space",
+                );
+            };
+            if let Some(size) = size.as_mut() {
+                *size = s;
+            }
+            if let Some(align) = align.as_mut() {
+                *align = u32::try_from(a).unwrap_or(u32::MAX);
+            }
+            Ok(())
+        })
+    }
+}
+
+/// The offset in bytes of field `index` of the struct type `t`, as `ty.offset` gives it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_type_field_offset(
+    m: *mut FirModule,
+    t: FirType,
+    index: u32,
+    offset: *mut u64,
+) -> FirStatus {
+    unsafe {
+        module_status(m, |m| {
+            let t = layout_ty(m, t)?;
+            let types = m.mb.types();
+            let Some(o) = types.field_offset(&m.mb.module().space, t, index) else {
+                return fail(
+                    FIR_ERR_INVALID,
+                    format!("{} has no field {index}", types.show(t)),
+                );
+            };
+            let Ok(o) = u64::try_from(o) else {
+                return fail(
+                    FIR_ERR_INVALID,
+                    "the offset is too large for the address space",
+                );
+            };
+            if let Some(offset) = offset.as_mut() {
+                *offset = o;
+            }
+            Ok(())
         })
     }
 }

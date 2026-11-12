@@ -1025,6 +1025,50 @@ static void exceptions(void) {
   fir_module_free(m);
 }
 
+/* Layout queries: a frontend checks its own layout (such as Clang's) against FIR's. */
+static void layout(void) {
+  FirModule *m = cur = fir_module_new();
+  FirType i8 = fir_type_int(8), i32 = fir_type_int(32), i64 = fir_type_int(64);
+  /* struct<C>{i8, i64, i32}: offsets 0, 8, 16; size 24, alignment 8. */
+  FirType fields[3] = {i8, i64, i32};
+  FirType s = ID(fir_type_struct(m, FIR_POLICY_C, fields, 3));
+  uint64_t size = 0, off = 0;
+  uint32_t align = 0;
+  OK(fir_type_layout(m, s, &size, &align));
+  CHECK(size == 24 && align == 8);
+  uint64_t want[3] = {0, 8, 16};
+  for (uint32_t i = 0; i < 3; i++) {
+    OK(fir_type_field_offset(m, s, i, &off));
+    CHECK(off == want[i]);
+  }
+  /* A zero-length array adds alignment and no size; arrays and scalars have layouts too. */
+  FirType aligned[2] = {ID(fir_type_array(m, 0, i64)), i8};
+  OK(fir_type_layout(m, ID(fir_type_struct(m, FIR_POLICY_C, aligned, 2)), &size, &align));
+  CHECK(size == 8 && align == 8);
+  OK(fir_type_layout(m, ID(fir_type_array(m, 3, s)), &size, &align));
+  CHECK(size == 72 && align == 8);
+  OK(fir_type_layout(m, FIR_TYPE_PTR, &size, NULL));
+  CHECK(size == 8);
+  /* Packed structs. */
+  FirType p = ID(fir_type_struct(m, FIR_POLICY_PACKED, fields, 3));
+  OK(fir_type_field_offset(m, p, 2, &off));
+  CHECK(off == 9);
+  /* No field 3, and function types have no layout. */
+  CHECK(fir_type_field_offset(m, s, 3, &off) == FIR_ERR_INVALID);
+  expect_error("struct<C>{i8, i64, i32} has no field 3", __LINE__);
+  CHECK(fir_type_layout(m, ID(fir_type_func(m, &i32, 1, NULL, 0)), &size, &align) ==
+        FIR_ERR_INVALID);
+  expect_error("func<(i32)> has no layout in memory", __LINE__);
+  fir_module_free(m);
+  /* Another data layout. */
+  FirModule *m32 = cur = fir_module_new();
+  OK(fir_module_set_space(m32, 32, 32, 0, NULL, 0));
+  FirType pi[2] = {FIR_TYPE_PTR, i64};
+  OK(fir_type_layout(m32, ID(fir_type_struct(m32, FIR_POLICY_C, pi, 2)), &size, &align));
+  CHECK(size == 16 && align == 8);
+  fir_module_free(m32);
+}
+
 int main(void) {
   CHECK(fir_api_version() == FIR_API_VERSION);
   blocks_loop();
@@ -1035,6 +1079,7 @@ int main(void) {
   lfir();
   building_blocks();
   exceptions();
+  layout();
   if (failures > 0) {
     fprintf(stderr, "%d checks failed\n", failures);
     return 1;
