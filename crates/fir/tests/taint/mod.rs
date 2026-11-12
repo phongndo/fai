@@ -25,10 +25,12 @@
 //! `cf.continue`, `cf.br`, `cf.cond_br`, `cf.switch`) and the loop's initial state, through calls
 //! (arguments to parameters, returns to results; an indirect call reaches every function and
 //! external function whose address is taken), and through exceptions (one abstract exception
-//! for the module). Every variadic argument passed to a FIR function flows to every `va.arg`
-//! (one abstract list for the module, which may be `poison`: a run may pass it), and `va.start`
-//! writes pointer bytes (the target's `va_list` holds addresses) that `va.end` replaces with
-//! `poison`.
+//! for the module). The variadic arguments a call passes join the summary of each function it
+//! can reach (one abstract list per function, which may be `poison`: a run may pass it).
+//! `va.start` writes pointer bytes (the target's `va_list` holds addresses) that name its
+//! function, and the names flow with the bytes (copies, a `va_list` passed by pointer or in a
+//! struct); a `va.arg` reads the summaries of the functions named by the `va_list` it reads.
+//! `va.end` replaces the bytes with `poison`.
 //!
 //! **Control.** A branch on a tainted value (`cf.if`, `cf.cond_br`, `cf.switch`, a call through
 //! a tainted pointer) taints the whole function: every value, store, trap, and event in it,
@@ -37,16 +39,21 @@
 //!
 //! **Outcomes.** A run's result at position `k` is tainted if the value its function returns
 //! there is; an external function's argument at position `k` if some call passes a tainted
-//! value there or makes the call under tainted control; a trap location if some op there has
-//! a tainted operand or runs under tainted control. [`Taint::exempt`] then excuses a difference
-//! only where each differing value is tainted and differs only in its numbers, or where the
-//! runs' events agree that way and one of them ends in an arithmetic or conversion trap at a
-//! tainted location while the other ends otherwise (the trapping run may have stopped before
-//! whatever ended the other; anything deterministic before it, both runs would have reached).
+//! value there or makes the call under tainted control; a trap with a reason at a location if
+//! some op there can trap with that reason (`.trap` arithmetic and division, shifts, and
+//! conversions, `cf.check`, and the other trapping ops) and every such op there has a tainted
+//! operand or runs under tainted control. [`Taint::exempt`] then excuses a difference only where
+//! each differing value is tainted and differs only in its numbers, or where the runs' events
+//! agree that way and one of them ends in an arithmetic or conversion trap that is tainted while
+//! the other ends otherwise (the trapping run may have stopped before whatever ended the other;
+//! anything deterministic before it, both runs would have reached).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use fir::{Body, Module, OpId, OpKind as K, OperandKind, Ovf, TruncMode, Ty, ValueId};
+use fir::{
+    AllocFail, Body, CvtEdge, Edge, Module, OpId, OpKind as K, OperandKind, Ovf, ShiftEdge,
+    TruncMode, Ty, ValueId,
+};
 
 /// Abstract objects: 0 is *wild*, any object; globals follow, then allocation sites.
 type Objs = BTreeSet<u32>;
@@ -63,16 +70,33 @@ struct Abs {
     ptr: bool,
     /// The objects those pointers may point into.
     pts: Objs,
+    /// The functions whose `va.start` may have written these bytes (a `va_list` cursor at their
+    /// variadic arguments).
+    va: BTreeSet<usize>,
 }
 
 impl Abs {
     fn join(&mut self, o: &Abs) -> bool {
-        let before = (self.taint, self.poison, self.ptr, self.pts.len());
+        let before = (
+            self.taint,
+            self.poison,
+            self.ptr,
+            self.pts.len(),
+            self.va.len(),
+        );
         self.taint |= o.taint;
         self.poison |= o.poison;
         self.ptr |= o.ptr;
         self.pts.extend(&o.pts);
-        before != (self.taint, self.poison, self.ptr, self.pts.len())
+        self.va.extend(&o.va);
+        before
+            != (
+                self.taint,
+                self.poison,
+                self.ptr,
+                self.pts.len(),
+                self.va.len(),
+            )
     }
 
     fn tainted(mut self, t: bool) -> Abs {
@@ -107,15 +131,52 @@ struct Analysis<'m> {
     sites: HashMap<(usize, OpId), u32>,
     /// What may be thrown.
     exn: Abs,
-    /// The variadic arguments passed to any FIR function, which `va.arg` may read.
-    va: Abs,
+    /// Per function, the variadic arguments the calls that may reach it pass.
+    va: Vec<Abs>,
     throws: bool,
     /// Functions and external functions whose address is taken.
     taken: Vec<usize>,
     taken_ext: Vec<usize>,
     events: Vec<Vec<bool>>,
-    traps: HashSet<Option<(u32, u32)>>,
+    /// Per op that can trap: its location, the reasons it can trap with, and whether it may
+    /// depend on addresses.
+    traps: HashMap<(usize, OpId), (Loc, &'static [&'static str], bool)>,
     changed: bool,
+}
+
+/// A trap's location as runs print it.
+type Loc = Option<(u32, u32)>;
+
+/// The reasons an op can trap with (`trap <reason>`), the arithmetic and conversion ones being
+/// those [`Taint::exempt`] may excuse.
+fn trap_reasons(k: K) -> &'static [&'static str] {
+    match k {
+        K::Arith(_, Ovf::Trap(_)) => &["overflow"],
+        K::Div(_, Edge::Trap, Edge::Trap) => &["div0", "overflow"],
+        K::Div(_, Edge::Trap, _) => &["div0"],
+        K::Div(_, _, Edge::Trap) => &["overflow"],
+        K::Shift(_, ShiftEdge::Trap) => &["shift"],
+        K::FloatToInt {
+            edge: CvtEdge::Trap,
+            ..
+        } => &["convert"],
+        K::Check(r) => match r {
+            fir::TrapReason::Div0 => &["div0"],
+            fir::TrapReason::Overflow => &["overflow"],
+            fir::TrapReason::Shift => &["shift"],
+            fir::TrapReason::Oom => &["oom"],
+            fir::TrapReason::Bounds => &["bounds"],
+            fir::TrapReason::Tag => &["tag"],
+            fir::TrapReason::Convert => &["convert"],
+        },
+        K::UnionGet { trap: true, .. } => &["tag"],
+        K::SliceGet { trap: true, .. } | K::SliceSet { trap: true, .. } => &["bounds"],
+        K::MemAlloc {
+            fail: AllocFail::Trap,
+            ..
+        } => &["oom"],
+        _ => &[],
+    }
 }
 
 /// The outcomes of a module's runs that may depend on addresses.
@@ -123,7 +184,8 @@ struct Analysis<'m> {
 pub struct Taint {
     rets: HashMap<String, Vec<bool>>,
     events: HashMap<String, Vec<bool>>,
-    traps: HashSet<Option<(u32, u32)>>,
+    /// The traps, by location and reason, that may depend on addresses.
+    traps: HashSet<(Loc, &'static str)>,
 }
 
 fn enclosing(b: &Body, op: OpId, pred: impl Fn(OpId) -> bool) -> Option<OpId> {
@@ -167,6 +229,7 @@ impl<'m> Analysis<'m> {
                     .iter()
                     .filter_map(|s| globals.get(s).copied())
                     .collect(),
+                va: BTreeSet::new(),
             });
             named.extend(syms);
         }
@@ -209,10 +272,13 @@ impl<'m> Analysis<'m> {
             objs,
             sites: HashMap::new(),
             exn: Abs::default(),
-            va: Abs {
-                poison: true,
-                ..Abs::default()
-            },
+            va: vec![
+                Abs {
+                    poison: true,
+                    ..Abs::default()
+                };
+                m.funcs.len()
+            ],
             throws,
             taken: Vec::new(),
             taken_ext: Vec::new(),
@@ -221,7 +287,7 @@ impl<'m> Analysis<'m> {
                 .iter()
                 .map(|x| vec![false; x.params.len()])
                 .collect(),
-            traps: HashSet::new(),
+            traps: HashMap::new(),
             changed: false,
         };
         for n in named {
@@ -315,7 +381,7 @@ impl<'m> Analysis<'m> {
             self.set(g, *p, &a);
         }
         for a in args.iter().skip(params.len()) {
-            self.changed |= self.va.join(&a.clone().tainted(c));
+            self.changed |= self.va[g].join(&a.clone().tainted(c));
         }
         if c {
             self.set_ctl(g);
@@ -422,8 +488,18 @@ impl<'m> Analysis<'m> {
         let args: Vec<Abs> = b.operands(op).iter().map(|&o| self.val(fi, o)).collect();
         let c = self.fns[fi].ctl;
         let any = |s: &[Abs]| s.iter().any(|a| a.taint);
-        if c || any(&args) {
-            self.traps.insert(b.loc(op).map(|l| (l.line, l.col)));
+        let reasons = trap_reasons(b.kind(op));
+        if !reasons.is_empty() {
+            let loc = b.loc(op).map(|l| (l.line, l.col));
+            let t = &mut self
+                .traps
+                .entry((fi, op))
+                .or_insert((loc, reasons, false))
+                .2;
+            if !*t && (c || any(&args)) {
+                *t = true;
+                self.changed = true;
+            }
         }
         let first = args.first().cloned().unwrap_or_default();
         let results: Vec<ValueId> = b.results(op).collect();
@@ -509,24 +585,35 @@ impl<'m> Analysis<'m> {
                 let v = self.read(&args[1].reach()).tainted(c || any(&args));
                 self.write(&args[0].reach(), &v);
             }
-            // A `va_list` holds addresses on the target (a cursor, `poison` to loads, in FIR).
+            // A `va_list` holds addresses on the target (a cursor, `poison` to loads, in FIR),
+            // and names the function whose variadic arguments it reads.
             K::VaStart => {
                 let v = Abs {
                     poison: true,
                     ptr: true,
                     pts: [WILD].into(),
+                    va: [fi].into(),
                     ..Abs::default()
                 };
                 self.write(&first.reach(), &v.tainted(c || first.taint));
             }
             K::VaArg => {
                 let cursor = self.read(&first.reach());
-                let v = self.va.clone().tainted(c || first.taint || cursor.taint);
-                res.push(Abs { poison: true, ..v });
+                let mut v = Abs::default();
+                for &g in &cursor.va {
+                    v.join(&self.va[g]);
+                }
+                let v = v.tainted(c || first.taint || cursor.taint);
+                res.push(Abs {
+                    poison: true,
+                    va: BTreeSet::new(),
+                    ..v
+                });
                 let w = Abs {
                     poison: true,
                     ptr: true,
                     pts: [WILD].into(),
+                    va: cursor.va,
                     ..Abs::default()
                 };
                 self.write(&first.reach(), &w.tainted(c || first.taint));
@@ -714,7 +801,17 @@ impl Taint {
                 .zip(a.events)
                 .map(|(x, e)| (x.name.clone(), e))
                 .collect(),
-            traps: a.traps,
+            traps: {
+                // A trap with a reason at a location may depend on addresses if every op there
+                // that can trap with it may (the trap may be any of theirs).
+                let mut by: HashMap<(Loc, &str), bool> = HashMap::new();
+                for &(loc, reasons, t) in a.traps.values() {
+                    for &r in reasons {
+                        *by.entry((loc, r)).or_insert(true) &= t;
+                    }
+                }
+                by.into_iter().filter(|e| e.1).map(|e| e.0).collect()
+            },
         }
     }
 
@@ -752,9 +849,10 @@ impl Taint {
                     .enumerate()
                     .all(|(k, (a, b))| value_ok(a, b, taint.get(k).copied().unwrap_or(false)));
         }
-        // One run traps where the other doesn't: allowed for an arithmetic or conversion trap,
-        // when every trap involved is at a tainted location.
-        let trap = |e: &str| -> Option<(bool, Option<(u32, u32)>)> {
+        // One run traps where the other doesn't: allowed for an arithmetic or conversion trap
+        // that may depend on addresses (an op there can trap with its reason, and every such op
+        // is tainted).
+        fn trap(e: &str) -> Option<(bool, (Loc, &str))> {
             let rest = e.strip_prefix("trap ")?;
             let (reason, loc) = match rest.split_once(" @") {
                 Some((r, l)) => {
@@ -764,10 +862,12 @@ impl Taint {
                 None => (rest, None),
             };
             let arith = ["overflow", "div0", "shift", "convert"].contains(&reason);
-            Some((arith, loc))
-        };
-        let traps: Vec<_> = [we, ge].into_iter().filter_map(trap).collect();
-        traps.iter().any(|t| t.0 && self.traps.contains(&t.1))
+            Some((arith, (loc, reason)))
+        }
+        [we, ge]
+            .into_iter()
+            .filter_map(trap)
+            .any(|(arith, t)| arith && self.traps.contains(&t))
     }
 
     fn event_ok(&self, want: &str, got: &str) -> bool {

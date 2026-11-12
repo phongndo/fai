@@ -1289,6 +1289,128 @@ fn address_exemptions_need_tainted_outcomes() {
 }
 
 #[test]
+fn variadic_arguments_taint_only_their_callees() {
+    // An address passed to one variadic function doesn't reach another's `va.arg`.
+    let text = |to: &str| {
+        format!(
+            "func @discard(...) -> i64 {{
+               %z: i64 = int.const 0
+               func.ret %z
+             }}
+             func @take(...) -> i64 {{
+               %ap: ptr = mem.stack.of va_list, align 8
+               va.start %ap
+               %x: i64 = va.arg %ap
+               func.ret %x
+             }}
+             func @main() -> i64 {{
+               %p: ptr = mem.stack 8, align 8
+               %a: i64 = ptr.addr %p
+               %u: i64 = func.call @{to}(... %a)
+               %n: i64 = int.const 42
+               %r: i64 = func.call @take(... %n)
+               func.ret %r
+             }}"
+        )
+    };
+    assert!(!taint_of(&text("discard")).exempt("main", "returned i64 42", "returned i64 99"));
+    assert!(taint_of(&text("take")).exempt("main", "returned i64 42", "returned i64 99"));
+    // Through a `va_list` passed to another function, `va.arg` reads the arguments of the
+    // function whose `va.start` filled it, and only those.
+    let text = |to: &str| {
+        format!(
+            "func @read(%ap: ptr) -> i64 {{
+               %x: i64 = va.arg %ap
+               func.ret %x
+             }}
+             func @outer(...) -> i64 {{
+               %ap: ptr = mem.stack.of va_list, align 8
+               va.start %ap
+               %aq: ptr = mem.stack.of va_list, align 8
+               mem.copy va_list %aq, %ap, align 8
+               %x: i64 = func.call @read(%aq)
+               func.ret %x
+             }}
+             func @other(...) -> i64 {{
+               %z: i64 = int.const 0
+               func.ret %z
+             }}
+             func @main() -> i64 {{
+               %p: ptr = mem.stack 8, align 8
+               %a: i64 = ptr.addr %p
+               %u: i64 = func.call @{to}(... %a)
+               %n: i64 = int.const 42
+               %r: i64 = func.call @outer(... %n)
+               func.ret %r
+             }}"
+        )
+    };
+    assert!(!taint_of(&text("other")).exempt("main", "returned i64 42", "returned i64 99"));
+    assert!(taint_of(&text("outer")).exempt("main", "returned i64 42", "returned i64 99"));
+    // An indirect call reaches every variadic function whose address is taken.
+    let t = taint_of(
+        "func @take(...) -> i64 {
+           %ap: ptr = mem.stack.of va_list, align 8
+           va.start %ap
+           %x: i64 = va.arg %ap
+           func.ret %x
+         }
+         func @main() -> i64 {
+           %f: ptr = func.addr @take
+           %p: ptr = mem.stack 8, align 8
+           %a: i64 = ptr.addr %p
+           %u: i64 = func.call.indirect func<(...) -> i64> %f(... %a)
+           %n: i64 = int.const 42
+           %r: i64 = func.call @take(... %n)
+           func.ret %r
+         }",
+    );
+    assert!(t.exempt("main", "returned i64 42", "returned i64 99"));
+}
+
+#[test]
+fn only_ops_that_can_trap_excuse_traps() {
+    // A tainted op that can't trap excuses no trap at its location.
+    let text = |op: &str| {
+        format!(
+            "func @main() -> i64 {{
+               %p: ptr = mem.stack 8, align 8
+               %a: i64 = ptr.addr %p
+               %unused: i64 = {op} %a, %a @9:9
+               %r: i64 = int.const 42
+               func.ret %r
+             }}"
+        )
+    };
+    let t = taint_of(&text("int.add.wrap"));
+    assert!(!t.exempt("main", "returned i64 42", "trap overflow @9:9"));
+    // One that can excuses its own reason, and no other.
+    let t = taint_of(&text("int.add.s.trap"));
+    assert!(t.exempt("main", "returned i64 42", "trap overflow @9:9"));
+    assert!(!t.exempt("main", "returned i64 42", "trap div0 @9:9"));
+    let t = taint_of(&text("int.div.s.trap"));
+    assert!(t.exempt("main", "returned i64 42", "trap div0 @9:9"));
+    assert!(t.exempt("main", "returned i64 42", "trap overflow @9:9"));
+    assert!(!t.exempt("main", "returned i64 42", "trap shift @9:9"));
+    let t = taint_of(&text("int.shl.trap"));
+    assert!(t.exempt("main", "returned i64 42", "trap shift @9:9"));
+    assert!(!t.exempt("main", "returned i64 42", "trap overflow @9:9"));
+    // Where an untainted op at the same location can trap with the same reason, the trap may
+    // be its: not excused.
+    let t = taint_of(
+        "func @main(%x: i64) -> i64 {
+           %p: ptr = mem.stack 8, align 8
+           %a: i64 = ptr.addr %p
+           %u: i64 = int.add.s.trap %a, %a @9:9
+           %v: i64 = int.add.s.trap %x, %x @9:9
+           %r: i64 = int.const 42
+           func.ret %r
+         }",
+    );
+    assert!(!t.exempt("main", "returned i64 42", "trap overflow @9:9"));
+}
+
+#[test]
 fn pointer_bytes_taint_only_where_pointers_go() {
     // A pointer stored in one slot makes integer loads from it tainted, not from another.
     let text = |from: &str| {
