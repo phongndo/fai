@@ -451,8 +451,8 @@ Instruction selection, Backend testing, Builder API, API.
   ABI's unit and the backend classifies. HFIR's semantics of aggregate calls is unchanged, and
   MFIR's composites are the same tuples of leaves.
 - **AAPCS64** (`spec/Fir/AArch64Abi.lean`, twin `abi.rs`): empty composites take nothing; HFAs
-  (one to four floats of one format, no padding, no zero-length array: GCC's rule) take FP
-  registers or, closing them, the stack; up to 16 bytes take one or two `x` registers (even
+  (one to four floats of one format tiling the type in memory, in any declared order, no
+  zero-length array: GCC's rule) take FP registers in memory order or, closing them, the stack; up to 16 bytes take one or two `x` registers (even
   first if 16-byte aligned) or, closing them, the stack; larger ones are a pointer to a copy in
   the caller's frame; results go where the first argument would, or at `x8`. Variadic composites
   go as named ones and `va.arg` follows AAPCS64's algorithm (general-purpose or FP save area,
@@ -462,7 +462,10 @@ Instruction selection, Backend testing, Builder API, API.
   that a composite's register pieces are its bytes (`pieces_flatten`), that a defined piece put in
   a register and stored back is itself, a pointer's eight fragments that pointer
   (`Word.bytes_ofBytes`), and so that registers carry a composite's defined bytes exactly
-  (`roundTrip`). `lowerFunc_refines` covers what it covered (functions with no aggregate
+  (`roundTrip`); and, for pieces partly undefined (padding, `poison` leaves), that any words
+  holding them give back every defined byte in place (`arrives`), that the machine's word for a
+  piece holds it (`Word.holds_fill`), and that a pointer leaf of a composite that doesn't split a
+  pointer is its register's pointer, provenance included (`ptrLeaf_inReg`). `lowerFunc_refines` covers what it covered (functions with no aggregate
   values; one that passes a struct has one).
 - **Semantics (Lean, both interpreters):** external functions take and give structs and arrays
   (a struct result only alone); their events show them as values, pointers in their leaves are
@@ -474,7 +477,9 @@ Instruction selection, Backend testing, Builder API, API.
 - **Backend:** a composite value is its leaves' registers; isel packs them into words (a
   pointer that fills a word moves as it is, keeping its provenance) or FP registers, stores
   them to the stack, a frame copy, or `x8`'s memory, and unpacks them where they arrive;
-  `va.arg` of a composite, and variadic functions' save areas counted with composites. The
+  `va.arg` of a composite, and variadic functions' save areas counted with composites. A
+  composite passed as words whose pointer leaf doesn't fill a word (a packed pointer) is refused
+  as a parameter, argument, or result: a compile error. The
   allocator's call shapes come from the ABI (blr's precomputed per signature).
 - **Text:** an op with no operands and no location no longer swallows the next line's result
   (`agg.make` of an empty composite, which the lowering emits): a `%name` followed by `:`
@@ -492,7 +497,9 @@ Instruction selection, Backend testing, Builder API, API.
   aligned structs, HFAs of 1 to 4 members) compiled by the cross GCC and FIR, each side calling
   the other directly and through `...`, every leaf reported and compared; 25 seeds of 1,000
   signatures each (about 14,000 leaves per seed in each of four directions) pass. It found GCC's
-  HFA rule: a struct of floats with a zero-length array (even of floats) isn't one.
+  HFA rule: a struct of floats with a zero-length array (even of floats) isn't one. (Since the
+  review below it also has `auto` structs, reordered HFAs, twins through `...`, register
+  exhaustion, FIR-to-FIR calls, dereferenced pointers, and interpreter runs.)
   `tests/capi/e2e.c` builds a module through the C API that C calls with every class (a large
   struct whose copy the callee keeps to itself), that calls C with them directly and through
   `...`, and reads C's composite variadic arguments, natively with and without `-O`, and checks
@@ -504,17 +511,54 @@ Instruction selection, Backend testing, Builder API, API.
   runs (each with and without `-O`) pass structs by value. Seed 71 is the same except one
   program (`s71-p534`, no composites in it), whose exposed address of an 8-aligned zero-size
   stack slot is 16-aligned natively and in LFIR: every interpreter layout keeps bit 3 set, so
-  main's moved-bits rule counts it as a difference; main fails it alike as a fixture (open). The
+  main's moved-bits rule counts it as a difference (fixed by the review below). The
   native harness declares C structs of each composite's layout and class and prints them as
   `fir run` renders them. Its direct selection of HFIR (main's coverage builds) found that isel
   took a struct among several results, which only the lowering may scalarize, as one register:
   it refuses it now, as HFIR only. `cargo xtask verify full` requires the ABI torture test's
   evidence (240 signatures).
+- **Review fixes:** (1) HFAs were classified in declared order, so a `struct<auto>` whose layout
+  puts a later field first (`struct<auto>{struct<packed>{f32}, f32}`, leaves at 4 and 0) went in
+  `x0` where GCC and Clang use `s0`, `s1`: `hfaOf?` and `hfa_of` now check that the floats tile
+  the type in memory, and isel assigns HFA registers in memory order (`abi::hfa_order`, for
+  arguments, results, parameters, and `va.arg`'s FP save area slots); `tests/abi/order.fir` fails
+  natively on the old classification. The words path and `va.arg` of words already went by
+  offset. (2) A packed pointer split across `x` register words crossed as address bits, so a
+  `read(args)` callee reached less in LFIR than in MFIR: instruction selection refuses such
+  composites (`Ty.splitsPtr`, `abi::splits_ptr`) as parameters, arguments, and results, rather
+  than carrying fragments through registers; `review_split_pointers_are_refused`, and the native
+  harness counts the refusal as a declared limit. (3) `arrives`, `Word.holds_fill`, and
+  `ptrLeaf_inReg` cover pieces with padding and `poison` (registered claims); the decision row
+  says what remains tested rather than proved, and that byte leaves holding pointer fragments
+  still cross as address bits (open). (4) The native harness's moved-bits rule took "forced"
+  low bits from first-fit layouts that agreed by accident (`s71-p534`): `Addresses::Scatter`
+  layouts flip each allocation's alignment bit, so only bits alignment forces stay fixed;
+  `s71-p534` passes. (5) The torture test now generates `auto` structs and reordered HFAs,
+  passes non-C composites through `...` as twins, compiles every signature with and without
+  `-O`, exhausts each register class in a third of the signatures (counted by its own AAPCS64)
+  and passes scalars after a composite on the stack, calls FIR from FIR, dereferences every
+  pointer where it arrives, runs FIR's calls in the interpreter as MFIR and LFIR (events must
+  agree, provenance included), and checks that split pointers are refused; `cargo xtask verify
+  full` requires each of those counts to be nonzero. With the old classification or without the
+  refusal it fails. Seed 1 (240 signatures): 236 compiled with and without `-O`, 4,218 leaves
+  each way, 178 through `...` (180 composites as twins), 79 exhausting the `x` registers and 67
+  the FP ones, 98 passing a scalar after a composite on the stack, 120 with `struct<auto>`, 9
+  with a reordered HFA, 4 refused, 1,416 interpreter runs agreeing; seeds 2 to 6 at 1,000
+  signatures each pass (246 to 269 exhausting `x`, 268 to 293 FP, 14 to 23 refused, 24 to 38
+  reordered HFAs per seed). `FIR_FUZZ=3000` for `fuzz.rs`, `opt.rs`, `builder.rs`, and
+  `aarch64.rs` on seeds 67, 71, 73, and 79: no differences (`s71-p534` included); per seed 473 to
+  500 modules pass composites to or from external functions, 146 to 172 through `...`, 35 to 48
+  read them with `va.arg`, 707 to 835 native runs (each with and without `-O`) pass structs by
+  value, and 1 to 7 runs are skipped as a declared limit for a split pointer.
 - **API:** version 1.5 (no new functions; external and MFIR functions take composites).
 - **Not yet:** `fai-cc`'s structs by value (done in track F2c); macOS's stack packing (composites
   on the stack are a compile error there); integer leaves wider than 64 bits in a passed composite
   (`__int128` fields: the backend rejects them); composites in MFIR region state and memory
-  accesses (the lowering never makes them; isel rejects them); other targets' classifications.
+  accesses (the lowering never makes them; isel rejects them); other targets' classifications;
+  packed pointers split across register words (refused); byte leaves holding pointer fragments
+  other than one whole pointer in a word (they cross as address bits, as bytes in LFIR registers
+  do anywhere); 16-byte aligned composites through `...` (no C composite FIR has is 16-byte
+  aligned without an `i128` leaf).
 
 ### Track F2c: structs and unions by value in fai-cc (done)
 
