@@ -4,7 +4,7 @@ FIR is a compiler environment for AOT, JIT, VM-based, and web (Wasm) targets, bu
 
 ## Phasing
 
-The first phase is the **AOT compiler** only, with a C subset as the first frontend. Nothing else is being built yet.
+The first phase is the **AOT compiler** only, with a C subset as the first frontend. Nothing else is being built yet. Within it, the three layers and the builder API come first, then the C frontend as the first compiler on top; see [03-plan.md](03-plan.md).
 
 Planned for later phases:
 
