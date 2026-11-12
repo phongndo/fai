@@ -1,6 +1,7 @@
 import Fir.AArch64
 import Fir.FloatProofs
 import Fir.Sem
+import Fir.Interp
 
 /-!
 # Arm's FP results are ones FIR allows
@@ -10,8 +11,9 @@ oracle (decision: NaN choice): `processNaNs` picks a quieted NaN operand, which 
 choices `nanResult` offers, and the default NaN is the canonical one, answer 0 (`fpAlu_allowed`,
 `fpSqrt_allowed`, `fpMulAdd_allowed`, `fpConvert_allowed`). Arm's choice depends only on the
 instruction and its operands, so the oracle whose `nan` is that choice is one the semantics
-quantifies over: native NaNs are the source's under it. `fcvtzs` and `fcvtzu` are
-`float.to_int.*.sat` exactly (`fcvtz_sat`).
+quantifies over: native NaNs are the source's under it (`armNan`, `Oracle.arm`, and the
+`*_arm` theorems: under that oracle FIR's float ops give exactly the instructions' results).
+`fcvtzs` and `fcvtzu` are `float.to_int.*.sat` exactly (`fcvtz_sat`).
 -/
 
 namespace Fir.AArch64
@@ -174,5 +176,79 @@ theorem fcvtz_sat (signed : Bool) (n : Nat) (x : Bits F) :
     all_goals first
       | rfl
       | (rename_i hr; rw [Int.min_eq_right hr.2, Int.max_eq_right hr.1])
+
+/-! ## Arm's NaN choice as the oracle's -/
+
+/-- The instruction instruction selection uses for a binary float op, if one. -/
+def _root_.Fir.FBinOp.arm : FBinOp → Option FAluOp
+  | .add => some .fadd
+  | .sub => some .fsub
+  | .mul => some .fmul
+  | .div => some .fdiv
+  | .copysign => none
+
+/-- Arm's NaN choice as the oracle's (`Oracle.nan`, decision: NaN choice): for a float op on
+defined operands of one format, an answer under which FIR's op gives what the instruction that
+implements it gives (`fadd`, …, `fsqrt`, `fmadd` with the addend `c` of `float.fma a, b, c`,
+`fcvt`). Chosen by the `*_allowed` theorems, so not computable; `fir run`'s counterpart is Rust's
+`NanRule::Arm`, which computes the instructions' results directly. -/
+noncomputable def armNan : OpKind → List RVal → Int
+  | .floatBin op, [.float f (.bits a), .float g (.bits b)] =>
+    if h : g = f then
+      match op.arm with
+      | some o => Classical.choose (fpAlu_allowed (F := f.fmt) o a (h ▸ b))
+      | none => 0
+    else 0
+  | .floatUn .sqrt, [.float f (.bits a)] => Classical.choose (fpSqrt_allowed (F := f.fmt) a)
+  | .floatFma, [.float f (.bits a), .float g (.bits b), .float k (.bits c)] =>
+    if h : g = f ∧ k = f then
+      Classical.choose (fpMulAdd_allowed (F := f.fmt) (h.2 ▸ c) a (h.1 ▸ b))
+    else 0
+  | .floatExt, [.float f (.bits a)] =>
+    Classical.choose (fpConvert_allowed (F := f.fmt) (G := FloatTy.f64.fmt) a)
+  | .floatTrunc, [.float f (.bits a)] =>
+    Classical.choose (fpConvert_allowed (F := f.fmt) (G := FloatTy.f32.fmt) a)
+  | _, _ => 0
+
+/-- The oracle that answers 0 to every sequential choice and picks NaNs as Arm does. -/
+noncomputable def _root_.Fir.Oracle.arm : Oracle := ⟨fun _ => 0, armNan⟩
+
+/-- **Under Arm's NaN choice, `float.add` and friends are `fadd` and friends.** -/
+theorem floatBin_arm {f : FloatTy} {op : FBinOp} {o : FAluOp} (ho : op.arm = some o)
+    (a b : BitVec f.width) :
+    Sem.floatBin f.fmt op (armNan (.floatBin op) [.float f (.bits a), .float f (.bits b)])
+      (.bits a) (.bits b) = .bits (fpAlu o a b) := by
+  have e := (Classical.choose_spec (fpAlu_allowed (F := f.fmt) o a b)).symm
+  cases op <;> simp only [FBinOp.arm, reduceCtorEq, Option.some.injEq] at ho <;> subst ho <;>
+    simp only [Sem.floatBin, armNan, FBinOp.arm, dite_true] <;> exact congrArg _ e
+
+/-- **Under Arm's NaN choice, `float.sqrt` is `fsqrt`.** -/
+theorem floatSqrt_arm {f : FloatTy} (a : BitVec f.width) :
+    Sem.floatUn f.fmt .sqrt (armNan (.floatUn .sqrt) [.float f (.bits a)]) (.bits a) =
+      .bits (fpSqrt a) := by
+  simp only [Sem.floatUn, armNan]
+  exact congrArg _ (Classical.choose_spec (fpSqrt_allowed (F := f.fmt) a)).symm
+
+/-- **Under Arm's NaN choice, `float.fma %a, %b, %c` is `fmadd` with addend `%c`.** -/
+theorem floatFma_arm {f : FloatTy} (a b c : BitVec f.width) :
+    Sem.floatFma f.fmt (armNan .floatFma [.float f (.bits a), .float f (.bits b), .float f (.bits c)])
+      (.bits a) (.bits b) (.bits c) = .bits (fpMulAdd c a b) := by
+  simp only [Sem.floatFma, armNan, and_self, dite_true]
+  exact congrArg _ (Classical.choose_spec (fpMulAdd_allowed (F := f.fmt) c a b)).symm
+
+/-- **Under Arm's NaN choice, `float.ext` and `float.trunc` are `fcvt`.** -/
+theorem floatExt_arm (a : BitVec FloatTy.f32.width) :
+    Sem.floatCvt FloatTy.f32.fmt FloatTy.f64.fmt (armNan .floatExt [.float .f32 (.bits a)])
+      (.bits a) = .bits (fpConvert FloatTy.f64.fmt a) := by
+  simp only [Sem.floatCvt, armNan]
+  exact congrArg _ (Classical.choose_spec (fpConvert_allowed (F := FloatTy.f32.fmt)
+    (G := FloatTy.f64.fmt) a)).symm
+
+theorem floatTrunc_arm (a : BitVec FloatTy.f64.width) :
+    Sem.floatCvt FloatTy.f64.fmt FloatTy.f32.fmt (armNan .floatTrunc [.float .f64 (.bits a)])
+      (.bits a) = .bits (fpConvert FloatTy.f32.fmt a) := by
+  simp only [Sem.floatCvt, armNan]
+  exact congrArg _ (Classical.choose_spec (fpConvert_allowed (F := FloatTy.f64.fmt)
+    (G := FloatTy.f32.fmt) a)).symm
 
 end Fir.AArch64
