@@ -13,7 +13,8 @@ An op whose results nothing reads can be deleted, if running it can't do anythin
 `Dce.refines` proves the rewrite correct at any number of places in a function, at any depth.
 It covers every *pure* op (`Pure`): no regions, no call, no stack allocation, not a terminator,
 operands that are variables, and a computation that leaves the core as it was and fails only by
-UB or getting stuck (`ReadOnly`). `copy_pure` shows copies qualify; so do `const` and `poison`.
+UB or getting stuck (`ReadOnly`). `copy_pure` shows copies qualify; so do `const` and `poison`,
+and every float op that can't trap (`float_pure`).
 "Reads" is syntactic (`opsReads`): an operand anywhere in the ops after the deleted one in its
 region, at any depth inside their regions. Calls need nothing special: a callee can't see the
 caller's frames.
@@ -164,6 +165,86 @@ theorem poison_pure (r : Result) (loc : Option Loc) : Pure (.mk .poison [r] [] [
     obtain ⟨n, ty, facts⟩ := r
     cases ty <;> exact .inr ⟨_, rfl⟩
   | _ :: _ => exact .inl ⟨_, rfl, trivial⟩
+
+/-! ## Floats
+
+The float ops are pure but for `float.to_int.*.trap`, which may trap: `evalFloat` only reads the
+core, since a NaN result reads the oracle's next answer without using it up (decision: NaN
+determinism). The pass reads its list of pure kinds off this (`crates/fir/src/passes/dce.rs`). -/
+
+/-- The float ops dead code elimination deletes: all but `float.to_int` with `.trap`. -/
+def floatPure : OpKind → Bool
+  | .floatConst _ | .floatBin _ | .floatUn _ | .floatFma | .floatCmp _ | .floatExt
+  | .floatTrunc | .intToFloat _ | .floatFromBits | .floatToBits => true
+  | .floatToInt _ edge => edge != .trap
+  | _ => false
+
+theorem readOnly_asFloat (loc : Option Loc) (f : FloatTy) (v : RVal) : ReadOnly (asFloat loc f v) := by
+  unfold asFloat
+  split
+  · split
+    · exact ReadOnly.pure' _
+    · exact ReadOnly.stuck _ _ _
+  · exact ReadOnly.stuck _ _ _
+
+theorem floatToInt_not_trap {F : FloatFmt} {signed : Bool} {edge : CvtEdge} {w : Nat}
+    {v : Val F.width} (he : edge ≠ .trap) (r : TrapReason) : Sem.floatToInt F signed edge w v ≠ .trap r := by
+  cases edge with
+  | trap => exact absurd rfl he
+  | ub | sat =>
+    unfold Sem.floatToInt
+    cases v with
+    | poison => simp
+    | bits x =>
+      simp only
+      repeat' split
+      all_goals simp
+
+theorem readOnly_fromOut {loc : Option Loc} {o : OpOut w} (h : ∀ r, o ≠ .trap r) :
+    ReadOnly (fromOut loc o) := by
+  unfold fromOut
+  cases o with
+  | ok v => exact ReadOnly.pure' _
+  | trap r => exact absurd rfl (h r)
+  | ub k => exact ReadOnly.ub' _ _ _
+
+/-- Close a goal `ReadOnly x` for an `x` made of reads, `asFloat`, results, getting stuck, and
+UB. -/
+local macro "readonly" : tactic => `(tactic| repeat' (first
+  | contradiction
+  | exact ReadOnly.pure' _
+  | exact ReadOnly.stuck _ _ _
+  | exact ReadOnly.ub' _ _ _
+  | exact ReadOnly.get'
+  | exact readOnly_asFloat _ _ _
+  | (rename_i h; injection h with h1 h2; subst h1; subst h2)
+  | exact ReadOnly.bind' (readOnly_fromOut (floatToInt_not_trap (by assumption))) fun _ =>
+      ReadOnly.pure' _
+  | refine ReadOnly.bind' ?_ fun _ => ?_
+  | split))
+
+theorem readOnly_evalFloat (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVal)
+    (hk : floatPure k = true) : ReadOnly (evalFloat loc k rs vs) := by
+  cases k <;> simp only [floatPure, bne_iff_ne, ne_eq] at hk
+  all_goals unfold evalFloat; refine ReadOnly.bind' ReadOnly.get' fun c => ?_
+  all_goals readonly
+
+theorem evalSimple_float {k : OpKind} (hk : floatPure k = true) (loc : Option Loc)
+    (rs : List Result) (vs : List RVal) :
+    evalSimple loc k rs vs = (get >>= fun _ => evalFloat loc k rs vs) := by
+  cases k <;> simp only [floatPure, reduceCtorEq] at hk <;> rfl
+
+/-- **The float ops that can't trap are pure**: every one but `float.to_int` with `.trap`. A NaN
+result reads the oracle's next answer without using it up, so computing one only reads the
+core. -/
+theorem float_pure {k : OpKind} (hk : floatPure k = true) (res : List Result) (args : List Operand)
+    (hargs : ∀ a ∈ args, ∃ n, a = .var n) (loc : Option Loc) : Pure (.mk k res args [] loc) := by
+  refine ⟨k, res, args, loc, rfl, ?_, ?_, ?_, hargs, fun vs => ?_⟩
+  · cases k <;> simp only [floatPure, reduceCtorEq] at hk <;> rfl
+  · cases k <;> simp only [floatPure, reduceCtorEq] at hk <;> rfl
+  · cases k <;> simp only [floatPure, reduceCtorEq] at hk <;> rfl
+  · rw [evalSimple_float hk]
+    exact ReadOnly.bind' ReadOnly.get' fun _ => readOnly_evalFloat loc k res vs hk
 
 /-! ## Steps -/
 

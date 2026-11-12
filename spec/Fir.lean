@@ -1,6 +1,7 @@
 import Fir.Basic
 import Fir.Float
 import Fir.FloatText
+import Fir.FloatProofs
 import Fir.OpDSL
 import Fir.Refinement
 import Fir.Syntax
