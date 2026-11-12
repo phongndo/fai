@@ -51,19 +51,34 @@ lower to are `cf.check.REASON %ok`, a core op (decision: Checks):
 | Tagged unions | `union<…>`; `union.make`, `union.tag`, `union.get.ub`/`.trap` (reason `tag`); SSA only | The tag and every variant's scalars (`poison` where not held); `int.cmp.eq` and `cf.check.tag` | Built; lowering tested |
 | Slices | `slice`; `slice.make`, `slice.ptr`, `slice.len`, `slice.get.ub`/`.trap`, `slice.set.ub`/`.trap` (reason `bounds`) | Pointer and length; `int.cmp.ult` and `cf.check.bounds`; `int.mul.wrap` and `ptr.offset.inbounds` | Built; lowering tested |
 | Field and element addresses | `ptr.field`, `ptr.index` (core HFIR ops) | `ptr.offset` by `int.const` offsets and exact products | Lowering proved |
-| Exceptions | `cf.try { } catch %e { }`, `exn.throw` | Calls that name their handler in MFIR (the Exceptions decision); LFIR lowers to unwind tables | Next |
+| Exceptions | `cf.try { } catch(%e: ptr) { }`, `exn.throw` (an exception is a `ptr`) | `cf.blocks` with the handler as a block; throws jump to it and calls that may throw name it (`func.invoke`); `cf.blocks` in between leave by `cf.yield` with a flag (decision: Exceptions in MFIR). AArch64: an error-return convention through the exception slot `__fir_exn` (decision: Exceptions at run time) | Built; lowering tested |
 
 The lowering (`Fir.Lower`, `crates/fir/src/lower.rs`; `fir lower FILE`) scalarizes each function,
 then expands it (decision: HFIR lowering). Both tools print the same lowering, and the tests run
 every fixture and fuzzed HFIR program before and after lowering: the same outcome, or, where the
 HFIR run is UB, the same events first. `Lower.Proof.Expand.refines` proves the expansion pass, and
 so the whole lowering of functions without aggregate, union, or slice values
-(`lowerFunc_refines`); the scalarizing pass is not proved yet (decision: Lowering proofs).
+(`lowerFunc_refines`, now for functions without `cf.try`); scalarizing and lowering `cf.try` are not
+proved yet (decision: Lowering proofs).
 `fir compile` and `fir_module_compile` lower HFIR before instruction selection, and the AArch64
 tests run the fixtures (`tests/blocks/` included) and fuzzed HFIR programs natively against
 `fir run` of the HFIR. The builder and the C API build every block (`fir_agg_make`,
 `fir_type_union`, `FIR_TYPE_SLICE`, …), and `tests/capi/modules.c` builds, runs, lowers,
 optimizes, and compiles a function using each one.
+
+**Exceptions** (decisions: Exception values, Exception semantics, Exceptions in MFIR, Exceptions at
+run time). Unwinding is one step of the semantics (`Fir.Interp.throwExn`, Rust's `throw_exn`):
+frames are popped, their stack memory ended and their calls' scopes closed, up to a `cf.try`
+frame or a `func.invoke`'s call frame; an exception escaping the call ends the run with
+`threw v`. The lockstep layer unwinds related stacks in lockstep (`throwExn_eq`), so
+`Dse.refines`, `Fwd.refines`, `CopyProp.refines`, `Dce.refines`, and `Lower.Proof.Expand.refines`
+hold, unchanged, for programs that throw and catch; the lowering of `cf.try` itself is tested
+(fixtures `tests/blocks/exceptions.fir` and `tests/blocks/invoke.fir`, error fixtures, and fuzzed
+programs that throw out of calls, loops, blocks, and handlers, and out of the entry function:
+Lean against Rust, HFIR against its lowering, optimized against original, and natively). Isel
+checks the exception slot after each call that may throw (none in code that can't throw), and
+both LFIR interpreters run the slot. External functions don't unwind; native unwind tables and
+a thread-local slot are open (open item 7).
 
 ## MFIR
 
@@ -112,8 +127,13 @@ Instruction selection, Register allocation, Traps at run time, AOT driver, Backe
   than 64 bits compile where only their low 64 bits matter, which covers the lowering of
   `ptr.index.inbounds`, but not checked arithmetic on `i64` (checked at 65 bits) or `mul` above
   32 bits.
+- Exceptions compile to an error-return convention: `exn.throw` sets the exception slot
+  `__fir_exn` and returns, and calls that may throw check it (`aarch64.exn.set`, `aarch64.b.exn`,
+  `aarch64.exn.take`). An exception that escapes to C is pending in `__fir_exn` when the call
+  returns; the test harnesses print it as `fir run` does (`threw ptr ?`).
 - Not yet: aggregates by value in the C ABI, `i128`, macOS's ABI differences (its assembly assembles, but
-  isn't run), tail calls, unwind tables, and the trust-round checkers.
+  isn't run), tail calls, native unwind tables (DWARF CFI with an LSDA and a personality
+  routine), a thread-local exception slot, and the trust-round checkers.
 
 ## Not in this round
 
@@ -132,6 +152,16 @@ Instruction selection, Register allocation, Traps at run time, AOT driver, Backe
 
 ## Progress
 
+- **Done when** is met: `tests/capi/e2e.c` (`cargo test -p fir-capi --test c`,
+  `end_to_end_through_the_c_api`) builds a program through the C API only, using aggregate
+  values (a struct passed and returned), checked arithmetic, a tagged union, slices, and
+  exceptions (caught across a call, and escaping), with a counted loop and `cf.blocks`, stack and
+  heap memory, a global array, an external call, and an indirect call; runs it in the
+  interpreter, which gives the expected lines, and again lowered and optimized; compiles it to
+  AArch64 with and without `-O`; links it with a generated `main` that prints `fir run`'s lines;
+  and runs it under `qemu-aarch64` (natively on AArch64): every run matches, the uncaught
+  exception and a bounds trap included. The fixtures and fuzzed programs check the same in
+  `tests/aarch64.rs`, exceptions included.
 - **Builder API (Rust, C):** done. `lake exe gen-builder` generates the op methods and C functions;
   `ModuleBuilder` covers memory spaces, types, functions, external functions, and globals;
   `crates/fir-capi` exports it with a cbindgen header. Every verified test file and 300 fuzzer
