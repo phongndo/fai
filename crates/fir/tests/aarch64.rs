@@ -7,9 +7,12 @@
 //! AArch64, under `qemu-aarch64` elsewhere), and compared with `fir run`:
 //!
 //! * A fixture is compiled with only the functions its runs reach; a run whose functions the
-//!   backend can't compile (holes, integers wider than 64 bits, other data layouts, floats until
-//!   floats on AArch64 land) is skipped and counted, and the rest of its file still runs. The
-//!   backend rejects every float with a compile error; those runs are counted on their own.
+//!   backend can't compile (holes, integers wider than 64 bits, other data layouts) is skipped
+//!   and counted, and the rest of its file still runs.
+//! * Floats pass as C's `float` and `double`, and print as their bits, which the test renders as
+//!   `fir run` does. The reference run picks NaN results by Arm's rule (`NanRule::Arm`, an
+//!   oracle the semantics allows), so a native NaN must be exactly the one that oracle gives,
+//!   payload and sign included; the LFIR machine follows Arm's rule too.
 //! * External functions are stubs that print the event and return zeros, as `fir run`'s world
 //!   does. Traps reach the test runtime's `__fir_trap`, which prints the reason and location.
 //!   An exception that leaves the called function is pending in the runtime's `__fir_exn` when
@@ -17,8 +20,8 @@
 //! * Runs that end in UB, get stuck, reach a hole, are ambiguous, or run out of fuel are not
 //!   comparable (UB allows anything) and are only counted.
 //! * Where a module observes addresses (the interpreter's and the hardware's differ), a run
-//!   that differs only in integers, or in ending with an arithmetic trap where the other
-//!   doesn't, is counted, not failed.
+//!   that differs only in integers or floats, or in ending with an arithmetic or conversion
+//!   trap where the other doesn't, is counted, not failed.
 //! * Where `fir run` prints `poison`, any value matches; a non-null pointer prints as `ptr ?`
 //!   (allocation numbers are the interpreter's); leak notes are dropped (counted).
 //!
@@ -55,6 +58,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use fir::backend::aarch64 as a64;
+use fir::interp::NanRule;
 use fir::{Module, Ty};
 
 struct Toolchain {
@@ -74,24 +78,34 @@ const RUNTIME: &str = r#"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
-static const char *reasons[] = {"div0", "overflow", "shift", "oom", "bounds", "tag"};
+static const char *reasons[] = {"div0", "overflow", "shift", "oom", "bounds", "tag", "convert"};
 
 /* The exception slot (decision: Exceptions at run time): a nonzero flag while an exception is
    pending, and its value. The compiled code defines it weakly; this definition wins. */
 struct fir_exn { void *flag; void *value; } __fir_exn;
 
 void __fir_trap(uint32_t reason, uint32_t line, uint32_t col) {
-    printf("trap %s", reason < 6 ? reasons[reason] : "?");
+    printf("trap %s", reason < 7 ? reasons[reason] : "?");
     if (line != 0xffffffffu) printf(" @%u:%u", line, col);
     printf("\n");
     fflush(stdout);
     exit(0);
 }
 
-/* One value: 'i' an iW, 'p' a pointer, 'b' a bW. */
+/* Floats from their bits, and back. */
+double fir_f64(uint64_t b) { double x; memcpy(&x, &b, 8); return x; }
+float fir_f32(uint32_t b) { float x; memcpy(&x, &b, 4); return x; }
+uint64_t fir_b64(double x) { uint64_t b; memcpy(&b, &x, 8); return b; }
+uint64_t fir_b32(float x) { uint32_t b; memcpy(&b, &x, 4); return b; }
+
+/* One value: 'i' an iW, 'p' a pointer, 'b' a bW, 'f' an fW (as its bits, which the test
+   renders). */
 void fir_print(char kind, unsigned w, uint64_t v) {
-    if (kind == 'p') {
+    if (kind == 'f') {
+        printf("f%u 0x%llx", w, (unsigned long long)(w == 32 ? v & 0xffffffffull : v));
+    } else if (kind == 'p') {
         printf(v == 0 ? "ptr null" : "ptr ?");
     } else if (kind == 'b') {
         printf("b%u (", w);
@@ -151,23 +165,92 @@ fn kind(t: Ty) -> (char, u32) {
     match t {
         Ty::Int(w) => ('i', w),
         Ty::Byte(w) => ('b', w),
+        Ty::Float(f) => ('f', f.width()),
         _ => ('p', 64),
     }
 }
 
-/// A C return type for `n` results under the backend's convention.
-fn c_ret(n: usize) -> String {
-    match n {
-        0 => "void".to_owned(),
-        1 => "uint64_t".to_owned(),
-        n => format!("struct r{n}"),
+/// The C type a value of type `t` travels as.
+fn c_ty(t: Ty) -> &'static str {
+    match t {
+        Ty::Float(fir::FloatTy::F32) => "float",
+        Ty::Float(fir::FloatTy::F64) => "double",
+        _ => "uint64_t",
     }
 }
 
-/// An argument as `fir run` reads it, as 64 bits (`poison` passes as 0).
+/// `fir_print` of the C expression `e` holding a value of type `t`.
+fn c_print(t: Ty, e: &str) -> String {
+    let (kd, w) = kind(t);
+    let bits = match t {
+        Ty::Float(fir::FloatTy::F32) => format!("fir_b32({e})"),
+        Ty::Float(fir::FloatTy::F64) => format!("fir_b64({e})"),
+        _ => e.to_owned(),
+    };
+    format!("fir_print('{kd}', {w}, {bits});")
+}
+
+/// The C type of results `rets` under the backend's convention, defining the struct it needs:
+/// one result as itself; two as a struct of 8-byte fields (an HFA of `float`s or `double`s when
+/// both are floats of one format); more as a struct of 8-byte slots in memory.
+fn c_ret(rets: &[Ty], defs: &mut String) -> String {
+    let name: String = rets
+        .iter()
+        .map(|&t| match t {
+            Ty::Float(f) => f.name().to_owned(),
+            _ => "i".to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("_");
+    match rets.len() {
+        0 => "void".to_owned(),
+        1 => c_ty(rets[0]).to_owned(),
+        n => {
+            let hfa = rets[0].is_float() && rets.iter().all(|&t| t == rets[0]);
+            let fields: Vec<String> = rets
+                .iter()
+                .enumerate()
+                .map(|(i, &t)| match t {
+                    _ if n > 2 => format!("union fir_slot r{i};"),
+                    Ty::Float(fir::FloatTy::F32) if !hfa => {
+                        format!("union {{ float f; uint64_t pad; }} r{i};")
+                    }
+                    t => format!("{} r{i};", c_ty(t)),
+                })
+                .collect();
+            let def = format!("struct r_{name} {{ {} }};\n", fields.join(" "));
+            if !defs.contains(&def) {
+                defs.push_str(&def);
+            }
+            format!("struct r_{name}")
+        }
+    }
+}
+
+/// Field `i` of a result struct of type `rets`, as a C expression of the value's C type.
+fn c_field(rets: &[Ty], i: usize, var: &str) -> String {
+    let hfa = rets[0].is_float() && rets.iter().all(|&t| t == rets[0]);
+    match rets[i] {
+        Ty::Float(fir::FloatTy::F32) if rets.len() > 2 || !hfa => format!("{var}.r{i}.f"),
+        Ty::Float(fir::FloatTy::F64) if rets.len() > 2 => format!("{var}.r{i}.d"),
+        _ if rets.len() > 2 => format!("{var}.r{i}.i"),
+        _ => format!("{var}.r{i}"),
+    }
+}
+
+/// An argument as `fir run` reads it, as its C type's value (`poison` passes as 0).
 fn c_arg(t: Ty, s: &str) -> String {
     match (t, s) {
         (_, "poison") | (_, "null") => "0".to_owned(),
+        (Ty::Float(f), _) => {
+            let bits = fir::float::parse_lit(s)
+                .and_then(|l| l.to_bits(f))
+                .unwrap_or_default();
+            match f {
+                fir::FloatTy::F32 => format!("fir_f32({bits:#x}u)"),
+                fir::FloatTy::F64 => format!("fir_f64({bits:#x}ull)"),
+            }
+        }
         _ => {
             let n: num_bigint::BigInt = fir::interp::parse_int(s).unwrap_or_default();
             let m = num_bigint::BigInt::from(1) << 64;
@@ -184,77 +267,72 @@ fn harness(m: &Module, runs: &[(String, Vec<String>)], darwin: bool) -> String {
     let mut c = String::from(
         "#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n\
          void fir_print(char kind, unsigned w, uint64_t v);\n\
+         double fir_f64(uint64_t b);\nfloat fir_f32(uint32_t b);\n\
+         uint64_t fir_b64(double x);\nuint64_t fir_b32(float x);\n\
+         union fir_slot { uint64_t i; double d; float f; };\n\
          extern struct fir_exn { void *flag; void *value; } __fir_exn;\n",
     );
-    let mut sizes: Vec<usize> = m.externs.iter().map(|x| x.rets.len()).collect();
-    sizes.extend(m.funcs.iter().map(|f| f.rets.len()));
-    sizes.sort_unstable();
-    sizes.dedup();
-    for n in sizes.into_iter().filter(|&n| n >= 2) {
-        writeln!(c, "struct r{n} {{ uint64_t r[{n}]; }};").unwrap();
-    }
-    for (i, x) in m.externs.iter().enumerate() {
-        let params: Vec<String> = (0..x.params.len())
-            .map(|k| format!("uint64_t a{k}"))
-            .collect();
-        let params = if params.is_empty() {
+    let mut defs = String::new();
+    let mut body = String::new();
+    let params = |ps: &[Ty]| -> String {
+        if ps.is_empty() {
             "void".to_owned()
         } else {
-            params.join(", ")
-        };
-        let ret = c_ret(x.rets.len());
+            ps.iter()
+                .enumerate()
+                .map(|(k, &t)| format!("{} a{k}", c_ty(t)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    for (i, x) in m.externs.iter().enumerate() {
+        let ps = params(&x.params);
+        let ret = c_ret(&x.rets, &mut defs);
         writeln!(
-            c,
-            "{ret} ext{i}({params}) __asm__(\"{us}fir_ext_{}\");",
+            body,
+            "{ret} ext{i}({ps}) __asm__(\"{us}fir_ext_{}\");",
             x.name
         )
         .unwrap();
-        writeln!(c, "{ret} ext{i}({params}) {{").unwrap();
-        writeln!(c, "  printf(\"@{}(\");", x.name).unwrap();
+        writeln!(body, "{ret} ext{i}({ps}) {{").unwrap();
+        writeln!(body, "  printf(\"@{}(\");", x.name).unwrap();
         for (k, &t) in x.params.iter().enumerate() {
-            let (kd, w) = kind(t);
             if k > 0 {
-                c.push_str("  printf(\", \");\n");
+                body.push_str("  printf(\", \");\n");
             }
-            writeln!(c, "  fir_print('{kd}', {w}, a{k});").unwrap();
+            writeln!(body, "  {}", c_print(t, &format!("a{k}"))).unwrap();
         }
-        c.push_str("  printf(\") -> \");\n");
+        body.push_str("  printf(\") -> \");\n");
         if x.rets.is_empty() {
-            c.push_str("  printf(\"()\");\n");
+            body.push_str("  printf(\"()\");\n");
         }
         for (k, &t) in x.rets.iter().enumerate() {
-            let (kd, w) = kind(t);
             if k > 0 {
-                c.push_str("  printf(\", \");\n");
+                body.push_str("  printf(\", \");\n");
             }
-            writeln!(c, "  fir_print('{kd}', {w}, 0);").unwrap();
+            writeln!(body, "  {}", c_print(t, "0")).unwrap();
         }
-        c.push_str("  printf(\"; \");\n");
+        body.push_str("  printf(\"; \");\n");
         match x.rets.len() {
             0 => {}
-            1 => c.push_str("  return 0;\n"),
-            n => writeln!(c, "  struct r{n} r = {{{{0}}}}; return r;").unwrap(),
+            1 => body.push_str("  return 0;\n"),
+            _ => writeln!(body, "  {ret} r; memset(&r, 0, sizeof r); return r;").unwrap(),
         }
-        c.push_str("}\n");
+        body.push_str("}\n");
     }
     for (i, f) in m.funcs.iter().enumerate() {
         let b = &f.body;
-        let np = b.params(b.entry()).len();
-        let params: Vec<&str> = (0..np).map(|_| "uint64_t").collect();
-        let params = if params.is_empty() {
-            "void".to_owned()
-        } else {
-            params.join(", ")
-        };
+        let ps: Vec<Ty> = b.params(b.entry()).map(|v| b.ty(v)).collect();
+        let ret = c_ret(&f.rets, &mut defs);
         writeln!(
-            c,
-            "{} fn{i}({params}) __asm__(\"{us}fir_{}\");",
-            c_ret(f.rets.len()),
+            body,
+            "{ret} fn{i}({}) __asm__(\"{us}fir_{}\");",
+            params(&ps),
             f.name
         )
         .unwrap();
     }
-    c.push_str("int main(int argc, char **argv) {\n  (void)argc;\n  switch (atoi(argv[1])) {\n");
+    body.push_str("int main(int argc, char **argv) {\n  (void)argc;\n  switch (atoi(argv[1])) {\n");
     for (k, (name, args)) in runs.iter().enumerate() {
         let i = m.funcs.iter().position(|f| &f.name == name).unwrap();
         let f = &m.funcs[i];
@@ -262,35 +340,72 @@ fn harness(m: &Module, runs: &[(String, Vec<String>)], darwin: bool) -> String {
         let tys: Vec<Ty> = b.params(b.entry()).map(|v| b.ty(v)).collect();
         let args: Vec<String> = tys.iter().zip(args).map(|(&t, a)| c_arg(t, a)).collect();
         let call = format!("fn{i}({})", args.join(", "));
-        writeln!(c, "  case {k}: {{").unwrap();
+        let ret = c_ret(&f.rets, &mut defs);
+        writeln!(body, "  case {k}: {{").unwrap();
         // An exception that leaves the function is pending in `__fir_exn` when it returns.
         let threw = "if (__fir_exn.flag) {\n      printf(\"threw \");\n      fir_print('p', 64, (uint64_t)(uintptr_t)__fir_exn.value);\n    } else ";
         match f.rets.len() {
-            0 => writeln!(c, "    {call};\n    {threw}printf(\"returned\");").unwrap(),
+            0 => writeln!(body, "    {call};\n    {threw}printf(\"returned\");").unwrap(),
             1 => {
-                let (kd, w) = kind(f.rets[0]);
-                writeln!(c, "    uint64_t r = {call};\n    {threw}{{\n      printf(\"returned \");\n      fir_print('{kd}', {w}, r);\n    }}").unwrap();
-            }
-            n => {
                 writeln!(
-                    c,
-                    "    struct r{n} r = {call};\n    {threw}{{\n      printf(\"returned \");"
+                    body,
+                    "    {ret} r = {call};\n    {threw}{{\n      printf(\"returned \");\n      {}\n    }}",
+                    c_print(f.rets[0], "r")
+                )
+                .unwrap();
+            }
+            _ => {
+                writeln!(
+                    body,
+                    "    {ret} r = {call};\n    {threw}{{\n      printf(\"returned \");"
                 )
                 .unwrap();
                 for (k, &t) in f.rets.iter().enumerate() {
-                    let (kd, w) = kind(t);
                     if k > 0 {
-                        c.push_str("      printf(\", \");\n");
+                        body.push_str("      printf(\", \");\n");
                     }
-                    writeln!(c, "      fir_print('{kd}', {w}, r.r[{k}]);").unwrap();
+                    writeln!(body, "      {}", c_print(t, &c_field(&f.rets, k, "r"))).unwrap();
                 }
-                c.push_str("    }\n");
+                body.push_str("    }\n");
             }
         }
-        c.push_str("    printf(\"\\n\");\n    break;\n  }\n");
+        body.push_str("    printf(\"\\n\");\n    break;\n  }\n");
     }
-    c.push_str("  }\n  return 0;\n}\n");
+    body.push_str("  }\n  return 0;\n}\n");
+    c.push_str("#include <string.h>\n");
+    c.push_str(&defs);
+    c.push_str(&body);
     c
+}
+
+/// A native output line with its floats (printed as `f64 0x…` bits) rendered as `fir run`
+/// renders them.
+fn render_floats(line: &str) -> String {
+    let mut out = String::new();
+    let mut prev = "";
+    for (i, tok) in line.split(' ').enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        // The type is its own word, or follows `(` in an event's arguments.
+        let ty = prev.rsplit('(').next().unwrap_or(prev);
+        let f = match ty {
+            "f32" => Some(fir::FloatTy::F32),
+            "f64" => Some(fir::FloatTy::F64),
+            _ => None,
+        };
+        match (f, tok.strip_prefix("0x")) {
+            (Some(f), Some(rest)) => {
+                let hex: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+                let bits = u64::from_str_radix(&hex, 16).unwrap_or(0);
+                out.push_str(&fir::float::render(f, bits));
+                out.push_str(&rest[hex.len()..]);
+            }
+            _ => out.push_str(tok),
+        }
+        prev = tok;
+    }
+    out
 }
 
 /// Compile `m` with a harness for `runs` into `dir/name`.
@@ -363,7 +478,7 @@ fn run_native(tc: &Toolchain, bin: &Path, k: usize) -> String {
         }
     }
     let out = child.wait_with_output().unwrap();
-    let s = String::from_utf8_lossy(&out.stdout).trim_end().to_owned();
+    let s = render_floats(String::from_utf8_lossy(&out.stdout).trim_end());
     if out.status.success() {
         s
     } else {
@@ -469,10 +584,11 @@ fn observes_addresses(m: &Module) -> bool {
     int_loads && ptr_bytes
 }
 
-/// Whether `got` differs from `want` only where runs that observe addresses may: in integer
-/// values, or in ending with a trap that integer arithmetic raises (`overflow`, `div0`, `shift`)
-/// where the other run doesn't, since the integers may come from addresses (`ptr.addr` of a
-/// stack slot squared overflows at qemu's addresses, not at the interpreter's).
+/// Whether `got` differs from `want` only where runs that observe addresses may: in integer or
+/// float values, or in ending with a trap that arithmetic raises (`overflow`, `div0`, `shift`,
+/// `convert`) where the other run doesn't, since the numbers may come from addresses
+/// (`ptr.addr` of a stack slot squared overflows at qemu's addresses, not at the
+/// interpreter's, and converts to a float that doesn't fit an `i32`).
 fn differs_in_integers(want: &str, got: &str) -> bool {
     let toks = |s: &str| -> Vec<String> {
         s.split([' ', ',', ';', '(', ')'])
@@ -480,7 +596,15 @@ fn differs_in_integers(want: &str, got: &str) -> bool {
             .map(str::to_owned)
             .collect()
     };
-    let num = |t: &str| t.parse::<i128>().is_ok() || t.starts_with("0x") || t == "?" || t == "null";
+    let num = |t: &str| {
+        t.parse::<i128>().is_ok()
+            || t.parse::<f64>().is_ok()
+            || t.starts_with("0x")
+            || t.starts_with("nan")
+            || t.starts_with("-nan")
+            || t == "?"
+            || t == "null"
+    };
     let ints = |want: &str, got: &str| {
         let (w, g) = (toks(want), toks(got));
         w.len() == g.len()
@@ -494,7 +618,7 @@ fn differs_in_integers(want: &str, got: &str) -> bool {
     let (wp, we) = want.rsplit_once("; ").unwrap_or(("", want));
     let (gp, ge) = got.rsplit_once("; ").unwrap_or(("", got));
     let arith = |e: &str| {
-        ["trap overflow", "trap div0", "trap shift"]
+        ["trap overflow", "trap div0", "trap shift", "trap convert"]
             .iter()
             .any(|t| e.starts_with(t))
     };
@@ -618,10 +742,15 @@ fn check_module(
     };
     let m = &m;
     let blocks = blocks_used(src);
+    let text = src.render(false);
+    let floats = text.contains("float.") || text.contains(": f32") || text.contains(": f64");
     {
         let mut t = tally.lock().unwrap();
         if lowered {
             t.count("(HFIR modules, lowered)");
+        }
+        if floats {
+            t.count("(modules with floats)");
         }
         for b in &blocks {
             t.count(format!("(modules using {b})"));
@@ -630,7 +759,7 @@ fn check_module(
     let mut comparable = Vec::new();
     for (f, args, fuel) in runs {
         let a: Vec<&str> = args.iter().map(String::as_str).collect();
-        let reference = fir::interp::run_detail(src, f, &a, *fuel, lowered)
+        let reference = fir::interp::run_detail_with(src, f, &a, *fuel, lowered, NanRule::Arm)
             .map(|r| r.line)
             .unwrap_or_else(|e| format!("error {e}"));
         match normalize(&reference) {
@@ -788,6 +917,12 @@ fn check_module(
             if matches(want, &got) {
                 let mut t = tally.lock().unwrap();
                 t.count(format!("{what} matches"));
+                if floats {
+                    t.count(format!("{what} matches (floats)"));
+                }
+                if want.contains("nan") {
+                    t.count(format!("{what} matches (NaN results)"));
+                }
                 if !blocks.is_empty() {
                     t.count(format!("{what} matches (building blocks)"));
                 }
@@ -917,12 +1052,6 @@ fn fixtures_run_natively() {
         for (f, a) in runs {
             match compiles(&prune(&m, &[&f])) {
                 Ok(()) => kept.push((f, a)),
-                Err(e) if e.contains("is a float, which the AArch64 backend doesn't support") => {
-                    tally
-                        .lock()
-                        .unwrap()
-                        .count("run skipped: floats (not compiled yet)");
-                }
                 Err(e) => {
                     eprintln!("  {name}: @{f}: not compiled: {e}");
                     tally.lock().unwrap().count("run skipped: not compiled");

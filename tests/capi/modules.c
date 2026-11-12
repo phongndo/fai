@@ -1115,7 +1115,7 @@ static void layout(void) {
 }
 
 /* Floats: f32 and f64 values, every kind of float op, constants from C floats, doubles, and bit
- * patterns (NaN payloads included), run in the interpreter; the backend doesn't compile them yet. */
+ * patterns (NaN payloads included), and float globals, run in the interpreter and compiled. */
 static void floats(void) {
   FirModule *m = cur = fir_module_new();
   FirType f32 = FIR_TYPE_F32, f64 = FIR_TYPE_F64, i1 = fir_type_int(1), i32 = fir_type_int(32),
@@ -1243,11 +1243,12 @@ static void floats(void) {
   expect_run(m, "consts", NULL, 0,
              "returned f32 0.1, f64 -nan(0x1), f64 nan(0x1), f64 -1.0, f32 inf, f64 nan");
 
-  /* The backend doesn't compile floats yet: a compile error, not a crash. */
+  /* The backend compiles floats (tests/capi/e2e.c runs them). */
   char *as = NULL;
-  CHECK(fir_module_compile(m, "aarch64", false, FIR_OS_LINUX, &as) == FIR_ERR_COMPILE &&
-        as == NULL);
-  expect_error("@hypot: f64 is a float, which the AArch64 backend doesn't support yet", __LINE__);
+  OK(fir_module_compile(m, "aarch64", false, FIR_OS_LINUX, &as));
+  CHECK(as != NULL && strstr(as, "fmadd d") != NULL && strstr(as, "fsqrt d") != NULL &&
+        strstr(as, "fcvtzs") != NULL);
+  fir_string_free(as);
 
   /* Errors: bits that don't fit, operands that aren't floats, bad enum values. */
   b = fir_func_begin(m, ID(fir_func_declare(m, "bad", &i32, 1, NULL, 0)));

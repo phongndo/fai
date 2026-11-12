@@ -39,14 +39,13 @@
 //! direct and indirect calls in it name (`func.invoke`). Each program comes with argument lists
 //! and fuel limits.
 //!
-//! Floats (`f32`, `f64`; not in the narrow mode, whose programs the AArch64 backend compiles):
-//! every `float.*` op and `int.to_float`, with constants biased toward the edge cases (zeros of
+//! Floats (`f32`, `f64`, in both modes): every `float.*` op and `int.to_float`, with constants biased toward the edge cases (zeros of
 //! both signs, subnormals, the largest values, infinities, NaNs with payloads, integers at the
 //! conversions' limits, halfway cases), conversions to and from integers of every width class
 //! with every edge-case modifier, `float.from_bits` of interesting integers, `select`,
 //! `freeze`, `poison`, and `copy` of floats, and floats as parameters, results, loop and block
-//! state, parts of aggregates and unions, globals, and values loaded and stored (and read back as
-//! integers and bytes).
+//! state, parts of aggregates and unions, globals (with float initializers), and values loaded
+//! and stored (and read back as integers and bytes).
 
 use std::fmt::Write;
 
@@ -195,7 +194,7 @@ fn make_vtys(rng: &mut Rng) {
             if !nested.is_empty() && rng.chance(25) {
                 return rng.pick(&nested);
             }
-            if !rng.1 && rng.chance(15) {
+            if rng.chance(15) {
                 return T::F(rng.pick(&[32, 64]));
             }
             match rng.below(10) {
@@ -887,7 +886,7 @@ impl Gen<'_> {
     }
 
     fn mem_type(&mut self) -> T {
-        if !self.rng.1 && self.rng.chance(12) {
+        if self.rng.chance(12) {
             return T::F(self.rng.pick(&[32, 64]));
         }
         match self.rng.below(10) {
@@ -900,7 +899,7 @@ impl Gen<'_> {
     /// One random op (possibly with regions).
     fn stmt(&mut self) {
         self.ops_left = self.ops_left.saturating_sub(1);
-        if !self.rng.1 && self.rng.chance(14) {
+        if self.rng.chance(14) {
             return self.float_op();
         }
         if !self.mfir && self.depth < 3 && self.rng.chance(4) {
@@ -1254,7 +1253,7 @@ impl Gen<'_> {
         if !self.mfir && num_vtys() > 0 && self.rng.chance(15) {
             return T::V(self.rng.below(num_vtys() as u64) as u8);
         }
-        if !self.rng.1 && self.rng.chance(12) {
+        if self.rng.chance(12) {
             return T::F(self.rng.pick(&[32, 64]));
         }
         if self.rng.chance(25) {
@@ -1664,7 +1663,7 @@ impl Gen<'_> {
 
     /// A value type for a field or element.
     fn field_type(&mut self) -> T {
-        if !self.rng.1 && self.rng.chance(10) {
+        if self.rng.chance(10) {
             return T::F(self.rng.pick(&[32, 64]));
         }
         match self.rng.below(12) {
@@ -2151,8 +2150,7 @@ impl Gen<'_> {
         }
         match a {
             Agg::Scalar(T::I(w) | T::B(w)) => interesting(self.rng, *w).to_string(),
-            // A float's initializer is `zero` or its bytes.
-            Agg::Scalar(T::F(_)) => "zero".to_owned(),
+            Agg::Scalar(T::F(_)) => float_lit(self.rng).to_owned(),
             Agg::Scalar(T::P) => match self.rng.below(3) {
                 0 => "null".to_owned(),
                 1 if n > 0 => format!("@g{}", self.rng.below(n as u64)),
@@ -2616,7 +2614,7 @@ pub fn program(rng: &mut Rng) -> Program {
                     t
                 } else if rng.chance(if i == 0 { 15 } else { 55 }) {
                     T::P
-                } else if !narrow && rng.chance(15) {
+                } else if rng.chance(15) {
                     T::F(rng.pick(&[32, 64]))
                 } else {
                     T::I(rng.width(&[1, 8, 32, 64, 7, 128]))
@@ -2626,7 +2624,7 @@ pub fn program(rng: &mut Rng) -> Program {
         let rets: Vec<T> = (0..rng.below(3))
             .map(|_| match pick_v(rng, 15) {
                 Some(t) => t,
-                None if !narrow && rng.chance(15) => T::F(rng.pick(&[32, 64])),
+                None if rng.chance(15) => T::F(rng.pick(&[32, 64])),
                 None => match rng.below(10) {
                     0..=1 => T::P,
                     2 => T::B(rng.pick(&[8, 32])),
@@ -2642,7 +2640,7 @@ pub fn program(rng: &mut Rng) -> Program {
             .map(|_| {
                 if rng.chance(55) {
                     T::P
-                } else if !narrow && rng.chance(10) {
+                } else if rng.chance(10) {
                     T::F(rng.pick(&[32, 64]))
                 } else {
                     T::I(rng.width(&[1, 8, 32, 64, 128]))
@@ -2651,7 +2649,7 @@ pub fn program(rng: &mut Rng) -> Program {
             .collect();
         let rets: Vec<T> = (0..rng.below(3))
             .map(|_| match rng.below(10) {
-                _ if !narrow && rng.chance(8) => T::F(rng.pick(&[32, 64])),
+                _ if rng.chance(8) => T::F(rng.pick(&[32, 64])),
                 0..=2 => T::P,
                 3 => T::B(rng.pick(&[8, 32])),
                 _ => T::I(rng.width(&[1, 8, 32, 64, 65, 128])),
