@@ -26,7 +26,7 @@ use std::fmt::Write;
 use num_bigint::{BigInt, BigUint};
 use rustc_hash::FxHashMap;
 
-use crate::body::{Body, Int, OpId, Operand, OperandKind, RegionId, ValueId};
+use crate::body::{Body, Int, OpId, Operand, OperandKind, RegionId, Succ, ValueId};
 use crate::ir::*;
 use crate::sem::{self, Bits, Out};
 pub use crate::sem::{TrapReason, UbKind};
@@ -113,6 +113,12 @@ enum Frame {
     IfJoin { op: OpId },
     /// A running `cf.loop`; `allocs` is where the allocations of its body's blocks start.
     Loop {
+        op: OpId,
+        progress: bool,
+        allocs: u32,
+    },
+    /// A running `cf.blocks`; `allocs` is where the allocations of its current block start.
+    Blocks {
         op: OpId,
         progress: bool,
         allocs: u32,
@@ -269,6 +275,17 @@ fn ub<T>(k: UbKind, loc: Option<Loc>, note: impl Into<String>) -> R<T> {
 
 fn stuck<T>(loc: Option<Loc>, msg: impl Into<String>) -> R<T> {
     halt(Behavior::Stuck(msg.into()), loc, "")
+}
+
+/// `k` modulo `2^w`, in `0..2^w`.
+fn key_mod(k: Int<'_>, w: u32) -> BigInt {
+    let m = BigInt::from(1) << w;
+    let r = k.to_bigint() % &m;
+    if r.sign() == num_bigint::Sign::Minus {
+        r + m
+    } else {
+        r
+    }
 }
 
 /// `@line:col`, or `@?` (Lean's `renderLoc`).
@@ -1655,12 +1672,49 @@ impl<'m> Machine<'m> {
         None
     }
 
+    /// Jump to block `s` of the nearest `cf.blocks` with arguments `vs`: pop the frames above
+    /// it, ending their stack memory, and start the block (Lean's `jump`).
+    fn jump(&mut self, loc: Option<Loc>, s: Succ, vs: &[Value]) -> R<()> {
+        let body = self.body();
+        let Some(i) = self.find_frame(|f| matches!(f, Frame::Blocks { .. })) else {
+            return stuck(loc, "a jump outside cf.blocks");
+        };
+        let Frame::Blocks { op, allocs, .. } = self.frames[i] else {
+            unreachable!()
+        };
+        let label = body.str(s.label);
+        let Some(&r) = body
+            .regions(op)
+            .iter()
+            .find(|&&r| body.label(r).is_some_and(|l| body.str(l) == label))
+        else {
+            return stuck(loc, format!("no block ^{label}"));
+        };
+        self.release_from(allocs);
+        self.frames.truncate(i + 1);
+        self.enter_body(loc, r, vs)
+    }
+
+    /// Whether `cf.switch`'s key `k` is the `w`-bit value `v`, modulo `2^w`.
+    fn key_matches(&self, k: Int<'_>, w: u32, v: Value) -> bool {
+        match (k, v) {
+            (Int::Small(k), Value::Int { bits, .. }) => {
+                i128::from(k).rem_euclid(1i128 << w) as u64 == bits
+            }
+            (k, Value::Int { bits, .. }) => key_mod(k, w) == BigInt::from(bits),
+            (k, Value::Wide { id, .. }) => {
+                key_mod(k, w) == BigInt::from(self.wides[id as usize].clone())
+            }
+            _ => false,
+        }
+    }
+
     /// Run a terminator; the current block has already been popped (Lean's `terminate`).
     fn terminate(&mut self, loc: Option<Loc>, k: OpKind, vs: &[Value]) -> R<()> {
         let body = self.body();
         match k {
             OpKind::Yield => match self.frames.last() {
-                Some(&Frame::IfJoin { op }) => {
+                Some(&Frame::IfJoin { op } | &Frame::Blocks { op, .. }) => {
                     self.frames.pop();
                     self.bind(body.loc(op), body.results(op), vs)
                 }
@@ -1737,6 +1791,48 @@ impl<'m> Machine<'m> {
                 let body = self.body();
                 self.bind(body.loc(op), body.results(op), vs)
             }
+            OpKind::Br { dest } => self.jump(loc, body.succ(dest), vs),
+            OpKind::CondBr { t, f } => {
+                let c = match vs.first() {
+                    Some(&v) => self.bits(loc, v)?,
+                    None => None,
+                };
+                let Some(c) = c else {
+                    return ub(UbKind::Poison, loc, "branch on poison");
+                };
+                let t = body.succ(t);
+                let rest = vs.get(1..).unwrap_or_default();
+                let n = (t.nargs as usize).min(rest.len());
+                if c.is_zero() {
+                    self.jump(loc, body.succ(f), &rest[n..])
+                } else {
+                    self.jump(loc, t, &rest[..n])
+                }
+            }
+            OpKind::Switch { dflt, cases } => {
+                let (v, rest) = match vs.split_first() {
+                    Some((&v, rest)) => (v, rest),
+                    None => return stuck(loc, "cf.switch needs an integer"),
+                };
+                let w = match v {
+                    Value::Int { w, .. } | Value::Wide { w, .. } => w,
+                    Value::Poison { .. } => return ub(UbKind::Poison, loc, "branch on poison"),
+                    _ => return stuck(loc, "cf.switch needs an integer"),
+                };
+                let dflt = body.succ(dflt);
+                let take = |at: usize, n: u32| {
+                    let end = (at + n as usize).min(rest.len());
+                    &rest[at.min(end)..end]
+                };
+                let mut at = dflt.nargs as usize;
+                for c in body.cases(cases) {
+                    if self.key_matches(body.int(c.key), w, v) {
+                        return self.jump(loc, c.succ, take(at, c.succ.nargs));
+                    }
+                    at += c.succ.nargs as usize;
+                }
+                self.jump(loc, dflt, take(0, dflt.nargs))
+            }
             _ => stuck(loc, "not a terminator"),
         }
     }
@@ -1761,6 +1857,17 @@ impl<'m> Machine<'m> {
                 let r = if c.is_zero() { regions[1] } else { regions[0] };
                 self.frames.push(Frame::IfJoin { op });
                 self.push_block(r);
+            }
+            OpKind::Blocks { progress } => {
+                let Some(&entry) = body.regions(op).first() else {
+                    return stuck(loc, "malformed op");
+                };
+                self.frames.push(Frame::Blocks {
+                    op,
+                    progress,
+                    allocs: self.stack_allocs.len() as u32,
+                });
+                self.enter_body(loc, entry, &[])?;
             }
             OpKind::Loop { progress } => {
                 self.operands(op, loc, &mut vs)?;
@@ -1802,7 +1909,13 @@ impl<'m> Machine<'m> {
                 };
                 self.stack_allocs.push(alloc);
             }
-            OpKind::Yield | OpKind::Break | OpKind::Continue | OpKind::Ret => {
+            OpKind::Yield
+            | OpKind::Break
+            | OpKind::Continue
+            | OpKind::Ret
+            | OpKind::Br { .. }
+            | OpKind::CondBr { .. }
+            | OpKind::Switch { .. } => {
                 self.operands(op, loc, &mut vs)?;
                 if let Some(&Frame::Block { allocs, .. }) = self.frames.last() {
                     self.frames.pop();
@@ -1872,10 +1985,12 @@ impl<'m> Machine<'m> {
         let mut steps = 0;
         loop {
             if steps >= fuel {
-                let progress = self
-                    .frames
-                    .iter()
-                    .any(|f| matches!(f, Frame::Loop { progress: true, .. }));
+                let progress = self.frames.iter().any(|f| {
+                    matches!(
+                        f,
+                        Frame::Loop { progress: true, .. } | Frame::Blocks { progress: true, .. }
+                    )
+                });
                 let tail = if progress { " in a progress loop" } else { "" };
                 return format!("out of fuel after {fuel} steps{tail}");
             }

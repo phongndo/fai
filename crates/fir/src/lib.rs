@@ -29,8 +29,8 @@ mod sem;
 mod verify;
 
 pub use body::{
-    Body, HoleId, Int, IntId, OpId, Operand, OperandKind, Ops, RegionId, StrId, UseId, Uses,
-    ValueDef, ValueId, ValueSpec,
+    Body, Case, CasesId, HoleId, Int, IntId, OpId, Operand, OperandKind, Ops, RegionId, StrId,
+    Succ, SuccId, UseId, Uses, ValueDef, ValueId, ValueSpec,
 };
 pub use decl::{Check, Effect, Field, FieldTy, Imm, Item, OpDecl, Tier, TyE};
 pub use ir::*;

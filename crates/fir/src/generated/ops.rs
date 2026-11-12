@@ -2,7 +2,7 @@
 // spec/Fir/Syntax.lean. Do not edit: change the declarations and regenerate with
 // `cd spec && lake exe gen-rust > ../crates/fir/src/generated/ops.rs`.
 
-use crate::body::{IntId, StrId};
+use crate::body::{CasesId, IntId, StrId, SuccId};
 use crate::decl::{Check, Effect, Field, FieldTy, Imm, Item, OpDecl, Tier, TyE};
 use crate::ir::*;
 
@@ -75,11 +75,24 @@ pub enum OpKind {
     Continue,
     /// `func.ret`
     Ret,
+    /// `cf.blocks [progress] { ^entry: … ^b(%x: i32): … }`: labeled blocks, entered at the first
+    /// (which has no parameters), with jumps between them. Each block ends with a terminator:
+    /// `cf.yield` leaves with the op's results; `cf.br`, `cf.cond_br`, and `cf.switch` jump. With
+    /// `progress`, control may be assumed to leave the op (as for `cf.loop progress`).
+    Blocks { progress: bool },
+    /// `cf.br ^b(%x, …)`: jump to a block of the nearest enclosing `cf.blocks`.
+    Br { dest: SuccId },
+    /// `cf.cond_br %c, ^t(…), ^f(…)`: jump to `^t` if `%c` is 1, otherwise to `^f`. Branching on
+    /// `poison` is UB.
+    CondBr { t: SuccId, f: SuccId },
+    /// `cf.switch %v, default ^d(…), [k: ^b(…), …]`: jump to the case whose key is `%v` (keys are
+    /// taken modulo `2^N`), or to the default. Branching on `poison` is UB.
+    Switch { dflt: SuccId, cases: CasesId },
 }
 
 impl OpKind {
     pub fn is_terminator(&self) -> bool {
-        matches!(self, OpKind::Yield | OpKind::Break | OpKind::Continue | OpKind::Ret)
+        matches!(self, OpKind::Yield | OpKind::Break | OpKind::Continue | OpKind::Ret | OpKind::Br { .. } | OpKind::CondBr { .. } | OpKind::Switch { .. })
     }
 
     /// The op's name with its modifiers, as printed.
@@ -244,6 +257,10 @@ impl OpKind {
             OpKind::Break => "cf.break",
             OpKind::Continue => "cf.continue",
             OpKind::Ret => "func.ret",
+            OpKind::Blocks { .. } => "cf.blocks",
+            OpKind::Br { .. } => "cf.br",
+            OpKind::CondBr { .. } => "cf.cond_br",
+            OpKind::Switch { .. } => "cf.switch",
         }
     }
 
@@ -282,6 +299,10 @@ impl OpKind {
             OpKind::Break => &DECLS[29],
             OpKind::Continue => &DECLS[30],
             OpKind::Ret => &DECLS[31],
+            OpKind::Blocks { .. } => &DECLS[32],
+            OpKind::Br { .. } => &DECLS[33],
+            OpKind::CondBr { .. } => &DECLS[34],
+            OpKind::Switch { .. } => &DECLS[35],
         }
     }
 
@@ -299,6 +320,12 @@ impl OpKind {
             (OpKind::Store { align: x, .. }, 1) => Imm::Align(*x),
             (OpKind::Call { callee: x }, 0) => Imm::Str(*x),
             (OpKind::Loop { progress: x }, 0) => Imm::Flag(*x),
+            (OpKind::Blocks { progress: x }, 0) => Imm::Flag(*x),
+            (OpKind::Br { dest: x }, 0) => Imm::Succ(*x),
+            (OpKind::CondBr { t: x, .. }, 0) => Imm::Succ(*x),
+            (OpKind::CondBr { f: x, .. }, 1) => Imm::Succ(*x),
+            (OpKind::Switch { dflt: x, .. }, 0) => Imm::Succ(*x),
+            (OpKind::Switch { cases: x, .. }, 1) => Imm::Cases(*x),
             _ => return None,
         })
     }
@@ -317,6 +344,12 @@ impl OpKind {
             (OpKind::Store { align: x, .. }, 1, Imm::Align(v)) => *x = v,
             (OpKind::Call { callee: x }, 0, Imm::Str(v)) => *x = v,
             (OpKind::Loop { progress: x }, 0, Imm::Flag(v)) => *x = v,
+            (OpKind::Blocks { progress: x }, 0, Imm::Flag(v)) => *x = v,
+            (OpKind::Br { dest: x }, 0, Imm::Succ(v)) => *x = v,
+            (OpKind::CondBr { t: x, .. }, 0, Imm::Succ(v)) => *x = v,
+            (OpKind::CondBr { f: x, .. }, 1, Imm::Succ(v)) => *x = v,
+            (OpKind::Switch { dflt: x, .. }, 0, Imm::Succ(v)) => *x = v,
+            (OpKind::Switch { cases: x, .. }, 1, Imm::Cases(v)) => *x = v,
             _ => {}
         }
     }
@@ -451,11 +484,15 @@ pub fn op_kind(name: &str) -> Option<OpKind> {
         "cf.break" => OpKind::Break,
         "cf.continue" => OpKind::Continue,
         "func.ret" => OpKind::Ret,
+        "cf.blocks" => OpKind::Blocks { progress: false },
+        "cf.br" => OpKind::Br { dest: SuccId::PLACEHOLDER },
+        "cf.cond_br" => OpKind::CondBr { t: SuccId::PLACEHOLDER, f: SuccId::PLACEHOLDER },
+        "cf.switch" => OpKind::Switch { dflt: SuccId::PLACEHOLDER, cases: CasesId::EMPTY },
         _ => return None,
     })
 }
 
-static DECLS: [OpDecl; 32] = [
+static DECLS: [OpDecl; 36] = [
     OpDecl {
         ctor: "const",
         imms: &[Field { name: "n", ty: FieldTy::Int }],
@@ -845,6 +882,42 @@ static DECLS: [OpDecl; 32] = [
         ctor: "ret",
         imms: &[],
         items: &[Item::Variadic],
+        terminator: true,
+        rule: None,
+        effects: &[],
+        tier: Tier::Verified,
+    },
+    OpDecl {
+        ctor: "blocks",
+        imms: &[Field { name: "progress", ty: FieldTy::Flag }],
+        items: &[Item::Imm(0), Item::Blocks],
+        terminator: false,
+        rule: None,
+        effects: &[Effect::Diverge],
+        tier: Tier::Verified,
+    },
+    OpDecl {
+        ctor: "br",
+        imms: &[Field { name: "dest", ty: FieldTy::Succ }],
+        items: &[Item::Imm(0)],
+        terminator: true,
+        rule: None,
+        effects: &[],
+        tier: Tier::Verified,
+    },
+    OpDecl {
+        ctor: "condBr",
+        imms: &[Field { name: "t", ty: FieldTy::Succ }, Field { name: "f", ty: FieldTy::Succ }],
+        items: &[Item::Operand, Item::Comma, Item::Imm(0), Item::Comma, Item::Imm(1)],
+        terminator: true,
+        rule: None,
+        effects: &[],
+        tier: Tier::Verified,
+    },
+    OpDecl {
+        ctor: "switch",
+        imms: &[Field { name: "dflt", ty: FieldTy::Succ }, Field { name: "cases", ty: FieldTy::Cases }],
+        items: &[Item::Operand, Item::Comma, Item::Keyword("default"), Item::Imm(0), Item::Comma, Item::Imm(1)],
         terminator: true,
         rule: None,
         effects: &[],

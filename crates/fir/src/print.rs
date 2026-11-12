@@ -3,7 +3,7 @@
 
 use std::fmt::Write;
 
-use crate::body::{Body, Int, OpId, Operand, OperandKind, RegionId, ValueId};
+use crate::body::{Body, Int, OpId, Operand, OperandKind, RegionId, Succ, ValueId};
 use crate::decl::{Field, FieldTy, Imm, Item};
 use crate::ir::*;
 
@@ -149,11 +149,16 @@ impl Printer<'_> {
 
     fn region(&mut self, depth: usize, r: RegionId) {
         self.out.push_str("{\n");
-        for op in self.body.ops(r) {
-            self.op(depth + 1, op);
-        }
+        self.ops(depth + 1, r);
         self.indent(depth);
         self.out.push('}');
+    }
+
+    /// A region's ops, at `depth`. The one place ops are printed, so `op` can be inlined here.
+    fn ops(&mut self, depth: usize, r: RegionId) {
+        for op in self.body.ops(r) {
+            self.op(depth, op);
+        }
     }
 
     fn op(&mut self, depth: usize, op: OpId) {
@@ -163,8 +168,15 @@ impl Printer<'_> {
             self.values(b.results(op));
             self.out.push_str(" = ");
         }
-        let params = b.regions(op).iter().map(|&r| b.params(r).len());
-        if b.kind(op).decl().fits(b.operands(op).len(), params) {
+        let kind = b.kind(op);
+        let regions = b
+            .regions(op)
+            .iter()
+            .map(|&r| (b.params(r).len(), b.label(r).is_some()));
+        if kind
+            .decl()
+            .fits(b.operands(op).len(), || kind.succ_args(b), regions)
+        {
             self.readable(depth, op);
         } else {
             self.generic(depth, op);
@@ -186,7 +198,69 @@ impl Printer<'_> {
             }
             Imm::Ty(t) => push_ty(self.out, t),
             Imm::Flag(b) => self.out.push_str(if b { "true" } else { "false" }),
+            Imm::Succ(s) => self.generic_succ(self.body.succ(s)),
+            Imm::Cases(c) => {
+                self.out.push('[');
+                for (i, case) in self.body.cases(c).iter().enumerate() {
+                    if i > 0 {
+                        self.out.push_str(", ");
+                    }
+                    push_int(self.out, self.body.int(case.key));
+                    self.out.push_str(": ");
+                    self.generic_succ(case.succ);
+                }
+                self.out.push(']');
+            }
         }
+    }
+
+    /// A branch target in the generic form: `^b`, or `^b(n)` for `n` arguments.
+    fn generic_succ(&mut self, s: Succ) {
+        self.out.push('^');
+        self.out.push_str(self.body.str(s.label));
+        if s.nargs > 0 {
+            self.out.push('(');
+            push_u64(self.out, s.nargs.into());
+            self.out.push(')');
+        }
+    }
+
+    /// A branch target with its arguments, the operands from `next` on; returns where the
+    /// next target's arguments start.
+    fn succ(&mut self, s: Succ, operands: &[Operand], next: usize) -> usize {
+        self.out.push('^');
+        self.out.push_str(self.body.str(s.label));
+        let end = (next + s.nargs as usize).min(operands.len());
+        let mine = &operands[next.min(end)..end];
+        if !mine.is_empty() {
+            self.out.push('(');
+            self.operand_list(mine);
+            self.out.push(')');
+        }
+        next + s.nargs as usize
+    }
+
+    /// `cf.blocks`'s blocks, each label at the op's indentation and its ops one level in.
+    #[inline(never)]
+    fn blocks(&mut self, depth: usize, op: OpId) {
+        let b = self.body;
+        self.out.push_str(" {\n");
+        for &r in b.regions(op) {
+            self.indent(depth);
+            self.out.push('^');
+            if let Some(l) = b.label(r) {
+                self.out.push_str(b.str(l));
+            }
+            if b.params(r).len() > 0 {
+                self.out.push('(');
+                self.values(b.params(r));
+                self.out.push(')');
+            }
+            self.out.push_str(":\n");
+            self.ops(depth + 1, r);
+        }
+        self.indent(depth);
+        self.out.push('}');
     }
 
     /// The readable form, from the op's declared format.
@@ -207,6 +281,22 @@ impl Printer<'_> {
                                 self.out.push(' ');
                                 self.out.push_str(f.name);
                             }
+                        }
+                        Some(Imm::Succ(s)) => {
+                            self.out.push(' ');
+                            next = self.succ(b.succ(s), operands, next);
+                        }
+                        Some(Imm::Cases(c)) => {
+                            self.out.push_str(" [");
+                            for (j, case) in b.cases(c).iter().enumerate() {
+                                if j > 0 {
+                                    self.out.push_str(", ");
+                                }
+                                push_int(self.out, b.int(case.key));
+                                self.out.push_str(": ");
+                                next = self.succ(case.succ, operands, next);
+                            }
+                            self.out.push(']');
                         }
                         Some(v) => {
                             self.out.push(' ');
@@ -257,7 +347,7 @@ impl Printer<'_> {
                     }
                     next = operands.len();
                 }
-                Item::Region(_) => {}
+                Item::Region(_) | Item::Blocks => {}
             }
         }
         self.loc(b.loc(op));
@@ -276,6 +366,9 @@ impl Printer<'_> {
                     }
                 }
             }
+        }
+        if decl.has_blocks() {
+            self.blocks(depth, op);
         }
     }
 
@@ -310,10 +403,17 @@ impl Printer<'_> {
                 if i > 0 {
                     self.out.push_str(", ");
                 }
+                if let Some(l) = b.label(r) {
+                    self.out.push('^');
+                    self.out.push_str(b.str(l));
+                }
                 if b.params(r).len() > 0 {
                     self.out.push('(');
                     self.values(b.params(r));
-                    self.out.push_str(") ");
+                    self.out.push(')');
+                }
+                if b.label(r).is_some() || b.params(r).len() > 0 {
+                    self.out.push(' ');
                 }
                 self.region(depth, r);
             }

@@ -9,8 +9,8 @@
 //!   and its location are four columns), so a pass reads only what it needs. Fields always used
 //!   together stay together, to keep the number of arrays (and allocations) per body small.
 //! * **No heap data per op.** [`OpKind`], [`Operand`], and facts are small `Copy` values. What
-//!   varies in size (names, big integers, holes) lives once in a side table, and lists (operands,
-//!   results, regions) are runs in shared pools.
+//!   varies in size (names, big integers, holes, branch targets and `cf.switch` cases) lives once
+//!   in a side table, and lists (operands, results, regions) are runs in shared pools.
 //! * **Stable ids.** A region's ops form an index-based doubly linked list, so inserting and
 //!   removing ops never moves other ops.
 //! * **Use lists on demand, in columns.** Each value's uses (the operand slots that name it)
@@ -71,6 +71,38 @@ id!(
     /// A use of a value: one operand slot of one op. See [`Body::uses`].
     UseId
 );
+id!(
+    /// A branch target in a [`Body`]: a block label and an argument count. See [`Body::succ`].
+    SuccId
+);
+
+/// `cf.switch`'s cases in a [`Body`]: a run in its case table. See [`Body::cases`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct CasesId {
+    start: u32,
+    len: u32,
+}
+
+impl CasesId {
+    /// No cases; also what an op's cases are before the parser stores them.
+    pub const EMPTY: CasesId = CasesId { start: 0, len: 0 };
+}
+
+/// A branch target (Lean's `Succ`): a block of the nearest enclosing `cf.blocks`, by label, and
+/// how many of the branch's operands are its arguments. A branch's operands are its own, then
+/// each target's arguments in the order the targets are written.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Succ {
+    pub label: StrId,
+    pub nargs: u32,
+}
+
+/// One case of `cf.switch`: its key, and where it jumps.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Case {
+    pub key: IntId,
+    pub succ: Succ,
+}
 
 impl ValueId {
     /// Stands in for an unresolved name in code that is parsed only to find syntax errors.
@@ -85,6 +117,11 @@ impl StrId {
 impl IntId {
     /// Stands in for an op's integer before the parser stores it.
     pub(crate) const PLACEHOLDER: IntId = IntId(0);
+}
+
+impl SuccId {
+    /// Stands in for an op's branch target before the parser stores it.
+    pub(crate) const PLACEHOLDER: SuccId = SuccId(0);
 }
 
 /// Marks an absent id in a column.
@@ -262,6 +299,8 @@ struct RegionData {
     first: u32,
     last: u32,
     parent: u32,
+    /// A block's label (a [`StrId`]), or `NONE`.
+    label: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -329,6 +368,8 @@ pub struct Body {
     small_ints: Vec<i64>,
     big_ints: Vec<BigInt>,
     holes: Vec<(StrId, Ty)>,
+    succs: Vec<Succ>,
+    cases: Vec<Case>,
     entry: RegionId,
 }
 
@@ -361,6 +402,8 @@ impl Body {
             small_ints: Vec::new(),
             big_ints: Vec::new(),
             holes: Vec::new(),
+            succs: Vec::new(),
+            cases: Vec::new(),
             entry: RegionId(0),
         };
         body.entry = body.new_region(None, []);
@@ -391,6 +434,8 @@ impl Body {
         self.small_ints.shrink_to_fit();
         self.big_ints.shrink_to_fit();
         self.holes.shrink_to_fit();
+        self.succs.shrink_to_fit();
+        self.cases.shrink_to_fit();
     }
 
     /// Empty the body, keeping its arrays' capacity, so it can be reused to build another
@@ -416,6 +461,8 @@ impl Body {
         self.small_ints.clear();
         self.big_ints.clear();
         self.holes.clear();
+        self.succs.clear();
+        self.cases.clear();
         self.entry = self.new_region(None, []);
     }
 
@@ -487,6 +534,30 @@ impl Body {
         self.holes[h.index()].1
     }
 
+    /// Store a branch target.
+    pub fn add_succ(&mut self, s: Succ) -> SuccId {
+        let id = SuccId(index32(self.succs.len()));
+        self.succs.push(s);
+        id
+    }
+
+    pub fn succ(&self, s: SuccId) -> Succ {
+        self.succs[s.index()]
+    }
+
+    /// Store `cf.switch`'s cases.
+    pub fn add_cases(&mut self, cases: impl IntoIterator<Item = Case>) -> CasesId {
+        let span = push_span(&mut self.cases, cases);
+        CasesId {
+            start: span.start,
+            len: span.len,
+        }
+    }
+
+    pub fn cases(&self, c: CasesId) -> &[Case] {
+        &self.cases[c.start as usize..(c.start + c.len) as usize]
+    }
+
     fn new_region<'s>(
         &mut self,
         parent: Option<OpId>,
@@ -499,8 +570,39 @@ impl Body {
             first: NONE,
             last: NONE,
             parent: parent.map_or(NONE, |p| p.0),
+            label: NONE,
         });
         id
+    }
+
+    /// Make a block of `op` (a `cf.blocks`) with this label and parameters, and nothing in it.
+    /// It becomes one of `op`'s regions with [`Body::set_regions`]; this lets a parser make each
+    /// block when it reaches it, after the blocks before it are filled.
+    pub fn new_block<'s>(
+        &mut self,
+        op: OpId,
+        label: StrId,
+        params: impl IntoIterator<Item = ValueSpec<'s>>,
+    ) -> RegionId {
+        let r = self.new_region(Some(op), params);
+        self.regions[r.index()].label = label.0;
+        r
+    }
+
+    /// Give an op without regions these regions, made by [`Body::new_block`].
+    pub fn set_regions(&mut self, op: OpId, regions: &[RegionId]) {
+        assert_eq!(
+            self.op_shape[op.index()].regions.len,
+            0,
+            "the op already has regions"
+        );
+        self.op_shape[op.index()].regions =
+            push_span(&mut self.region_ids, regions.iter().copied());
+    }
+
+    /// Label a region, as a block of `cf.blocks` (the generic form may label any region).
+    pub fn set_label(&mut self, region: RegionId, label: StrId) {
+        self.regions[region.index()].label = label.0;
     }
 
     /// Give a region without parameters its parameters (the entry region gets the function's).
@@ -1053,6 +1155,11 @@ impl Body {
         opt(self.regions[region.index()].parent).map(OpId)
     }
 
+    /// A block's label; `None` for other regions.
+    pub fn label(&self, region: RegionId) -> Option<StrId> {
+        opt(self.regions[region.index()].label).map(StrId)
+    }
+
     // Values
 
     /// How many values the body has; value ids are below this.
@@ -1392,7 +1499,48 @@ mod tests {
             }
             OperandKind::Value(_) => panic!("expected a hole"),
         }
+        let label = b.add_str("loop");
+        let s = b.add_succ(Succ { label, nargs: 2 });
+        let key = b.add_small_int(-1);
+        let cases = b.add_cases([Case {
+            key,
+            succ: Succ { label, nargs: 0 },
+        }]);
+        assert_eq!(b.succ(s), Succ { label, nargs: 2 });
+        assert_eq!(b.cases(cases).len(), 1);
+        assert_eq!(b.int(b.cases(cases)[0].key), Int::Small(-1));
+        assert!(b.cases(CasesId::EMPTY).is_empty());
         assert_eq!(std::mem::size_of::<Operand>(), 4);
         assert_eq!(std::mem::size_of::<OpKind>(), 16);
+    }
+
+    /// A `cf.blocks` op gets its blocks after they are made, one by one, with ops nested in
+    /// the earlier ones in between.
+    #[test]
+    fn blocks_are_attached_after_they_are_filled() {
+        let mut b = Body::new();
+        let r = b.entry();
+        let op = b.append_op(r, OpKind::Blocks { progress: false }, [], [], [], None);
+        let (l0, l1) = (b.add_str("entry"), b.add_str("next"));
+        let first = b.new_block(op, l0, []);
+        let dest = b.add_succ(Succ {
+            label: l1,
+            nargs: 1,
+        });
+        let inner = b.append_op(first, OpKind::Copy, [], [val("c")], [], None);
+        let c = Operand::value(value(&b, inner));
+        b.append_op(first, OpKind::Br { dest }, [c], [], [], None);
+        let second = b.new_block(op, l1, [val("x")]);
+        b.append_op(second, OpKind::Yield, [], [], [], None);
+        b.set_regions(op, &[first, second]);
+        assert_eq!(b.regions(op), [first, second]);
+        assert_eq!(b.label(second), Some(l1));
+        assert_eq!(b.label(r), None);
+        assert_eq!(b.parent_op(second), Some(op));
+        b.build_uses();
+        b.check_invariants().unwrap();
+        b.erase(op);
+        assert!(b.is_erased(inner) && b.is_empty(first));
+        b.check_invariants().unwrap();
     }
 }

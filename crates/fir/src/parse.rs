@@ -3,12 +3,15 @@
 //! The Lean parser keeps value names as text and leaves scoping to its verifier. This parser
 //! builds the arena directly, so it resolves each use to its definition as it goes, with the
 //! verifier's rules and messages: a value is defined once per function, and visible after its
-//! definition in the same region or a nested one.
+//! definition in the same region or a nested one (a block of `cf.blocks` is a region). Block
+//! labels are kept as text; the verifier resolves them.
 
 use num_bigint::Sign;
 use rustc_hash::FxHashMap;
 
-use crate::body::{Body, IntId, OpId, Operand, RegionId, StrId, ValueId, ValueSpec};
+use crate::body::{
+    Body, Case, CasesId, IntId, OpId, Operand, RegionId, StrId, Succ, ValueId, ValueSpec,
+};
 use crate::decl::{Field, FieldTy, Imm, Item};
 use crate::ir::*;
 use crate::lex::{Lexer, Sym, Tok, Token, int_value};
@@ -128,6 +131,19 @@ impl<'a> Parser<'a> {
                 Ok(s)
             }
             t => self.fail(format!("expected a name but found {}", t.describe())),
+        }
+    }
+
+    fn label(&mut self) -> PResult<&'a str> {
+        match self.peek() {
+            Tok::Label(s) => {
+                self.bump()?;
+                Ok(s)
+            }
+            t => self.fail(format!(
+                "expected a block label like ^b but found {}",
+                t.describe()
+            )),
         }
     }
 
@@ -342,18 +358,116 @@ impl<'a> Parser<'a> {
         self.expect_sym(Sym::LBrace)?;
         let mark = self.undo.len();
         self.define(params, self.body.params(region))?;
-        while !self.try_sym(Sym::RBrace)? {
-            if self.peek() == Tok::Eof {
-                return self.fail("expected '}'");
+        self.ops(region, false)?;
+        self.bump()?;
+        self.hide(mark);
+        Ok(())
+    }
+
+    /// Ops into `region`, up to the `}` that closes it (left for the caller), or for a block of
+    /// `cf.blocks`, up to the next label too. The one place ops are parsed, so `op` can be
+    /// inlined here.
+    fn ops(&mut self, region: RegionId, block: bool) -> PResult<()> {
+        loop {
+            match self.peek() {
+                Tok::Sym(Sym::RBrace) => return Ok(()),
+                Tok::Label(_) if block => return Ok(()),
+                Tok::Eof => return self.fail("expected '}'"),
+                _ => self.op(region)?,
             }
-            self.op(region)?;
         }
+    }
+
+    /// Hide the names defined since `undo` had `mark` entries.
+    fn hide(&mut self, mark: usize) {
         for name in self.undo.drain(mark..) {
             if let Some(e) = self.names.get_mut(name) {
                 e.1 = false;
             }
         }
+    }
+
+    /// `cf.blocks`'s blocks, `{ ^a: ops ^b(%x: T): ops … }`, into `op`. A block's ops run up to
+    /// the next label or the closing `}`; its names are hidden at its end.
+    #[inline(never)]
+    fn blocks(&mut self, op: OpId) -> PResult<()> {
+        self.expect_sym(Sym::LBrace)?;
+        let mut blocks = Vec::new();
+        while !self.try_sym(Sym::RBrace)? {
+            let label = self.label()?;
+            let params = if self.try_sym(Sym::LParen)? {
+                self.sep_by(Self::result, Sym::RParen)?
+            } else {
+                Vec::new()
+            };
+            self.expect_sym(Sym::Colon)?;
+            let names: Vec<&'a str> = params.iter().map(|p| p.name).collect();
+            let label = self.body.add_str(label);
+            let r = self.body.new_block(op, label, params);
+            blocks.push(r);
+            let mark = self.undo.len();
+            self.define(&names, self.body.params(r))?;
+            self.ops(r, true)?;
+            self.hide(mark);
+        }
+        self.body.set_regions(op, &blocks);
         Ok(())
+    }
+
+    /// A branch target in the readable form, `^b` or `^b(%x, …)`; its arguments go on the
+    /// scratch operands.
+    #[inline(never)]
+    fn succ(&mut self) -> PResult<Succ> {
+        let label = self.label()?;
+        let start = self.operands.len();
+        if self.try_sym(Sym::LParen)? && !self.try_sym(Sym::RParen)? {
+            self.variadic_until_close()?;
+        }
+        Ok(Succ {
+            label: self.body.add_str(label),
+            nargs: (self.operands.len() - start) as u32,
+        })
+    }
+
+    /// A branch target in the generic form: `^b`, or `^b(n)` for `n` arguments.
+    #[inline(never)]
+    fn generic_succ(&mut self) -> PResult<Succ> {
+        let label = self.label()?;
+        let nargs = if self.try_sym(Sym::LParen)? {
+            let n = self.nat()?;
+            self.expect_sym(Sym::RParen)?;
+            n
+        } else {
+            0
+        };
+        Ok(Succ {
+            label: self.body.add_str(label),
+            nargs,
+        })
+    }
+
+    /// `cf.switch`'s cases, `[k: target, …]`, with targets in the readable or generic form.
+    #[inline(never)]
+    fn cases(&mut self, generic: bool) -> PResult<CasesId> {
+        self.expect_sym(Sym::LBracket)?;
+        let mut cases = Vec::new();
+        if !self.try_sym(Sym::RBracket)? {
+            loop {
+                let key = self.int()?;
+                self.expect_sym(Sym::Colon)?;
+                let succ = if generic {
+                    self.generic_succ()?
+                } else {
+                    self.succ()?
+                };
+                cases.push(Case { key, succ });
+                if !self.try_sym(Sym::Comma)? {
+                    break;
+                }
+            }
+            self.expect_sym(Sym::RBracket)?;
+        }
+        Ok(self.body.add_cases(cases))
     }
 
     fn op(&mut self, region: RegionId) -> PResult<()> {
@@ -426,6 +540,8 @@ impl<'a> Parser<'a> {
     }
 
     /// An immediate, as the readable form writes it. A flag is a keyword named after its field.
+    /// Branch targets are read here as the generic form writes them; the readable form's go with
+    /// their operands (`readable_op`).
     fn imm(&mut self, f: Field) -> PResult<Imm> {
         Ok(match f.ty {
             FieldTy::Int => Imm::Int(self.int()?),
@@ -438,6 +554,11 @@ impl<'a> Parser<'a> {
             FieldTy::Func => Imm::Str(self.func_name()?),
             FieldTy::Ty => Imm::Ty(self.ty()?),
             FieldTy::Flag => Imm::Flag(self.try_ident(f.name)?),
+            FieldTy::Succ => {
+                let s = self.generic_succ()?;
+                Imm::Succ(self.body.add_succ(s))
+            }
+            FieldTy::Cases => Imm::Cases(self.cases(true)?),
         })
     }
 
@@ -449,7 +570,15 @@ impl<'a> Parser<'a> {
         for &item in decl.head() {
             match item {
                 Item::Imm(i) => {
-                    let v = self.imm(decl.imms[usize::from(i)])?;
+                    let f = decl.imms[usize::from(i)];
+                    let v = match f.ty {
+                        FieldTy::Succ => {
+                            let s = self.succ()?;
+                            Imm::Succ(self.body.add_succ(s))
+                        }
+                        FieldTy::Cases => Imm::Cases(self.cases(false)?),
+                        _ => self.imm(f)?,
+                    };
                     kind.set_imm(i.into(), v);
                 }
                 Item::Operand => {
@@ -475,7 +604,7 @@ impl<'a> Parser<'a> {
                         iter = self.sep_by(Self::iter_arg, Sym::RParen)?;
                     }
                 }
-                Item::Region(_) => {}
+                Item::Region(_) | Item::Blocks => {}
             }
         }
         let loc = self.opt_loc()?;
@@ -502,6 +631,9 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
+        }
+        if decl.has_blocks() {
+            self.blocks(op)?;
         }
         Ok(op)
     }
@@ -579,10 +711,17 @@ impl<'a> Parser<'a> {
             (0..n).map(|_| Vec::new()),
             loc,
         );
-        // `((%x: T, ...) { ... }, ...)`, the parameters optional.
+        // `(^b(%x: T, ...) { ... }, ...)`, the label and parameters optional.
         if self.try_sym(Sym::LParen)? && !self.try_sym(Sym::RParen)? {
             let mut i = 0;
             loop {
+                let label = match self.peek() {
+                    Tok::Label(l) => {
+                        self.bump()?;
+                        Some(l)
+                    }
+                    _ => None,
+                };
                 let params = if self.try_sym(Sym::LParen)? {
                     self.sep_by(Self::result, Sym::RParen)?
                 } else {
@@ -596,6 +735,10 @@ impl<'a> Parser<'a> {
                 };
                 let names: Vec<&'a str> = params.iter().map(|p| p.name).collect();
                 self.body.set_params(r, params);
+                if let Some(l) = label {
+                    let l = self.body.add_str(l);
+                    self.body.set_label(r, l);
+                }
                 self.region(r, &names)?;
                 i += 1;
                 if !self.try_sym(Sym::Comma)? {

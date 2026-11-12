@@ -8,9 +8,9 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use num_bigint::Sign;
+use num_bigint::{BigInt, Sign};
 
-use crate::body::{Body, Int, OpId, Operand, OperandKind, RegionId, ValueId};
+use crate::body::{Body, Int, OpId, Operand, OperandKind, RegionId, Succ, ValueId};
 use crate::decl::{Check, Imm, TyE};
 use crate::ir::*;
 
@@ -78,10 +78,19 @@ fn verr<T>(loc: Option<Loc>, msg: impl std::fmt::Display) -> VResult<T> {
 }
 
 /// The region being checked (Lean's `RegionCtx`).
-enum RegionCtx {
+enum RegionCtx<'a> {
     Func(Vec<Ty>),
     IfBranch(Vec<Ty>),
-    LoopBody { params: Vec<Ty>, results: Vec<Ty> },
+    LoopBody {
+        params: Vec<Ty>,
+        results: Vec<Ty>,
+    },
+    /// A block of `cf.blocks`: the labels of its blocks with their parameter types, and the
+    /// `cf.blocks`'s results. One entry serves all the blocks of a `cf.blocks`.
+    Block {
+        blocks: Vec<(&'a str, Vec<Ty>)>,
+        results: Vec<Ty>,
+    },
 }
 
 fn check_ty(loc: Option<Loc>, t: Ty) -> VResult<()> {
@@ -433,7 +442,7 @@ struct FuncVerifier<'a> {
     visible: Vec<bool>,
     scope: Vec<ValueId>,
     /// The enclosing regions, innermost last.
-    ctx: Vec<RegionCtx>,
+    ctx: Vec<RegionCtx<'a>>,
 }
 
 impl<'a> FuncVerifier<'a> {
@@ -522,6 +531,9 @@ impl<'a> FuncVerifier<'a> {
                     "a loop body must end with cf.break or cf.continue",
                 );
             }
+            Some(RegionCtx::Block { .. }) => {
+                return verr(region_loc, "a block must end with a terminator");
+            }
             _ => return verr(region_loc, "the function body must end with func.ret"),
         }
         self.restore(mark);
@@ -533,6 +545,86 @@ impl<'a> FuncVerifier<'a> {
             RegionCtx::LoopBody { params, results } => Some((&params[..], &results[..])),
             _ => None,
         })
+    }
+
+    /// The blocks of the nearest enclosing `cf.blocks`.
+    fn nearest_blocks(&self) -> Option<&[(&'a str, Vec<Ty>)]> {
+        self.ctx.iter().rev().find_map(|c| match c {
+            RegionCtx::Block { blocks, .. } => Some(&blocks[..]),
+            _ => None,
+        })
+    }
+
+    /// Check a jump to `s` with arguments of types `args` (Lean's `checkSucc`).
+    fn check_succ(&self, loc: Option<Loc>, s: Succ, args: &[Ty]) -> VResult<()> {
+        let label = self.body.str(s.label);
+        let blocks = self.nearest_blocks().unwrap_or_default();
+        let Some((_, ps)) = blocks.iter().find(|(l, _)| *l == label) else {
+            return verr(loc, format!("no block ^{label} in the enclosing cf.blocks"));
+        };
+        expect_tys(loc, &format!("arguments of ^{label}"), args, ps)
+    }
+
+    /// Check jumps to `targets`, whose arguments are `args` in order (Lean's `splitArgs`).
+    fn check_succs(
+        &self,
+        loc: Option<Loc>,
+        targets: impl Iterator<Item = Succ>,
+        args: &[Ty],
+    ) -> VResult<()> {
+        let mut next = 0;
+        for s in targets {
+            let end = next + s.nargs as usize;
+            self.check_succ(loc, s, &args[next..end])?;
+            next = end;
+        }
+        Ok(())
+    }
+
+    /// `cf.blocks` (Lean's `verifyOp` on `.blocks`).
+    fn blocks(
+        &mut self,
+        loc: Option<Loc>,
+        ins: &[Ty],
+        outs: &[Ty],
+        rs: &[RegionId],
+    ) -> VResult<()> {
+        let body = self.body;
+        if !ins.is_empty() {
+            return verr(loc, "malformed op");
+        }
+        let Some(&entry) = rs.first() else {
+            return verr(loc, "cf.blocks needs at least one block");
+        };
+        let mut blocks: Vec<(&'a str, Vec<Ty>)> = Vec::with_capacity(rs.len());
+        let mut seen = FxHashSet::default();
+        for &r in rs {
+            let Some(l) = body.label(r) else {
+                return verr(loc, "every block of cf.blocks needs a label");
+            };
+            let l = body.str(l);
+            if !seen.insert(l) {
+                return verr(loc, format!("block ^{l} is defined more than once"));
+            }
+            blocks.push((l, body.params(r).map(|v| body.ty(v)).collect()));
+        }
+        if body.params(entry).len() != 0 {
+            return verr(loc, "the entry block of cf.blocks has no parameters");
+        }
+        self.ctx.push(RegionCtx::Block {
+            blocks,
+            results: outs.to_vec(),
+        });
+        for &r in rs {
+            let mark = self.scope.len();
+            for v in body.params(r) {
+                self.define(loc, v, false)?;
+            }
+            self.ops(r, loc)?;
+            self.restore(mark);
+        }
+        self.ctx.pop();
+        Ok(())
     }
 
     fn func_rets(&self) -> &[Ty] {
@@ -556,12 +648,12 @@ impl<'a> FuncVerifier<'a> {
         }
         let kind = body.kind(op);
         match (kind, body.regions(op)) {
-            (OpKind::Yield, []) => {
-                let Some(RegionCtx::IfBranch(rs)) = self.ctx.last() else {
-                    return verr(loc, "cf.yield must end a cf.if region");
-                };
-                expect_tys(loc, "cf.yield", &ins, rs)?;
-            }
+            (OpKind::Yield, []) => match self.ctx.last() {
+                Some(RegionCtx::IfBranch(rs) | RegionCtx::Block { results: rs, .. }) => {
+                    expect_tys(loc, "cf.yield", &ins, rs)?;
+                }
+                _ => return verr(loc, "cf.yield must end a cf.if region or a block"),
+            },
             (OpKind::Break, []) => {
                 let Some((_, rs)) = self.nearest_loop() else {
                     return verr(loc, "cf.break outside a loop");
@@ -575,11 +667,72 @@ impl<'a> FuncVerifier<'a> {
                 expect_tys(loc, "cf.continue", &ins, ps)?;
             }
             (OpKind::Ret, []) => expect_tys(loc, "func.ret", &ins, self.func_rets())?,
+            (OpKind::Br { dest }, []) => {
+                if self.nearest_blocks().is_none() {
+                    return verr(loc, "cf.br outside cf.blocks");
+                }
+                let dest = body.succ(dest);
+                if ins.len() != dest.nargs as usize {
+                    return verr(loc, "malformed op");
+                }
+                self.check_succ(loc, dest, &ins)?;
+            }
+            (OpKind::CondBr { t, f }, []) => {
+                if self.nearest_blocks().is_none() {
+                    return verr(loc, "cf.cond_br outside cf.blocks");
+                }
+                let (t, f) = (body.succ(t), body.succ(f));
+                if ins.len() != 1 + t.nargs as usize + f.nargs as usize {
+                    return verr(loc, "malformed op");
+                }
+                expect_tys(loc, "cf.cond_br condition", &ins[..1], &[Ty::Int(1)])?;
+                self.check_succs(loc, [t, f].into_iter(), &ins[1..])?;
+            }
+            (OpKind::Switch { dflt, cases }, []) => {
+                if self.nearest_blocks().is_none() {
+                    return verr(loc, "cf.switch outside cf.blocks");
+                }
+                let (dflt, cases) = (body.succ(dflt), body.cases(cases));
+                let targets = || std::iter::once(dflt).chain(cases.iter().map(|c| c.succ));
+                if ins.len() != 1 + targets().map(|s| s.nargs as usize).sum::<usize>() {
+                    return verr(loc, "malformed op");
+                }
+                let t = ins[0];
+                if !is_int(t) {
+                    return verr(
+                        loc,
+                        format!("cf.switch value: expected an integer but got {t}"),
+                    );
+                }
+                let w = width(t);
+                let modulus = BigInt::from(1) << w;
+                let mut seen = FxHashSet::default();
+                for c in cases {
+                    let k = body.int(c.key);
+                    if !(fits_signed(w, k) || fits_unsigned(w, k)) {
+                        return verr(loc, format!("{k} does not fit in {t}"));
+                    }
+                    let r = k.to_bigint() % &modulus;
+                    let r = if r.sign() == Sign::Minus {
+                        r + &modulus
+                    } else {
+                        r
+                    };
+                    if !seen.insert(r) {
+                        return verr(loc, format!("cf.switch has more than one case {k}"));
+                    }
+                }
+                self.check_succs(loc, targets(), &ins[1..])?;
+            }
+            (OpKind::Blocks { .. }, rs) => self.blocks(loc, &ins, &outs, rs)?,
             (OpKind::If, &[thn, els]) => {
                 expect_tys(loc, "cf.if condition", &ins, &[Ty::Int(1)])?;
                 for r in [thn, els] {
                     if body.params(r).len() != 0 {
                         return verr(loc, "cf.if regions have no parameters");
+                    }
+                    if body.label(r).is_some() {
+                        return verr(loc, "only blocks of cf.blocks have labels");
                     }
                     self.ctx.push(RegionCtx::IfBranch(outs.to_vec()));
                     self.ops(r, loc)?;
@@ -587,6 +740,9 @@ impl<'a> FuncVerifier<'a> {
                 }
             }
             (OpKind::Loop { .. }, &[inner]) => {
+                if body.label(inner).is_some() {
+                    return verr(loc, "only blocks of cf.blocks have labels");
+                }
                 let ps: Vec<Ty> = body.params(inner).map(|v| body.ty(v)).collect();
                 expect_tys(loc, "cf.loop initial values", &ins, &ps)?;
                 let mark = self.scope.len();

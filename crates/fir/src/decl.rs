@@ -5,7 +5,7 @@
 //! [`OpKind::mnemonic`]), and one [`OpDecl`] per variant ([`OpKind::decl`]). The parser, printer,
 //! and verifier interpret the declarations, as the Lean ones do.
 
-use crate::body::{IntId, StrId};
+use crate::body::{Body, CasesId, IntId, StrId, SuccId};
 use crate::ir::{OpKind, Ty};
 
 /// What an op's declaration says. The parser, printer, and verifier read `imms`, `items`, and
@@ -49,6 +49,11 @@ pub enum FieldTy {
     Ty,
     /// A keyword named after the field (`true` or `false` in the generic form), [`Imm::Flag`].
     Flag,
+    /// A branch target, `^b(%x, …)`, [`Imm::Succ`]. Its arguments are among the op's operands;
+    /// the generic form writes it as `^b(1)`.
+    Succ,
+    /// `cf.switch`'s cases, `[k: ^b(…), …]`, [`Imm::Cases`].
+    Cases,
 }
 
 /// An immediate's value.
@@ -60,6 +65,8 @@ pub enum Imm {
     Str(StrId),
     Ty(Ty),
     Flag(bool),
+    Succ(SuccId),
+    Cases(CasesId),
 }
 
 /// One piece of an op's readable format (Lean's `Item`).
@@ -79,6 +86,8 @@ pub enum Item {
     Iter,
     /// A region; one introduced by a keyword is left out when empty.
     Region(Option<&'static str>),
+    /// `cf.blocks`'s labeled blocks, `{ ^a: … ^b(%x: T): … }`: any number of regions.
+    Blocks,
 }
 
 /// A type in a rule (Lean's `TyE`), with names resolved: the types named by earlier checks are
@@ -149,9 +158,15 @@ impl OpDecl {
         let n = self
             .items
             .iter()
-            .position(|i| matches!(i, Item::Region(_)))
+            .position(|i| matches!(i, Item::Region(_) | Item::Blocks))
             .unwrap_or(self.items.len());
         &self.items[..n]
+    }
+
+    /// Whether the op's regions are labeled blocks (`cf.blocks`). `blocks` is always the last
+    /// item.
+    pub fn has_blocks(&self) -> bool {
+        self.items.last() == Some(&Item::Blocks)
     }
 
     /// The regions, each with the keyword that introduces it, if any.
@@ -162,31 +177,52 @@ impl OpDecl {
         })
     }
 
-    /// Whether the readable form can show an op with `operands` operands and regions with
-    /// `params` parameters each: as many operands as the format holds, and the regions it lists,
-    /// with parameters only where `%iter` gives them. Otherwise the op prints in the generic
-    /// form (Lean's `OpDecl.fits`).
-    pub fn fits(&self, operands: usize, params: impl ExactSizeIterator<Item = usize>) -> bool {
-        let (mut fixed, mut any, mut iter, mut regions) = (0, false, false, 0);
+    /// Whether the readable form can show an op with `operands` operands, `succ_args()` of
+    /// them its branch targets' arguments, and regions with these parameter counts and labels:
+    /// as many operands as the format holds, and the regions it lists, unlabeled and with
+    /// parameters only where `%iter` gives them; or, for `cf.blocks`, regions that all have
+    /// labels. Otherwise the op prints in the generic form (Lean's `OpDecl.fits`).
+    #[inline]
+    pub fn fits(
+        &self,
+        operands: usize,
+        succ_args: impl FnOnce() -> usize,
+        mut regions: impl ExactSizeIterator<Item = (usize, bool)>,
+    ) -> bool {
+        let (mut fixed, mut any, mut iter, mut n_regions, mut blocks) = (0, false, false, 0, false);
+        let mut targets = false;
         for item in self.items {
             match item {
                 Item::Operand => fixed += 1,
+                Item::Imm(i) => {
+                    targets |= matches!(
+                        self.imms[usize::from(*i)].ty,
+                        FieldTy::Succ | FieldTy::Cases
+                    );
+                }
                 Item::Variadic | Item::Args => any = true,
                 Item::Iter => iter = true,
-                Item::Region(_) => regions += 1,
+                Item::Region(_) => n_regions += 1,
+                Item::Blocks => blocks = true,
                 _ => {}
             }
         }
-        if params.len() != regions {
-            return false;
-        }
         let mut first = None;
-        for (i, n) in params.enumerate() {
-            if i == 0 {
-                first = Some(n);
-            }
-            if n != 0 && !(iter && i == 0) {
+        if blocks {
+            if !regions.all(|(_, labeled)| labeled) {
                 return false;
+            }
+        } else {
+            if regions.len() != n_regions {
+                return false;
+            }
+            for (i, (n, labeled)) in regions.enumerate() {
+                if i == 0 {
+                    first = Some(n);
+                }
+                if labeled || (n != 0 && !(iter && i == 0)) {
+                    return false;
+                }
             }
         }
         if any {
@@ -194,7 +230,7 @@ impl OpDecl {
         } else if iter {
             first == Some(operands)
         } else {
-            operands == fixed
+            operands == fixed + if targets { succ_args() } else { 0 }
         }
     }
 }
@@ -208,5 +244,25 @@ impl OpKind {
     /// Append the op's name with its modifiers.
     pub fn write_name(&self, out: &mut String) {
         out.push_str(self.mnemonic());
+    }
+
+    /// How many of the op's operands are its branch targets' arguments (Lean's
+    /// `OpKind.succArgs`).
+    pub fn succ_args(&self, body: &Body) -> usize {
+        let mut n = 0;
+        for (i, f) in self.decl().imms.iter().enumerate() {
+            match (f.ty, self.imm(i)) {
+                (FieldTy::Succ, Some(Imm::Succ(s))) => n += body.succ(s).nargs as usize,
+                (FieldTy::Cases, Some(Imm::Cases(c))) => {
+                    n += body
+                        .cases(c)
+                        .iter()
+                        .map(|c| c.succ.nargs as usize)
+                        .sum::<usize>();
+                }
+                _ => {}
+            }
+        }
+        n
     }
 }

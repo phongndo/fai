@@ -65,6 +65,8 @@ pub enum Tok<'a> {
     Loc(u32, u32),
     /// `?name`
     Hole(&'a str),
+    /// `^name`, a block label
+    Label(&'a str),
     Ident(&'a str),
     /// An integer literal: an optional `-` and decimal digits.
     Int(&'a str),
@@ -88,6 +90,7 @@ impl Tok<'_> {
             Tok::Global(s) => format!("@{s}"),
             Tok::Loc(l, c) => format!("@{l}:{c}"),
             Tok::Hole(s) => format!("?{s}"),
+            Tok::Label(s) => format!("^{s}"),
             Tok::Ident(s) => format!("'{s}'"),
             Tok::Int(s) => int_value(s).to_string(),
             Tok::Str(s) => format!("\"{s}\""),
@@ -248,11 +251,31 @@ impl<'a> Lexer<'a> {
             Tok::Str(body)
         } else if c.is_ascii_alphabetic() || c == b'_' {
             Tok::Ident(self.skip_ascii(is_name_byte))
+        } else if c == b'^' {
+            // Last, and out of line: labels are rare.
+            return self.label(line, col);
         } else {
             let ch = self.text[self.pos..].chars().next().expect("a character");
             return fail(format!("unexpected character '{ch}'"));
         };
         Ok(Token { tok, line, col })
+    }
+
+    /// `^name`, a block label.
+    #[cold]
+    #[inline(never)]
+    fn label(&mut self, line: u32, col: u32) -> Result<Token<'a>, String> {
+        self.pos += 1;
+        self.col += 1;
+        let name = self.skip_ascii(is_name_byte);
+        if name.is_empty() {
+            return Err(format!("{line}:{col}: expected a name after '^'"));
+        }
+        Ok(Token {
+            tok: Tok::Label(name),
+            line,
+            col,
+        })
     }
 
     /// The first lexing error from here to the end of the input, if any.
