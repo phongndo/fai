@@ -203,6 +203,49 @@ Decisions: Floats, Float ops, NaN choice, Float text.
   every `tests/float/` run line with rounding toward +∞ and subnormals flushed (MXCSR or FPCR)
   and requires the expected outcomes (32 of 196 differed before).
 
+### Track N: Floats on AArch64 (done)
+
+Decisions: NaN choice (replaced), LFIR for AArch64, AArch64 semantics, Calling convention,
+Instruction selection, Register allocation, Backend testing, Globals, Floats.
+
+- **NaN choice:** the oracle is a structure (`Oracle`): `next` answers the sequential choices and
+  `nan` picks a float op's NaN result from the op and its operands, so NaN payloads no longer
+  share an answer with the next `freeze` or allocation, and hardware's fixed NaN rule is one of
+  the choices. `Dce.evalFloat_oracle` proves every float op a function of the oracle (pure,
+  deterministic, shareable); `Dce.float_pure` is unchanged.
+- **Float globals:** `global @g: f64 = 1.5` and floats in `{…}` (`Init.float` with its format;
+  the parsers read an initializer for its type), in both implementations, the builder, the C
+  API (`fir_init_f32`, `fir_init_f64`; version 1.3), and the emitter.
+- **LFIR:** FP registers `d0`…`d31` and virtual `fvN` (the top bit of `Reg` and `FirReg` is the
+  class; `.s`/`.d` pick the width), and `fadd`/`fsub`/`fmul`/`fdiv`, `fmov` (also between
+  classes), `fabs`, `fneg`, `fsqrt`, `fmadd` with the destination as addend (four registers don't
+  fit `OpKind`), `fmov.imm` (Arm's 8-bit encoding), `fcmp`, `fcsel`, `fcvt`, `scvtf`/`ucvtf`,
+  `fcvtzs`/`fcvtzu`, and FP `ldr`/`str`. `Fir.AArch64` specifies them in ASL's shape with Arm's
+  NaN rules; `Fir.AArch64Proofs` proves each result one FIR allows, defines `Oracle.arm`, under
+  which FIR's float ops compute the instructions' results exactly, and proves `fcvtz` is
+  `float.to_int.*.sat`. Both machines check register classes, keep FP registers and FP virtual
+  registers, follow AAPCS64 for floats (`abi.rs`), and check that `d8`…`d15` survive calls;
+  `tests/lfir/floats.fir` runs them by hand.
+- **Backend:** isel for every float op, `int.to_float`, `select`, `freeze`, `poison`, loads and
+  stores, and float parameters, results, call arguments, and region state; the allocator's FP
+  class (spills, scratch `d29`…`d31`, AAPCS64 clobbers, `d8`…`d15` saved in the frame, the
+  checker over both classes); the emitter's FP instructions and float data, ELF and Mach-O.
+- **Tests:** the backend harness passes floats as C types, renders their printed bits, and
+  compares with `fir run` under Arm's NaN choice (`NanRule::Arm`), so native NaN payloads must
+  be exactly the ones that allowed oracle gives. All 7 float fixtures with runs compile (except
+  the runs that use integers over 64 bits); 188 float runs match natively (34 with NaN results),
+  and every fixture's LFIR matches before and after allocation, also in `fir-ref`. The fuzzer's
+  narrow mode makes floats (in about 98% of programs): `FIR_FUZZ=3000` on seeds 21 and 37 for
+  `aarch64.rs` (about 3,100 float runs matching natively per seed, with and without `-O`, 54–68
+  of them with NaN results), `fuzz.rs`, and `opt.rs`: no differences. `tests/capi/e2e.c`
+  builds a float module through the C API that C calls (register and stack arguments, an HFA
+  pair and a mixed pair, an `f64` global) and that calls libm's `sqrt` and `fabsf` and a
+  ten-double C function, and checks that a FIR call keeps `d8`…`d15`; `modules.c` builds every
+  new LFIR op and float initializer.
+- **Not yet:** `fai-cc` still rejects floats (track F2); varargs with floats (track V) and HFAs
+  by value (track A); macOS's argument packing; a four-register `fmadd`; a proof that isel
+  refines its source.
+
 ## Not in this round
 
 - Proofs beyond the float semantics and the purity of the new pure ops: scalarizing, lowering
