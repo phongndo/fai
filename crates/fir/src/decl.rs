@@ -7,10 +7,11 @@
 
 use crate::body::{Body, CasesId, IntId, StrId, SuccId};
 use crate::ir::{OpKind, Ty};
+use crate::ops::TARGETS;
 
 /// What an op's declaration says. The parser, printer, and verifier read `imms`, `items`, and
-/// `rule`, and `terminator` through [`OpKind::is_terminator`]; `effects` and `tier` are declared
-/// but not yet read.
+/// `rule`, and `terminator` through [`OpKind::is_terminator`]; the verifier reads `layers` and
+/// `dialect` ([`Layer::allows`]); `effects` and `tier` are declared but not yet read.
 #[derive(Debug)]
 pub struct OpDecl {
     /// The Lean constructor, such as `memAlloc`.
@@ -25,6 +26,57 @@ pub struct OpDecl {
     pub rule: Option<&'static [Check]>,
     pub effects: &'static [Effect],
     pub tier: Tier,
+    /// The layers whose modules may contain the op.
+    pub layers: Layers,
+    /// The op group it belongs to: `int`, `mem`, … (decision: Dialects).
+    pub dialect: &'static str,
+}
+
+/// The layers an op is allowed in (Lean's `List LayerKind`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Layers {
+    pub hfir: bool,
+    pub mfir: bool,
+    pub lfir: bool,
+}
+
+/// A module's layer (Lean's `Layer`): `layer hfir`, `layer mfir`, or `layer lfir aarch64`. HFIR
+/// when the module doesn't say.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Layer {
+    #[default]
+    Hfir,
+    Mfir,
+    /// LFIR for a target, one of [`TARGETS`].
+    Lfir(&'static str),
+}
+
+impl Layer {
+    /// The target with this name, from [`TARGETS`].
+    pub fn target(name: &str) -> Option<&'static str> {
+        TARGETS.iter().copied().find(|t| *t == name)
+    }
+
+    /// Whether a module of this layer may contain the op: the op lists the layer, and in LFIR,
+    /// an op of a target's dialect belongs to the module's target (Lean's `Layer.allows`).
+    #[inline]
+    pub fn allows(self, d: &OpDecl) -> bool {
+        match self {
+            Layer::Hfir => d.layers.hfir,
+            Layer::Mfir => d.layers.mfir,
+            Layer::Lfir(t) => d.layers.lfir && (d.dialect == t || !TARGETS.contains(&d.dialect)),
+        }
+    }
+}
+
+impl std::fmt::Display for Layer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Layer::Hfir => f.write_str("hfir"),
+            Layer::Mfir => f.write_str("mfir"),
+            Layer::Lfir(t) => write!(f, "lfir {t}"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -169,6 +221,26 @@ pub enum Tier {
 }
 
 impl OpDecl {
+    /// The layers that allow the op, for messages: `hfir, mfir`, or `lfir aarch64` for a
+    /// target's op (Lean's `OpDecl.layersText`).
+    pub fn layers_text(&self) -> String {
+        let mut out = Vec::new();
+        if self.layers.hfir {
+            out.push("hfir".to_owned());
+        }
+        if self.layers.mfir {
+            out.push("mfir".to_owned());
+        }
+        if self.layers.lfir {
+            out.push(if TARGETS.contains(&self.dialect) {
+                format!("lfir {}", self.dialect)
+            } else {
+                "lfir".to_owned()
+            });
+        }
+        out.join(", ")
+    }
+
     /// The items before the first region.
     pub fn head(&self) -> &'static [Item] {
         let n = self
@@ -280,5 +352,41 @@ impl OpKind {
             }
         }
         n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::body::IntId;
+
+    /// No target has ops yet, so the target rule is checked on a made-up AArch64 op, as in
+    /// `spec/Fir/Syntax.lean`.
+    static AARCH64_OP: OpDecl = OpDecl {
+        ctor: "nop",
+        imms: &[],
+        items: &[],
+        terminator: false,
+        rule: None,
+        effects: &[],
+        tier: Tier::Verified,
+        layers: Layers {
+            hfir: false,
+            mfir: false,
+            lfir: true,
+        },
+        dialect: "aarch64",
+    };
+
+    #[test]
+    fn lfir_allows_its_target_and_func_ret() {
+        let aarch64 = Layer::Lfir(Layer::target("aarch64").unwrap());
+        assert!(aarch64.allows(&AARCH64_OP));
+        assert!(!Layer::Lfir("x86").allows(&AARCH64_OP));
+        assert!(!Layer::Mfir.allows(&AARCH64_OP) && !Layer::Hfir.allows(&AARCH64_OP));
+        assert_eq!(AARCH64_OP.layers_text(), "lfir aarch64");
+        assert!(aarch64.allows(OpKind::Ret.decl()));
+        assert!(!aarch64.allows(OpKind::Const(IntId::PLACEHOLDER).decl()));
+        assert_eq!(Layer::target("x86"), None);
     }
 }

@@ -580,6 +580,9 @@ pub fn op_kind(name: &str) -> Option<OpKind> {
     })
 }
 
+/// The LFIR target dialects (Lean's `Fir.targets`).
+pub static TARGETS: [&str; 1] = ["aarch64"];
+
 static DECLS: [OpDecl; 46] = [
     OpDecl {
         ctor: "const",
@@ -594,6 +597,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "int",
     },
     OpDecl {
         ctor: "poison",
@@ -607,6 +612,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "value",
     },
     OpDecl {
         ctor: "freeze",
@@ -620,6 +627,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "value",
     },
     OpDecl {
         ctor: "copy",
@@ -632,6 +641,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "value",
     },
     OpDecl {
         ctor: "select",
@@ -646,6 +657,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "value",
     },
     OpDecl {
         ctor: "arith",
@@ -660,6 +673,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[Effect::Trap],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "int",
     },
     OpDecl {
         ctor: "bit",
@@ -674,6 +689,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "int",
     },
     OpDecl {
         ctor: "div",
@@ -688,6 +705,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[Effect::Trap],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "int",
     },
     OpDecl {
         ctor: "shift",
@@ -702,6 +721,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[Effect::Trap],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "int",
     },
     OpDecl {
         ctor: "cmp",
@@ -716,6 +737,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "int",
     },
     OpDecl {
         ctor: "zext",
@@ -730,6 +753,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "int",
     },
     OpDecl {
         ctor: "sext",
@@ -744,6 +769,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "int",
     },
     OpDecl {
         ctor: "trunc",
@@ -758,6 +785,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "int",
     },
     OpDecl {
         ctor: "memStack",
@@ -771,6 +800,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[Effect::Alloc],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "mem",
     },
     OpDecl {
         ctor: "memAlloc",
@@ -784,6 +815,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[Effect::Alloc, Effect::Trap],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "mem",
     },
     OpDecl {
         ctor: "memFree",
@@ -796,6 +829,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[Effect::Free],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "mem",
     },
     OpDecl {
         ctor: "load",
@@ -810,6 +845,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[Effect::Read],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "mem",
     },
     OpDecl {
         ctor: "store",
@@ -824,6 +861,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[Effect::Write],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "mem",
     },
     OpDecl {
         ctor: "ptrOffset",
@@ -836,6 +875,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "ptr",
     },
     OpDecl {
         ctor: "ptrAddr",
@@ -848,6 +889,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "ptr",
     },
     OpDecl {
         ctor: "ptrExpose",
@@ -860,6 +903,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[Effect::Write],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "ptr",
     },
     OpDecl {
         ctor: "ptrFromExposed",
@@ -872,6 +917,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[Effect::Read],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "ptr",
     },
     OpDecl {
         ctor: "ptrWithAddr",
@@ -884,6 +931,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "ptr",
     },
     OpDecl {
         ctor: "ptrNull",
@@ -896,6 +945,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "ptr",
     },
     OpDecl {
         ctor: "ptrCmp",
@@ -909,6 +960,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "ptr",
     },
     OpDecl {
         ctor: "call",
@@ -920,6 +973,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[Effect::Read, Effect::Write, Effect::Alloc, Effect::Free, Effect::Trap, Effect::Diverge],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "func",
     },
     OpDecl {
         ctor: "if_",
@@ -929,6 +984,8 @@ static DECLS: [OpDecl; 46] = [
         rule: None,
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "cf",
     },
     OpDecl {
         ctor: "loop",
@@ -938,6 +995,8 @@ static DECLS: [OpDecl; 46] = [
         rule: None,
         effects: &[Effect::Diverge],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "cf",
     },
     OpDecl {
         ctor: "yield",
@@ -947,6 +1006,8 @@ static DECLS: [OpDecl; 46] = [
         rule: None,
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "cf",
     },
     OpDecl {
         ctor: "brk",
@@ -956,6 +1017,8 @@ static DECLS: [OpDecl; 46] = [
         rule: None,
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "cf",
     },
     OpDecl {
         ctor: "cont",
@@ -965,6 +1028,8 @@ static DECLS: [OpDecl; 46] = [
         rule: None,
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "cf",
     },
     OpDecl {
         ctor: "ret",
@@ -974,6 +1039,8 @@ static DECLS: [OpDecl; 46] = [
         rule: None,
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: true },
+        dialect: "func",
     },
     OpDecl {
         ctor: "blocks",
@@ -983,6 +1050,8 @@ static DECLS: [OpDecl; 46] = [
         rule: None,
         effects: &[Effect::Diverge],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "cf",
     },
     OpDecl {
         ctor: "br",
@@ -992,6 +1061,8 @@ static DECLS: [OpDecl; 46] = [
         rule: None,
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "cf",
     },
     OpDecl {
         ctor: "condBr",
@@ -1001,6 +1072,8 @@ static DECLS: [OpDecl; 46] = [
         rule: None,
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "cf",
     },
     OpDecl {
         ctor: "switch",
@@ -1010,6 +1083,8 @@ static DECLS: [OpDecl; 46] = [
         rule: None,
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "cf",
     },
     OpDecl {
         ctor: "tySize",
@@ -1023,6 +1098,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "ty",
     },
     OpDecl {
         ctor: "tyAlign",
@@ -1036,6 +1113,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "ty",
     },
     OpDecl {
         ctor: "tyOffset",
@@ -1049,6 +1128,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "ty",
     },
     OpDecl {
         ctor: "ptrField",
@@ -1062,6 +1143,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: false, lfir: false },
+        dialect: "ptr",
     },
     OpDecl {
         ctor: "ptrIndex",
@@ -1075,6 +1158,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: false, lfir: false },
+        dialect: "ptr",
     },
     OpDecl {
         ctor: "memStackOf",
@@ -1089,6 +1174,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[Effect::Alloc],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "mem",
     },
     OpDecl {
         ctor: "memCopy",
@@ -1103,6 +1190,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[Effect::Read, Effect::Write],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "mem",
     },
     OpDecl {
         ctor: "memGlobal",
@@ -1116,6 +1205,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "mem",
     },
     OpDecl {
         ctor: "funcAddr",
@@ -1129,6 +1220,8 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "func",
     },
     OpDecl {
         ctor: "callIndirect",
@@ -1140,5 +1233,7 @@ static DECLS: [OpDecl; 46] = [
         ]),
         effects: &[Effect::Read, Effect::Write, Effect::Alloc, Effect::Free, Effect::Trap, Effect::Diverge],
         tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "func",
     },
 ];

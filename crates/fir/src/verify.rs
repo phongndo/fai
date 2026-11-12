@@ -11,7 +11,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use num_bigint::{BigInt, Sign};
 
 use crate::body::{Body, Int, OpId, Operand, OperandKind, RegionId, Succ, ValueId};
-use crate::decl::{Check, Imm, TyE};
+use crate::decl::{Check, Imm, Layer, TyE};
 use crate::ir::*;
 use crate::types::Shape;
 
@@ -154,6 +154,7 @@ pub fn verify_module(m: &Module) -> Result<Vec<Hole>, String> {
             body: &f.body,
             cx: Cx {
                 space: sp,
+                layer: m.layer,
                 sigs: &sigs,
                 globals: &globals,
             },
@@ -581,6 +582,7 @@ fn check_simple(
         space,
         sigs,
         globals,
+        ..
     } = *cx;
     let Some(rule) = k.decl().rule else {
         return verr(loc, "unexpected op");
@@ -774,6 +776,7 @@ fn check_simple(
 #[derive(Clone, Copy)]
 struct Cx<'a> {
     space: &'a SpaceCfg,
+    layer: Layer,
     /// Each function's parameter and result types.
     sigs: &'a FxHashMap<&'a str, (Vec<Ty>, Vec<Ty>)>,
     globals: &'a FxHashSet<&'a str>,
@@ -991,6 +994,18 @@ impl<'a> FuncVerifier<'a> {
     fn op(&mut self, op: OpId) -> VResult<()> {
         let body = self.body;
         let loc = body.loc(op);
+        let kind = body.kind(op);
+        let layer = self.cx.layer;
+        if !layer.allows(kind.decl()) {
+            return verr(
+                loc,
+                format!(
+                    "{} is not allowed in layer {layer}; it is allowed in {}",
+                    kind.mnemonic(),
+                    kind.decl().layers_text()
+                ),
+            );
+        }
         let mut ins = Tys::default();
         for a in body.operands(op) {
             ins.push(self.operand_ty(loc, *a)?);
@@ -999,7 +1014,6 @@ impl<'a> FuncVerifier<'a> {
         for v in body.results(op) {
             outs.push(body.ty(v));
         }
-        let kind = body.kind(op);
         match (kind, body.regions(op)) {
             (OpKind::Yield, []) => match self.ctx.last() {
                 Some(RegionCtx::IfBranch(rs) | RegionCtx::Block { results: rs, .. }) => {

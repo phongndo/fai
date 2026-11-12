@@ -286,9 +286,10 @@ impl Extern {
     }
 }
 
-/// A module: the default memory space, globals, external functions, and functions.
+/// A module: its layer, the default memory space, globals, external functions, and functions.
 #[derive(Clone, Debug, Default)]
 pub struct Module {
+    pub layer: crate::Layer,
     pub space: SpaceCfg,
     pub globals: Globals,
     pub externs: Vec<Extern>,

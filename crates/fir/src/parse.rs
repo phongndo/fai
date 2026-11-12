@@ -12,10 +12,10 @@ use rustc_hash::FxHashMap;
 use crate::body::{
     Body, Case, CasesId, IntId, OpId, Operand, RegionId, StrId, Succ, ValueId, ValueSpec,
 };
-use crate::decl::{Field, FieldTy, Imm, Item};
+use crate::decl::{Field, FieldTy, Imm, Item, Layer};
 use crate::ir::*;
 use crate::lex::{Lexer, Sym, Tok, Token, int_value};
-use crate::ops::op_kind;
+use crate::ops::{TARGETS, op_kind};
 use crate::types::Types;
 
 pub fn parse_module(input: &str) -> Result<Module, String> {
@@ -1124,10 +1124,54 @@ impl<'a> Parser<'a> {
         Ok((params, rets))
     }
 
+    /// `hfir`, `mfir`, or `lfir TARGET`, after `layer`.
+    fn layer(&mut self) -> PResult<Layer> {
+        match self.peek() {
+            Tok::Ident("hfir") => {
+                self.bump()?;
+                Ok(Layer::Hfir)
+            }
+            Tok::Ident("mfir") => {
+                self.bump()?;
+                Ok(Layer::Mfir)
+            }
+            Tok::Ident("lfir") => {
+                self.bump()?;
+                match self.peek() {
+                    Tok::Ident(t) => {
+                        let Some(t) = Layer::target(t) else {
+                            return self.fail(format!(
+                                "unknown target '{t}': expected {}",
+                                TARGETS.join(", ")
+                            ));
+                        };
+                        self.bump()?;
+                        Ok(Layer::Lfir(t))
+                    }
+                    t => self.fail(format!(
+                        "expected a target after lfir but found {}",
+                        t.describe()
+                    )),
+                }
+            }
+            Tok::Ident(s) => {
+                self.fail(format!("unknown layer '{s}': expected hfir, mfir, or lfir"))
+            }
+            t => self.fail(format!("expected a layer but found {}", t.describe())),
+        }
+    }
+
     fn module(&mut self) -> PResult<Module> {
         let mut m = Module::default();
+        let mut layer = None;
         while self.peek() != Tok::Eof {
-            if self.try_ident("memspace")? {
+            if self.peek() == Tok::Ident("layer") {
+                if layer.is_some() {
+                    return self.fail("the module's layer is declared more than once");
+                }
+                self.bump()?;
+                layer = Some(self.layer()?);
+            } else if self.try_ident("memspace")? {
                 m.space = self.memspace()?;
             } else if self.try_ident("global")? {
                 self.global()?;
@@ -1139,6 +1183,7 @@ impl<'a> Parser<'a> {
             }
         }
         m.globals = std::mem::take(&mut self.globals);
+        m.layer = layer.unwrap_or_default();
         Ok(m)
     }
 }

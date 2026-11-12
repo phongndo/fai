@@ -25,7 +25,9 @@
 //! offset, or poison pointer; globals hold function tables that calls dispatch through. External
 //! functions (`@x0`, …) with random effects are called directly and through pointers and tables,
 //! so their events, the exposure of what they reach, and the facts on their results are
-//! covered. Each program comes with argument lists and fuel limits.
+//! covered. Programs sometimes declare their layer: `layer hfir`, or `layer mfir`, where field and
+//! element addresses are `ptr.offset` by `ty.offset` or a multiplied stride instead of `ptr.field`
+//! and `ptr.index`. Each program comes with argument lists and fuel limits.
 
 use std::fmt::Write;
 
@@ -289,6 +291,8 @@ struct Gen<'r> {
     globals: Vec<GlobalInfo>,
     /// Visible pointers to functions, with the function they point at.
     fnptrs: Vec<(String, usize)>,
+    /// Whether the module is MFIR, which has no `ptr.field` or `ptr.index`.
+    mfir: bool,
 }
 
 impl Gen<'_> {
@@ -1382,6 +1386,31 @@ impl Gen<'_> {
         }
     }
 
+    /// Field `i` of the struct `a` at `p` (an operand): `ptr.field`, or in MFIR `ptr.offset` by
+    /// `ty.offset`.
+    fn field_ptr(&mut self, mode: &str, a: &Agg, p: &str, i: usize) -> String {
+        if self.mfir {
+            let o = self.def(T::I(self.addr), &format!("ty.offset {a}, {i}"));
+            self.def(T::P, &format!("ptr.offset.{mode} {p}, %{o}"))
+        } else {
+            self.def(T::P, &format!("ptr.field.{mode} {a} {p}, {i}"))
+        }
+    }
+
+    /// Element `idx` (an operand) of an array of `elem` at `p`: `ptr.index`, or in MFIR
+    /// `ptr.offset` by the index times the stride.
+    fn index_ptr(&mut self, mode: &str, elem: &Agg, p: &str, idx: &str) -> String {
+        if self.mfir {
+            let stride = self.layout.stride(elem) as i64;
+            let s = self.small(self.addr, stride, stride);
+            let ovf = if mode == "inbounds" { "nsw" } else { "wrap" };
+            let n = self.def(T::I(self.addr), &format!("int.mul.{ovf} {idx}, {s}"));
+            self.def(T::P, &format!("ptr.offset.{mode} {p}, %{n}"))
+        } else {
+            self.def(T::P, &format!("ptr.index.{mode} {elem} {p}, {idx}"))
+        }
+    }
+
     /// `ptr.field`: usually of a struct in a known allocation, with a valid index.
     fn field_addr(&mut self) {
         let mode = if self.rng.chance(80) {
@@ -1401,7 +1430,7 @@ impl Gen<'_> {
                 unreachable!()
             };
             let i = self.rng.below(fs.len() as u64) as usize;
-            let name = self.def(T::P, &format!("ptr.field.{mode} {a} %{}, {i}", m.name));
+            let name = self.field_ptr(mode, a, &format!("%{}", m.name), i);
             let (offs, _, _) = self.layout.place(p, fs);
             let align = if *p == "packed" {
                 1
@@ -1417,7 +1446,7 @@ impl Gen<'_> {
             };
             let i = self.rng.below(fs.len() as u64 + 1).min(fs.len() as u64 - 1);
             let p = self.operand(T::P);
-            self.def(T::P, &format!("ptr.field.{mode} {a} {p}, {i}"));
+            self.field_ptr(mode, &a, &p, i as usize);
         }
     }
 
@@ -1467,7 +1496,7 @@ impl Gen<'_> {
             Some(m) => format!("%{}", m.name),
             None => self.operand(T::P),
         };
-        let name = self.def(T::P, &format!("ptr.index.{mode} {elem} {p}, {idx}"));
+        let name = self.index_ptr(mode, &elem, &p, &idx);
         if let Some(m) = base
             && i >= 0
             && (i as u64) < n
@@ -1609,7 +1638,7 @@ impl Gen<'_> {
         let t = self.def(T::P, &format!("mem.global @{}", g.name));
         let i = self.rng.below(table.len() as u64 + 1);
         let idx = self.small(self.addr, i as i64, i as i64);
-        let e = self.def(T::P, &format!("ptr.index.inbounds ptr %{t}, {idx}"));
+        let e = self.index_ptr("inbounds", &Agg::Scalar(T::P), &format!("%{t}"), &idx);
         let align = self
             .layout
             .ptr_align
@@ -1886,6 +1915,11 @@ pub fn program(rng: &mut Rng) -> Program {
         _ => vec![(8, 1), (16, 2), (32, 4), (64, 8), (128, 16)],
     };
     let custom_ints = ints.len() != 5 || ints[4].1 != 16;
+    let layer = match rng.below(8) {
+        0 => Some("hfir"),
+        1..=3 => Some("mfir"),
+        _ => None,
+    };
     let layout = Layout {
         ptr_size: u64::from(ptr_size / 8),
         ptr_align,
@@ -1911,8 +1945,14 @@ pub fn program(rng: &mut Rng) -> Program {
         layout,
         globals: Vec::new(),
         fnptrs: Vec::new(),
+        mfir: layer == Some("mfir"),
     };
-    if (ptr_size, addr) != (64, 64) || ptr_align != natural || custom_ints {
+    if let Some(l) = layer {
+        write!(g.out, "layer {l}").unwrap();
+        g.newline();
+    }
+    let memspace = (ptr_size, addr) != (64, 64) || ptr_align != natural || custom_ints;
+    if memspace {
         write!(g.out, "memspace default ptr {ptr_size} addr {addr}").unwrap();
         if ptr_align != natural || g.rng.chance(10) {
             write!(g.out, " align {ptr_align}").unwrap();
@@ -1924,6 +1964,8 @@ pub fn program(rng: &mut Rng) -> Program {
             }
         }
         g.newline();
+    }
+    if layer.is_some() || memspace {
         g.newline();
     }
     g.declare_globals();

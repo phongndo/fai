@@ -4,7 +4,7 @@
 use std::fmt::Write;
 
 use crate::body::{Body, Int, OpId, Operand, OperandKind, RegionId, Succ, ValueId};
-use crate::decl::{Field, FieldTy, Imm, Item};
+use crate::decl::{Field, FieldTy, Imm, Item, Layer};
 use crate::ir::*;
 use crate::types::write_rets;
 
@@ -492,6 +492,9 @@ impl Module {
     /// Canonical text. With `show_locs` off, op locations and function files are left out.
     pub fn render(&self, show_locs: bool) -> String {
         let mut out = String::new();
+        if self.layer != Layer::Hfir {
+            writeln!(out, "layer {}", self.layer).unwrap();
+        }
         let sp = &self.space;
         if *sp != SpaceCfg::default() {
             write!(
@@ -509,7 +512,10 @@ impl Module {
                     write!(out, " {w}:{a}").unwrap();
                 }
             }
-            out.push_str("\n\n");
+            out.push('\n');
+        }
+        if !out.is_empty() {
+            out.push('\n');
         }
         let g = &self.globals;
         for i in 0..g.len() {

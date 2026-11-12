@@ -36,10 +36,10 @@ pub use body::{
     Body, Case, CasesId, HoleId, Int, IntId, OpId, Operand, OperandKind, Ops, RegionId, StrId,
     Succ, SuccId, UseId, Uses, ValueDef, ValueId, ValueSpec,
 };
-pub use decl::{Check, Effect, Field, FieldTy, Imm, Item, OpDecl, Tier, TyE};
+pub use decl::{Check, Effect, Field, FieldTy, Imm, Item, Layer, Layers, OpDecl, Tier, TyE};
 pub use globals::Run;
 pub use ir::*;
-pub use ops::op_kind;
+pub use ops::{TARGETS, op_kind};
 pub use parse::parse_module;
 pub use types::align_up;
 pub use verify::{Hole, render_loc, verify_module};
