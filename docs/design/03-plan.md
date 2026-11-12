@@ -21,7 +21,8 @@ on the fixtures and on random programs from the fuzzer, running the binaries und
 
 Every op's declaration in the op table names the layers that allow it, and each module states its
 layer (`layer hfir`, `layer mfir`, `layer lfir aarch64`). The verifier rejects an op outside its
-layer, as the Layers decision requires. Today's core ops are in HFIR and MFIR.
+layer, as the Layers decision requires. Today's core ops are in HFIR and MFIR, except `ptr.field` and
+`ptr.index`, which are HFIR only.
 
 **Dialects** are declared op groups in the op table, such as `aarch64.*` and the building blocks.
 The op set stays closed and versioned: a dialect is added by declaring its ops, not registered at

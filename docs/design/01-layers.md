@@ -17,6 +17,27 @@ FIR has one structure (ops, regions, typed values, one text grammar, one Lean se
 
 The verifier enforces each layer's allowed ops. A `slice.get` in MFIR or an `x86.*` op in HFIR is an error.
 
+## Layers in the op table
+
+Each op's declaration (`fir_ops` in `spec/Fir/Syntax.lean`) names the layers that allow it, `layers hfir mfir` by default, and belongs to a dialect: the namespace of its name (`int`, `mem`, `ptr`, `cf`, `func`, `ty`), or `value` for `poison`, `freeze`, `copy`, and `select`. A module states its layer before anything else it declares:
+
+```
+layer mfir
+memspace default ptr 32 addr 32
+```
+
+`layer hfir`, `layer mfir`, or `layer lfir aarch64`. Without a `layer` line a module is HFIR, and HFIR prints as nothing, like the default memory space. The verifier rejects an op its module's layer doesn't allow, before checking anything else about it, with the same message in Lean and Rust: `ptr.field.inbounds is not allowed in layer mfir; it is allowed in hfir`.
+
+| | HFIR | MFIR | LFIR for target `T` |
+|---|---|---|---|
+| Core ops | All | All but `ptr.field` and `ptr.index` | `func.ret` |
+| Target dialects | None | None yet | `T`'s |
+
+- `ptr.field` and `ptr.index` address by type, so they are HFIR only. MFIR addresses with `ptr.offset` by an offset: `ty.offset`, or the index times the stride (decision: Layout). `ty.size`, `ty.align`, and `ty.offset` stay in MFIR as layout queries the optimizer can fold.
+- LFIR keeps `func.ret` because every layer has functions; globals and external functions are module structure, not ops. Whether LFIR also keeps `cf.blocks` and its branches is decided with the AArch64 dialect.
+- The targets are listed in `Fir.targets` (`aarch64`, with no ops yet). Adding one means naming it there and declaring its ops in its dialect with `layers lfir`. An unknown target is a parse error, like an unknown op.
+- The interpreter runs every layer the same way: an op means the same wherever it is allowed.
+
 ## HFIR
 
 HFIR is the contract between a language and FIR, and it carries no hardware information. It contains:
