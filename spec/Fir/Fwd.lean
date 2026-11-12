@@ -289,56 +289,6 @@ def R (mt ms : Machine) : Prop := (MRel L mt ms ∨ Mid mt ms) ∧ 0 < ms.core.s
 
 /-! ## Steps -/
 
-theorem execOp_simple (m : Machine) (k : OpKind) (res : List Result) (args : List Operand)
-    (loc : Option Loc) (h1 : k.callee? = none) (h2 : k.stackAlloc? = none)
-    (h3 : k.isTerminator = false) :
-    execOp m (.mk k res args [] loc) =
-      match simpleOp loc k res args m.core with
-      | .ok (_, core) => .ok { m with core }
-      | .error h => .error h := by
-  simp only [execOp, execFlat, h1, h2, h3, Machine.exec, StateT.run, Bool.false_eq_true, ite_false]
-  cases simpleOp loc k res args m.core with
-  | error h => rfl
-  | ok r => rfl
-
-theorem shape_cons {f f' : Frame} {rt rs : List Frame} (h : f.isProgressLoop = f'.isProgressLoop)
-    (hrest : Forall2 (FrameRel L) rt rs) :
-    (f :: rt).map Frame.isProgressLoop = (f' :: rs).map Frame.isProgressLoop := by
-  simp [h, shape_eq hrest]
-
-/-- The machine after a core computation `x`, with stack `m`'s. -/
-def after (m : Machine) : Except Halt (Unit × Core) → Except Halt Machine
-  | .ok (_, core) => .ok { m with core }
-  | .error h => .error h
-
-/-- One target step matched by one source step that does the same thing to the same core. -/
-theorem step_same {mt ms mt'' ms'' : Machine} {x : Except Halt (Unit × Core)}
-    (ht : step mt = after mt'' x) (hs : step ms = after ms'' x)
-    (hshape : ms.shape = mt.shape)
-    (hR : ∀ u core, x = .ok (u, core) → R { mt'' with core } { ms'' with core }) :
-    StepMatch R mt ms := by
-  cases x with
-  | ok p =>
-    obtain ⟨_, core⟩ := p
-    refine ⟨fun mt' e => ?_, fun h e => ?_⟩
-    · rw [ht, after] at e
-      cases e
-      refine .inr ⟨0, { ms'' with core }, by rw [runSteps_one, hs, after], hR _ core rfl, ?_⟩
-      intro j mj hj ej
-      obtain rfl : j = 0 := by omega
-      simp only [runSteps, Except.ok.injEq] at ej
-      subst ej
-      exact hshape
-    · rw [ht, after] at e; cases e
-  | error h' =>
-    refine ⟨fun mt' e => ?_, fun h e => ?_⟩
-    · rw [ht, after] at e; cases e
-    · rw [ht, after] at e
-      cases e
-      by_cases hamb : h'.behavior = .ambiguous
-      · exact .inl ⟨1, h', by rw [runSteps_one, hs, after], .inr hamb⟩
-      · exact .inr ⟨1, h', by rw [runSteps_one, hs, after], Behavior.Refines.refl _ hamb⟩
-
 /-- At a rewritten spot, both run the store, and land between it and the load. -/
 theorem step_store {mt ms : Machine} {s l c : Op} {t s' : List Op} {ids : List Nat}
     {rt rs : List Frame} (hc : mt.core = ms.core) (hp : Pat s l c) (hts : OpsRel L t s')
@@ -368,11 +318,11 @@ theorem step_mid {mt ms : Machine} (hmid : Mid mt ms) (hsp : 0 < ms.core.space.p
     StepMatch R mt ms := by
   obtain ⟨hc, c, l, t, s, ids, rt, rs, ht, hs, hts, hrest, A2, r, op, v, loc, rfl, rfl, hready⟩ :=
     hmid
-  have stepT : step mt = after { mt with stack := .block t ids :: rt }
+  have stepT : step mt = afterOp { mt with stack := .block t ids :: rt }
       (simpleOp loc .copy [r] [v] ms.core) := by
     simp only [step, ht, execOp_simple _ .copy _ _ _ rfl rfl rfl, hc]
     cases simpleOp loc .copy [r] [v] ms.core <;> rfl
-  have stepS : step ms = after { ms with stack := .block s ids :: rs }
+  have stepS : step ms = afterOp { ms with stack := .block s ids :: rs }
       (simpleOp loc (.load A2) [r] [op] ms.core) := by
     simp only [step, hs, execOp_simple _ (.load A2) _ _ _ rfl rfl rfl]
     cases simpleOp loc (.load A2) [r] [op] ms.core <;> rfl

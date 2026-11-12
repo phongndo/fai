@@ -436,6 +436,59 @@ theorem step_eq {mt ms : Machine} (hR : MRel L mt ms)
       | _ =>
         cases hf <;> (simp only [step, ht, hs]; exact .halt)
 
+/-! ## Steps that run the same core computation -/
+
+theorem execOp_simple (m : Machine) (k : OpKind) (res : List Result) (args : List Operand)
+    (loc : Option Loc) (h1 : k.callee? = none) (h2 : k.stackAlloc? = none)
+    (h3 : k.isTerminator = false) :
+    execOp m (.mk k res args [] loc) =
+      match simpleOp loc k res args m.core with
+      | .ok (_, core) => .ok { m with core }
+      | .error h => .error h := by
+  simp only [execOp, execFlat, h1, h2, h3, Machine.exec, StateT.run, Bool.false_eq_true, ite_false]
+  cases simpleOp loc k res args m.core with
+  | error h => rfl
+  | ok r => rfl
+
+theorem shape_cons {f f' : Frame} {rt rs : List Frame} (h : f.isProgressLoop = f'.isProgressLoop)
+    (hrest : Forall2 (FrameRel L) rt rs) :
+    (f :: rt).map Frame.isProgressLoop = (f' :: rs).map Frame.isProgressLoop := by
+  simp [h, shape_eq hrest]
+
+/-- The machine after a core computation `x`, with stack `m`'s. -/
+def afterOp (m : Machine) : Except Halt (Unit × Core) → Except Halt Machine
+  | .ok (_, core) => .ok { m with core }
+  | .error h => .error h
+
+/-- One target step matched by one source step that runs the same core computation, from tops of
+the stack that differ only in code. -/
+theorem step_same {R : Machine → Machine → Prop} {mt ms mt'' ms'' : Machine} {x : Except Halt (Unit × Core)}
+    (ht : step mt = afterOp mt'' x) (hs : step ms = afterOp ms'' x)
+    (hshape : ms.shape = mt.shape)
+    (hR : ∀ u core, x = .ok (u, core) → R { mt'' with core } { ms'' with core }) :
+    StepMatch R mt ms := by
+  cases x with
+  | ok p =>
+    obtain ⟨_, core⟩ := p
+    refine ⟨fun mt' e => ?_, fun h e => ?_⟩
+    · rw [ht, afterOp] at e
+      cases e
+      refine .inr ⟨0, { ms'' with core }, by rw [runSteps_one, hs, afterOp], hR _ core rfl, ?_⟩
+      intro j mj hj ej
+      obtain rfl : j = 0 := by omega
+      simp only [runSteps, Except.ok.injEq] at ej
+      subst ej
+      exact hshape
+    · rw [ht, afterOp] at e; cases e
+  | error h' =>
+    refine ⟨fun mt' e => ?_, fun h e => ?_⟩
+    · rw [ht, afterOp] at e; cases e
+    · rw [ht, afterOp] at e
+      cases e
+      by_cases hamb : h'.behavior = .ambiguous
+      · exact .inl ⟨1, h', by rw [runSteps_one, hs, afterOp], .inr hamb⟩
+      · exact .inr ⟨1, h', by rw [runSteps_one, hs, afterOp], Behavior.Refines.refl _ hamb⟩
+
 /-- A lockstep step is a simulation step: the source takes one step. -/
 theorem StepMatch.of_lockstep {mt ms : Machine} (hR : MRel L mt ms)
     (h : Lockstep L (step mt) (step ms)) : StepMatch (MRel L) mt ms := by
@@ -450,6 +503,29 @@ theorem StepMatch.of_lockstep {mt ms : Machine} (hR : MRel L mt ms)
       simp only [runSteps, Except.ok.injEq] at ej
       subst ej
       exact (shape_eq hR.2).symm
+  · intro ht e
+    rcases h with ⟨h, e1, e2⟩ | ⟨_, _, e1, _⟩
+    · rw [e, Except.error.injEq] at e1
+      subst e1
+      by_cases hamb : ht.behavior = .ambiguous
+      · exact .inl ⟨1, ht, by rw [runSteps_one]; exact e2, .inr hamb⟩
+      · exact .inr ⟨1, ht, by rw [runSteps_one]; exact e2, Behavior.Refines.refl _ hamb⟩
+    · rw [e] at e1; cases e1
+
+/-- A lockstep step is a simulation step, for machines whose stacks agree on `progress` loops. -/
+theorem StepMatch.of_lockstep' {mt ms : Machine} (hshape : ms.shape = mt.shape)
+    (h : Lockstep L (step mt) (step ms)) : StepMatch (MRel L) mt ms := by
+  constructor
+  · intro mt' e
+    rcases h with ⟨h, e1, _⟩ | ⟨mt'', ms', e1, e2, hR'⟩
+    · rw [e] at e1; cases e1
+    · rw [e, Except.ok.injEq] at e1
+      subst e1
+      refine .inr ⟨0, ms', by rw [runSteps_one]; exact e2, hR', fun j mj hj ej => ?_⟩
+      obtain rfl : j = 0 := by omega
+      simp only [runSteps, Except.ok.injEq] at ej
+      subst ej
+      exact hshape
   · intro ht e
     rcases h with ⟨h, e1, e2⟩ | ⟨_, _, e1, _⟩
     · rw [e, Except.error.injEq] at e1

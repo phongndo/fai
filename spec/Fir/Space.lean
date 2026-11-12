@@ -10,19 +10,24 @@ least one byte, get them from the module once and keep them for the whole run.
 
 namespace Fir
 
+/-- A core computation started on a core where `proj` is `v` ends on one where it is still `v`.
+The combinators below build such proofs from a computation's structure, for any part of the core
+that the computation's updates leave alone. -/
+def Keeps (proj : Core → γ) (v : γ) (x : CM α) : Prop :=
+  ∀ c r, proj c = v → x c = .ok r → proj r.2 = v
+
 /-- A core computation started with memory space `sp` ends with memory space `sp`. -/
-def KeepsSpace (sp : SpaceCfg) (x : CM α) : Prop :=
-  ∀ c r, c.space = sp → x c = .ok r → r.2.space = sp
+abbrev KeepsSpace (sp : SpaceCfg) (x : CM α) : Prop := Keeps Core.space sp x
 
-namespace KeepsSpace
+namespace Keeps
 
-variable {sp : SpaceCfg}
+variable {proj : Core → γ} {v : γ}
 
-theorem pure' (a : α) : KeepsSpace sp (pure a : CM α) := by
+theorem pure' (a : α) : Keeps proj v (pure a : CM α) := by
   intro c r hc e; cases e; exact hc
 
-theorem bind' {x : CM α} {f : α → CM β} (hx : KeepsSpace sp x) (hf : ∀ a, KeepsSpace sp (f a)) :
-    KeepsSpace sp (x >>= f) := by
+theorem bind' {x : CM α} {f : α → CM β} (hx : Keeps proj v x) (hf : ∀ a, Keeps proj v (f a)) :
+    Keeps proj v (x >>= f) := by
   intro c r hc e
   simp only [bind, StateT.bind, Except.bind] at e
   cases ex : x c with
@@ -31,42 +36,42 @@ theorem bind' {x : CM α} {f : α → CM β} (hx : KeepsSpace sp x) (hf : ∀ a,
     rw [ex] at e
     exact hf p.1 p.2 r (hx c p hc ex) e
 
-theorem bind_get {f : Core → CM β} (hf : ∀ c, c.space = sp → KeepsSpace sp (f c)) :
-    KeepsSpace sp (get >>= f) := by
+theorem bind_get {f : Core → CM β} (hf : ∀ c, proj c = v → Keeps proj v (f c)) :
+    Keeps proj v (get >>= f) := by
   intro c r hc e
   exact hf c hc c r hc e
 
-theorem set' {c' : Core} (h : c'.space = sp) : KeepsSpace sp (set c' : CM PUnit) := by
+theorem set' {c' : Core} (h : proj c' = v) : Keeps proj v (set c' : CM PUnit) := by
   intro c r _ e; cases e; exact h
 
-theorem modify' {f : Core → Core} (h : ∀ c, (f c).space = c.space) :
-    KeepsSpace sp (modify f : CM PUnit) := by
+theorem modify' {f : Core → Core} (h : ∀ c, proj (f c) = proj c) :
+    Keeps proj v (modify f : CM PUnit) := by
   intro c r hc e; cases e; exact (h c).trans hc
 
-theorem get' : KeepsSpace sp (get : CM Core) := by
+theorem get' : Keeps proj v (get : CM Core) := by
   intro c r hc e; cases e; exact hc
 
-theorem throw' (h : Halt) : KeepsSpace sp (throw h : CM α) := by
+theorem throw' (h : Halt) : Keeps proj v (throw h : CM α) := by
   intro c r _ e; cases e
 
-theorem lift' (x : Except Halt α) : KeepsSpace sp (liftM x : CM α) := by
+theorem lift' (x : Except Halt α) : Keeps proj v (liftM x : CM α) := by
   intro c r hc e
   cases x with
   | error h => cases e
   | ok a => cases e; exact hc
 
-theorem monadLift' (x : Except Halt α) : KeepsSpace sp (MonadLiftT.monadLift x : CM α) :=
+theorem monadLift' (x : Except Halt α) : Keeps proj v (MonadLiftT.monadLift x : CM α) :=
   lift' x
 
-theorem map' {f : α → β} {x : CM α} (hx : KeepsSpace sp x) : KeepsSpace sp (f <$> x) := by
+theorem map' {f : α → β} {x : CM α} (hx : Keeps proj v x) : Keeps proj v (f <$> x) := by
   intro c r hc e
   simp only [Functor.map, StateT.map] at e
   cases ex : x c with
   | error h => rw [ex] at e; cases e
   | ok p => rw [ex] at e; cases e; exact hx c p hc ex
 
-theorem tryCatch' {x : CM α} {handle : Halt → CM α} (hx : KeepsSpace sp x)
-    (hh : ∀ h, KeepsSpace sp (handle h)) : KeepsSpace sp (tryCatch x handle) := by
+theorem tryCatch' {x : CM α} {handle : Halt → CM α} (hx : Keeps proj v x)
+    (hh : ∀ h, Keeps proj v (handle h)) : Keeps proj v (tryCatch x handle) := by
   intro c r hc e
   have e' : (match x c with | .error h => handle h c | .ok p => .ok p) = Except.ok r := by
     rw [← e]
@@ -76,12 +81,12 @@ theorem tryCatch' {x : CM α} {handle : Halt → CM α} (hx : KeepsSpace sp x)
   | error h => rw [ex] at e'; exact hh h c r hc e'
   | ok p => rw [ex] at e'; cases e'; exact hx c _ hc ex
 
-theorem ite' {p : Prop} [Decidable p] {x y : CM α} (hx : KeepsSpace sp x) (hy : KeepsSpace sp y) :
-    KeepsSpace sp (if p then x else y) := by
+theorem ite' {p : Prop} [Decidable p] {x y : CM α} (hx : Keeps proj v x) (hy : Keeps proj v y) :
+    Keeps proj v (if p then x else y) := by
   split <;> assumption
 
 theorem forIn' {l : List α} {init : β} {f : α → β → CM (ForInStep β)}
-    (hf : ∀ a b, KeepsSpace sp (f a b)) : KeepsSpace sp (forIn l init f) := by
+    (hf : ∀ a b, Keeps proj v (f a b)) : Keeps proj v (forIn l init f) := by
   induction l generalizing init with
   | nil => exact pure' _
   | cons a l ih =>
@@ -91,8 +96,8 @@ theorem forIn' {l : List α} {init : β} {f : α → β → CM (ForInStep β)}
     | done b => exact pure' _
     | yield b => exact ih
 
-theorem mapM' {l : List α} {f : α → CM β} (hf : ∀ a, KeepsSpace sp (f a)) :
-    KeepsSpace sp (l.mapM f) := by
+theorem mapM' {l : List α} {f : α → CM β} (hf : ∀ a, Keeps proj v (f a)) :
+    Keeps proj v (l.mapM f) := by
   induction l with
   | nil => exact pure' _
   | cons a l ih =>
@@ -100,34 +105,34 @@ theorem mapM' {l : List α} {f : α → CM β} (hf : ∀ a, KeepsSpace sp (f a))
     exact bind' (hf a) fun b => bind' ih fun bs => pure' _
 
 theorem halt' (b : Behavior) (loc : Option Loc) (note : String) :
-    KeepsSpace sp (halt b loc note : CM α) := throw' _
+    Keeps proj v (halt b loc note : CM α) := throw' _
 
 theorem ub' (k : UBKind) (loc : Option Loc) (note : String) :
-    KeepsSpace sp (ub k loc note : CM α) := throw' _
+    Keeps proj v (ub k loc note : CM α) := throw' _
 
-end KeepsSpace
+end Keeps
 
 /-- One step of `keeps` that applies a lemma about a named computation. Extended below. -/
 syntax "keeps_lemma" : tactic
 macro_rules | `(tactic| keeps_lemma) => `(tactic| fail)
 
-/-- Prove `KeepsSpace sp x` by following `x`'s structure. -/
+/-- Prove `Keeps proj v x` by following `x`'s structure. -/
 macro "keeps" : tactic => `(tactic| repeat' (first
-  | with_reducible exact Fir.KeepsSpace.pure' _
-  | with_reducible exact Fir.KeepsSpace.get'
-  | with_reducible exact Fir.KeepsSpace.throw' _
-  | with_reducible exact Fir.KeepsSpace.halt' _ _ _
-  | with_reducible exact Fir.KeepsSpace.ub' _ _ _
-  | with_reducible exact Fir.KeepsSpace.lift' _
-  | with_reducible exact Fir.KeepsSpace.monadLift' _
-  | with_reducible exact Fir.KeepsSpace.set' (by assumption)
-  | with_reducible exact Fir.KeepsSpace.modify' (fun _ => rfl)
-  | with_reducible refine Fir.KeepsSpace.bind_get (fun _ _ => ?_)
-  | with_reducible refine Fir.KeepsSpace.bind' ?_ (fun _ => ?_)
-  | with_reducible refine Fir.KeepsSpace.map' ?_
-  | with_reducible refine Fir.KeepsSpace.tryCatch' ?_ (fun _ => ?_)
-  | with_reducible refine Fir.KeepsSpace.forIn' (fun _ _ => ?_)
-  | with_reducible refine Fir.KeepsSpace.mapM' (fun _ => ?_)
+  | with_reducible exact Fir.Keeps.pure' _
+  | with_reducible exact Fir.Keeps.get'
+  | with_reducible exact Fir.Keeps.throw' _
+  | with_reducible exact Fir.Keeps.halt' _ _ _
+  | with_reducible exact Fir.Keeps.ub' _ _ _
+  | with_reducible exact Fir.Keeps.lift' _
+  | with_reducible exact Fir.Keeps.monadLift' _
+  | with_reducible exact Fir.Keeps.set' (by assumption)
+  | with_reducible exact Fir.Keeps.modify' (fun _ => rfl)
+  | with_reducible refine Fir.Keeps.bind_get (fun _ _ => ?_)
+  | with_reducible refine Fir.Keeps.bind' ?_ (fun _ => ?_)
+  | with_reducible refine Fir.Keeps.map' ?_
+  | with_reducible refine Fir.Keeps.tryCatch' ?_ (fun _ => ?_)
+  | with_reducible refine Fir.Keeps.forIn' (fun _ _ => ?_)
+  | with_reducible refine Fir.Keeps.mapM' (fun _ => ?_)
   | keeps_lemma
   | split
   | dsimp only))
@@ -221,7 +226,7 @@ macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_loa
 theorem keeps_storeC (loc : Option Loc) (T : Ty) (A : Nat) (v : RVal) (p : Option Ptr) :
     KeepsSpace sp (storeC loc T A v p) := by
   cases p with
-  | none => exact KeepsSpace.ub' _ _ _
+  | none => exact Keeps.ub' _ _ _
   | some p =>
     intro c r hc e
     cases hty : v.hasTy T with
