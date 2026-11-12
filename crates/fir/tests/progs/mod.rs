@@ -27,7 +27,9 @@
 //! so their events, the exposure of what they reach, and the facts on their results are
 //! covered. Programs sometimes declare their layer: `layer hfir`, or `layer mfir`, where field and
 //! element addresses are `ptr.offset` by `ty.offset` or a multiplied stride instead of `ptr.field`
-//! and `ptr.index`. Each program comes with argument lists and fuel limits.
+//! and `ptr.index`. Stores are sometimes followed at once by another store or a load through the
+//! same pointer, and copies come in chains, so the passes' patterns occur. Each program comes
+//! with argument lists and fuel limits.
 
 use std::fmt::Write;
 
@@ -293,6 +295,9 @@ struct Gen<'r> {
     fnptrs: Vec<(String, usize)>,
     /// Whether the module is MFIR, which has no `ptr.field` or `ptr.index`.
     mfir: bool,
+    /// Values read back after stores in the function's top region, which `func.ret` prefers, so
+    /// that what memory holds shows in the outcome.
+    watch: Vec<(String, T)>,
 }
 
 impl Gen<'_> {
@@ -653,7 +658,9 @@ impl Gen<'_> {
     /// One random op (possibly with regions).
     fn stmt(&mut self) {
         self.ops_left = self.ops_left.saturating_sub(1);
-        match self.rng.below(118) {
+        match self.rng.below(124) {
+            118..=120 => self.store_pair(),
+            121..=123 => self.copies(),
             100..=101 => self.layout_query(),
             102..=104 => self.stack_of(),
             105..=107 => self.field_addr(),
@@ -1507,6 +1514,71 @@ impl Gen<'_> {
         }
     }
 
+    /// Back-to-back accesses through one pointer, for dead store elimination and forwarding: a
+    /// store, then a second store, a load, or both. The second access usually has the stored
+    /// type, sometimes another of the same size (`bN` for `iN`, an integer for a pointer), and
+    /// sometimes one of another size; it sometimes goes through another pointer. Values read back
+    /// at the top of the function are usually returned.
+    fn store_pair(&mut self) {
+        let t = self.mem_type();
+        let v = self.operand(t);
+        let (p, a) = self.access(self.size_of(t), true);
+        let t2 = match t {
+            T::I(w) if self.rng.chance(25) => T::B(w),
+            T::B(w) if self.rng.chance(25) => T::I(w),
+            T::P if self.rng.chance(20) => T::I(self.ptr_size),
+            _ if self.rng.chance(20) => self.mem_type(),
+            _ => t,
+        };
+        let v2 = self.operand(t2);
+        // Sometimes the second access goes through another pointer, which may alias.
+        let (p2, a2) = if self.rng.chance(15) {
+            self.access(self.size_of(t2), true)
+        } else {
+            (p.clone(), a)
+        };
+        let (store, load) = match self.rng.below(3) {
+            0 => (true, false),
+            1 => (false, true),
+            _ => (true, true),
+        };
+        self.op(&[], &format!("mem.store {t} {v}, {p}, align {a}"));
+        if store {
+            self.op(&[], &format!("mem.store {t2} {v2}, {p2}, align {a2}"));
+        }
+        if load {
+            let lt = if store || self.rng.chance(20) { t2 } else { t };
+            let r = self.def(lt, &format!("mem.load {p2}, align {a2}"));
+            if self.depth == 0 {
+                self.watch.push((r, lt));
+            }
+        }
+        // Read back what the first store wrote, if something else may have overwritten it.
+        if store && (p2 != p || t2 != t) && self.rng.chance(60) {
+            let r = self.def(t, &format!("mem.load {p}, align {a}"));
+            if self.depth == 0 {
+                self.watch.push((r, t));
+            }
+        }
+    }
+
+    /// A chain of copies, usually read at once, for copy propagation.
+    fn copies(&mut self) {
+        let t = if self.rng.chance(25) {
+            T::P
+        } else {
+            self.int_type()
+        };
+        let mut x = self.operand(t);
+        for _ in 0..=self.rng.below(3) {
+            x = format!("%{}", self.def(t, &format!("copy {x}")));
+        }
+        if let (T::I(_), true) = (t, self.rng.chance(70)) {
+            let y = self.operand(t);
+            self.def(t, &format!("int.xor {x}, {y}"));
+        }
+    }
+
     /// `mem.copy` between two allocations that usually hold the type.
     fn copy(&mut self) {
         let a = self.agg();
@@ -1768,6 +1840,7 @@ impl Gen<'_> {
         self.exposed.clear();
         self.fnptrs.clear();
         self.ops_left = 45;
+        self.watch.clear();
         let (params, rets) = (self.sigs[idx].params.clone(), self.sigs[idx].rets.clone());
         let mut ps = Vec::new();
         for t in &params {
@@ -1819,7 +1892,22 @@ impl Gen<'_> {
             }
             self.stmt();
         }
-        let vs: Vec<String> = rets.iter().map(|t| self.operand(*t)).collect();
+        let vs: Vec<String> = rets
+            .iter()
+            .map(|&t| {
+                let w: Vec<String> = self
+                    .watch
+                    .iter()
+                    .filter(|(_, u)| *u == t)
+                    .map(|(n, _)| format!("%{n}"))
+                    .collect();
+                if !w.is_empty() && self.rng.chance(60) {
+                    w[self.rng.below(w.len() as u64) as usize].clone()
+                } else {
+                    self.operand(t)
+                }
+            })
+            .collect();
         self.op(&[], format!("func.ret {}", vs.join(", ")).trim_end());
         self.out.push('}');
         self.newline();
@@ -1946,6 +2034,7 @@ pub fn program(rng: &mut Rng) -> Program {
         globals: Vec::new(),
         fnptrs: Vec::new(),
         mfir: layer == Some("mfir"),
+        watch: Vec::new(),
     };
     if let Some(l) = layer {
         write!(g.out, "layer {l}").unwrap();
