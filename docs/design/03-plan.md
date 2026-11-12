@@ -77,6 +77,23 @@ ops; the whole `-O` pipeline costs less than parsing.
   certificate checker comes in the trust round.
 - **Output:** GNU-syntax assembly, assembled and linked with the system toolchain (clang).
 
+**Status.** Built (decisions: LFIR for AArch64, AArch64 semantics, Calling convention,
+Instruction selection, Register allocation, Traps at run time, AOT driver, Backend testing):
+
+- The dialect is in machine form: registers are op immediates (`Reg`), a function's code is
+  `aarch64.code`. `spec/Fir/AArch64.lean` has the instructions' bits in ASL's shape;
+  `spec/Fir/AArch64Machine.lean` runs LFIR over FIR's memory, and `fir-ref run` and `fir run`
+  (`crates/fir/src/backend/aarch64/machine.rs`) agree on it.
+- `crates/fir/src/backend/aarch64/`: `isel.rs` (all MFIR core ops, every edge-case modifier,
+  integers up to 64 bits), `regalloc.rs` (linear scan with spilling, the frame, and the
+  certificate check), `emit.rs` (ELF and Mach-O), `lfir.rs` (the LFIR module at either stage).
+  `fir compile` drives them.
+- Tests (`crates/fir/tests/aarch64.rs`): every fixture's comparable runs and random programs,
+  natively under `qemu-aarch64` and in LFIR before and after allocation, with no differences;
+  `FIR_FUZZ=3000` on seeds 1 and 2 included.
+- Not yet: aggregates by value, `i128`, macOS's ABI differences (its assembly assembles, but
+  isn't run), tail calls, unwind tables, and the trust-round checkers.
+
 ## Not in this round
 
 - The C frontend (Clang AST → HFIR, decided), floats, and full varargs: the next round, the first

@@ -34,9 +34,9 @@ memspace default ptr 32 addr 32
 | Target dialects | None | None yet | `T`'s |
 
 - `ptr.field` and `ptr.index` address by type, so they are HFIR only. MFIR addresses with `ptr.offset` by an offset: `ty.offset`, or the index times the stride (decision: Layout). `ty.size`, `ty.align`, and `ty.offset` stay in MFIR as layout queries the optimizer can fold.
-- LFIR keeps `func.ret` because every layer has functions; globals and external functions are module structure, not ops. Whether LFIR also keeps `cf.blocks` and its branches is decided with the AArch64 dialect.
-- The targets are listed in `Fir.targets` (`aarch64`, with no ops yet). Adding one means naming it there and declaring its ops in its dialect with `layers lfir`. An unknown target is a parse error, like an unknown op.
-- The interpreter runs every layer the same way: an op means the same wherever it is allowed.
+- LFIR keeps `func.ret` because every layer has functions; globals and external functions are module structure, not ops. LFIR for AArch64 doesn't keep `cf.blocks`: a function's code is `aarch64.code`, labeled blocks of machine instructions on registers with explicit branches (decision: LFIR for AArch64). A function whose body is a plain `func.ret` of its parameters returns them where the calling convention puts results.
+- The targets are listed in `Fir.targets` (`aarch64`). Adding one means naming it there and declaring its ops in its dialect with `layers lfir`. An unknown target is a parse error, like an unknown op.
+- The interpreter runs every layer the same way: an op means the same wherever it is allowed. LFIR modules run on their target's machine (`Fir.AArch64Machine`: registers, flags, and FIR's memory), since target ops read and write registers, not SSA values.
 
 ## HFIR
 
