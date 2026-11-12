@@ -8,12 +8,14 @@
 //!                                            optimize, print canonical text
 //! fir compile FILE [-o OUT] [--emit asm|lfir|lfir-vregs] [--os linux|darwin]
 //!                                            compile to AArch64 (see `compile`)
+//! fir lower FILE [--no-locs]                  lower an HFIR module to MFIR and print it
 //! ```
 //!
 //! `check` prints what `fir-ref check` prints: `ok`, or one `hole ?NAME: TYPE @LOC` line per
 //! hole; on failure, `FILE: MESSAGE` on stderr and exit code 1. `run` prints the one-line
 //! outcome `fir-ref run` prints, for the same oracle (every choice answers `0`); arguments are
-//! integers, `null`, or `poison`, parsed as Lean parses them.
+//! integers, `null`, or `poison`, parsed as Lean parses them. `lower` prints what `fir-ref lower`
+//! prints: the verified MFIR lowering of a verified HFIR module.
 //!
 //! `opt` runs a pipeline of passes (`fir::passes`): the default `-O` one to a fixed point, or the
 //! passes named by `--passes`, once each, in order. It prints the optimized module; `--remarks`
@@ -85,9 +87,16 @@ fn run(args: &[&str]) -> Result<(), ExitCode> {
         }
         ["opt", file, opts @ ..] => opt(file, opts),
         ["compile", file, opts @ ..] => compile(file, opts),
+        ["lower", file, opts @ ..] => {
+            let m = fir::parse_module(&read(file)?).map_err(|e| fail(file, e))?;
+            fir::verify_module(&m).map_err(|e| fail(file, e))?;
+            let l = fir::lower_checked(&m).map_err(|e| fail(file, e))?;
+            print!("{}", l.render(!opts.contains(&"--no-locs")));
+            Ok(())
+        }
         _ => {
             eprintln!(
-                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--remarks] [--stats] [--verify-each] [--no-locs]\n  fir compile FILE [-o OUT] [--emit asm|lfir|lfir-vregs] [--os linux|darwin]"
+                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--remarks] [--stats] [--verify-each] [--no-locs]\n  fir compile FILE [-o OUT] [--emit asm|lfir|lfir-vregs] [--os linux|darwin]\n  fir lower FILE [--no-locs]"
             );
             Err(ExitCode::from(2))
         }
