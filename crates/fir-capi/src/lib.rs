@@ -41,7 +41,10 @@
 //! none has a default), then the op's immediates and operands as its text writes them; lists are
 //! a pointer and a length. Ops with regions are made with their regions empty
 //! (`fir_cf_if_begin`); `fir_op_region` and `fir_position_at_end` fill them, and
-//! `fir_block_new` adds the blocks of `cf.blocks` and `aarch64.code`. The `aarch64.*` ops of
+//! `fir_block_new` adds the blocks of `cf.blocks` and `aarch64.code`. A region's parameters (a
+//! loop's state, `cf.try`'s exception, which the builder makes) are `fir_region_param`. Code that
+//! calls a compiled function that may throw finds an escaping exception in `__fir_exn` (see
+//! `fir_module_compile`). The `aarch64.*` ops of
 //! LFIR (`fir_module_set_layer(m, FIR_LAYER_LFIR, "aarch64")`) name registers as `FirReg`
 //! numbers.
 //!
@@ -962,6 +965,9 @@ pub unsafe extern "C" fn fir_module_optimize(
 /// `optimize` the default pass pipeline runs on the MFIR (`fir compile -O`). `*out` gets the
 /// assembly text; free it with `fir_string_free`. `FIR_ERR_COMPILE` if the module uses what the
 /// backend doesn't support yet (integers wider than 64 bits, holes, other data layouts).
+/// Exceptions use an error-return convention: an exception that escapes a compiled function is
+/// pending in `struct { void *flag; void *value; } __fir_exn` (nonzero `flag`) when it returns;
+/// a C caller checks `flag` after the call, and clears it to catch.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_module_compile(
     m: *mut FirModule,

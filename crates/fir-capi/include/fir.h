@@ -541,6 +541,9 @@ FirStatus fir_module_optimize(struct FirModule *m, struct FirModule **out);
 // `optimize` the default pass pipeline runs on the MFIR (`fir compile -O`). `*out` gets the
 // assembly text; free it with `fir_string_free`. `FIR_ERR_COMPILE` if the module uses what the
 // backend doesn't support yet (integers wider than 64 bits, holes, other data layouts).
+// Exceptions use an error-return convention: an exception that escapes a compiled function is
+// pending in `struct { void *flag; void *value; } __fir_exn` (nonzero `flag`) when it returns;
+// a C caller checks `flag` after the call, and clears it to catch.
 FirStatus fir_module_compile(struct FirModule *m,
                              const char *target,
                              bool optimize,
