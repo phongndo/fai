@@ -48,6 +48,14 @@ fn text_matches_reference() {
         let parsed = fir::parse_module(&text);
         if let Ok(m) = &parsed {
             check_stable(&name, m, &mut fails);
+            for f in &m.funcs {
+                let mut body = f.body.clone();
+                let before = body.check_invariants();
+                body.build_uses();
+                if let Err(e) = before.and(body.check_invariants()) {
+                    fails.push(format!("{name}: @{}: broken body: {e}", f.name));
+                }
+            }
         }
         let Some(tool) = &tool else {
             match &parsed {

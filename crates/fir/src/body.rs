@@ -13,6 +13,15 @@
 //!   results, regions) are runs in shared pools.
 //! * **Stable ids.** A region's ops form an index-based doubly linked list, so inserting and
 //!   removing ops never moves other ops.
+//! * **Use lists on demand, in columns.** Each value's uses (the operand slots that name it)
+//!   form an index-based singly linked list: a head per value, and a next link per operand
+//!   slot, parallel to the operand pool. A use is its slot's index ([`UseId`]); its op is found
+//!   by binary search, since ops take their operand runs in id order, so no column stores it.
+//!   The lists are an index that passes build ([`Body::build_uses`], one sweep over the
+//!   operands); from then on every edit keeps them exact ([`Body::check_invariants`] checks
+//!   them). Parsing and verifying don't need them and don't pay for them: kept up to date while
+//!   parsing, they cost 8% of the parse time. Removing one use walks its value's list; values
+//!   have few uses, and [`Body::replace_all_uses`] moves a whole list at once.
 
 use std::fmt;
 
@@ -58,6 +67,10 @@ id!(
     /// A hole operand (`?name: T`) in a [`Body`].
     HoleId
 );
+id!(
+    /// A use of a value: one operand slot of one op. See [`Body::uses`].
+    UseId
+);
 
 impl ValueId {
     /// Stands in for an unresolved name in code that is parsed only to find syntax errors.
@@ -76,8 +89,11 @@ impl IntId {
 
 /// Marks an absent id in a column.
 const NONE: u32 = u32::MAX;
-/// Marks an op that is in no region (it was unlinked).
+/// Marks an op that is in no region (it was unlinked), and an operand slot in no use list (a
+/// hole, or an operand of an erased op) in `use_next`.
 const DETACHED: u32 = u32::MAX - 1;
+/// Marks an erased op.
+const ERASED: u32 = u32::MAX - 2;
 /// The top bit of an [`Operand`] or [`IntId`] picks the second of two kinds.
 const TAG: u32 = 1 << 31;
 
@@ -198,18 +214,46 @@ struct OpShape {
 }
 
 /// An op's neighbors in its region (`NONE` at the ends). `prev` is `DETACHED` for an unlinked
-/// op.
+/// op and `ERASED` for an erased one.
 #[derive(Clone, Copy, Debug)]
 struct Link {
     prev: u32,
     next: u32,
 }
 
-/// What only printing, diagnostics, and structural queries read.
+/// What only printing, diagnostics, and structural queries read: the location, and the parent
+/// region's id with `TAG` set when there is a location (`Option<Loc>` would take 4 more bytes).
 #[derive(Clone, Copy, Debug)]
 struct OpCold {
-    loc: Option<Loc>,
-    parent: RegionId,
+    loc: Loc,
+    parent: u32,
+}
+
+impl OpCold {
+    fn new(loc: Option<Loc>, parent: RegionId) -> OpCold {
+        match loc {
+            Some(loc) => OpCold {
+                loc,
+                parent: parent.0 | TAG,
+            },
+            None => OpCold {
+                loc: Loc { line: 0, col: 0 },
+                parent: parent.0,
+            },
+        }
+    }
+
+    fn loc(self) -> Option<Loc> {
+        (self.parent & TAG != 0).then_some(self.loc)
+    }
+
+    fn parent(self) -> RegionId {
+        RegionId(self.parent & !TAG)
+    }
+
+    fn set_parent(&mut self, parent: RegionId) {
+        self.parent = parent.0 | (self.parent & TAG);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -224,7 +268,35 @@ struct RegionData {
 struct ValueInfo {
     name: Span,
     facts: Span,
-    def: ValueDef,
+    def: PackedDef,
+}
+
+/// A [`ValueDef`] in 8 bytes: the op or region id, with `TAG` set for a region, and the index.
+#[derive(Clone, Copy, Debug)]
+struct PackedDef(u32, u32);
+
+impl PackedDef {
+    fn pack(d: ValueDef) -> PackedDef {
+        match d {
+            ValueDef::Result { op, index } => PackedDef(op.0, index),
+            ValueDef::Param { region, index } => PackedDef(region.0 | TAG, index),
+        }
+    }
+
+    fn unpack(self) -> ValueDef {
+        let PackedDef(id, index) = self;
+        if id & TAG == 0 {
+            ValueDef::Result {
+                op: OpId(id),
+                index,
+            }
+        } else {
+            ValueDef::Param {
+                region: RegionId(id & !TAG),
+                index,
+            }
+        }
+    }
 }
 
 /// A function's code: its entry region and everything nested in it.
@@ -239,8 +311,15 @@ pub struct Body {
     // Values, by `ValueId`.
     value_ty: Vec<Ty>,
     value_info: Vec<ValueInfo>,
+    /// The first use of each value, or `NONE`; empty until `build_uses`.
+    first_use: Vec<u32>,
     // Pools: runs referred to by spans.
     operands: Vec<Operand>,
+    /// Each operand slot's next use in its value's use list (`NONE` at the end, `DETACHED` for
+    /// a slot in no list), by `UseId`; empty until `build_uses`.
+    use_next: Vec<u32>,
+    /// Whether the use lists are built (and kept up to date).
+    uses_built: bool,
     region_ids: Vec<RegionId>,
     facts: Vec<TrustedFact>,
     /// All text: value names and strings, end to end.
@@ -271,7 +350,10 @@ impl Body {
             regions: Vec::new(),
             value_ty: Vec::new(),
             value_info: Vec::new(),
+            first_use: Vec::new(),
             operands: Vec::new(),
+            use_next: Vec::new(),
+            uses_built: false,
             region_ids: Vec::new(),
             facts: Vec::new(),
             text: String::new(),
@@ -299,7 +381,9 @@ impl Body {
         self.regions.shrink_to_fit();
         self.value_ty.shrink_to_fit();
         self.value_info.shrink_to_fit();
+        self.first_use.shrink_to_fit();
         self.operands.shrink_to_fit();
+        self.use_next.shrink_to_fit();
         self.region_ids.shrink_to_fit();
         self.facts.shrink_to_fit();
         self.text.shrink_to_fit();
@@ -321,7 +405,10 @@ impl Body {
         self.regions.clear();
         self.value_ty.clear();
         self.value_info.clear();
+        self.first_use.clear();
         self.operands.clear();
+        self.use_next.clear();
+        self.uses_built = false;
         self.region_ids.clear();
         self.facts.clear();
         self.text.clear();
@@ -444,8 +531,11 @@ impl Body {
             self.value_info.push(ValueInfo {
                 name,
                 facts,
-                def: def(index32(i)),
+                def: PackedDef::pack(def(index32(i))),
             });
+            if self.uses_built {
+                self.first_use.push(NONE);
+            }
         }
         Span {
             start: index32(start),
@@ -464,8 +554,74 @@ impl Body {
         regions: impl IntoIterator<Item = Vec<ValueSpec<'s>>>,
         loc: Option<Loc>,
     ) -> OpId {
+        let id = self.create_op(region, kind, operands, results, regions, loc);
+        let last = self.regions[region.index()].last;
+        self.link_between(region, last, NONE, id);
+        id
+    }
+
+    /// Insert an op right before `before`, in its region. Like [`Body::append_op`] otherwise.
+    pub fn insert_before<'s>(
+        &mut self,
+        before: OpId,
+        kind: OpKind,
+        operands: impl IntoIterator<Item = Operand>,
+        results: impl IntoIterator<Item = ValueSpec<'s>>,
+        regions: impl IntoIterator<Item = Vec<ValueSpec<'s>>>,
+        loc: Option<Loc>,
+    ) -> OpId {
+        assert!(
+            self.is_linked(before),
+            "insert_before: the op is in no region"
+        );
+        let region = self.parent(before);
+        let id = self.create_op(region, kind, operands, results, regions, loc);
+        let prev = self.op_link[before.index()].prev;
+        self.link_between(region, prev, before.0, id);
+        id
+    }
+
+    /// Insert an op right after `after`, in its region. Like [`Body::append_op`] otherwise.
+    pub fn insert_after<'s>(
+        &mut self,
+        after: OpId,
+        kind: OpKind,
+        operands: impl IntoIterator<Item = Operand>,
+        results: impl IntoIterator<Item = ValueSpec<'s>>,
+        regions: impl IntoIterator<Item = Vec<ValueSpec<'s>>>,
+        loc: Option<Loc>,
+    ) -> OpId {
+        assert!(
+            self.is_linked(after),
+            "insert_after: the op is in no region"
+        );
+        let region = self.parent(after);
+        let id = self.create_op(region, kind, operands, results, regions, loc);
+        let next = self.op_link[after.index()].next;
+        self.link_between(region, after.0, next, id);
+        id
+    }
+
+    /// Create an op in no region yet (but with `region` as its parent), and add its operands to
+    /// their values' use lists. Ops take their operand runs in id order, which [`Body::user`]
+    /// relies on.
+    fn create_op<'s>(
+        &mut self,
+        region: RegionId,
+        kind: OpKind,
+        operands: impl IntoIterator<Item = Operand>,
+        results: impl IntoIterator<Item = ValueSpec<'s>>,
+        regions: impl IntoIterator<Item = Vec<ValueSpec<'s>>>,
+        loc: Option<Loc>,
+    ) -> OpId {
         let id = OpId(index32(self.op_kind.len()));
         let operands = push_span(&mut self.operands, operands);
+        if self.uses_built {
+            for u in operands.range() {
+                self.use_next.push(DETACHED);
+                self.link_use(u as u32);
+            }
+        }
         let results = self.new_values(results, |index| ValueDef::Result { op: id, index });
         let start = self.region_ids.len();
         for params in regions {
@@ -476,34 +632,45 @@ impl Body {
             start: index32(start),
             len: index32(self.region_ids.len() - start),
         };
-        let prev = self.regions[region.index()].last;
         self.op_kind.push(kind);
         self.op_shape.push(OpShape {
             results,
             operands,
             regions,
         });
-        self.op_link.push(Link { prev, next: NONE });
-        self.op_cold.push(OpCold {
-            loc,
-            parent: region,
+        self.op_link.push(Link {
+            prev: DETACHED,
+            next: NONE,
         });
-        match opt(prev) {
-            Some(p) => self.op_link[p as usize].next = id.0,
-            None => self.regions[region.index()].first = id.0,
-        }
-        self.regions[region.index()].last = id.0;
+        self.op_cold.push(OpCold::new(loc, region));
         id
     }
 
-    /// Remove an op from its region. Its id stays valid but no longer appears in any region.
-    /// Unlinking an op that is already unlinked does nothing.
+    /// Put an op that is in no region between `prev` and `next` (`NONE` at the ends) of
+    /// `region`.
+    fn link_between(&mut self, region: RegionId, prev: u32, next: u32, op: OpId) {
+        self.op_link[op.index()] = Link { prev, next };
+        self.op_cold[op.index()].set_parent(region);
+        let r = &mut self.regions[region.index()];
+        match opt(prev) {
+            Some(p) => self.op_link[p as usize].next = op.0,
+            None => r.first = op.0,
+        }
+        match opt(next) {
+            Some(n) => self.op_link[n as usize].prev = op.0,
+            None => r.last = op.0,
+        }
+    }
+
+    /// Remove an op from its region. Its id stays valid but no longer appears in any region; its
+    /// operands are still uses (see [`Body::erase`] to drop them). Unlinking an op that is
+    /// already unlinked does nothing.
     pub fn unlink(&mut self, op: OpId) {
         let Link { prev, next } = self.op_link[op.index()];
-        if prev == DETACHED {
+        if prev == DETACHED || prev == ERASED {
             return;
         }
-        let parent = self.op_cold[op.index()].parent.index();
+        let parent = self.op_cold[op.index()].parent().index();
         match opt(prev) {
             Some(p) => self.op_link[p as usize].next = next,
             None => self.regions[parent].first = next,
@@ -518,9 +685,303 @@ impl Body {
         };
     }
 
-    /// Whether the op is in a region (it hasn't been unlinked).
+    /// Whether the op is in a region (it hasn't been unlinked or erased).
     pub fn is_linked(&self, op: OpId) -> bool {
-        self.op_link[op.index()].prev != DETACHED
+        !matches!(self.op_link[op.index()].prev, DETACHED | ERASED)
+    }
+
+    /// Whether the op was erased.
+    pub fn is_erased(&self, op: OpId) -> bool {
+        self.op_link[op.index()].prev == ERASED
+    }
+
+    /// Remove an op from its region and drop its uses, and those of every op nested in its
+    /// regions, which end up empty. Its results (and the values defined inside it) must have no
+    /// uses left. Ids stay valid; erasing an erased op does nothing.
+    pub fn erase(&mut self, op: OpId) {
+        if self.is_erased(op) {
+            return;
+        }
+        self.unlink(op);
+        let mut work = vec![op];
+        let mut erased = Vec::new();
+        while let Some(o) = work.pop() {
+            for u in self.op_shape[o.index()].operands.range() {
+                self.unlink_use(u as u32);
+            }
+            for i in self.op_shape[o.index()].regions.range() {
+                let r = self.region_ids[i];
+                while let Some(inner) = opt(self.regions[r.index()].first) {
+                    self.unlink(OpId(inner));
+                    work.push(OpId(inner));
+                }
+            }
+            self.op_link[o.index()] = Link {
+                prev: ERASED,
+                next: NONE,
+            };
+            erased.push(o);
+        }
+        debug_assert!(
+            !self.uses_built
+                || erased
+                    .iter()
+                    .all(|&o| self.results(o).all(|v| !self.has_uses(v))),
+            "erase: a value defined by the erased ops is still used"
+        );
+    }
+
+    // Uses
+
+    /// Build the use lists, if they aren't built yet. Each value's list starts in op id order.
+    pub fn build_uses(&mut self) {
+        if self.uses_built {
+            return;
+        }
+        self.uses_built = true;
+        self.first_use.clear();
+        self.first_use.resize(self.value_ty.len(), NONE);
+        self.use_next.clear();
+        self.use_next.resize(self.operands.len(), DETACHED);
+        // Backwards, so that putting each use at the head leaves the lists in order.
+        for o in (0..self.op_shape.len()).rev() {
+            if self.op_link[o].prev == ERASED {
+                continue;
+            }
+            for u in self.op_shape[o].operands.range().rev() {
+                self.link_use(u as u32);
+            }
+        }
+    }
+
+    /// Whether the use lists are built; see [`Body::build_uses`].
+    pub fn has_use_lists(&self) -> bool {
+        self.uses_built
+    }
+
+    fn need_uses(&self) {
+        assert!(
+            self.uses_built,
+            "the use lists aren't built: call Body::build_uses"
+        );
+    }
+
+    /// Add operand slot `u` to its value's use list, if it names a value.
+    fn link_use(&mut self, u: u32) {
+        let OperandKind::Value(v) = self.operands[u as usize].get() else {
+            return;
+        };
+        // A body parsed only to find syntax errors has placeholder operands that may name no
+        // value; they stay out of every list.
+        let Some(head) = self.first_use.get_mut(v.index()) else {
+            return;
+        };
+        self.use_next[u as usize] = std::mem::replace(head, u);
+    }
+
+    /// Take operand slot `u` out of its value's use list, if it is in one: a walk from the
+    /// list's head to `u`.
+    fn unlink_use(&mut self, u: u32) {
+        if !self.uses_built {
+            return;
+        }
+        let next = self.use_next[u as usize];
+        if next == DETACHED {
+            return;
+        }
+        let OperandKind::Value(v) = self.operands[u as usize].get() else {
+            unreachable!("a hole in a use list")
+        };
+        let head = self.first_use[v.index()];
+        if head == u {
+            self.first_use[v.index()] = next;
+        } else {
+            let mut p = head;
+            while self.use_next[p as usize] != u {
+                p = self.use_next[p as usize];
+            }
+            self.use_next[p as usize] = next;
+        }
+        self.use_next[u as usize] = DETACHED;
+    }
+
+    /// The uses of a value, in no particular order. Needs the use lists built.
+    pub fn uses(&self, value: ValueId) -> Uses<'_> {
+        self.need_uses();
+        Uses {
+            next: &self.use_next,
+            cur: self.first_use[value.index()],
+        }
+    }
+
+    /// Whether a value has uses. Needs the use lists built.
+    pub fn has_uses(&self, value: ValueId) -> bool {
+        self.need_uses();
+        self.first_use[value.index()] != NONE
+    }
+
+    /// The op a use belongs to, and which of its operands it is.
+    pub fn user(&self, u: UseId) -> (OpId, usize) {
+        // Operand runs are allocated in op id order, so the owner is the last op whose run
+        // starts at or before `u`.
+        let i = self.op_shape.partition_point(|s| s.operands.start <= u.0) - 1;
+        (
+            OpId(i as u32),
+            (u.0 - self.op_shape[i].operands.start) as usize,
+        )
+    }
+
+    /// The use that is operand `i` of `op`.
+    pub fn operand_use(&self, op: OpId, i: usize) -> UseId {
+        let span = self.op_shape[op.index()].operands;
+        assert!(
+            i < span.len as usize,
+            "operand {i} of an op with {}",
+            span.len
+        );
+        UseId(span.start + i as u32)
+    }
+
+    /// Make operand `i` of `op` refer to `new`, keeping use lists exact.
+    pub fn set_operand(&mut self, op: OpId, i: usize, new: Operand) {
+        assert!(!self.is_erased(op), "set_operand on an erased op");
+        let u = self.operand_use(op, i).0;
+        self.unlink_use(u);
+        self.operands[u as usize] = new;
+        if self.uses_built {
+            self.link_use(u);
+        }
+    }
+
+    /// Make every use of `old` a use of `new`. Needs the use lists built.
+    pub fn replace_all_uses(&mut self, old: ValueId, new: ValueId) {
+        self.need_uses();
+        if old == new {
+            return;
+        }
+        let first = self.first_use[old.index()];
+        let mut last = NONE;
+        let mut u = first;
+        while let Some(x) = opt(u) {
+            self.operands[x as usize] = Operand::value(new);
+            last = x;
+            u = self.use_next[x as usize];
+        }
+        let Some(last) = opt(last) else { return };
+        // Put `old`'s list in front of `new`'s.
+        let head = std::mem::replace(&mut self.first_use[new.index()], first);
+        self.use_next[last as usize] = head;
+        self.first_use[old.index()] = NONE;
+    }
+
+    /// Check the body's internal links, for tests and debugging: every region's op list is
+    /// well formed and holds exactly the ops whose parent it is, ops take their operand runs in
+    /// id order, and (once built) every use list holds exactly the value operands of the ops
+    /// that aren't erased.
+    pub fn check_invariants(&self) -> Result<(), String> {
+        let n_ops = self.op_kind.len();
+        for (name, len) in [
+            ("op_shape", self.op_shape.len()),
+            ("op_link", self.op_link.len()),
+            ("op_cold", self.op_cold.len()),
+        ] {
+            if len != n_ops {
+                return Err(format!("{name} has {len} entries for {n_ops} ops"));
+            }
+        }
+        if self.value_info.len() != self.value_ty.len() {
+            return Err("value columns differ in length".into());
+        }
+        let (want_values, want_uses) = if self.uses_built {
+            (self.value_ty.len(), self.operands.len())
+        } else {
+            (0, 0)
+        };
+        if self.first_use.len() != want_values || self.use_next.len() != want_uses {
+            return Err("the use list columns have the wrong length".into());
+        }
+        let mut end = 0;
+        for (i, s) in self.op_shape.iter().enumerate() {
+            if s.operands.start < end {
+                return Err(format!("op {i}'s operands start before op {}'s end", i - 1));
+            }
+            end = s.operands.start + s.operands.len;
+        }
+        // Region lists.
+        let mut listed = vec![false; n_ops];
+        for (r, data) in self.regions.iter().enumerate() {
+            let mut prev = NONE;
+            let mut cur = data.first;
+            while let Some(op) = opt(cur) {
+                let o = op as usize;
+                if o >= n_ops || listed[o] {
+                    return Err(format!(
+                        "region {r}'s list revisits or leaves the ops at {op}"
+                    ));
+                }
+                listed[o] = true;
+                let link = self.op_link[o];
+                if link.prev != prev {
+                    return Err(format!("op {op}'s prev link is wrong"));
+                }
+                if self.op_cold[o].parent().index() != r {
+                    return Err(format!(
+                        "op {op} is listed in region {r} but has another parent"
+                    ));
+                }
+                prev = op;
+                cur = link.next;
+            }
+            if data.last != prev {
+                return Err(format!("region {r}'s last op is wrong"));
+            }
+        }
+        for (o, &l) in listed.iter().enumerate() {
+            if l != self.is_linked(OpId(o as u32)) {
+                return Err(format!("op {o} is linked but not listed, or the reverse"));
+            }
+        }
+        if !self.uses_built {
+            return Ok(());
+        }
+        // Use lists.
+        let mut seen = vec![false; self.operands.len()];
+        for v in 0..self.first_use.len() {
+            let mut cur = self.first_use[v];
+            while let Some(u) = opt(cur) {
+                let ui = u as usize;
+                if ui >= seen.len() || seen[ui] {
+                    return Err(format!(
+                        "value {v}'s use list revisits or leaves the uses at {u}"
+                    ));
+                }
+                seen[ui] = true;
+                if self.operands[ui].get() != OperandKind::Value(ValueId(v as u32)) {
+                    return Err(format!("use {u} is in value {v}'s list but names another"));
+                }
+                let (op, _) = self.user(UseId(u));
+                if self.is_erased(op) {
+                    return Err(format!("use {u} belongs to erased op {}", op.0));
+                }
+                cur = self.use_next[ui];
+            }
+        }
+        for (o, s) in self.op_shape.iter().enumerate() {
+            let erased = self.is_erased(OpId(o as u32));
+            for u in s.operands.range() {
+                let named = matches!(
+                    self.operands[u].get(),
+                    OperandKind::Value(v) if v.index() < self.first_use.len()
+                );
+                if seen[u] != (named && !erased) {
+                    return Err(format!("use {u} of op {o} is listed wrongly"));
+                }
+                if !seen[u] && self.use_next[u] != DETACHED {
+                    return Err(format!("use {u} of op {o} is in no list but has links"));
+                }
+            }
+        }
+        Ok(())
     }
 
     // Ops
@@ -545,11 +1006,11 @@ impl Body {
     }
 
     pub fn loc(&self, op: OpId) -> Option<Loc> {
-        self.op_cold[op.index()].loc
+        self.op_cold[op.index()].loc()
     }
 
     pub fn parent(&self, op: OpId) -> RegionId {
-        self.op_cold[op.index()].parent
+        self.op_cold[op.index()].parent()
     }
 
     pub fn next(&self, op: OpId) -> Option<OpId> {
@@ -558,7 +1019,7 @@ impl Body {
 
     pub fn prev(&self, op: OpId) -> Option<OpId> {
         match self.op_link[op.index()].prev {
-            DETACHED => None,
+            DETACHED | ERASED => None,
             p => opt(p).map(OpId),
         }
     }
@@ -612,7 +1073,23 @@ impl Body {
     }
 
     pub fn def(&self, value: ValueId) -> ValueDef {
-        self.value_info[value.index()].def
+        self.value_info[value.index()].def.unpack()
+    }
+}
+
+/// The uses of a value. See [`Body::uses`].
+pub struct Uses<'a> {
+    next: &'a [u32],
+    cur: u32,
+}
+
+impl Iterator for Uses<'_> {
+    type Item = UseId;
+
+    fn next(&mut self) -> Option<UseId> {
+        let u = opt(self.cur)?;
+        self.cur = self.next[u as usize];
+        Some(UseId(u))
     }
 }
 
@@ -666,6 +1143,234 @@ mod tests {
         let a_val = b.results(a).next().unwrap();
         assert_eq!(b.name(a_val), "a");
         assert_eq!(b.def(a_val), ValueDef::Result { op: a, index: 0 });
+    }
+
+    fn uses_of(b: &Body, v: ValueId) -> Vec<(OpId, usize)> {
+        let mut us: Vec<_> = b.uses(v).map(|u| b.user(u)).collect();
+        us.sort();
+        us
+    }
+
+    fn value(b: &Body, op: OpId) -> ValueId {
+        b.results(op).next().unwrap()
+    }
+
+    #[test]
+    fn uses_follow_edits() {
+        let mut b = Body::new();
+        let r = b.entry();
+        b.set_params(r, [val("x"), val("y")]);
+        let mut ps = b.params(r);
+        let (x, y) = (ps.next().unwrap(), ps.next().unwrap());
+        let (ox, oy) = (Operand::value(x), Operand::value(y));
+        let add = b.append_op(r, OpKind::Copy, [ox], [val("a")], [], None);
+        let ret = b.append_op(
+            r,
+            OpKind::Ret,
+            [Operand::value(value(&b, add))],
+            [],
+            [],
+            None,
+        );
+        assert!(!b.has_use_lists());
+        b.check_invariants().unwrap();
+        b.build_uses();
+        assert_eq!(uses_of(&b, x), [(add, 0)]);
+        // Insert on both sides.
+        let c = b.insert_before(add, OpKind::Copy, [ox], [val("c")], [], None);
+        let d = b.insert_after(add, OpKind::Copy, [oy], [val("d")], [], None);
+        let e = b.insert_before(c, OpKind::Copy, [ox], [val("e")], [], None);
+        assert_eq!(b.ops(r).collect::<Vec<_>>(), [e, c, add, d, ret]);
+        assert_eq!(uses_of(&b, x), [(add, 0), (c, 0), (e, 0)]);
+        assert_eq!(uses_of(&b, y), [(d, 0)]);
+        b.check_invariants().unwrap();
+        // Rewrite one operand, then all uses of a value.
+        b.set_operand(c, 0, oy);
+        assert_eq!(uses_of(&b, x), [(add, 0), (e, 0)]);
+        assert_eq!(uses_of(&b, y), [(c, 0), (d, 0)]);
+        b.replace_all_uses(x, y);
+        assert!(!b.has_uses(x));
+        assert_eq!(uses_of(&b, y), [(add, 0), (c, 0), (d, 0), (e, 0)]);
+        assert_eq!(b.operands(e), [oy]);
+        b.check_invariants().unwrap();
+        // A hole is in no list; setting it back to a value relinks it.
+        let h = b.add_hole("h", Ty::Int(32));
+        b.set_operand(d, 0, h);
+        assert_eq!(uses_of(&b, y), [(add, 0), (c, 0), (e, 0)]);
+        b.set_operand(d, 0, ox);
+        assert_eq!(uses_of(&b, x), [(d, 0)]);
+        // Erasing drops uses.
+        b.erase(e);
+        b.erase(e);
+        assert!(b.is_erased(e) && !b.is_linked(e));
+        assert_eq!(uses_of(&b, y), [(add, 0), (c, 0)]);
+        assert_eq!(b.ops(r).collect::<Vec<_>>(), [c, add, d, ret]);
+        b.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn erase_empties_nested_regions() {
+        let mut b = Body::new();
+        let r = b.entry();
+        b.set_params(r, [val("x")]);
+        let x = b.params(r).next().unwrap();
+        let ox = Operand::value(x);
+        b.build_uses();
+        let lp = b.append_op(
+            r,
+            OpKind::Loop { progress: false },
+            [ox],
+            [],
+            [vec![val("i")]],
+            None,
+        );
+        let body = b.regions(lp)[0];
+        let i = b.params(body).next().unwrap();
+        let inner = b.append_op(body, OpKind::Copy, [ox], [val("a")], [], None);
+        let a = value(&b, inner);
+        b.append_op(body, OpKind::Continue, [Operand::value(a)], [], [], None);
+        b.append_op(
+            body,
+            OpKind::Copy,
+            [Operand::value(i)],
+            [val("unused")],
+            [],
+            None,
+        );
+        assert_eq!(uses_of(&b, x), [(lp, 0), (inner, 0)]);
+        b.check_invariants().unwrap();
+        b.erase(lp);
+        assert!(!b.has_uses(x) && !b.has_uses(a) && !b.has_uses(i));
+        assert!(b.is_empty(body) && b.is_empty(r));
+        assert!(b.is_erased(inner));
+        b.check_invariants().unwrap();
+    }
+
+    /// Random edits, checked after each against use lists computed from scratch.
+    #[test]
+    fn random_edits_keep_use_lists_exact() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rand = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..40 {
+            let mut b = Body::new();
+            let r = b.entry();
+            b.set_params(r, [val("p"), val("q")]);
+            let mut values: Vec<ValueId> = b.params(r).collect();
+            // Build the lists at the start, or after some edits.
+            let build_at = rand(3) * 30;
+            for step in 0..150 {
+                if step == build_at {
+                    b.build_uses();
+                }
+                let live: Vec<OpId> = (0..b.num_ops() as u32)
+                    .map(OpId)
+                    .filter(|&o| b.is_linked(o))
+                    .collect();
+                let n_operands = rand(4);
+                let operands: Vec<Operand> = (0..n_operands)
+                    .map(|_| {
+                        if rand(10) == 0 {
+                            b.add_hole("h", Ty::Int(32))
+                        } else {
+                            Operand::value(values[rand(values.len())])
+                        }
+                    })
+                    .collect();
+                let name = format!("v{step}");
+                let spec = || vec![val(&name)];
+                match rand(7) {
+                    0 | 1 => {
+                        // Sometimes with a region holding an op of its own.
+                        let regions = if rand(4) == 0 { vec![vec![]] } else { vec![] };
+                        let op = b.append_op(r, OpKind::Copy, operands, spec(), regions, None);
+                        if let Some(&inner) = b.regions(op).first() {
+                            let o = Operand::value(values[rand(values.len())]);
+                            b.append_op(inner, OpKind::Copy, [o], [], [], None);
+                        }
+                        values.extend(b.results(op));
+                    }
+                    2 if !live.is_empty() => {
+                        let at = live[rand(live.len())];
+                        let op = if rand(2) == 0 {
+                            b.insert_before(at, OpKind::Copy, operands, spec(), [], None)
+                        } else {
+                            b.insert_after(at, OpKind::Copy, operands, spec(), [], None)
+                        };
+                        values.extend(b.results(op));
+                    }
+                    3 if !live.is_empty() => {
+                        let op = live[rand(live.len())];
+                        let k = b.operands(op).len();
+                        if k > 0 {
+                            b.set_operand(
+                                op,
+                                rand(k),
+                                operands
+                                    .first()
+                                    .copied()
+                                    .unwrap_or(Operand::value(values[0])),
+                            );
+                        }
+                    }
+                    4 if b.has_use_lists() => {
+                        let (old, new) = (values[rand(values.len())], values[rand(values.len())]);
+                        b.replace_all_uses(old, new);
+                    }
+                    5 if !live.is_empty() && b.has_use_lists() => {
+                        // Erase an op after redirecting the uses of what it defines.
+                        let op = live[rand(live.len())];
+                        let mut defined: Vec<ValueId> = b.results(op).collect();
+                        for &rg in b.regions(op) {
+                            for inner in b.ops(rg) {
+                                defined.extend(b.results(inner));
+                            }
+                        }
+                        for v in &defined {
+                            b.replace_all_uses(*v, values[0]);
+                        }
+                        b.erase(op);
+                        values.retain(|v| !defined.contains(v));
+                    }
+                    _ if !live.is_empty() => b.unlink(live[rand(live.len())]),
+                    _ => {}
+                }
+                b.check_invariants().unwrap();
+                if !b.has_use_lists() {
+                    continue;
+                }
+                // Compare with use lists computed from scratch, and with lists built afresh.
+                let mut fresh = b.clone();
+                fresh.uses_built = false;
+                fresh.first_use.clear();
+                fresh.use_next.clear();
+                fresh.build_uses();
+                fresh.check_invariants().unwrap();
+                for v in 0..b.num_values() as u32 {
+                    let v = ValueId(v);
+                    let mut want = Vec::new();
+                    for o in 0..b.num_ops() as u32 {
+                        let o = OpId(o);
+                        if b.is_erased(o) {
+                            continue;
+                        }
+                        for (i, x) in b.operands(o).iter().enumerate() {
+                            if x.get() == OperandKind::Value(v) {
+                                want.push((o, i));
+                            }
+                        }
+                    }
+                    assert_eq!(uses_of(&b, v), want, "value {v:?} after step {step}");
+                    // Built lists are in op order.
+                    let built: Vec<_> = fresh.uses(v).map(|u| fresh.user(u)).collect();
+                    assert_eq!(built, want);
+                }
+            }
+        }
     }
 
     #[test]
