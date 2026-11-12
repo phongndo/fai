@@ -69,6 +69,7 @@ fn copy_init(g: &Globals, init: Init, mb: &mut ModuleBuilder) -> Result<Init, Bu
 fn rebuild(m: &Module) -> Result<Module, BuildError> {
     let mut mb = ModuleBuilder::new();
     mb.set_space(m.space.clone());
+    mb.set_layer(m.layer);
     let gt = &m.globals.types;
     for x in &m.externs {
         let ps: Vec<Ty> = x.params.iter().map(|&t| copy_ty(gt, t, &mut mb)).collect();

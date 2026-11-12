@@ -37,6 +37,9 @@ typedef struct FirIntAlign {
   uint32_t align;
 } FirIntAlign;
 
+// A module's layer, for `fir_module_set_layer`.
+typedef uint32_t FirLayer;
+
 // A type: a value type (`fir_type_int`, `fir_type_byte`, `FIR_TYPE_PTR`), or a struct, array,
 // or function type of a module.
 typedef uint32_t FirType;
@@ -139,6 +142,13 @@ typedef struct FirCase {
 
 // A bug in FIR, caught before it crossed the boundary.
 #define FIR_ERR_INTERNAL 5
+
+#define FIR_LAYER_HFIR 0
+
+#define FIR_LAYER_MFIR 1
+
+// LFIR for a target, named when the layer is set.
+#define FIR_LAYER_LFIR 2
 
 // `ptr`
 #define FIR_TYPE_PTR 3221225472
@@ -314,6 +324,11 @@ FirStatus fir_module_set_space(struct FirModule *m,
                                uint32_t ptr_align,
                                const struct FirIntAlign *ints,
                                size_t nints);
+
+// Set the module's layer: HFIR (the default), MFIR, or LFIR for the target `target` (such as
+// `"aarch64"`; ignored for the other layers). Set it before building functions: each op is
+// checked against it as it is built.
+FirStatus fir_module_set_layer(struct FirModule *m, FirLayer layer, const char *target);
 
 // Check the module (its finished functions) as `fir check` does. On failure the message is the
 // verifier's.

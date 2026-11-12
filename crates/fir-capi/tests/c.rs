@@ -15,11 +15,26 @@ fn repo() -> PathBuf {
         .unwrap()
 }
 
-/// `libfir_capi.a`, built next to this test's executable (`target/<profile>/deps/`).
+/// `libfir_capi.a`, built from the current sources. `cargo test` doesn't build a crate's static
+/// library, and one left over from an earlier build may be stale, so build it here: with the
+/// test's profile, in a target directory of its own (the outer cargo holds the main one's lock).
+/// Cargo makes this a no-op when nothing changed.
 fn static_lib() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let dir = exe.parent().and_then(Path::parent).unwrap();
-    let lib = dir.join("libfir_capi.a");
+    let release = !cfg!(debug_assertions);
+    let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("capi-target");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let mut cmd = Command::new(cargo);
+    cmd.current_dir(repo())
+        .args(["build", "--quiet", "-p", "fir-capi", "--target-dir"])
+        .arg(&target);
+    if release {
+        cmd.arg("--release");
+    }
+    let status = cmd.status().expect("running cargo");
+    assert!(status.success(), "building the static library failed");
+    let lib = target
+        .join(if release { "release" } else { "debug" })
+        .join("libfir_capi.a");
     assert!(lib.exists(), "{} is missing", lib.display());
     lib
 }

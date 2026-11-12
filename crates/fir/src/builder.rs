@@ -375,6 +375,16 @@ impl ModuleBuilder {
         self.module.space = space;
     }
 
+    /// Set the module's layer (HFIR unless set). Set it before building functions: each op is
+    /// checked against it as it is built.
+    pub fn set_layer(&mut self, layer: crate::Layer) {
+        self.module.layer = layer;
+    }
+
+    pub fn layer(&self) -> crate::Layer {
+        self.module.layer
+    }
+
     /// The table of the module's struct, array, and function types.
     pub fn types(&self) -> &Types {
         &self.module.globals.types
@@ -1042,6 +1052,19 @@ impl<'m> FuncBuilder<'m> {
         Ok(self.m.st.body.add_cases(cases))
     }
 
+    /// The op must be allowed in the module's layer, with the verifier's message.
+    fn check_layer(&self, kind: OpKind) -> Result<(), BuildError> {
+        let layer = self.m.module.layer;
+        if layer.allows(kind.decl()) {
+            return Ok(());
+        }
+        Err(BuildError::new(format!(
+            "{} is not allowed in layer {layer}; it is allowed in {}",
+            kind.mnemonic(),
+            kind.decl().layers_text()
+        )))
+    }
+
     pub(crate) fn result(&self, op: OpId, i: usize) -> ValueId {
         Values::of(self.m.st.body.results(op)).get(i)
     }
@@ -1056,6 +1079,7 @@ impl<'m> FuncBuilder<'m> {
     /// Make an op without regions from the operands added since [`FuncBuilder::begin_op`],
     /// after checking it by its typing rule as far as that is cheap.
     pub(crate) fn simple(&mut self, kind: OpKind, res: Res<'_>) -> Result<OpId, BuildError> {
+        self.check_layer(kind)?;
         let operands = std::mem::take(&mut self.m.st.operands);
         let mut outs = std::mem::take(&mut self.m.st.tys);
         outs.clear();
@@ -1077,6 +1101,7 @@ impl<'m> FuncBuilder<'m> {
         regions: usize,
         iter: bool,
     ) -> Result<OpId, BuildError> {
+        self.check_layer(kind)?;
         let operands = std::mem::take(&mut self.m.st.operands);
         let r = self.region_op_with(kind, &operands, results, regions, iter);
         self.m.st.operands = operands;

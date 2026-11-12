@@ -510,6 +510,30 @@ static void errors(void) {
   CHECK(fir_module_run(m, "nope", NULL, 0, 10, &out) == FIR_ERR_VERIFY);
   fir_module_free(m);
 
+  /* Layers: ops are checked against the module's layer as they are built. */
+  m = cur = fir_module_new();
+  CHECK(fir_module_set_layer(m, FIR_LAYER_LFIR, "x86") == FIR_ERR_INVALID);
+  expect_error("unknown target 'x86'", __LINE__);
+  CHECK(fir_module_set_layer(m, 9, NULL) == FIR_ERR_INVALID);
+  expect_error("9 is not a FirLayer", __LINE__);
+  OK(fir_module_set_layer(m, FIR_LAYER_LFIR, "aarch64"));
+  OK(fir_module_set_layer(m, FIR_LAYER_MFIR, NULL));
+  FirType pair = ID(fir_type_struct(m, FIR_POLICY_C, both, 2));
+  FirType ptr = FIR_TYPE_PTR;
+  b = fir_func_begin(m, ID(fir_func_declare(m, "field", &ptr, 1, &ptr, 1)));
+  FirValue p = ID(fir_builder_param(b, 0));
+  CHECK(fir_ptr_field(b, true, pair, p, 1) == FIR_INVALID);
+  expect_error("ptr.field.inbounds is not allowed in layer mfir; it is allowed in hfir", __LINE__);
+  FirValue off = ID(fir_ty_offset(b, pair, 1));
+  FirValue q = ID(fir_ptr_offset(b, true, p, off));
+  ID(fir_func_ret(b, &q, 1));
+  OK(fir_func_end(b));
+  OK(fir_module_verify(m));
+  char *ltext = fir_module_print(m, false);
+  CHECK(ltext != NULL && strncmp(ltext, "layer mfir\n", 11) == 0);
+  fir_string_free(ltext);
+  fir_module_free(m);
+
   /* Parsing. */
   FirModule *parsed = NULL;
   char *msg = NULL;

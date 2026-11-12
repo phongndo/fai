@@ -114,6 +114,13 @@ pub const FIR_ERR_RUN: FirStatus = 4;
 /// A bug in FIR, caught before it crossed the boundary.
 pub const FIR_ERR_INTERNAL: FirStatus = 5;
 
+/// A module's layer, for `fir_module_set_layer`.
+pub type FirLayer = u32;
+pub const FIR_LAYER_HFIR: FirLayer = 0;
+pub const FIR_LAYER_MFIR: FirLayer = 1;
+/// LFIR for a target, named when the layer is set.
+pub const FIR_LAYER_LFIR: FirLayer = 2;
+
 /// `ptr`
 pub const FIR_TYPE_PTR: FirType = 0xC000_0000;
 const TY_TAG: u32 = 3 << 30;
@@ -638,6 +645,35 @@ pub unsafe extern "C" fn fir_module_set_space(
                     .collect();
             }
             m.mb.set_space(sp);
+            Ok(())
+        })
+    }
+}
+
+/// Set the module's layer: HFIR (the default), MFIR, or LFIR for the target `target` (such as
+/// `"aarch64"`; ignored for the other layers). Set it before building functions: each op is
+/// checked against it as it is built.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_module_set_layer(
+    m: *mut FirModule,
+    layer: FirLayer,
+    target: *const c_char,
+) -> FirStatus {
+    unsafe {
+        module_status(m, |m| {
+            let layer = match layer {
+                FIR_LAYER_HFIR => fir::Layer::Hfir,
+                FIR_LAYER_MFIR => fir::Layer::Mfir,
+                FIR_LAYER_LFIR => {
+                    let name = cstr(target)?;
+                    match fir::Layer::target(name) {
+                        Some(t) => fir::Layer::Lfir(t),
+                        None => return fail(FIR_ERR_INVALID, format!("unknown target '{name}'")),
+                    }
+                }
+                n => return fail(FIR_ERR_INVALID, format!("{n} is not a FirLayer")),
+            };
+            m.mb.set_layer(layer);
             Ok(())
         })
     }
