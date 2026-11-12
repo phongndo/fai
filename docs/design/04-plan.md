@@ -347,9 +347,9 @@ Lowering proofs, Backend testing, C external functions.
   `fir_module_set_va_list`, and the generated `fir_va_start`, `fir_va_arg`, `fir_va_end`.
 - **Tests:** `tests/varargs/` (definitions and calls with mixed classes, more than eight of each
   class, `va_copy`, a `va_list` passed to another function and in a struct, nested variadic
-  calls, restarts, narrow and wide reads, variadic externs and indirect calls; 30 run lines, 10
-  of them UB (`va-arg`, `use-after-free`, `bad-call`), and 19
-  error fixtures): `fir-ref test` and `fir run` agree on every run line; every run that the
+  calls, restarts, narrow and wide reads, a `va_list`'s bytes, variadic externs and indirect
+  calls; 30 run lines, 10 of them UB (`va-arg`, `use-after-free`, `bad-call`), and 19 error
+  fixtures): `fir-ref test` and `fir run` agree on every run line; every run that the
   backend compiles matches natively under qemu, with and without `-O`, and in LFIR before and
   after allocation (also in `fir-ref`). `tests/capi/e2e.c` builds a module through the C API
   that calls glibc's `printf` (directly and through a pointer), `snprintf` (integers on the
@@ -358,7 +358,14 @@ Lowering proofs, Backend testing, C external functions.
   formats. The fuzzer makes variadic functions (the entry included) and external functions,
   calls passing their usual argument types or others, and `va.arg` (sometimes of another width,
   class, or past the end), restarts, copies, and ends: `FIR_FUZZ=3000` on seeds 43 and 59 for
-  `fuzz.rs`, `opt.rs`, `builder.rs`, and `aarch64.rs`: no differences (SEEDSTATS).
+  `fuzz.rs`, `opt.rs` (in a release build: a few seed-59 programs' lowered runs take minutes in
+  the interpreter, varargs or not), `builder.rs`, and `aarch64.rs`: no differences. Per seed,
+  about 1,620 of the 3,000 programs have variadic functions and 720 `va.arg`, about 105 runs end
+  in `va-arg` UB, and about 1,700 runs of programs with varargs match natively with and without
+  `-O` (22 and 15 modules aren't run natively: a variadic external function called with
+  several argument lists). The first native runs found that a `va_list`'s bytes, loaded as
+  `bN` and returned, are the cursor's in FIR and the target's natively: any byte now refines a
+  cursor's, as it refines `poison` (`Byte.Refines`).
 - **Not yet:** `fai-cc`'s varargs (track F2); macOS's variant (open item 4); aggregates as
   variadic arguments (track A); integers wider than 64 bits as variadic arguments.
 
