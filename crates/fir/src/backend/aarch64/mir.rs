@@ -435,8 +435,11 @@ pub struct MFunc {
     pub blocks: Vec<u32>,
     /// How many virtual registers the code names (`v0` to `vN-1`).
     pub nvregs: u32,
-    /// The signatures of calls through pointers: parameter and result types.
+    /// The signatures of calls through pointers: parameter and result types, of the source
+    /// function's type table.
     pub sigs: Vec<(Vec<Ty>, Vec<Ty>)>,
+    /// The registers each of those calls reads and writes.
+    pub sig_shapes: Vec<super::abi::CallShape>,
     pub frame: Frame,
 }
 

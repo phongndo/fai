@@ -41,7 +41,7 @@ pub use crate::float::NanRule;
 use crate::ir::*;
 use crate::sem::{self, Bits, Out};
 pub use crate::sem::{TrapReason, UbKind};
-use crate::types::Shape;
+use crate::types::{Policy, Shape};
 
 // The machine that runs LFIR modules for AArch64; a child module, so it shares the memory model.
 #[path = "backend/aarch64/machine.rs"]
@@ -584,7 +584,8 @@ impl RunOutput {
 }
 
 /// [`run`], with the outcome's parts. With `lower_rets`, returned values are shown as the
-/// scalars the lowering returns instead (Lean's `Lower.lowerValue`).
+/// lowering returns them instead: as their scalars (Lean's `Lower.lowerValue`), unless the one
+/// result is a composite, which calls pass whole.
 pub fn run_detail(
     m: &Module,
     name: &str,
@@ -752,8 +753,10 @@ struct Machine<'m> {
     /// Each scope's marks, by byte offset.
     marks: Vec<FxHashMap<u64, u8>>,
     families: Vec<&'m str>,
-    /// The types of every call's variadic arguments, in runs (`Kind::Va`).
+    /// The types of every call's variadic arguments, in runs (`Kind::Va`), aggregates in
+    /// `va_types`.
     va_tys: Vec<Ty>,
+    va_types: Types,
     /// `va_list` cursors: the variadic arguments' allocation, its first tag, and the position
     /// (`Byte::Va`).
     cursors: Vec<(u32, u32, u32)>,
@@ -819,6 +822,7 @@ impl<'m> Machine<'m> {
             marks: Vec::new(),
             families: Vec::new(),
             va_tys: Vec::new(),
+            va_types: Types::new(),
             cursors: Vec::new(),
             stack_allocs: Vec::new(),
             frames: Vec::new(),
@@ -2782,50 +2786,109 @@ impl<'m> Machine<'m> {
         }
     }
 
-    /// Whether values fit parameters of types `ps`, then variadic arguments if `variadic` (Lean's
-    /// `argsFit`).
+    /// The type a variadic argument is passed as (Lean's `RVal.argTy`): a scalar's own, and for
+    /// an aggregate the `struct<C>` of its parts', in `va_types`.
+    fn arg_ty(&mut self, v: Value) -> Ty {
+        match self.parts(v) {
+            Some(ps) => {
+                let ps = ps.to_vec();
+                let fs: Vec<Ty> = ps.into_iter().map(|p| self.arg_ty(p)).collect();
+                self.va_types.structure(Policy::C, &fs)
+            }
+            None => self.scalar_ty(v),
+        }
+    }
+
+    /// Whether a value can be a variadic argument (Lean's `RVal.argTy` and `Ty.isVararg`).
+    fn is_vararg_value(&self, v: Value) -> bool {
+        match self.parts(v) {
+            Some(ps) => !ps.is_empty() && ps.iter().all(|&p| self.is_vararg_value(p)),
+            None => {
+                let t = self.scalar_ty(v);
+                t.is_vararg() || t.is_value()
+            }
+        }
+    }
+
+    /// Whether values fit parameters of types `ps` (an external function's, of the module's
+    /// table), then variadic arguments if `variadic` (Lean's `argsFit`).
     fn args_fit(&self, ps: &[Ty], variadic: bool, vs: &[Value]) -> bool {
+        let types = &self.module.globals.types;
         let n = ps.len();
         (if variadic {
             n <= vs.len()
         } else {
             n == vs.len()
-        }) && vs.iter().zip(ps).all(|(&v, &t)| self.has_ty(v, t))
-            && vs[n.min(vs.len())..]
-                .iter()
-                .all(|&v| self.scalar_ty(v).is_vararg())
+        }) && vs
+            .iter()
+            .zip(ps)
+            .all(|(&v, &t)| self.has_ty_in(types, v, t))
+            && vs[n.min(vs.len())..].iter().all(|&v| match self.parts(v) {
+                Some(_) => self.is_vararg_value(v),
+                None => self.scalar_ty(v).is_vararg(),
+            })
     }
 
-    /// The allocation holding a call's variadic arguments, one 8-byte slot each, holding one
-    /// argument (Lean's `newVaArea`, `SpaceCfg.isVararg`).
+    /// A variadic argument's slot: its size rounded up to 8 bytes (Lean's `vaSlot`).
+    fn va_slot(&self, t: Ty) -> u64 {
+        (self.va_types.size(self.space, t) as u64).next_multiple_of(8)
+    }
+
+    /// Where variadic argument `k` of the run `args` starts (Lean's `vaOffset`).
+    fn va_offset(&self, args: Span, k: usize) -> u64 {
+        self.va_tys[args.range()][..k]
+            .iter()
+            .map(|&t| self.va_slot(t))
+            .sum()
+    }
+
+    /// The allocation holding a call's variadic arguments, a slot each (Lean's `newVaArea`); a
+    /// scalar takes one 8-byte slot (`SpaceCfg.isVararg`).
     fn new_va_area(&mut self, loc: Option<Loc>, vs: &[Value]) -> R<u32> {
-        if !vs.iter().all(|&v| self.space.is_vararg(self.scalar_ty(v))) {
+        if !vs.iter().all(|&v| match self.parts(v) {
+            Some(_) => self.is_vararg_value(v),
+            None => self.space.is_vararg(self.scalar_ty(v)),
+        }) {
             return stuck(
                 loc,
-                "a variadic argument must be an iN or bN of 8 to 64 bits, a ptr of at most 64 bits, or a float",
+                "a variadic argument must be an iN or bN of 8 to 64 bits, a ptr of at most 64 bits, a float, or a C struct or array",
             );
         }
-        let p = self.new_alloc(loc, 8 * vs.len() as u64, 8, Kind::Stack);
+        let start = self.va_tys.len() as u32;
+        for &v in vs {
+            let t = self.arg_ty(v);
+            self.va_tys.push(t);
+        }
+        let args = Span {
+            start,
+            len: vs.len() as u32,
+        };
+        let size = self.va_offset(args, vs.len());
+        let p = self.new_alloc(loc, size, 8, Kind::Stack);
         let Ptr::Rel { alloc, tag, .. } = self.ptrs[p as usize] else {
             unreachable!()
         };
-        let start = self.va_tys.len() as u32;
-        for &v in vs {
-            let t = self.scalar_ty(v);
-            self.va_tys.push(t);
-        }
-        self.allocs.kind[alloc as usize] = Kind::Va {
-            tag,
-            args: Span {
-                start,
-                len: vs.len() as u32,
-            },
-        };
+        self.allocs.kind[alloc as usize] = Kind::Va { tag, args };
+        let mut leaves = Vec::new();
+        let mut vals = Vec::new();
         for (i, &v) in vs.iter().enumerate() {
-            self.encode(v);
-            let mem = &mut self.allocs.bytes[alloc as usize];
-            for (k, b) in self.bytes_buf.iter().enumerate() {
-                mem.set(8 * i as u64 + k as u64, *b);
+            let base = self.va_offset(args, i);
+            leaves.clear();
+            vals.clear();
+            let t = self.va_tys[start as usize + i];
+            if t.is_value() {
+                leaves.push((0, t));
+                vals.push(v);
+            } else {
+                self.va_types.leaves(self.space, t, 0, &mut leaves);
+                self.leaf_values(v, &mut vals);
+            }
+            for (&(o, _), &l) in leaves.iter().zip(&vals) {
+                self.encode(l);
+                let mem = &mut self.allocs.bytes[alloc as usize];
+                for (k, b) in self.bytes_buf.iter().enumerate() {
+                    mem.set(base + o as u64 + k as u64, *b);
+                }
             }
         }
         Ok(alloc)
@@ -2928,19 +2991,55 @@ impl<'m> Machine<'m> {
                 format!("no variadic argument is left: the call passed {}", args.len),
             );
         };
-        if u.is_float() != ty.is_float() {
+        let types: &'m Types = self.body().types();
+        if types.is_composite(ty) || self.va_types.is_composite(u) {
+            if !types.canon_is(ty, &self.va_types, u) {
+                return ub(
+                    UbKind::VaArg,
+                    loc,
+                    format!(
+                        "variadic argument {k} has type {}, not {}",
+                        self.va_types.show(u),
+                        types.show(ty)
+                    ),
+                );
+            }
+        } else if u.is_float() != ty.is_float() {
             return ub(
                 UbKind::VaArg,
                 loc,
                 format!("variadic argument {k} has type {u}, of the other class than {ty}"),
             );
         }
-        let n = self.ty_size(ty);
-        let mem = &self.allocs.bytes[a as usize];
-        self.bytes_buf.clear();
-        self.bytes_buf
-            .extend((0..n).map(|i| mem.get(8 * u64::from(k) + i)));
-        let v = self.decode(loc, ty)?;
+        let base = self.va_offset(args, k as usize);
+        let v = if ty.is_value() {
+            let n = self.ty_size(ty);
+            let mem = &self.allocs.bytes[a as usize];
+            self.bytes_buf.clear();
+            self.bytes_buf.extend((0..n).map(|i| mem.get(base + i)));
+            self.decode(loc, ty)?
+        } else {
+            let mut leaves = Vec::new();
+            types.leaves(self.space, ty, 0, &mut leaves);
+            let mut vals = Vec::with_capacity(leaves.len());
+            for &(o, t) in &leaves {
+                let n = self.ty_size(t);
+                let mem = &self.allocs.bytes[a as usize];
+                self.bytes_buf.clear();
+                self.bytes_buf
+                    .extend((0..n).map(|i| mem.get(base + o as u64 + i)));
+                vals.push(self.decode(loc, t)?);
+            }
+            match self.build(types, ty, &vals, 0) {
+                Some((v, n)) if n == vals.len() => v,
+                _ => {
+                    return stuck(
+                        loc,
+                        format!("{} has no value of its leaves", types.show(ty)),
+                    );
+                }
+            }
+        };
         self.write_va_list(loc, p, Some((a, tag, k + 1)))?;
         Ok(v)
     }
@@ -3034,7 +3133,18 @@ impl<'m> Machine<'m> {
                     .extend(std::iter::repeat_n(Byte::Bits(0), n as usize));
                 Value::Bytes { start, len: n }
             }
-            Ty::Agg(_) | Ty::Slice | Ty::VaList => Value::Bytes { start: 0, len: 0 },
+            Ty::Agg(id) => {
+                // A composite of an external function's (the module's table).
+                let types: &'m Types = &self.module.globals.types;
+                let parts: Vec<Ty> = match types.shape(id) {
+                    Shape::Struct(_, fs) => fs.to_vec(),
+                    Shape::Array(n, e) => vec![e; n as usize],
+                    _ => return Value::Bytes { start: 0, len: 0 },
+                };
+                let vs: Vec<Value> = parts.into_iter().map(|t| self.zero(t)).collect();
+                self.new_agg(&vs)
+            }
+            Ty::Slice | Ty::VaList => Value::Bytes { start: 0, len: 0 },
         }
     }
 
@@ -3073,9 +3183,35 @@ impl<'m> Machine<'m> {
     fn extern_reach(&self, x: &Extern, vs: &[Value]) -> Vec<(u32, u32)> {
         let names = |m| x.has(ExtEffect::Read(m)) || x.has(ExtEffect::Write(m));
         let mut found = Vec::new();
+        let mut leaves = Vec::new();
         for &v in vs {
-            if let Value::Ptr(p) = v {
-                self.push_pairs(p, &mut found);
+            match v {
+                Value::Ptr(p) => self.push_pairs(p, &mut found),
+                // A composite's pointer leaves, and the fragments in its byte leaves (Lean's
+                // `RVal.pairs`).
+                Value::Agg { .. } => {
+                    leaves.clear();
+                    self.leaf_values(v, &mut leaves);
+                    for &l in &leaves {
+                        match l {
+                            Value::Ptr(p) => self.push_pairs(p, &mut found),
+                            Value::Bytes { start, len } => {
+                                for &b in &self.byte_vals[Span { start, len }.range()] {
+                                    match b {
+                                        Byte::Frag { ptr, .. } => self.push_pairs(ptr, &mut found),
+                                        Byte::Va { cursor, .. } => {
+                                            let (area, tag, _) = self.cursors[cursor as usize];
+                                            found.push((area, tag));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         let arg_allocs: Vec<u32> = found.iter().map(|&(a, _)| a).collect();
@@ -3339,7 +3475,9 @@ impl<'m> Machine<'m> {
                 let Some(op) = op else {
                     let mut out = String::new();
                     let mut lowered = Vec::new();
-                    let vs = if self.lower_rets {
+                    // A composite that is the only result passes whole (Lean's `wholeRets`).
+                    let whole = rets.len() == 1 && self.body().types().is_composite(rets[0]);
+                    let vs = if self.lower_rets && !whole {
                         let types = self.body().types();
                         for (&v, &t) in vs.iter().zip(rets) {
                             self.lower_value(types, t, v, &mut lowered);

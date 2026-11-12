@@ -2585,7 +2585,7 @@ static DECLS: [OpDecl; 109] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
-        layers: crate::decl::Layers { hfir: true, mfir: false, lfir: false },
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
         dialect: "agg",
     },
     OpDecl {
@@ -2600,7 +2600,7 @@ static DECLS: [OpDecl; 109] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
-        layers: crate::decl::Layers { hfir: true, mfir: false, lfir: false },
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
         dialect: "agg",
     },
     OpDecl {
@@ -2615,7 +2615,7 @@ static DECLS: [OpDecl; 109] = [
         ]),
         effects: &[],
         tier: Tier::Verified,
-        layers: crate::decl::Layers { hfir: true, mfir: false, lfir: false },
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
         dialect: "agg",
     },
     OpDecl {

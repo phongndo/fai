@@ -11,7 +11,7 @@
 //! caller-saved registers zero (the oracle's choice).
 
 use super::*;
-use crate::backend::aarch64::abi::{self, ArgLoc};
+use crate::backend::aarch64::abi::{self, ArgLoc, PassKind};
 use crate::body::StrId;
 use crate::decl::Imm;
 use crate::float::NanRule;
@@ -576,25 +576,163 @@ impl<'m> Lfir<'m> {
         })
     }
 
-    /// Lean's `argVals`.
-    fn arg_vals(&mut self, loc: Option<Loc>, ps: &[Ty]) -> R<Vec<Value>> {
-        let mut out = Vec::with_capacity(ps.len());
-        for (&t, l) in ps.iter().zip(abi::arg_locs(ps)) {
-            let w = match l {
-                ArgLoc::Reg(r) => self.read_any(loc, r)?,
-                ArgLoc::Stack(off) => {
-                    let a = self.offset_word(loc, self.sp, i128::from(off))?;
-                    self.load(loc, 8, a)?
+    /// `n` bytes of memory at `w` (Lean's `loadBytes`).
+    fn load_bytes(&mut self, loc: Option<Loc>, w: Word, n: u64) -> R<Vec<Byte>> {
+        let (a, off) = self.locate(loc, w, n)?;
+        let mem = &self.m.allocs.bytes[a as usize];
+        Ok((0..n).map(|i| mem.get(off + i)).collect())
+    }
+
+    /// Lean's `storeBytes`.
+    fn store_bytes(&mut self, loc: Option<Loc>, w: Word, bs: &[Byte]) -> R<()> {
+        let (a, off) = self.locate(loc, w, bs.len() as u64)?;
+        let mem = &mut self.m.allocs.bytes[a as usize];
+        for (i, &b) in bs.iter().enumerate() {
+            mem.set(off + i as u64, b);
+        }
+        Ok(())
+    }
+
+    /// A composite of type `t` (of table `types`) from its bytes (Lean's `valOfBytes`).
+    fn val_of_bytes(&mut self, loc: Option<Loc>, types: &Types, t: Ty, bs: &[Byte]) -> R<Value> {
+        let mut leaves = Vec::new();
+        types.leaves(self.m.space, t, 0, &mut leaves);
+        let mut vals = Vec::with_capacity(leaves.len());
+        for &(o, l) in &leaves {
+            let n = self.m.ty_size(l) as usize;
+            let o = o as usize;
+            self.m.bytes_buf.clear();
+            self.m
+                .bytes_buf
+                .extend((o..o + n).map(|i| bs.get(i).copied().unwrap_or(Byte::Poison)));
+            vals.push(self.m.decode(loc, l)?);
+        }
+        match self.m.build(types, t, &vals, 0) {
+            Some((v, n)) if n == vals.len() => Ok(v),
+            _ => stuck(loc, format!("{} has no value of its leaves", types.show(t))),
+        }
+    }
+
+    /// A composite value's bytes, `poison` in the padding (Lean's `bytesOfVal`).
+    fn bytes_of_val(&mut self, types: &Types, t: Ty, v: Value) -> Vec<Byte> {
+        let sp = self.m.space;
+        let mut out = vec![Byte::Poison; types.size(sp, t) as usize];
+        let mut leaves = Vec::new();
+        types.leaves(sp, t, 0, &mut leaves);
+        let mut vals = Vec::new();
+        self.m.leaf_values(v, &mut vals);
+        for (&(o, _), &l) in leaves.iter().zip(&vals) {
+            self.m.encode(l);
+            for (i, &b) in self.m.bytes_buf.iter().enumerate() {
+                if let Some(x) = out.get_mut(o as usize + i) {
+                    *x = b;
                 }
-            };
-            out.push(self.val_of_word(loc, t, w)?);
+            }
+        }
+        out
+    }
+
+    /// The bytes a composite of kind `k` has in registers `rs` (Lean's `regBytes`).
+    fn reg_bytes(&mut self, loc: Option<Loc>, k: PassKind, l: ArgLoc) -> R<Vec<Byte>> {
+        let mut out = Vec::new();
+        let mut buf = Vec::with_capacity(8);
+        for r in l.regs() {
+            match k {
+                PassKind::Hfa(f, _) => {
+                    let b = self.read_f(loc, r)?;
+                    out.extend((0..f.width() / 8).map(|i| Byte::Bits((b >> (8 * i)) as u8)));
+                }
+                _ => {
+                    let w = self.read(loc, r)?;
+                    self.bytes_of_word(loc, 8, w, &mut buf)?;
+                    out.extend_from_slice(&buf);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Put a composite's pieces in its registers (Lean's `placeBytes`).
+    fn place_bytes(&mut self, loc: Option<Loc>, k: PassKind, l: ArgLoc, bs: &[Byte]) -> R<()> {
+        for ((o, n), r) in abi::pieces(k, bs.len() as u32).into_iter().zip(l.regs()) {
+            let w = self.word_of_bytes(loc, &bs[o as usize..(o + n) as usize])?;
+            self.write_any(loc, r, w)?;
+        }
+        Ok(())
+    }
+
+    /// An argument of type `t` from where the convention put it (Lean's `argVal`).
+    fn arg_val(&mut self, loc: Option<Loc>, types: &Types, t: Ty, l: ArgLoc) -> R<Value> {
+        let sp = self.m.space;
+        let size = types.size(sp, t) as u64;
+        match l {
+            ArgLoc::Reg(r) => {
+                let w = self.read_any(loc, r)?;
+                self.val_of_word(loc, t, w)
+            }
+            ArgLoc::Stack(off) => {
+                let a = self.offset_word(loc, self.sp, i128::from(off))?;
+                let w = self.load(loc, 8, a)?;
+                self.val_of_word(loc, t, w)
+            }
+            ArgLoc::Regs(..) => {
+                let mut bs = self.reg_bytes(loc, abi::pass_kind(types, sp, t), l)?;
+                bs.truncate(size as usize);
+                self.val_of_bytes(loc, types, t, &bs)
+            }
+            ArgLoc::Mem(off) => {
+                let a = self.offset_word(loc, self.sp, i128::from(off))?;
+                let bs = self.load_bytes(loc, a, size)?;
+                self.val_of_bytes(loc, types, t, &bs)
+            }
+            ArgLoc::RefReg(_) | ArgLoc::RefStack(_) => {
+                let p = match l {
+                    ArgLoc::RefReg(r) => self.read(loc, r)?,
+                    ArgLoc::RefStack(off) => {
+                        let a = self.offset_word(loc, self.sp, i128::from(off))?;
+                        self.load(loc, 8, a)?
+                    }
+                    _ => unreachable!(),
+                };
+                let bs = self.load_bytes(loc, p, size)?;
+                self.val_of_bytes(loc, types, t, &bs)
+            }
+            ArgLoc::Nothing => self.val_of_bytes(loc, types, t, &[]),
+        }
+    }
+
+    /// Lean's `argVals`.
+    fn arg_vals(&mut self, loc: Option<Loc>, types: &Types, ps: &[Ty]) -> R<Vec<Value>> {
+        let mut out = Vec::with_capacity(ps.len());
+        let (locs, _) = abi::arg_locs(types, self.m.space, ps);
+        for (&t, l) in ps.iter().zip(locs) {
+            out.push(self.arg_val(loc, types, t, l)?);
         }
         Ok(out)
     }
 
     /// Lean's `setResults`.
-    fn set_results(&mut self, loc: Option<Loc>, rets: &[Ty], vs: &[Value]) -> R<()> {
-        match abi::res_regs(rets) {
+    fn set_results(&mut self, loc: Option<Loc>, types: &Types, rets: &[Ty], vs: &[Value]) -> R<()> {
+        let sp = self.m.space;
+        if let ([t], [v]) = (rets, vs)
+            && types.is_composite(*t)
+        {
+            let bs = self.bytes_of_val(types, *t, *v);
+            return match abi::res_regs(types, sp, rets) {
+                Some(rs) => {
+                    let l = match rs.first() {
+                        Some(&r) => ArgLoc::Regs(r, rs.len() as u32),
+                        None => ArgLoc::Nothing,
+                    };
+                    self.place_bytes(loc, abi::pass_kind(types, sp, *t), l, &bs)
+                }
+                None => {
+                    let area = self.x[8];
+                    self.store_bytes(loc, area, &bs)
+                }
+            };
+        }
+        match abi::res_regs(types, sp, rets) {
             Some(rs) => {
                 for (&v, r) in vs.iter().zip(rs) {
                     let w = self.word_of_val(loc, v)?;
@@ -662,8 +800,36 @@ impl<'m> Lfir<'m> {
             }));
         }
         let rets = self.rets(f);
+        let module: &'m Module = self.m.module;
+        let types = module.funcs[f as usize].body.types();
+        let sp = self.m.space;
+        if let [t] = *rets
+            && types.is_composite(t)
+        {
+            let v = match abi::res_regs(types, sp, rets) {
+                Some(rs) => {
+                    let l = match rs.first() {
+                        Some(&r) => ArgLoc::Regs(r, rs.len() as u32),
+                        None => ArgLoc::Nothing,
+                    };
+                    self.arg_val(loc, types, t, l)?
+                }
+                None => {
+                    let bs = self.load_bytes(loc, self.res_area, types.size(sp, t) as u64)?;
+                    self.val_of_bytes(loc, types, t, &bs)?
+                }
+            };
+            let mut out = String::new();
+            self.m.render_value(v, &mut out);
+            return Err(Box::new(Halt {
+                behavior: Behavior::Ret(out),
+                loc,
+                note: String::new(),
+                leaks: self.m.leaks(),
+            }));
+        }
         let mut ws = Vec::with_capacity(rets.len());
-        match abi::res_regs(rets) {
+        match abi::res_regs(types, sp, rets) {
             Some(rs) => {
                 for r in rs {
                     ws.push(self.read_any(loc, r)?);
@@ -755,7 +921,7 @@ impl<'m> Lfir<'m> {
                 self.m.profile.record(OpKind::Ret);
                 let params: Vec<ValueId> = body.params(body.entry()).collect();
                 let tys: Vec<Ty> = params.iter().map(|&v| body.ty(v)).collect();
-                let vs = self.arg_vals(loc, &tys)?;
+                let vs = self.arg_vals(loc, body.types(), &tys)?;
                 let rloc = body.loc(op);
                 let mut outs = Vec::with_capacity(func.rets.len());
                 for &a in body.operands(op) {
@@ -771,7 +937,7 @@ impl<'m> Lfir<'m> {
                         }
                     }
                 }
-                self.set_results(rloc, &func.rets, &outs)
+                self.set_results(rloc, body.types(), &func.rets, &outs)
             }
             _ => stuck(
                 loc,
@@ -783,10 +949,14 @@ impl<'m> Lfir<'m> {
     /// Lean's `callExt`: one event, then the results where the convention puts them. The
     /// arguments are read by `site`, the call's argument types, when given (`blr`), else by the
     /// callee's parameters.
-    fn call_ext(&mut self, loc: Option<Loc>, x: u32, site: Option<&[Ty]>) -> R<()> {
+    fn call_ext(&mut self, loc: Option<Loc>, x: u32, site: Option<(&[Ty], &Types)>) -> R<()> {
         let module: &'m Module = self.m.module;
         let ext = &module.externs[x as usize];
-        let vs = self.arg_vals(loc, site.unwrap_or(&ext.params))?;
+        let gtypes = &module.globals.types;
+        let vs = match site {
+            Some((ps, types)) => self.arg_vals(loc, types, ps)?,
+            None => self.arg_vals(loc, gtypes, &ext.params)?,
+        };
         if !self.m.args_fit(&ext.params, ext.variadic, &vs) {
             return stuck(loc, format!("wrong arguments for @{}", ext.name));
         }
@@ -821,14 +991,14 @@ impl<'m> Lfir<'m> {
         }
         trace.push_str("; ");
         self.m.trace = trace;
-        self.set_results(loc, &ext.rets, &rs)?;
-        self.clobber(&abi::res_regs(&ext.rets).unwrap_or_default());
+        self.set_results(loc, gtypes, &ext.rets, &rs)?;
+        self.clobber(&abi::res_regs(gtypes, self.m.space, &ext.rets).unwrap_or_default());
         Ok(())
     }
 
     /// Call function `f` (an index like `Kind::Func`'s), an external one with arguments of
     /// types `site` if given (Lean's `callNamed`).
-    fn call(&mut self, loc: Option<Loc>, f: u32, site: Option<&[Ty]>) -> R<()> {
+    fn call(&mut self, loc: Option<Loc>, f: u32, site: Option<(&[Ty], &Types)>) -> R<()> {
         if f < self.m.nfuncs {
             self.x[30] = Word::Bits(0);
             self.enter(loc, f)
@@ -1251,7 +1421,7 @@ impl<'m> Lfir<'m> {
                     Some(Shape::Func(ps, ..)) => Some(ps.to_vec()),
                     _ => None,
                 };
-                self.call(loc, f, site.as_deref())?;
+                self.call(loc, f, site.as_deref().map(|ps| (ps, body.types())))?;
             }
             OpKind::A64BlAlloc { family, align } => {
                 let size = self.read_bits(loc, Reg::x(0))?;
@@ -1295,36 +1465,70 @@ impl<'m> Lfir<'m> {
             l.sp = l.offset_word(None, l.sp, -(n as i128))?;
             Ok(())
         };
-        if nrets > 2 {
-            down(self, 8 * nrets)?;
-            self.res_area = self.sp;
-            self.x[8] = self.sp;
-        }
         let module: &'m Module = self.m.module;
         let func = &module.funcs[f as usize];
         let body = &func.body;
+        let types = body.types();
+        let sp = self.m.space;
+        if abi::res_regs(types, sp, &func.rets).is_none() {
+            let n = match *func.rets {
+                [t] if types.is_composite(t) => types.size(sp, t) as usize,
+                _ => 8 * nrets,
+            };
+            down(self, n)?;
+            self.res_area = self.sp;
+            self.x[8] = self.sp;
+        }
         // A variadic function's variadic arguments go where fixed ones of their types would.
-        let ps: Vec<Ty> = if func.variadic {
-            args.iter().map(|&v| self.m.scalar_ty(v)).collect()
-        } else {
-            body.params(body.entry()).map(|v| body.ty(v)).collect()
-        };
-        let locs = abi::arg_locs(&ps);
-        let slots = abi::stack_slots(&ps);
-        if slots > 0 {
-            down(self, 8 * slots as usize)?;
-            for (&v, &l) in args.iter().zip(&locs) {
-                if let ArgLoc::Stack(off) = l {
+        let mut ps: Vec<Ty> = body.params(body.entry()).map(|v| body.ty(v)).collect();
+        for &v in args.get(ps.len()..).unwrap_or(&[]) {
+            if self.m.parts(v).is_some() {
+                return stuck(None, "a variadic aggregate argument to the outermost call");
+            }
+            ps.push(self.m.scalar_ty(v));
+        }
+        // Copies of the composites passed by reference.
+        let mut refs = Vec::with_capacity(args.len());
+        for (&v, &t) in args.iter().zip(&ps) {
+            if abi::pass_kind(types, sp, t) == PassKind::Ref {
+                down(self, types.size(sp, t) as usize)?;
+                let bs = self.bytes_of_val(types, t, v);
+                self.store_bytes(None, self.sp, &bs)?;
+                refs.push(self.sp);
+            } else {
+                refs.push(Word::Bits(0));
+            }
+        }
+        let (locs, n) = abi::arg_locs(types, sp, &ps);
+        if n > 0 {
+            down(self, n as usize)?;
+        }
+        for (((&v, &t), &l), &p) in args.iter().zip(&ps).zip(&locs).zip(&refs) {
+            match l {
+                ArgLoc::Reg(r) => {
+                    let w = self.word_of_val(None, v)?;
+                    self.write_any(None, r, w)?;
+                }
+                ArgLoc::Stack(off) => {
                     let a = self.offset_word(None, self.sp, i128::from(off))?;
                     let w = self.word_of_val(None, v)?;
                     self.store(None, 8, a, w)?;
                 }
-            }
-        }
-        for (&v, &l) in args.iter().zip(&locs) {
-            if let ArgLoc::Reg(r) = l {
-                let w = self.word_of_val(None, v)?;
-                self.write_any(None, r, w)?;
+                ArgLoc::Regs(..) => {
+                    let bs = self.bytes_of_val(types, t, v);
+                    self.place_bytes(None, abi::pass_kind(types, sp, t), l, &bs)?;
+                }
+                ArgLoc::Mem(off) => {
+                    let a = self.offset_word(None, self.sp, i128::from(off))?;
+                    let bs = self.bytes_of_val(types, t, v);
+                    self.store_bytes(None, a, &bs)?;
+                }
+                ArgLoc::RefReg(r) => self.write(r, p),
+                ArgLoc::RefStack(off) => {
+                    let a = self.offset_word(None, self.sp, i128::from(off))?;
+                    self.store(None, 8, a, p)?;
+                }
+                ArgLoc::Nothing => {}
             }
         }
         self.enter(None, f)?;

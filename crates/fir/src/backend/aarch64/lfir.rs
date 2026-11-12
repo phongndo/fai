@@ -30,7 +30,11 @@ fn func(m: &Module, mm: &MModule, f: &MFunc) -> Func {
         .params(sb.entry())
         .map(|v| (sb.name(v).to_owned(), sb.ty(v)))
         .collect();
-    // Parameter types: value types, which need no table.
+    // Parameter types, in the new table (composites name their types).
+    let params: Vec<(String, Ty)> = params
+        .into_iter()
+        .map(|(n, t)| (n, body.types_mut().import(sb.types(), t)))
+        .collect();
     body.set_params(
         body.entry(),
         params.iter().map(|(n, t)| ValueSpec {
@@ -142,8 +146,16 @@ fn func(m: &Module, mm: &MModule, f: &MFunc) -> Func {
                 },
                 Inst::Blr { n, sig } => {
                     let (ps, rs) = &f.sigs[sig as usize];
+                    let ps: Vec<Ty> = ps
+                        .iter()
+                        .map(|&t| body.types_mut().import(sb.types(), t))
+                        .collect();
+                    let rs: Vec<Ty> = rs
+                        .iter()
+                        .map(|&t| body.types_mut().import(sb.types(), t))
+                        .collect();
                     OpKind::A64Blr {
-                        sig: body.types_mut().func(ps, rs),
+                        sig: body.types_mut().func(&ps, &rs),
                         n,
                     }
                 }
@@ -203,9 +215,14 @@ fn func(m: &Module, mm: &MModule, f: &MFunc) -> Func {
         }
     }
     body.shrink_to_fit();
+    let rets = src
+        .rets
+        .iter()
+        .map(|&t| body.types_mut().import(sb.types(), t))
+        .collect();
     Func {
         name: src.name.clone(),
-        rets: src.rets.clone(),
+        rets,
         file: src.file.clone(),
         body,
         variadic: src.variadic,

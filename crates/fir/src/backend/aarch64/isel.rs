@@ -31,8 +31,17 @@
 //! encodes the value, else through a general-purpose register); `fcsel` for `select`. The
 //! instructions' NaN results are Arm's, which the source allows (`Fir.AArch64Proofs`).
 //!
-//! **HFIR.** The building blocks (aggregate, union, and slice values, `int.*.overflow.*`) are
-//! rejected with a message to lower first: drivers compile HFIR through `fir::backend::prepare`,
+//! **Composites** (decision: C ABI for aggregates): a struct or array value, which MFIR has only
+//! to pass whole across calls, is its leaves' registers, one per scalar (`agg.make`,
+//! `agg.extract`, `agg.insert`, and `copy` only regroup them). Where it travels as AAPCS64 says
+//! (`super::abi`), its leaves are packed into the `x` registers' words (shifts and `orr`; a
+//! pointer that fills a word is moved as it is) or moved to FP registers (an HFA), stored to the
+//! stack or to a copy whose address is passed, or stored at `x8` (a large result), and unpacked
+//! where it arrives; `va.arg` follows AAPCS64's algorithm for its class. Anything else that takes
+//! or gives a composite is rejected.
+//!
+//! **HFIR.** The building blocks (union and slice values, aggregates beyond what calls pass,
+//! `int.*.overflow.*`) are rejected with a message to lower first: drivers compile HFIR through `fir::backend::prepare`,
 //! which lowers it to MFIR (`fir lower`). The lowering checks overflow at one more bit (twice
 //! the bits for `mul`), so overflow ops on integers wider than 63 bits (32 for `mul`) need the
 //! integers above 64 bits that the backend doesn't support yet.
@@ -42,8 +51,9 @@
 //! stores of odd sizes split into 4-, 2-, and 1-byte accesses; `mem.copy` copies up to 64 bytes
 //! through registers and larger sizes in a loop whose direction depends on the addresses, so
 //! overlap is fine. **Calls** follow AAPCS64 (see `super::abi`): integers and floats in their own
-//! registers, then stack slots; results in `d0`/`d1` when all are floats of one format,
-//! otherwise in `x0`/`x1` (a float moved there by `fmov`) or memory at `x8`.
+//! registers, then stack slots, composites by their class; results in `d0`/`d1` when all are
+//! floats of one format, otherwise in `x0`/`x1` (a float moved there by `fmov`) or memory at
+//! `x8`, a composite where it would be passed first or at `x8`.
 //!
 //! **Exceptions** use an error-return convention (decision: Exceptions at run time):
 //! `exn.throw` makes its value the pending exception (`aarch64.exn.set`) and returns through
@@ -202,7 +212,7 @@ pub fn check_module(m: &Module) -> Result<()> {
     }
     for x in &m.externs {
         for &t in x.params.iter().chain(&x.rets) {
-            check_ty(None, t).map_err(|e| format!("extern @{}: {e}", x.name))?;
+            check_ty(&m.globals.types, None, t).map_err(|e| format!("extern @{}: {e}", x.name))?;
         }
     }
     Ok(())
@@ -356,15 +366,17 @@ fn low_bits_only(k: OpKind) -> (bool, bool) {
     }
 }
 
-fn check_ty(loc: Option<Loc>, t: Ty) -> Result<()> {
+fn check_ty(types: &Types, loc: Option<Loc>, t: Ty) -> Result<()> {
     match t {
         Ty::Int(w) | Ty::Byte(w) if w > 64 => Err(format!(
             "{}{t} is wider than 64 bits, which the AArch64 backend doesn't support yet",
             at(loc)
         )),
-        // Aggregate, union, and slice values are HFIR's: core ops over them (a `mem.load` of a
-        // struct) select only after the lowering has scalarized them.
-        _ if !t.is_value() => Err(format!(
+        // Union and slice values are HFIR's, and so are aggregates other than the composites
+        // calls pass whole (decision: C ABI for aggregates; `Sel::op` refuses composites in any
+        // other op): core ops over them (a `mem.load` of a struct) select only after the
+        // lowering has scalarized them.
+        _ if !t.is_value() && !types.is_composite(t) => Err(format!(
             "{}a value of an aggregate, union, or slice type is HFIR only: lower the module to MFIR first",
             at(loc)
         )),
@@ -530,6 +542,8 @@ struct Sel<'a, 'c> {
     done: bool,
     /// Each value's virtual register (`NONE` until defined).
     vreg: Vec<u32>,
+    /// Each composite value's leaves' registers (decision: C ABI for aggregates), by value.
+    agg: FxHashMap<u32, Vec<Reg>>,
     nv: u32,
     ctx: Vec<Ctx>,
     sigs: Vec<(Vec<Ty>, Vec<Ty>)>,
@@ -591,7 +605,7 @@ pub fn select_func(cx: &ModuleCx<'_>, index: u32, families: &mut Vec<String>) ->
     let f = &cx.m.funcs[index as usize];
     let body = &f.body;
     for &t in &f.rets {
-        check_ty(None, t).map_err(|e| format!("@{}: {e}", f.name))?;
+        check_ty(body.types(), None, t).map_err(|e| format!("@{}: {e}", f.name))?;
     }
     let mut s = Sel {
         cx,
@@ -605,6 +619,7 @@ pub fn select_func(cx: &ModuleCx<'_>, index: u32, families: &mut Vec<String>) ->
         cur: 0,
         done: false,
         vreg: vec![NONE; body.num_values()],
+        agg: FxHashMap::default(),
         nv: 0,
         ctx: Vec::new(),
         sigs: Vec::new(),
@@ -679,6 +694,14 @@ impl Sel<'_, '_> {
             Reg::fvirt(i)
         } else {
             Reg::virt(i)
+        }
+    }
+
+    /// The type of an op's `i`th operand.
+    fn ty_of_operand(&self, op: OpId, i: usize) -> Ty {
+        match self.body.operands(op)[i].get() {
+            OperandKind::Value(v) => self.body.ty(v),
+            OperandKind::Hole(h) => self.body.hole_ty(h),
         }
     }
 
@@ -1042,6 +1065,253 @@ impl Sel<'_, '_> {
         self.body.types().size(self.sp, t) as u64
     }
 
+    // Composites (decision: C ABI for aggregates)
+
+    /// The leaves of a type of the function's table, with their offsets.
+    fn leaves_of(&self, t: Ty) -> Vec<(u64, Ty)> {
+        let mut out = Vec::new();
+        self.body.types().leaves(self.sp, t, 0, &mut out);
+        out.into_iter().map(|(o, t)| (o as u64, t)).collect()
+    }
+
+    /// Whether a type is a composite, which calls pass whole.
+    fn is_composite(&self, t: Ty) -> bool {
+        self.body.types().is_composite(t)
+    }
+
+    /// Fresh registers for a composite's leaves, checked to fit registers.
+    fn fresh_leaves(&mut self, t: Ty) -> Result<Vec<Reg>> {
+        let mut out = Vec::new();
+        for (_, l) in self.leaves_of(t) {
+            check_ty(self.body.types(), self.loc, l)?;
+            out.push(if l.is_float() {
+                self.fresh_fp()
+            } else {
+                self.fresh()
+            });
+        }
+        Ok(out)
+    }
+
+    /// A value's registers: a scalar's one, or a composite's leaves'.
+    fn regs_of(&mut self, v: ValueId) -> Result<Vec<Reg>> {
+        let t = self.body.ty(v);
+        if !self.is_composite(t) {
+            return Ok(vec![self.val(v)]);
+        }
+        if let Some(rs) = self.agg.get(&(v.index() as u32)) {
+            return Ok(rs.clone());
+        }
+        let rs = self.fresh_leaves(t)?;
+        self.agg.insert(v.index() as u32, rs.clone());
+        Ok(rs)
+    }
+
+    /// An operand's registers.
+    fn operand_regs(&mut self, op: OpId, i: usize) -> Result<Vec<Reg>> {
+        match self.body.operands(op)[i].get() {
+            OperandKind::Value(v) => self.regs_of(v),
+            OperandKind::Hole(h) => Err(format!(
+                "{}the hole ?{} can't be compiled",
+                at(self.loc),
+                self.body.hole_name(h)
+            )),
+        }
+    }
+
+    /// Give a value these registers: a composite its leaves', a scalar the one's.
+    fn set_regs(&mut self, v: ValueId, rs: Vec<Reg>) {
+        if self.is_composite(self.body.ty(v)) {
+            self.agg.insert(v.index() as u32, rs);
+        } else if let Some(&r) = rs.first() {
+            self.vreg[v.index()] = r.virt_index();
+        }
+    }
+
+    /// How many leaves each part of a composite has.
+    fn part_counts(&self, t: Ty) -> Vec<usize> {
+        let parts: Vec<Ty> = match self.body.types().shape_of(t) {
+            Some(Shape::Struct(_, fs)) => fs.to_vec(),
+            Some(Shape::Array(n, e)) => vec![e; n as usize],
+            _ => Vec::new(),
+        };
+        parts
+            .into_iter()
+            .map(|p| {
+                if p.is_value() {
+                    1
+                } else {
+                    self.leaves_of(p).len()
+                }
+            })
+            .collect()
+    }
+
+    /// The bits of a leaf in a general-purpose register, zero-extended from its size.
+    fn leaf_bits(&mut self, r: Reg, t: Ty, size: u64) -> Reg {
+        let g = if r.is_fp() {
+            let g = self.fresh();
+            self.fmov(fsize(t), g, r);
+            g
+        } else {
+            r
+        };
+        self.zx(g, (8 * size) as u32)
+    }
+
+    /// The `x` registers a composite of up to 16 bytes travels in: its leaves' bytes, 8 per
+    /// register, as `ldr` would load them (padding as zeros). A pointer that fills a word is
+    /// that word, so it keeps its provenance.
+    fn pack(&mut self, t: Ty, leaves: &[Reg]) -> Vec<Reg> {
+        let size = self.type_size(t);
+        let ls = self.leaves_of(t);
+        let n = size.div_ceil(8);
+        let mut out = Vec::new();
+        for k in 0..n {
+            let (lo, hi) = (8 * k, 8 * k + 8);
+            let inside: Vec<(u64, Ty, Reg)> = ls
+                .iter()
+                .zip(leaves)
+                .filter(|&(&(o, l), _)| o < hi && o + self.type_size(l) > lo)
+                .map(|(&(o, l), &r)| (o, l, r))
+                .collect();
+            if let [(o, l, r)] = inside[..]
+                && o == lo
+                && self.type_size(l) == 8
+            {
+                out.push(self.in_class(r, false, fsize(l)));
+                continue;
+            }
+            let mut acc: Option<Reg> = None;
+            for (o, l, r) in inside {
+                let size = self.type_size(l);
+                let g = self.leaf_bits(r, l, size);
+                let part = if o >= lo {
+                    if o == lo {
+                        g
+                    } else {
+                        let d = self.fresh();
+                        self.emit(Inst::ShiftImm {
+                            op: ShiftImmOp::Lsl,
+                            sf: Sf::X,
+                            d,
+                            n: g,
+                            amount: (8 * (o - lo)) as u8,
+                        });
+                        d
+                    }
+                } else {
+                    let d = self.fresh();
+                    self.emit(Inst::ShiftImm {
+                        op: ShiftImmOp::Lsr,
+                        sf: Sf::X,
+                        d,
+                        n: g,
+                        amount: (8 * (lo - o)) as u8,
+                    });
+                    d
+                };
+                acc = Some(match acc {
+                    None => part,
+                    Some(a) => self.alu_new(AluOp::Orr, a, part),
+                });
+            }
+            out.push(match acc {
+                Some(a) => a,
+                None => self.konst(0),
+            });
+        }
+        out
+    }
+
+    /// A composite's leaves from the registers it travels in (`pack`'s inverse): an HFA's
+    /// members as they are, or each leaf's bytes taken out of its words.
+    fn unpack(&mut self, t: Ty, regs: &[Reg]) -> Result<Vec<Reg>> {
+        if let abi::PassKind::Hfa(..) = abi::pass_kind(self.body.types(), self.sp, t) {
+            return Ok(regs.to_vec());
+        }
+        let mut out = Vec::new();
+        for (o, l) in self.leaves_of(t) {
+            check_ty(self.body.types(), self.loc, l)?;
+            let size = self.type_size(l);
+            let (k, b) = ((o / 8) as usize, o % 8);
+            let g = if b == 0 && size == 8 {
+                regs[k]
+            } else {
+                let lo = if b == 0 {
+                    regs[k]
+                } else {
+                    let d = self.fresh();
+                    self.emit(Inst::ShiftImm {
+                        op: ShiftImmOp::Lsr,
+                        sf: Sf::X,
+                        d,
+                        n: regs[k],
+                        amount: (8 * b) as u8,
+                    });
+                    d
+                };
+                if b + size > 8 {
+                    let h = self.fresh();
+                    self.emit(Inst::ShiftImm {
+                        op: ShiftImmOp::Lsl,
+                        sf: Sf::X,
+                        d: h,
+                        n: regs[k + 1],
+                        amount: (8 * (8 - b)) as u8,
+                    });
+                    self.alu_new(AluOp::Orr, lo, h)
+                } else {
+                    lo
+                }
+            };
+            let r = if l.is_float() {
+                let f = self.fresh_fp();
+                self.fmov(fsize(l), f, g);
+                f
+            } else {
+                let r = self.fresh();
+                self.mov(r, g);
+                r
+            };
+            out.push(r);
+        }
+        Ok(out)
+    }
+
+    /// Store a composite's leaves at `base + off`, each as a store of its type (padding is
+    /// left alone).
+    fn store_leaves(&mut self, t: Ty, leaves: &[Reg], base: Reg, off: i64) {
+        for (&(o, l), &r) in self.leaves_of(t).iter().zip(leaves) {
+            let size = self.type_size(l);
+            if r.is_fp() {
+                self.str_(MemSize::of_bytes(size).unwrap(), r, base, off + o as i64);
+            } else {
+                self.store(r, base, off + o as i64, size);
+            }
+        }
+    }
+
+    /// Load a composite's leaves from `base + off`.
+    fn load_leaves(&mut self, t: Ty, base: Reg, off: i64) -> Result<Vec<Reg>> {
+        let mut out = Vec::new();
+        for (o, l) in self.leaves_of(t) {
+            check_ty(self.body.types(), self.loc, l)?;
+            let size = self.type_size(l);
+            let r = if l.is_float() {
+                let r = self.fresh_fp();
+                self.ldr(MemSize::of_bytes(size).unwrap(), r, base, off + o as i64);
+                r
+            } else {
+                let r = self.fresh();
+                self.load(r, base, off + o as i64, size);
+                r
+            };
+            out.push(r);
+        }
+        Ok(out)
+    }
+
     // The function
 
     fn func(&mut self) -> Result<()> {
@@ -1056,11 +1326,13 @@ impl Sel<'_, '_> {
                     // A variadic call passes every argument by its type, as fixed ones.
                     OpKind::Call { .. } | OpKind::Invoke { .. } => {
                         let ps = arg_tys(body, op, 0);
-                        outgoing = outgoing.max(8 * u64::from(abi::stack_slots(&ps)));
+                        let n = abi::arg_locs(body.types(), self.sp, &ps).1;
+                        outgoing = outgoing.max(u64::from(n));
                     }
                     OpKind::CallIndirect(_) | OpKind::InvokeIndirect { .. } => {
                         let ps = arg_tys(body, op, 1);
-                        outgoing = outgoing.max(8 * u64::from(abi::stack_slots(&ps)));
+                        let n = abi::arg_locs(body.types(), self.sp, &ps).1;
+                        outgoing = outgoing.max(u64::from(n));
                     }
                     OpKind::MemStack { align: a, .. } => align = align.max(u64::from(a)),
                     OpKind::MemStackOf { ty, align: a } => {
@@ -1113,15 +1385,52 @@ impl Sel<'_, '_> {
         // Parameters, from where the convention puts them.
         let params: Vec<ValueId> = body.params(body.entry()).collect();
         let ps: Vec<Ty> = params.iter().map(|&p| body.ty(p)).collect();
-        for ((&p, &t), l) in params.iter().zip(&ps).zip(abi::arg_locs(&ps)) {
-            check_ty(None, t)?;
-            let r = self.val(p);
+        let (locs, _) = abi::arg_locs(body.types(), self.sp, &ps);
+        // First every register argument into virtual registers, then the composites taken
+        // apart, so nothing is read from an argument register after other code.
+        let mut later = Vec::new();
+        for ((&p, &t), &l) in params.iter().zip(&ps).zip(&locs) {
+            check_ty(body.types(), None, t)?;
             match l {
-                ArgLoc::Reg(a) => self.mov(r, a),
-                ArgLoc::Stack(off) => self.ldr(slot_size(t), r, Reg::FP, 16 + i64::from(off)),
+                ArgLoc::Reg(a) => {
+                    let r = self.val(p);
+                    self.mov(r, a);
+                }
+                ArgLoc::Stack(off) => {
+                    let r = self.val(p);
+                    self.ldr(slot_size(t), r, Reg::FP, 16 + i64::from(off));
+                }
+                ArgLoc::Regs(..) | ArgLoc::RefReg(_) => {
+                    let regs: Vec<Reg> = l
+                        .regs()
+                        .map(|a| {
+                            let r = self.fresh_like(a);
+                            self.mov(r, a);
+                            r
+                        })
+                        .collect();
+                    later.push((p, t, l, regs));
+                }
+                ArgLoc::Mem(_) | ArgLoc::RefStack(_) | ArgLoc::Nothing => {
+                    later.push((p, t, l, Vec::new()))
+                }
             }
         }
-        if abi::res_regs(self.rets).is_none() {
+        for (p, t, l, regs) in later {
+            let leaves = match l {
+                ArgLoc::Regs(..) => self.unpack(t, &regs)?,
+                ArgLoc::RefReg(_) => self.load_leaves(t, regs[0], 0)?,
+                ArgLoc::RefStack(off) => {
+                    let q = self.fresh();
+                    self.ldr(MemSize::X, q, Reg::FP, 16 + i64::from(off));
+                    self.load_leaves(t, q, 0)?
+                }
+                ArgLoc::Mem(off) => self.load_leaves(t, Reg::FP, 16 + i64::from(off))?,
+                _ => Vec::new(),
+            };
+            self.agg.insert(p.index() as u32, leaves);
+        }
+        if abi::res_regs(body.types(), self.sp, self.rets).is_none() {
             let r = self.fresh();
             self.mov(r, Reg::x(8));
             self.res_ptr = Some(r);
@@ -1189,10 +1498,16 @@ impl Sel<'_, '_> {
         for (i, &b) in order.iter().enumerate() {
             new_index[b as usize] = i as u32;
         }
+        let sig_shapes = self
+            .sigs
+            .iter()
+            .map(|(p, r)| abi::CallShape::of(self.body.types(), self.sp, p, r))
+            .collect();
         let mut out = MFunc {
             index,
             nvregs: self.nv,
             sigs: self.sigs,
+            sig_shapes,
             frame: self.frame,
             ..MFunc::default()
         };
@@ -1345,17 +1660,80 @@ impl Sel<'_, '_> {
         // Wide integers are rejected where their high bits matter.
         for v in body.results(op) {
             if !wide_results {
-                check_ty(self.loc, body.ty(v))?;
+                check_ty(body.types(), self.loc, body.ty(v))?;
             }
         }
         for o in body.operands(op) {
             if let OperandKind::Value(v) = o.get()
                 && !wide_operands
             {
-                check_ty(self.loc, body.ty(v))?;
+                check_ty(body.types(), self.loc, body.ty(v))?;
+            }
+        }
+        // Composites are made, taken apart, copied, and passed through calls; nothing else
+        // takes or gives one.
+        let composite_ok = matches!(
+            kind,
+            OpKind::AggMake
+                | OpKind::AggExtract { .. }
+                | OpKind::AggInsert { .. }
+                | OpKind::Copy
+                | OpKind::Call { .. }
+                | OpKind::Invoke { .. }
+                | OpKind::CallIndirect(_)
+                | OpKind::InvokeIndirect { .. }
+                | OpKind::Ret
+                | OpKind::VaArg
+        );
+        if !composite_ok {
+            let types = body.types();
+            let mut tys: Vec<Ty> = body.results(op).map(|v| body.ty(v)).collect();
+            tys.extend(arg_tys(body, op, 0));
+            for &r in body.regions(op) {
+                tys.extend(body.params(r).map(|v| body.ty(v)));
+            }
+            if let Some(&t) = tys.iter().find(|&&t| types.is_composite(t)) {
+                return Err(format!(
+                    "{}{} values are passed through calls, made, and taken apart; in {} they are HFIR only: lower the module to MFIR first",
+                    at(self.loc),
+                    types.show(t),
+                    kind.mnemonic()
+                ));
             }
         }
         match kind {
+            OpKind::AggMake => {
+                let mut leaves = Vec::new();
+                for i in 0..body.operands(op).len() {
+                    leaves.extend(self.operand_regs(op, i)?);
+                }
+                let v = body.results(op).next().unwrap();
+                self.set_regs(v, leaves);
+            }
+            OpKind::AggExtract { index } => {
+                let a = self.operand_regs(op, 0)?;
+                let counts = self.part_counts(self.ty_of_operand(op, 0));
+                let start: usize = counts[..index as usize].iter().sum();
+                let part = a[start..start + counts[index as usize]].to_vec();
+                let v = body.results(op).next().unwrap();
+                self.set_regs(v, part);
+            }
+            OpKind::AggInsert { index } => {
+                let a = self.operand_regs(op, 0)?;
+                let x = self.operand_regs(op, 1)?;
+                let counts = self.part_counts(self.ty_of_operand(op, 0));
+                let start: usize = counts[..index as usize].iter().sum();
+                let mut leaves = a[..start].to_vec();
+                leaves.extend(x);
+                leaves.extend_from_slice(&a[start + counts[index as usize]..]);
+                let v = body.results(op).next().unwrap();
+                self.set_regs(v, leaves);
+            }
+            OpKind::Copy if self.is_composite(self.ty_of_operand(op, 0)) => {
+                let a = self.operand_regs(op, 0)?;
+                let v = body.results(op).next().unwrap();
+                self.set_regs(v, a);
+            }
             OpKind::Const(n) => {
                 let w = width_bits(body.ty(body.results(op).next().unwrap()));
                 let bits = int_low_bits(body.int(n));
@@ -1540,8 +1918,13 @@ impl Sel<'_, '_> {
                 let ap = self.operand(op, 0)?;
                 let v = body.results(op).next().unwrap();
                 let t = body.ty(v);
-                let d = self.val(v);
-                self.va_arg(ap, t, d);
+                if self.is_composite(t) {
+                    let leaves = self.va_arg_composite(ap, t)?;
+                    self.set_regs(v, leaves);
+                } else {
+                    let d = self.val(v);
+                    self.va_arg(ap, t, d);
+                }
             }
             // The cursor needs no cleanup on AAPCS64.
             OpKind::VaEnd => {}
@@ -1608,30 +1991,35 @@ impl Sel<'_, '_> {
             }
             OpKind::Call { callee } | OpKind::Invoke { callee, .. } => {
                 let func = self.cx.funcs[body.str(callee)];
-                let args = self.operands(op)?;
-                let (ps, rs) = self.cx.sig(func);
+                let args = (0..body.operands(op).len())
+                    .map(|i| self.operand_regs(op, i))
+                    .collect::<Result<Vec<_>>>()?;
+                // The argument and result types as the call has them, in this function's table.
+                let ps = arg_tys(body, op, 0);
+                let rs: Vec<Ty> = body.results(op).map(|v| body.ty(v)).collect();
                 if self.cx.variadic(func) {
                     // A variadic callee is called through its address, with every argument's
                     // type in the call's signature: on Linux, variadic arguments go where fixed
                     // ones of their types would (decision: Varargs).
-                    let ps = arg_tys(body, op, 0);
-                    self.sigs.push((ps.clone(), rs.to_vec()));
+                    self.sigs.push((ps.clone(), rs.clone()));
                     let sig = (self.sigs.len() - 1) as u32;
                     let target = self.fresh();
                     self.emit(Inst::AdrlFunc { d: target, func });
-                    self.call(op, &args, &ps, rs, |s| {
+                    self.call(op, &args, &ps, &rs, |s| {
                         s.emit(Inst::Blr { n: target, sig });
-                    });
+                    })?;
                 } else {
-                    self.call(op, &args, &ps, rs, |s| {
+                    self.call(op, &args, &ps, &rs, |s| {
                         s.emit(Inst::Bl { func });
-                    });
+                    })?;
                 }
                 let throws = self.cx.throws.get(func as usize).copied().unwrap_or(false);
                 self.after_call(kind, throws);
             }
             OpKind::CallIndirect(sig) | OpKind::InvokeIndirect { sig, .. } => {
-                let args = self.operands(op)?;
+                let args = (0..body.operands(op).len())
+                    .map(|i| self.operand_regs(op, i))
+                    .collect::<Result<Vec<_>>>()?;
                 let Some(Shape::Func(ps, rs, va)) = body.types().shape_of(sig) else {
                     return Err(format!("{}not a function type", at(self.loc)));
                 };
@@ -1643,10 +2031,10 @@ impl Sel<'_, '_> {
                 };
                 self.sigs.push((ps.clone(), rs.clone()));
                 let sig = (self.sigs.len() - 1) as u32;
-                let target = args[0];
+                let target = args[0][0];
                 self.call(op, &args[1..], &ps, &rs, |s| {
                     s.emit(Inst::Blr { n: target, sig });
-                });
+                })?;
                 let throws = self.cx.throws.iter().any(|&t| t);
                 self.after_call(kind, throws);
             }
@@ -1742,12 +2130,29 @@ impl Sel<'_, '_> {
                 self.moves(&params, &vals);
                 self.emit(Inst::B { t: header });
             }
+            OpKind::Ret if self.rets.len() == 1 && self.is_composite(self.rets[0]) => {
+                let t = self.rets[0];
+                let leaves = self.operand_regs(op, 0)?;
+                match self.res_ptr {
+                    None => {
+                        let dsts =
+                            abi::res_regs(body.types(), self.sp, self.rets).unwrap_or_default();
+                        let srcs = match abi::pass_kind(body.types(), self.sp, t) {
+                            abi::PassKind::Hfa(..) => leaves,
+                            _ => self.pack(t, &leaves),
+                        };
+                        self.moves(&dsts, &srcs);
+                    }
+                    Some(area) => self.store_leaves(t, &leaves, area, 0),
+                }
+                self.emit(Inst::B { t: self.exit });
+            }
             OpKind::Ret => {
                 let vals = self.operands(op)?;
                 let rets = self.rets;
                 match self.res_ptr {
                     None => {
-                        let dsts = abi::res_regs(rets).unwrap_or_default();
+                        let dsts = abi::res_regs(body.types(), self.sp, rets).unwrap_or_default();
                         let srcs: Vec<Reg> = vals
                             .iter()
                             .zip(&dsts)
@@ -2071,33 +2476,90 @@ impl Sel<'_, '_> {
         }
     }
 
-    /// A call: arguments where the convention puts them, the call, then the results.
+    /// A call: arguments where the convention puts them (each argument's registers: a scalar's
+    /// one, a composite's leaves'), the call, then the results. The types are this function's.
     fn call(
         &mut self,
         op: OpId,
-        args: &[Reg],
+        args: &[Vec<Reg>],
         ps: &[Ty],
         rets: &[Ty],
         emit: impl FnOnce(&mut Self),
-    ) {
-        let locs = abi::arg_locs(ps);
+    ) -> Result<()> {
+        let types = self.body.types();
+        let (locs, _) = abi::arg_locs(types, self.sp, ps);
         let (mut dsts, mut srcs) = (Vec::new(), Vec::new());
-        for ((&a, &t), &l) in args.iter().zip(ps).zip(&locs) {
+        for ((a, &t), &l) in args.iter().zip(ps).zip(&locs) {
             match l {
-                ArgLoc::Stack(off) => self.str_(slot_size(t), a, Reg::SP, i64::from(off)),
+                ArgLoc::Stack(off) => self.str_(slot_size(t), a[0], Reg::SP, i64::from(off)),
                 ArgLoc::Reg(r) => {
                     dsts.push(r);
-                    srcs.push(a);
+                    srcs.push(a[0]);
                 }
+                ArgLoc::Regs(..) => {
+                    let pieces = match abi::pass_kind(types, self.sp, t) {
+                        abi::PassKind::Hfa(..) => a.clone(),
+                        _ => self.pack(t, a),
+                    };
+                    dsts.extend(l.regs());
+                    srcs.extend(pieces);
+                }
+                ArgLoc::Mem(off) => self.store_leaves(t, a, Reg::SP, i64::from(off)),
+                ArgLoc::RefReg(_) | ArgLoc::RefStack(_) => {
+                    // A copy the callee owns, in this frame.
+                    let (size, align) = types.dims(self.sp, t);
+                    let slot = self.local(size as u64, align);
+                    self.store_leaves(t, a, Reg::SP, slot);
+                    let p = self.fresh();
+                    self.add_imm(p, Reg::SP, slot);
+                    match l {
+                        ArgLoc::RefReg(r) => {
+                            dsts.push(r);
+                            srcs.push(p);
+                        }
+                        ArgLoc::RefStack(off) => self.str_(MemSize::X, p, Reg::SP, i64::from(off)),
+                        _ => unreachable!(),
+                    }
+                }
+                ArgLoc::Nothing => {}
             }
         }
-        let rr = abi::res_regs(rets);
-        let area = rr.is_none().then(|| self.local(8 * rets.len() as u64, 8));
+        let rr = abi::res_regs(types, self.sp, rets);
+        let whole = rets.len() == 1 && types.is_composite(rets[0]);
+        let area = match (&rr, whole) {
+            (Some(_), _) => None,
+            (None, true) => {
+                let (size, align) = types.dims(self.sp, rets[0]);
+                Some(self.local(size as u64, align))
+            }
+            (None, false) => Some(self.local(8 * rets.len() as u64, 8)),
+        };
         if let Some(off) = area {
             self.add_imm(Reg::x(8), Reg::SP, off);
         }
         self.moves(&dsts, &srcs);
         emit(self);
+        if whole {
+            let t = rets[0];
+            let v = self.body.results(op).next().unwrap();
+            let leaves = match (rr, area) {
+                (Some(rs), _) => {
+                    let regs: Vec<Reg> = rs
+                        .iter()
+                        .map(|&r| {
+                            let d = self.fresh_like(r);
+                            self.mov(d, r);
+                            d
+                        })
+                        .collect();
+                    self.unpack(t, &regs)?
+                }
+                (None, Some(off)) => self.load_leaves(t, Reg::SP, off)?,
+                (None, None) => unreachable!(),
+            };
+            self.set_regs(v, leaves);
+            return Ok(());
+        }
         let results: Vec<Reg> = (0..rets.len()).map(|i| self.result(op, i)).collect();
         match (rr, area) {
             (Some(rs), _) => {
@@ -2116,6 +2578,7 @@ impl Sel<'_, '_> {
             }
             (None, None) => unreachable!(),
         }
+        Ok(())
     }
 
     /// Save the argument registers a variadic function's named parameters leave over, as
@@ -2123,16 +2586,8 @@ impl Sel<'_, '_> {
     /// ending at `__gr_top`, and `d[m]`…`d7` (the low 64 bits FIR uses of `q[m]`…`q7`) in 16-byte
     /// slots ending at `__vr_top`.
     fn save_va_regs(&mut self, ps: &[Ty]) {
-        let locs = abi::arg_locs(ps);
-        let gp = locs
-            .iter()
-            .filter(|l| matches!(l, ArgLoc::Reg(r) if !r.is_fp()))
-            .count() as u32;
-        let fp = locs
-            .iter()
-            .filter(|l| matches!(l, ArgLoc::Reg(r) if r.is_fp()))
-            .count() as u32;
-        let stack = abi::stack_slots(ps);
+        // NGRN, NSRN, and NSAA after the named parameters, composites included.
+        let (_, (gp, fp, stack)) = abi::arg_state(self.body.types(), self.sp, ps);
         let (gr_size, vr_size) = (8 * i64::from(8 - gp), 16 * i64::from(8 - fp));
         let gr_off = self.local(gr_size as u64, 8);
         let vr_off = self.local(vr_size as u64, 16);
@@ -2149,7 +2604,7 @@ impl Sel<'_, '_> {
             gr_size,
             vr_off,
             vr_size,
-            stack: 16 + 8 * i64::from(stack),
+            stack: 16 + i64::from(stack),
         });
     }
 
@@ -2230,6 +2685,100 @@ impl Sel<'_, '_> {
         self.str_(MemSize::X, sp2, ap, 0);
         self.emit(Inst::B { t: join });
         self.switch_to(join);
+    }
+
+    /// `va.arg` of a composite: AAPCS64's algorithm (decision: Varargs) for its class. Up to 16
+    /// bytes, it takes as many 8-byte slots of the general-purpose save area as it has words
+    /// (from an even one if it is 16-byte aligned), or else the stack; an HFA takes one 16-byte
+    /// slot of the FP save area per member, or else the stack; a larger one is a pointer, read
+    /// as a general-purpose argument, to a copy. Once a class's offset turns positive it stays,
+    /// and the arguments after go on the stack too, as the caller placed them.
+    fn va_arg_composite(&mut self, ap: Reg, t: Ty) -> Result<Vec<Reg>> {
+        let kind = abi::pass_kind(self.body.types(), self.sp, t);
+        let size = self.type_size(t);
+        if kind == abi::PassKind::Ref {
+            let p = self.fresh();
+            self.va_arg(ap, Ty::Ptr, p);
+            return self.load_leaves(t, p, 0);
+        }
+        let (fp, slots, even) = match kind {
+            abi::PassKind::Hfa(_, n) => (true, n, false),
+            abi::PassKind::Words(n, even) => (false, n, even),
+            _ => (false, 0, false),
+        };
+        let (offs_at, top_at, step) = if fp { (28, 16, 16) } else { (24, 8, 8) };
+        let (reg, stack, join) = (
+            self.new_block(false),
+            self.new_block(false),
+            self.new_block(false),
+        );
+        let leaves = self.fresh_leaves(t)?;
+        let w = self.fresh();
+        self.ldr(MemSize::W, w, ap, offs_at);
+        let offs0 = self.sx(w, 32);
+        self.cmp_imm(offs0, 0);
+        let check = self.new_block(false);
+        self.emit(Inst::BCond {
+            c: Cond::Ge,
+            t: stack,
+            f: check,
+        });
+        self.switch_to(check);
+        let offs = if even {
+            let t = self.fresh();
+            self.add_imm(t, offs0, 15);
+            let m = self.konst(-16i64 as u64);
+            self.alu_new(AluOp::And, t, m)
+        } else {
+            offs0
+        };
+        let next = self.fresh();
+        self.add_imm(next, offs, i64::from(step * slots));
+        self.str_(MemSize::W, next, ap, offs_at);
+        self.cmp_imm(next, 0);
+        self.emit(Inst::BCond {
+            c: Cond::Gt,
+            t: stack,
+            f: reg,
+        });
+        self.switch_to(reg);
+        let top = self.fresh();
+        self.ldr(MemSize::X, top, ap, top_at);
+        let at = self.alu_new(AluOp::Add, top, offs);
+        let got = if fp {
+            // One member per 16-byte slot.
+            let mut got = Vec::new();
+            for (i, (_, l)) in self.leaves_of(t).into_iter().enumerate() {
+                let r = self.fresh_fp();
+                let size = self.type_size(l);
+                self.ldr(MemSize::of_bytes(size).unwrap(), r, at, 16 * i as i64);
+                got.push(r);
+            }
+            got
+        } else {
+            self.load_leaves(t, at, 0)?
+        };
+        self.moves(&leaves, &got);
+        self.emit(Inst::B { t: join });
+        self.switch_to(stack);
+        let sp0 = self.fresh();
+        self.ldr(MemSize::X, sp0, ap, 0);
+        let sp = if even {
+            let t = self.fresh();
+            self.add_imm(t, sp0, 15);
+            let m = self.konst(-16i64 as u64);
+            self.alu_new(AluOp::And, t, m)
+        } else {
+            sp0
+        };
+        let got = self.load_leaves(t, sp, 0)?;
+        self.moves(&leaves, &got);
+        let sp2 = self.fresh();
+        self.add_imm(sp2, sp, size.next_multiple_of(8) as i64);
+        self.str_(MemSize::X, sp2, ap, 0);
+        self.emit(Inst::B { t: join });
+        self.switch_to(join);
+        Ok(leaves)
     }
 
     /// Load `size` bytes at `base` into `d`, of either class.

@@ -2,7 +2,9 @@
 //! `fir-ref lower` prints Lean's.
 //!
 //! Lean lowers each function in three passes: scalarizing (aggregates, unions, and slices become
-//! their scalars, and the building-block ops become core ops), lowering exceptions (`cf.try`
+//! their scalars, except that calls pass composites whole as the C ABI's unit, made with
+//! `agg.make` and taken apart with `agg.extract` at the boundary; and the building-block ops
+//! become core ops), lowering exceptions (`cf.try`
 //! becomes `cf.blocks` with its handler as a block; see [`lower_exn`]), and expanding (checked
 //! arithmetic, `ptr.field`, and `ptr.index` become core ops). The ops expanding changes take and give
 //! scalars, and scalarizing passes them through, so one walk does both here: it scalarizes each
@@ -208,6 +210,8 @@ struct Lowerer<'a> {
     leaves: Vec<ValueId>,
     s_count: u32,
     e_count: u32,
+    /// Whether the function's one result is a composite, which `func.ret` passes whole.
+    whole_ret: bool,
 }
 
 fn lower_func(sp: &SpaceCfg, ext: &[String], f: &Func) -> Result<Func, String> {
@@ -221,25 +225,64 @@ fn lower_func(sp: &SpaceCfg, ext: &[String], f: &Func) -> Result<Func, String> {
         leaves: Vec::new(),
         s_count: 0,
         e_count: 0,
+        whole_ret: false,
     };
+    lw.whole_ret = f.rets.len() == 1 && src.types().is_composite(f.rets[0]);
     let entry = src.entry();
     let params: Vec<ValueId> = src.params(entry).collect();
-    let specs_ = lw.explode_values(&params);
-    let dentry = lw.dst.entry();
-    lw.dst.set_params(dentry, specs(&specs_));
-    lw.map_params(&params, dentry);
-    lw.region(entry, dentry)?;
-    let mut rets = Vec::new();
-    for &t in &f.rets {
-        let mut ts = Vec::new();
-        src.types().scalars(lw.aw, t, &mut ts);
-        for t in ts {
-            rets.push(lw.dst.types_mut().import(src.types(), t));
+    // A composite parameter stays whole (Lean's `scalarizeParams`); the others become their
+    // scalars.
+    let mut specs_ = Vec::new();
+    for &v in &params {
+        if src.types().is_composite(src.ty(v)) {
+            let ty = lw.import_ty(src.ty(v));
+            specs_.push(Spec {
+                name: src.name(v).to_owned(),
+                ty,
+                facts: Vec::new(),
+            });
+        } else {
+            lw.explode_into(v, &mut specs_);
         }
     }
+    let dentry = lw.dst.entry();
+    lw.dst.set_params(dentry, specs(&specs_));
+    let dparams: Vec<ValueId> = lw.dst.params(dentry).collect();
+    let mut at = 0;
+    for &v in &params {
+        if src.types().is_composite(src.ty(v)) {
+            let mut leaves = Vec::new();
+            lw.explode_into(v, &mut leaves);
+            let mut leaves = leaves.into_iter();
+            let mut out = Vec::new();
+            let w = Operand::value(dparams[at]);
+            lw.extract_whole(dentry, src.ty(v), w, &mut leaves, &mut out, None);
+            at += 1;
+            lw.map_values(&[v], out.into_iter());
+        } else {
+            let n = src.types().num_scalars(src.ty(v));
+            lw.map_values(&[v], dparams[at..at + n].iter().copied());
+            at += n;
+        }
+    }
+    lw.region(entry, dentry)?;
+    let whole_ret = lw.whole_ret;
     let mut body = lw.dst;
     if has_try(src) {
         body = lower_exn(&body, ext);
+    }
+    // The results, in the final body's table.
+    let mut rets = Vec::new();
+    if whole_ret {
+        rets.push(body.types_mut().import(src.types(), f.rets[0]));
+    } else {
+        for &t in &f.rets {
+            let mut ts = Vec::new();
+            src.types().scalars(sp.addr_bits, t, &mut ts);
+            for t in ts {
+                rets.push(body.types_mut().import(src.types(), t));
+            }
+        }
     }
     body.shrink_to_fit();
     Ok(Func {
@@ -917,6 +960,92 @@ impl<'a> Lowerer<'a> {
                 self.store_from(r, ty, align, &lv, p, loc);
                 Vec::new()
             }
+            (OpKind::Call { .. } | OpKind::CallIndirect(_), _, _) => {
+                // Composite arguments and a composite result pass whole (Lean's `makeArgs` and
+                // `extractWhole`).
+                let skip = usize::from(matches!(k, OpKind::CallIndirect(_)));
+                let k = match self.import_kind(k) {
+                    OpKind::CallIndirect(sig) => OpKind::CallIndirect(self.flat_sig(sig)),
+                    k => k,
+                };
+                let mut operands = self.explode_all(&args[..skip.min(args.len())]);
+                for &a in args.iter().skip(skip) {
+                    let t = self.ty_of(a);
+                    if types.is_composite(t) {
+                        let mut ls = Vec::new();
+                        self.explode_operand(a, &mut ls);
+                        let mut at = 0;
+                        let v = self.make_whole(r, t, &ls, &mut at, loc);
+                        operands.push(v);
+                    } else {
+                        self.explode_operand(a, &mut operands);
+                    }
+                }
+                if rs.len() == 1 && types.is_composite(src.ty(rs[0])) {
+                    let whole = Spec {
+                        name: src.name(rs[0]).to_owned(),
+                        ty: self.import_ty(src.ty(rs[0])),
+                        facts: Vec::new(),
+                    };
+                    let dop = self.dst.append_op(
+                        r,
+                        k,
+                        operands,
+                        self::specs(std::slice::from_ref(&whole)),
+                        [],
+                        loc,
+                    );
+                    let w = Operand::value(self.dst.results(dop).next().unwrap());
+                    let mut leaves = specs.into_iter();
+                    let mut out = Vec::new();
+                    self.extract_whole(r, src.ty(rs[0]), w, &mut leaves, &mut out, loc);
+                    out
+                } else {
+                    let dop = self
+                        .dst
+                        .append_op(r, k, operands, self::specs(&specs), [], loc);
+                    self.dst.results(dop).collect()
+                }
+            }
+            (OpKind::VaArg, 1, _) if types.is_composite(src.ty(rs[0])) => {
+                // A composite read whole, then taken apart (Lean's `extractWhole`).
+                let whole = Spec {
+                    name: src.name(rs[0]).to_owned(),
+                    ty: self.import_ty(src.ty(rs[0])),
+                    facts: Vec::new(),
+                };
+                let operands = self.explode_all(args);
+                let dop = self.dst.append_op(
+                    r,
+                    OpKind::VaArg,
+                    operands,
+                    self::specs(std::slice::from_ref(&whole)),
+                    [],
+                    loc,
+                );
+                let w = Operand::value(self.dst.results(dop).next().unwrap());
+                let mut leaves = specs.into_iter();
+                let mut out = Vec::new();
+                self.extract_whole(r, src.ty(rs[0]), w, &mut leaves, &mut out, loc);
+                out
+            }
+            (OpKind::Ret, 0, _) if self.whole_ret => {
+                let mut operands = Vec::new();
+                for &a in args {
+                    let t = self.ty_of(a);
+                    if types.is_composite(t) {
+                        let mut ls = Vec::new();
+                        self.explode_operand(a, &mut ls);
+                        let mut at = 0;
+                        let v = self.make_whole(r, t, &ls, &mut at, loc);
+                        operands.push(v);
+                    } else {
+                        self.explode_operand(a, &mut operands);
+                    }
+                }
+                self.dst.append_op(r, OpKind::Ret, operands, [], [], loc);
+                Vec::new()
+            }
             _ => {
                 let (k, operands) = self.fix_succs(k, args);
                 self.emit(r, k, operands, specs, loc)?
@@ -925,6 +1054,98 @@ impl<'a> Lowerer<'a> {
         let rs_src: Vec<ValueId> = rs;
         self.map_values(&rs_src, defined.into_iter());
         Ok(())
+    }
+
+    /// A function type of the target with each parameter and result replaced as calls pass
+    /// them (Lean's `flatSig`): a composite parameter, or a composite that is the only result,
+    /// stays whole; anything else becomes its scalars.
+    fn flat_sig(&mut self, sig: Ty) -> Ty {
+        match self.dst.types().shape_of(sig) {
+            Some(Shape::Func(ps, rs, va)) => {
+                let (ps, rs) = (ps.to_vec(), rs.to_vec());
+                let types = self.dst.types();
+                let mut fps = Vec::new();
+                let mut frs = Vec::new();
+                for t in ps {
+                    if types.is_composite(t) {
+                        fps.push(t);
+                    } else {
+                        types.scalars(self.aw, t, &mut fps);
+                    }
+                }
+                if rs.len() == 1 && types.is_composite(rs[0]) {
+                    frs.push(rs[0]);
+                } else {
+                    for t in rs {
+                        types.scalars(self.aw, t, &mut frs);
+                    }
+                }
+                self.dst.types_mut().func_va(&fps, &frs, va)
+            }
+            _ => sig,
+        }
+    }
+
+    /// Make a composite of source type `t` from its scalars `ls`, from `at` on (Lean's
+    /// `makeWhole`): its nested parts first, then an `agg.make` into a temporary.
+    fn make_whole(
+        &mut self,
+        r: RegionId,
+        t: Ty,
+        ls: &[Operand],
+        at: &mut usize,
+        loc: Option<Loc>,
+    ) -> Operand {
+        let src: &'a Body = self.src;
+        let parts: Vec<Ty> = match src.types().shape_of(t) {
+            Some(Shape::Struct(_, fs)) => fs.to_vec(),
+            Some(Shape::Array(n, e)) => vec![e; n as usize],
+            _ => {
+                let o = ls[*at];
+                *at += 1;
+                return o;
+            }
+        };
+        let mut ops = Vec::with_capacity(parts.len());
+        for p in parts {
+            ops.push(self.make_whole(r, p, ls, at, loc));
+        }
+        let name = self.fresh(false);
+        let ty = self.import_ty(t);
+        let v = self.op1(r, OpKind::AggMake, &ops, Self::spec(name, ty), loc);
+        Operand::value(v)
+    }
+
+    /// Take composite `v` of source type `t` apart into the next of `leaves`, its scalars, in
+    /// order, appending them to `out` (Lean's `extractWhole`): each part by `agg.extract`, a
+    /// nested one into a temporary and then its parts.
+    fn extract_whole(
+        &mut self,
+        r: RegionId,
+        t: Ty,
+        v: Operand,
+        leaves: &mut std::vec::IntoIter<Spec>,
+        out: &mut Vec<ValueId>,
+        loc: Option<Loc>,
+    ) {
+        let src: &'a Body = self.src;
+        let parts: Vec<Ty> = match src.types().shape_of(t) {
+            Some(Shape::Struct(_, fs)) => fs.to_vec(),
+            Some(Shape::Array(n, e)) => vec![e; n as usize],
+            _ => return,
+        };
+        for (i, p) in parts.into_iter().enumerate() {
+            let k = OpKind::AggExtract { index: i as u32 };
+            if p.is_value() {
+                let Some(spec) = leaves.next() else { return };
+                out.push(self.op1(r, k, &[v], spec, loc));
+            } else {
+                let name = self.fresh(false);
+                let ty = self.import_ty(p);
+                let w = self.op1(r, k, &[v], Self::spec(name, ty), loc);
+                self.extract_whole(r, p, Operand::value(w), leaves, out, loc);
+            }
+        }
     }
 
     /// A flat op's kind, with its immediates in the target and its branch targets' argument

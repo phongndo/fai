@@ -7,8 +7,9 @@
 //!
 //! The working form is [`mir::MFunc`], flat arrays of [`mir::Inst`] (one LFIR op each);
 //! [`lfir::to_module`] turns it into an LFIR module at either stage, which `fir run` and
-//! `fir-ref run` execute. The calling convention is AAPCS64 for integers and pointers: see the
-//! decision log (LFIR for AArch64) and [`machine`]'s twin in Lean, `Fir.AArch64Machine`.
+//! `fir-ref run` execute. The calling convention is AAPCS64, structs and arrays by value included:
+//! see the decision log (LFIR for AArch64, Calling convention, C ABI for aggregates), [`abi`] and
+//! its twin in Lean, `Fir.AArch64Abi`, and [`machine`]'s, `Fir.AArch64Machine`.
 
 pub mod abi;
 pub mod emit;
@@ -38,13 +39,13 @@ pub fn shapes(m: &Module) -> Vec<abi::CallShape> {
         .map(|f| {
             let b = &f.body;
             let ps: Vec<crate::ir::Ty> = b.params(b.entry()).map(|v| b.ty(v)).collect();
-            abi::CallShape::of(&ps, &f.rets)
+            abi::CallShape::of(b.types(), &m.space, &ps, &f.rets)
         })
         .collect();
     out.extend(
         m.externs
             .iter()
-            .map(|x| abi::CallShape::of(&x.params, &x.rets)),
+            .map(|x| abi::CallShape::of(&m.globals.types, &m.space, &x.params, &x.rets)),
     );
     out
 }
@@ -120,6 +121,52 @@ fn uses_varargs(m: &Module) -> Option<String> {
     None
 }
 
+/// A function, external function, or call of the module that passes a struct or array on the
+/// stack, if it has one, for the message: Apple's AArch64 ABI packs stack arguments, which FIR
+/// doesn't follow yet (open item 4).
+fn stack_composites(m: &Module) -> Option<String> {
+    let on_stack = |types: &crate::types::Types, ps: &[crate::ir::Ty]| {
+        abi::arg_locs(types, &m.space, ps)
+            .0
+            .iter()
+            .any(|l| matches!(l, abi::ArgLoc::Mem(_)))
+    };
+    for f in &m.funcs {
+        let b = &f.body;
+        let ps: Vec<crate::ir::Ty> = b.params(b.entry()).map(|v| b.ty(v)).collect();
+        if on_stack(b.types(), &ps) {
+            return Some(format!("@{}", f.name));
+        }
+        let mut stack = vec![b.entry()];
+        while let Some(r) = stack.pop() {
+            for op in b.ops(r) {
+                let skip = match b.kind(op) {
+                    crate::OpKind::Call { .. } | crate::OpKind::Invoke { .. } => 0,
+                    crate::OpKind::CallIndirect(_) | crate::OpKind::InvokeIndirect { .. } => 1,
+                    _ => {
+                        stack.extend_from_slice(b.regions(op));
+                        continue;
+                    }
+                };
+                let ps: Vec<crate::ir::Ty> = b.operands(op)[skip..]
+                    .iter()
+                    .map(|o| match o.get() {
+                        crate::body::OperandKind::Value(v) => b.ty(v),
+                        crate::body::OperandKind::Hole(h) => b.hole_ty(h),
+                    })
+                    .collect();
+                if on_stack(b.types(), &ps) {
+                    return Some(format!("a call in @{}", f.name));
+                }
+            }
+        }
+    }
+    m.externs
+        .iter()
+        .find(|x| on_stack(&m.globals.types, &x.params))
+        .map(|x| format!("@{}", x.name))
+}
+
 /// Compile a verified module to assembly.
 pub fn compile(m: &Module, o: &Options) -> Result<String, String> {
     if o.os == Os::Darwin
@@ -129,6 +176,13 @@ pub fn compile(m: &Module, o: &Options) -> Result<String, String> {
         // pointer (open item: macOS varargs).
         return Err(format!(
             "{what} is variadic, and variadic functions aren't supported on macOS yet"
+        ));
+    }
+    if o.os == Os::Darwin
+        && let Some(what) = stack_composites(m)
+    {
+        return Err(format!(
+            "{what} passes a struct or array on the stack, which isn't supported on macOS yet"
         ));
     }
     let mut mm = select(m)?;

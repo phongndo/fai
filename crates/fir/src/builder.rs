@@ -447,12 +447,15 @@ impl ModuleBuilder {
         Ok(())
     }
 
-    /// Every type is a value type: a scalar, or for a function (`what` is `func`) of an HFIR
-    /// module also an aggregate, a union, or a slice.
+    /// Every type is a value type: a scalar or a composite (a struct or array, which calls pass
+    /// whole), or for a function (`what` is `func`) of an HFIR module also a union, a slice, or an
+    /// aggregate holding them.
     fn value_tys(&self, what: &str, name: &str, ts: &[Ty]) -> Result<(), BuildError> {
         self.check_tys(ts)?;
         let hfir = what == "func" && self.module.layer == crate::Layer::Hfir;
-        let ok = |t: Ty| t.is_value() || (hfir && self.types().is_hvalue(t));
+        let ok = |t: Ty| {
+            t.is_value() || self.types().is_composite(t) || (hfir && self.types().is_hvalue(t))
+        };
         if let Some(&t) = ts.iter().find(|&&t| !ok(t)) {
             return err(format!(
                 "{what} @{name}: {} is not a value type",
@@ -1382,8 +1385,11 @@ impl<'m> FuncBuilder<'m> {
                         self.show_list(&ins[..n])
                     ));
                 }
-                let space = &self.m.module.space;
-                if let Some(&t) = ins[n..].iter().find(|&&t| !space.is_vararg(t)) {
+                let types = self.m.st.body.types();
+                if let Some(&t) = ins[n..]
+                    .iter()
+                    .find(|&&t| !types.is_vararg(&self.m.module.space, t))
+                {
                     let name = &self.m.syms[f.index()].name;
                     return err(format!(
                         "arguments of @{name}: {} can't be a variadic argument",
@@ -1418,8 +1424,10 @@ impl<'m> FuncBuilder<'m> {
                         self.show_list(&ins[..n])
                     ));
                 }
-                let space = &self.m.module.space;
-                if let Some(&t) = ins[n..].iter().find(|&&t| !space.is_vararg(t)) {
+                if let Some(&t) = ins[n..]
+                    .iter()
+                    .find(|&&t| !types.is_vararg(&self.m.module.space, t))
+                {
                     return err(format!(
                         "operands: {} can't be a variadic argument",
                         types.show(t)
@@ -1563,7 +1571,7 @@ impl<'m> FuncBuilder<'m> {
                 }
                 Check::Vararg(t) => {
                     let t = ty(&vars, t);
-                    if !self.m.module.space.is_vararg(t) {
+                    if !self.m.st.body.types().is_vararg(&self.m.module.space, t) {
                         return err(format!("{} can't be a variadic argument", self.show(t)));
                     }
                 }

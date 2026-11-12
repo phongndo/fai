@@ -129,14 +129,9 @@ pub(super) struct Shapes<'a> {
 
 pub(super) fn effects(f: &MFunc, sh: &Shapes<'_>, i: Inst, out: &mut Effects) {
     i.regs(&mut out.defs, &mut out.uses);
-    let indirect;
     let shape = match i {
         Inst::Bl { func } => &sh.callees[func as usize],
-        Inst::Blr { sig, .. } => {
-            let (p, r) = &f.sigs[sig as usize];
-            indirect = CallShape::of(p, r);
-            &indirect
-        }
+        Inst::Blr { sig, .. } => &f.sig_shapes[sig as usize],
         Inst::BlAlloc { .. } | Inst::BlFree { .. } => {
             out.uses.push(Reg::x(0));
             out.defs.extend(CALLER_SAVED.iter().map(|&r| Reg::x(r)));

@@ -117,13 +117,27 @@ pub fn verify_module(m: &Module) -> Result<Vec<Hole>, String> {
     // External functions.
     for x in &m.externs {
         for &t in x.params.iter().chain(&x.rets) {
-            if !t.is_value() {
+            check_ty(&gs.types, sp, m.layer, None, t).map_err(|e| {
+                format!(
+                    "extern @{}: {}",
+                    x.name,
+                    e.strip_prefix("@?: ").unwrap_or(&e)
+                )
+            })?;
+            if !(t.is_value() || gs.types.is_composite(t)) {
                 return Err(format!(
                     "extern @{}: {} is not a value type",
                     x.name,
                     gs.types.show(t)
                 ));
             }
+        }
+        if let Some(t) = shared_composite(&gs.types, &x.rets) {
+            return Err(format!(
+                "extern @{}: {}",
+                x.name,
+                shared_composite_msg(&gs.types, t)
+            ));
         }
         for (i, e) in x.effects.iter().enumerate() {
             if x.effects[..i].contains(e) {
@@ -159,6 +173,15 @@ pub fn verify_module(m: &Module) -> Result<Vec<Hole>, String> {
                     f.body.types().show(t)
                 ));
             }
+        }
+        if m.layer != Layer::Hfir
+            && let Some(t) = shared_composite(f.body.types(), &f.rets)
+        {
+            return Err(format!(
+                "in @{}: @?: {}",
+                f.name,
+                shared_composite_msg(f.body.types(), t)
+            ));
         }
     }
     let mut holes = Vec::new();
@@ -320,12 +343,29 @@ enum RegionCtx<'a> {
 }
 
 /// Whether values of type `t` can exist in a module of this layer (Lean's `Layer.valueTy`):
-/// in HFIR anything but a function type, elsewhere the scalars; never with a `va_list` in it.
+/// in HFIR anything but a function type, elsewhere the scalars and the composites calls pass
+/// whole; never with a `va_list` in it.
 fn value_ty(layer: Layer, types: &Types, t: Ty) -> bool {
     match layer {
         Layer::Hfir => types.is_hvalue(t) && !types.has_va_list(t),
-        _ => t.is_value(),
+        _ => t.is_value() || types.is_composite(t),
     }
+}
+
+/// A composite among several results, which only HFIR allows (Lean's `sharedComposite`).
+fn shared_composite(types: &Types, rs: &[Ty]) -> Option<Ty> {
+    if rs.len() > 1 {
+        rs.iter().copied().find(|&t| types.is_composite(t))
+    } else {
+        None
+    }
+}
+
+fn shared_composite_msg(types: &Types, t: Ty) -> String {
+    format!(
+        "{} can't be one of several results: outside HFIR, a struct or array result is the only one",
+        types.show(t)
+    )
 }
 
 /// Check that a type is well formed: valid widths, parts with a layout, unions of value types,
@@ -370,6 +410,11 @@ fn check_ty(types: &Types, sp: &SpaceCfg, layer: Layer, loc: Option<Loc>, t: Ty)
                                 ),
                             );
                         }
+                    }
+                    if layer != Layer::Hfir
+                        && let Some(x) = shared_composite(types, rs)
+                    {
+                        return verr(loc, shared_composite_msg(types, x));
                     }
                     return Ok(());
                 }
@@ -813,6 +858,15 @@ fn check_simple(
                         format!("{} can't be {verb}: it is not a value type", show(t)),
                     );
                 }
+                if !t.is_value() && layer != Layer::Hfir {
+                    return verr(
+                        loc,
+                        format!(
+                            "{} can't be {verb}: outside HFIR, memory is accessed by scalars",
+                            show(t)
+                        ),
+                    );
+                }
                 if !(t.is_value() || has_layout(types, t)) {
                     return verr(
                         loc,
@@ -1019,7 +1073,7 @@ fn check_simple(
             }
             Check::Vararg(t) => {
                 let t = ty(&t);
-                if !space.is_vararg(t) {
+                if !types.is_vararg(space, t) {
                     return verr(loc, format!("{} can't be a variadic argument", show(t)));
                 }
             }
@@ -1028,7 +1082,7 @@ fn check_simple(
     Ok(())
 }
 
-/// A call's variadic arguments (Lean's `checkArgs`): each of a type `SpaceCfg.isVararg` allows.
+/// A call's variadic arguments (Lean's `checkArgs`): each of a type `SpaceCfg.isVararg` allows (C composites included).
 fn check_varargs(
     types: &Types,
     space: &SpaceCfg,
@@ -1036,7 +1090,7 @@ fn check_varargs(
     what: &str,
     ins: &[Ty],
 ) -> VResult<()> {
-    match ins.iter().find(|&&t| !space.is_vararg(t)) {
+    match ins.iter().find(|&&t| !types.is_vararg(space, t)) {
         Some(&t) => verr(
             loc,
             format!("{what}: {} can't be a variadic argument", types.show(t)),

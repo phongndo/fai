@@ -860,11 +860,14 @@ fn calls_check_the_signature_and_declarations_clash() {
         "@g is defined more than once"
     );
     let s = mb.struct_ty(Policy::C, &[i32()]).unwrap();
+    // Outside HFIR, structs and arrays are values that calls pass whole; unions aren't.
     mb.set_layer(Layer::Mfir);
+    let u1 = mb.union_ty(&[i32()]).unwrap();
     assert_eq!(
-        message(mb.declare_func("h", &[s], &[])),
-        "func @h: struct<C>{i32} is not a value type"
+        message(mb.declare_func("h", &[u1], &[])),
+        "func @h: union<i32> is not a value type"
     );
+    mb.declare_func("h_mfir", &[s], &[s]).unwrap();
     mb.set_layer(Layer::Hfir);
     let sig = mb.func_ty(&[], &[]).unwrap();
     assert_eq!(

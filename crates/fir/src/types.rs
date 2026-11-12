@@ -282,6 +282,51 @@ impl Types {
         t != Ty::VaList && !matches!(self.shape_of(t), Some(Shape::Func(..)))
     }
 
+    /// Whether calls pass values of this type whole outside HFIR, as the C ABI's unit (Lean's
+    /// `Ty.isComposite`): a struct or array of scalars and of such aggregates.
+    pub fn is_composite(&self, t: Ty) -> bool {
+        match self.shape_of(t) {
+            Some(Shape::Struct(_, fs)) => fs.iter().all(|&f| f.is_value() || self.is_composite(f)),
+            Some(Shape::Array(_, e)) => e.is_value() || self.is_composite(e),
+            _ => false,
+        }
+    }
+
+    /// Whether a variadic argument can be this composite (Lean's `Ty.isCComposite`): a nonempty
+    /// `struct<C>` or array of scalars and of such composites.
+    pub fn is_c_composite(&self, t: Ty) -> bool {
+        match self.shape_of(t) {
+            Some(Shape::Struct(Policy::C, fs)) => {
+                !fs.is_empty() && fs.iter().all(|&f| f.is_value() || self.is_c_composite(f))
+            }
+            Some(Shape::Array(n, e)) => n > 0 && (e.is_value() || self.is_c_composite(e)),
+            _ => false,
+        }
+    }
+
+    /// Whether a variadic argument can have this type in memory space `space` (Lean's
+    /// `SpaceCfg.isVararg`): a scalar that fits an argument slot, or a C composite.
+    pub fn is_vararg(&self, space: &SpaceCfg, t: Ty) -> bool {
+        space.is_vararg(t) || self.is_c_composite(t)
+    }
+
+    /// Whether `t` here is `u` of `other` up to Lean's `Ty.canon`, which makes arrays structs of
+    /// their elements. `u` is canonical (a variadic argument's type: scalars and `struct<C>`s).
+    pub fn canon_is(&self, t: Ty, other: &Types, u: Ty) -> bool {
+        match (self.shape_of(t), other.shape_of(u)) {
+            (Some(Shape::Struct(p, fs)), Some(Shape::Struct(q, gs))) => {
+                p == q
+                    && fs.len() == gs.len()
+                    && fs.iter().zip(gs).all(|(&f, &g)| self.canon_is(f, other, g))
+            }
+            (Some(Shape::Array(n, e)), Some(Shape::Struct(Policy::C, gs))) => {
+                n == gs.len() as u64 && gs.iter().all(|&g| self.canon_is(e, other, g))
+            }
+            (None, None) => t == u,
+            _ => false,
+        }
+    }
+
     /// Whether a type has a `va_list` in it, which values can't (Lean's `Ty.hasVaList`).
     pub fn has_va_list(&self, t: Ty) -> bool {
         match t {
