@@ -59,6 +59,11 @@ every fixture and fuzzed HFIR program before and after lowering: the same outcom
 HFIR run is UB, the same events first. `Lower.Proof.Expand.refines` proves the expansion pass, and
 so the whole lowering of functions without aggregate, union, or slice values
 (`lowerFunc_refines`); the scalarizing pass is not proved yet (decision: Lowering proofs).
+`fir compile` and `fir_module_compile` lower HFIR before instruction selection, and the AArch64
+tests run the fixtures (`tests/blocks/` included) and fuzzed HFIR programs natively against
+`fir run` of the HFIR. The builder and the C API build every block (`fir_agg_make`,
+`fir_type_union`, `FIR_TYPE_SLICE`, …), and `tests/capi/modules.c` builds, runs, lowers,
+optimizes, and compiles a function using each one.
 
 ## MFIR
 
@@ -73,7 +78,9 @@ Passes): `fir opt FILE [-O | --passes dse,fwd,copyprop,dce] [--remarks] [--stats
 after every pass in development builds. Optimized fixtures and random programs (including
 programs made to exercise the memory passes) refine the originals in `fir run` and still verify
 (the fixtures in `fir-ref check` too). Each pass costs a few nanoseconds per op on functions of a million
-ops; the whole `-O` pipeline costs less than parsing.
+ops; the whole `-O` pipeline costs less than parsing. `dse` and `fwd` match scalar stores and loads
+only, as their theorems now state; `dce` deletes the building blocks that only build or take apart
+values. `fir compile -O` runs the pipeline on the lowered MFIR before instruction selection.
 
 ## LFIR for AArch64
 
@@ -100,7 +107,12 @@ Instruction selection, Register allocation, Traps at run time, AOT driver, Backe
 - Tests (`crates/fir/tests/aarch64.rs`): every fixture's comparable runs and random programs,
   natively under `qemu-aarch64` and in LFIR before and after allocation, with no differences;
   `FIR_FUZZ=3000` on seeds 1 and 2 included.
-- Not yet: aggregates by value, `i128`, macOS's ABI differences (its assembly assembles, but
+- HFIR compiles through its lowering (`fir::backend::prepare`), so aggregates, unions, and slices
+  pass as their scalars; `cf.check` traps with reasons `bounds` and `tag` too. Integers wider
+  than 64 bits compile where only their low 64 bits matter, which covers the lowering of
+  `ptr.index.inbounds`, but not checked arithmetic on `i64` (checked at 65 bits) or `mul` above
+  32 bits.
+- Not yet: aggregates by value in the C ABI, `i128`, macOS's ABI differences (its assembly assembles, but
   isn't run), tail calls, unwind tables, and the trust-round checkers.
 
 ## Not in this round
@@ -125,5 +137,7 @@ Instruction selection, Register allocation, Traps at run time, AOT driver, Backe
   `crates/fir-capi` exports it with a cbindgen header. Every verified test file and 300 fuzzer
   programs rebuild through the builder byte for byte, and `tests/capi/modules.c` builds,
   verifies, prints, and runs modules through the C API in `cargo test` (clean under ASan and
-  valgrind). Building is about 2.4 times as fast as parsing (`examples/build_bench.rs`). Left
-  until they exist: the module's layer, and lowering, optimizing, and compiling from the API.
+  valgrind). Building is about 2.4 times as fast as parsing (`examples/build_bench.rs`). The
+  module's layer, the building blocks (union and slice types, aggregate signatures), lowering
+  (`fir_module_lower`), the `-O` pipeline (`fir_module_optimize`), and compiling to AArch64
+  assembly (`fir_module_compile`) are in the API too.
