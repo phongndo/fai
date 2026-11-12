@@ -46,6 +46,8 @@ const CLEARED: &[&str] = &[
     "FIR_FUZZ",
     "FIR_FUZZ_SEED",
     "FIR_FUZZ_LEAN",
+    "FIR_ABI",
+    "FIR_ABI_SEED",
     "FIR_SHOW_ADDRESS_DIFFS",
     "CBINDGEN",
 ];
@@ -71,6 +73,7 @@ const SUITES: &[&str] = &[
     "text_fixtures",
     "capi_programs",
     "capi_e2e",
+    "abi_torture",
 ];
 
 /// Op constructors no differential test can exercise, and why. Every other constructor that a
@@ -668,6 +671,8 @@ fn check_evidence(
         Some(1),
     );
     need(&mut bad, "contracts", "kinds", None);
+    // The C ABI against the C compiler: the default number of random signatures, all agreeing.
+    need(&mut bad, "abi_torture", "signatures", Some(240));
     need(
         &mut bad,
         "dce_check",

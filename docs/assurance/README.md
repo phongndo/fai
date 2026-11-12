@@ -48,7 +48,7 @@ toolchain's version):
    fuzz counts set explicitly (200 programs, seed 1).
 7. **The C API tests under AddressSanitizer.**
 8. **Evidence.** Each suite writes what it actually did to `FIR_EVIDENCE`
-   (`crates/fir/tests/common/evidence.rs`). The run fails if a required suite (16 of them) wrote
+   (`crates/fir/tests/common/evidence.rs`). The run fails if a required suite (17 of them, the ABI torture test included) wrote
    nothing, recorded a skip or a failure, ran fewer programs than configured, compared fewer
    runs with `fir-ref` than it had run lines, or if any op constructor that a component claims
    to support was never exercised by that component's differential comparison. The coverage is

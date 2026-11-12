@@ -608,6 +608,12 @@ pub fn select_func(cx: &ModuleCx<'_>, index: u32, families: &mut Vec<String>) ->
     for &t in &f.rets {
         check_ty(body.types(), None, t).map_err(|e| format!("@{}: {e}", f.name))?;
     }
+    if f.rets.len() > 1 && f.rets.iter().any(|&t| body.types().is_composite(t)) {
+        return Err(format!(
+            "@{}: a struct or array among several results is HFIR only: lower the module to MFIR first",
+            f.name
+        ));
+    }
     let mut s = Sel {
         cx,
         body,
@@ -1686,6 +1692,24 @@ impl Sel<'_, '_> {
                 | OpKind::Ret
                 | OpKind::VaArg
         );
+        // A composite among several results is HFIR's (the lowering scalarizes those).
+        let several = match kind {
+            OpKind::Ret => self.rets.len() > 1 && self.rets.iter().any(|&t| self.is_composite(t)),
+            OpKind::Call { .. }
+            | OpKind::Invoke { .. }
+            | OpKind::CallIndirect(_)
+            | OpKind::InvokeIndirect { .. } => {
+                body.results(op).len() > 1
+                    && body.results(op).any(|v| self.is_composite(body.ty(v)))
+            }
+            _ => false,
+        };
+        if several {
+            return Err(format!(
+                "{}a struct or array among several results is HFIR only: lower the module to MFIR first",
+                at(self.loc)
+            ));
+        }
         if !composite_ok {
             let types = body.types();
             let mut tys: Vec<Ty> = body.results(op).map(|v| body.ty(v)).collect();

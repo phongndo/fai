@@ -484,7 +484,8 @@ Instruction selection, Backend testing, Builder API, API.
   structs written by the callee, pointers dereferenced after crossing, empty, `auto`, and packed
   structs, stack placement after a class's registers close, nested and indirect calls, external
   calls, and variadic composites of every class, after the registers fill, read back as arrays,
-  and UB for a wrong type: 22 run lines); `fir-ref test`, `fir run`, the lowering, and native
+  and UB for a wrong type; an MFIR module making, inserting into, and passing composites: 23 run
+  lines); `fir-ref test`, `fir run`, the lowering, and native
   runs under qemu (with and without `-O`, and the LFIR before and after allocation in both
   machines) agree. `crates/fir/tests/abi.rs` is the ABI torture test: random signatures (up to
   12 arguments, structs of `i8`…`i64`, `f32`, `f64`, `ptr`, arrays, nested, packed, and 16-byte
@@ -501,7 +502,10 @@ Instruction selection, Backend testing, Builder API, API.
   no differences. Per seed 480 to 500 modules pass composites to or from external functions,
   150 to 170 pass them through `...`, 45 to 48 read them with `va.arg`, and 790 to 850 native
   runs (each with and without `-O`) pass structs by value. The native harness declares C structs of each
-  composite's layout and class and prints them as `fir run` renders them.
+  composite's layout and class and prints them as `fir run` renders them. Its direct selection
+  of HFIR (main's coverage builds) found that isel took a struct among several results, which
+  only the lowering may scalarize, as one register: it refuses it now, as HFIR only. `cargo
+  xtask verify full` requires the ABI torture test's evidence (240 signatures).
 - **API:** version 1.5 (no new functions; external and MFIR functions take composites).
 - **Not yet:** `fai-cc`'s structs by value (track F2); macOS's stack packing (composites on the
   stack are a compile error there); integer leaves wider than 64 bits in a passed composite

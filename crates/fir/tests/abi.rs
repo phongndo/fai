@@ -13,13 +13,19 @@
 //!   and returns a constant result, whose leaves FIR reports.
 //!
 //! The expected output is computed here from the values. `FIR_ABI=N` sets how many signatures
-//! (default 240), `FIR_ABI_SEED` the seed (default 1); `FIR_CC` the C compiler.
+//! (default 240), `FIR_ABI_SEED` the seed (default 1); `FIR_CC` the C compiler. Without a C
+//! compiler or a way to run AArch64 binaries it skips, unless `FIR_REQUIRE_FULL=1`; it records
+//! its counts for `cargo xtask verify` (`abi_torture`).
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use fir::backend::aarch64 as a64;
+
+#[allow(dead_code)]
+mod common;
+use common::evidence::{Evidence, require};
 
 /// A deterministic random source (xorshift64*).
 struct Rng(u64);
@@ -770,7 +776,7 @@ fn structs_cross_the_c_abi_both_ways() {
             "aarch64-unknown-linux-gnu-cc".to_owned()
         }
         Err(_) => {
-            eprintln!("skipped: no AArch64 C compiler (set FIR_CC, or use the dev shell)");
+            require("no AArch64 C compiler (set FIR_CC, or use the dev shell)");
             return;
         }
     };
@@ -779,7 +785,7 @@ fn structs_cross_the_c_abi_both_ways() {
     } else if on_path("qemu-aarch64") {
         Some("qemu-aarch64")
     } else {
-        eprintln!("skipped: no qemu-aarch64");
+        require("no qemu-aarch64");
         return;
     };
     let count: usize = std::env::var("FIR_ABI")
@@ -834,6 +840,12 @@ fn structs_cross_the_c_abi_both_ways() {
     eprintln!(
         "{count} signatures (seed {seed}), {leaves_n} leaves each way and through `...`, {stack_args} with more than four arguments"
     );
+    let ev = Evidence::new("abi_torture");
+    ev.count("signatures", count as u64);
+    ev.count("leaves", leaves_n as u64);
+    ev.count("batches", sigs.len().div_ceil(40) as u64);
+    ev.count("failures", failures.len() as u64);
+    ev.write();
     if failures.is_empty() {
         let _ = std::fs::remove_dir_all(&dir);
     }
