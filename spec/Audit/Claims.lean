@@ -112,7 +112,13 @@ def claims : List Claim := [
   { name := ``Fir.AArch64.roundTrip, role := "AArch64 C ABI",
     summary := "A struct or array passed in registers (an HFA or up to 16 bytes) arrives with its defined bytes exactly: its pieces, each loaded into a register and stored back, are its bytes; a word of eight fragments of one pointer stays that pointer. That native code passes exactly these pieces where Fir.AArch64.argLocs says is tested (the ABI torture test), not proved." },
   { name := ``Fir.AArch64.pieces_flatten, role := "AArch64 C ABI",
-    summary := "The register pieces of a composite passed in registers (8-byte words, or an HFA's members), joined, are its bytes." }
+    summary := "The register pieces of a composite passed in registers (8-byte words, or an HFA's members), joined, are its bytes." },
+  { name := ``Fir.AArch64.arrives, role := "AArch64 C ABI",
+    summary := "A struct or array passed in registers arrives with every defined byte in place even when its pieces are partly undefined (padding or poison leaves): any words that hold its pieces (Word.Holds), stored back, give as many bytes with each defined one unchanged." },
+  { name := ``Fir.AArch64.ptrLeaf_inReg, role := "AArch64 C ABI",
+    summary := "In a composite passed as x-register words that doesn't split a pointer (Ty.splitsPtr, which instruction selection refuses), a pointer leaf's register holds that pointer, provenance included, whatever the other pieces hold." },
+  { name := ``Fir.AArch64.Word.holds_fill, role := "AArch64 C ABI",
+    summary := "The machine's word for a piece (Word.fill, the shape of AArch64Machine's wordOfBytes: an arbitrary choice for poison and stray fragment bytes) holds it: a whole pointer's eight fragments are that pointer, and every defined byte is in the register. That wordOfBytes is this function is by inspection, not proved." }
 ]
 
 /-- Theorems the audit would flag that are steps toward claims. -/

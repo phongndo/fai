@@ -5,7 +5,7 @@ of the Lean development, with its statement as Lean prints it, its transitive ax
 many `Fir` definitions its meaning depends on. A claim is only as strong as its statement:
 read the hypotheses. Open obligations are listed in `docs/assurance/README.md`.
 
-35 claims; 25 supporting lemmas registered; 0 errors; 0 changes needing review.
+38 claims; 25 supporting lemmas registered; 0 errors; 0 changes needing review.
 
 ## `Fir.Dce.dcePerm_sound` (binding: Rust permissions)
 
@@ -497,7 +497,7 @@ A struct or array passed in registers (an HFA or up to 16 bytes) arrives with it
 ```
 
 - axioms: propext, Quot.sound
-- hypotheses: 3; `Fir` definitions depended on: 233
+- hypotheses: 3; `Fir` definitions depended on: 232
 
 ## `Fir.AArch64.pieces_flatten` (AArch64 C ABI)
 
@@ -512,5 +512,58 @@ The register pieces of a composite passed in registers (8-byte words, or an HFA'
 ```
 
 - axioms: propext, Quot.sound
-- hypotheses: 2; `Fir` definitions depended on: 162
+- hypotheses: 2; `Fir` definitions depended on: 161
+
+## `Fir.AArch64.arrives` (AArch64 C ABI)
+
+A struct or array passed in registers arrives with every defined byte in place even when its pieces are partly undefined (padding or poison leaves): any words that hold its pieces (Word.Holds), stored back, give as many bytes with each defined one unchanged.
+
+```lean
+∀ {sp : Fir.SpaceCfg} {t : Fir.Ty} {bs : List Fir.Byte},
+  bs.length = Fir.Ty.size sp t →
+    ((∃ n e, Fir.AArch64.passKind sp t = Fir.AArch64.PassKind.words n e) ∨
+        ∃ f n, Fir.AArch64.passKind sp t = Fir.AArch64.PassKind.hfa f n) →
+      ∀ {ws : List Fir.AArch64.Word},
+        Fir.AArch64.Word.HoldAll (Fir.AArch64.pieces (Fir.AArch64.passKind sp t) bs) ws →
+          Fir.AArch64.Agrees
+            (List.zipWith (fun pc w => Fir.AArch64.Word.bytes pc.length w)
+                (Fir.AArch64.pieces (Fir.AArch64.passKind sp t) bs) ws).flatten
+            bs
+```
+
+- axioms: propext, Classical.choice, Quot.sound
+- hypotheses: 3; `Fir` definitions depended on: 226
+
+## `Fir.AArch64.ptrLeaf_inReg` (AArch64 C ABI)
+
+In a composite passed as x-register words that doesn't split a pointer (Ty.splitsPtr, which instruction selection refuses), a pointer leaf's register holds that pointer, provenance included, whatever the other pieces hold.
+
+```lean
+∀ {sp : Fir.SpaceCfg} {t : Fir.Ty} {bs : List Fir.Byte} {n : Nat} {e : Bool},
+  Fir.AArch64.passKind sp t = Fir.AArch64.PassKind.words n e →
+    Fir.Ty.splitsPtr sp t = false →
+      bs.length = Fir.Ty.size sp t →
+        ∀ {o : Nat},
+          (o, Fir.Ty.ptr) ∈ Fir.Ty.leaves sp t →
+            ∀ {p : Fir.Ptr},
+              List.take 8 (List.drop o bs) = List.map (Fir.Byte.frag p) (List.range 8) →
+                ∀ {ws : List Fir.AArch64.Word},
+                  Fir.AArch64.Word.HoldAll (Fir.AArch64.pieces (Fir.AArch64.passKind sp t) bs) ws →
+                    ws[o / 8]? = some (Fir.AArch64.Word.ptr p)
+```
+
+- axioms: propext, Quot.sound
+- hypotheses: 6; `Fir` definitions depended on: 229
+
+## `Fir.AArch64.Word.holds_fill` (AArch64 C ABI)
+
+The machine's word for a piece (Word.fill, the shape of AArch64Machine's wordOfBytes: an arbitrary choice for poison and stray fragment bytes) holds it: a whole pointer's eight fragments are that pointer, and every defined byte is in the register. That wordOfBytes is this function is by inspection, not proved.
+
+```lean
+∀ (c : Nat → Nat) {pc : List Fir.Byte},
+  pc.length ≤ 8 → Fir.AArch64.Word.Holds pc (Fir.AArch64.Word.fill c pc)
+```
+
+- axioms: propext, Quot.sound
+- hypotheses: 1; `Fir` definitions depended on: 73
 

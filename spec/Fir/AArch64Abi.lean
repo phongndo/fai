@@ -36,10 +36,16 @@ floats of one format, otherwise `x0`, `x1`; three or more in 8-byte slots at `x8
 
 **Bytes and registers.** A composite's bytes (its leaves' encodings at their offsets, `poison`
 in padding) split into register pieces (`pieces`): 8-byte words, or an HFA's members. A piece
-is a register's low bytes (`Word.ofBytes?`, `Word.bytes`). `pieces_flatten` and `words_roundTrip`
-prove the round trip: bytes split into pieces, each put in a register and read back, are the
-bytes, wherever they are defined (no `poison`); a word of eight fragments of one pointer is that
-pointer, so provenance survives.
+is a register's low bytes (`Word.ofBytes?`, `Word.bytes`). `pieces_flatten` and `roundTrip`
+prove the round trip for pieces that are wholly defined: bytes split into pieces, each put in a
+register and read back, are the bytes; a word of eight fragments of one pointer is that pointer,
+so provenance survives. `arrives` drops the premise: for any words that hold the pieces
+(`Word.Holds`, as the machine's word for a piece does whatever it picks for `poison` and stray
+fragments, `Word.holds_fill`), every defined byte comes back in place, padding or `poison`
+leaves notwithstanding. A pointer leaf keeps its provenance when it fills a word
+(`ptrLeaf_inReg`); one that doesn't (`Ty.splitsPtr`: a packed pointer at an offset that isn't a
+multiple of 8) could only travel as address bits, so instruction selection refuses to pass such a
+composite by value.
 -/
 
 namespace Fir.AArch64
@@ -400,5 +406,215 @@ theorem roundTrip {sp : SpaceCfg} {t : Ty} {bs : List Byte} (hl : bs.length = t.
       have h8 : f.bytes ≤ 8 := by cases f <;> decide
       omega
   simp [hw, Word.bytes_ofBytes hw hlen]
+
+
+/-! ## Partly defined pieces
+
+`roundTrip` needs every piece defined. A composite's pieces usually aren't: padding is `poison`,
+and a `poison` leaf is too. What a register gets for such a piece is the machine's choice
+(`wordOfBytes` in `Fir.AArch64Machine`: an oracle byte for `poison`, a fragment's address byte
+for a fragment of no whole pointer). `Word.Holds` says what any such choice keeps: the pointer
+of a piece of eight fragments of one pointer, else bits that agree with every defined byte. -/
+
+/-- What a register may hold for a piece: the pointer whose eight fragments it is, or, for any
+other piece, bits whose low bytes are the piece's defined ones (any bits where it is `poison` or
+a fragment). -/
+def Word.Holds (pc : List Byte) : Word → Prop
+  | .ptr p => ptrOfFrags? 8 pc = some p
+  | .bits b => ptrOfFrags? 8 pc = none ∧
+      ∀ (i : Nat) (x : BitVec 8), pc[i]? = some (Byte.bits x) →
+        ((Word.bits b).bytes pc.length)[i]? = some (Byte.bits x)
+
+/-- Bytes that arrived for `sent`: as many, and each defined byte of `sent` in place. -/
+def Agrees (got sent : List Byte) : Prop :=
+  got.length = sent.length ∧
+    ∀ (i : Nat) (x : BitVec 8), sent[i]? = some (Byte.bits x) → got[i]? = some (Byte.bits x)
+
+theorem Agrees.append {a b c d : List Byte} (h1 : Agrees a b) (h2 : Agrees c d) :
+    Agrees (a ++ c) (b ++ d) := by
+  refine ⟨by simp [h1.1, h2.1], fun i x hx => ?_⟩
+  rcases Nat.lt_or_ge i b.length with h | h
+  · rw [List.getElem?_append_left h] at hx
+    rw [List.getElem?_append_left (h1.1 ▸ h)]
+    exact h1.2 i x hx
+  · rw [List.getElem?_append_right h] at hx
+    rw [List.getElem?_append_right (h1.1 ▸ h), h1.1]
+    exact h2.2 _ x hx
+
+/-- The word the machine puts in a register for a piece (`wordOfBytes`), given what it picks for
+the bytes that aren't bits (`c i` for byte `i`): the pointer of eight fragments of one, else the
+bits, little-endian. -/
+def Word.fill (c : Nat → Nat) (pc : List Byte) : Word :=
+  match ptrOfFrags? 8 pc with
+  | some p => .ptr p
+  | none => .bits (BitVec.ofNat 64 (undigits (pc.zipIdx.map fun (b, i) =>
+      match b with
+      | .bits x => x.toNat
+      | _ => c i % 256)))
+
+theorem frags_ptrOfFrags (p : Ptr) : ptrOfFrags? 8 ((List.range 8).map (.frag p)) = some p := by
+  simp [ptrOfFrags?, List.range_succ]
+
+theorem eq_frags_of_ptrOfFrags {pc : List Byte} {p : Ptr} (h : ptrOfFrags? 8 pc = some p) :
+    pc = (List.range 8).map (.frag p) := by
+  unfold ptrOfFrags? at h
+  split at h
+  · split at h
+    · rename_i heq
+      cases h
+      exact beq_iff_eq.mp heq
+    · cases h
+  · cases h
+
+theorem length_digits : ∀ (k n : Nat), (digits k n).length = k
+  | 0, _ => rfl
+  | k + 1, n => by simp [digits, length_digits k]
+
+/-- **The machine's word for a piece holds it**: whatever it picks for `poison` and stray
+fragments, a word of eight fragments of one pointer is that pointer, and every defined byte is
+in the register. -/
+theorem Word.holds_fill (c : Nat → Nat) {pc : List Byte} (hn : pc.length ≤ 8) :
+    (Word.fill c pc).Holds pc := by
+  unfold Word.fill
+  split
+  · rename_i p hp
+    exact hp
+  · rename_i hp
+    refine ⟨hp, ?_⟩
+    intro i x hi
+    let ds := pc.zipIdx.map fun (b, i) =>
+      match b with
+      | .bits x => x.toNat
+      | _ => c i % 256
+    have hlt : ∀ d ∈ ds, d < 256 := by
+      intro d hd
+      simp only [ds, List.mem_map] at hd
+      obtain ⟨⟨b, j⟩, _, rfl⟩ := hd
+      cases b <;> simp <;> first | exact BitVec.isLt _ | exact Nat.mod_lt _ (by decide)
+    have hlen : ds.length = pc.length := by simp [ds]
+    have h64 : undigits ds < 2 ^ 64 := by
+      have := undigits_lt ds hlt
+      have : (256 : Nat) ^ ds.length ≤ 256 ^ 8 :=
+        Nat.pow_le_pow_right (by decide) (by omega)
+      have : (256 : Nat) ^ 8 = 2 ^ 64 := by decide
+      omega
+    have hd := digits_undigits ds hlt
+    rw [hlen] at hd
+    show ((Word.bits (BitVec.ofNat 64 (undigits ds))).bytes pc.length)[i]? = _
+    simp only [Word.bytes, BitVec.toNat_ofNat]
+    rw [Nat.mod_eq_of_lt h64, hd]
+    have hi' : i < pc.length := by
+      rcases Nat.lt_or_ge i pc.length with h | h
+      · exact h
+      · rw [List.getElem?_eq_none h] at hi; cases hi
+    have hpi : pc[i] = .bits x := by
+      rw [List.getElem?_eq_getElem hi'] at hi; exact Option.some.inj hi
+    simp [ds, List.getElem?_map, List.getElem?_zipIdx, List.getElem?_eq_getElem hi', hpi]
+
+/-- A register that holds a piece gives back, stored, bytes that agree with it, and the piece
+itself if it is a whole pointer. -/
+theorem Word.holds_bytes {pc : List Byte} {w : Word} (h : w.Holds pc) :
+    Agrees (w.bytes pc.length) pc := by
+  cases w with
+  | ptr p =>
+    have := eq_frags_of_ptrOfFrags (show ptrOfFrags? 8 pc = some p from h)
+    subst this
+    have hb : (Word.ptr p).bytes ((List.range 8).map (Byte.frag p)).length =
+        (List.range 8).map (.frag p) := rfl
+    rw [hb]
+    exact ⟨rfl, fun _ _ h => h⟩
+  | bits b =>
+    refine ⟨?_, h.2⟩
+    simp only [Word.bytes, List.length_map]
+    exact length_digits _ _
+
+/-- The `k`th of `n` chunks of `w` bytes is the `w` bytes from `w * k`. -/
+theorem chunks_getElem? (w : Nat) : ∀ (n k : Nat) (bs : List Byte), k < n →
+    (chunks w n bs)[k]? = some ((bs.drop (w * k)).take w)
+  | 0, _, _, h => by omega
+  | n + 1, 0, bs, _ => by simp [chunks]
+  | n + 1, k + 1, bs, h => by
+    simp only [chunks, List.getElem?_cons_succ]
+    rw [chunks_getElem? w n k (bs.drop w) (by omega), List.drop_drop, Nat.mul_succ, Nat.add_comm]
+
+/-- Words for pieces: one each, each holding its piece. -/
+def Word.HoldAll (pcs : List (List Byte)) (ws : List Word) : Prop :=
+  ws.length = pcs.length ∧
+    ∀ (i : Nat) (pc : List Byte) (w : Word), pcs[i]? = some pc → ws[i]? = some w → w.Holds pc
+
+/-- **Registers carry a composite's defined bytes, padding or not**: whatever words hold its
+pieces (`Word.Holds`, as the machine's do: `Word.holds_fill`), stored back they give as many
+bytes as it has, with every defined byte of it in place, whatever its padding and `poison`
+leaves held. -/
+theorem arrives {sp : SpaceCfg} {t : Ty} {bs : List Byte} (hl : bs.length = t.size sp)
+    (hk : (∃ n e, passKind sp t = .words n e) ∨ (∃ f n, passKind sp t = .hfa f n))
+    {ws : List Word} (hw : Word.HoldAll (pieces (passKind sp t) bs) ws) :
+    Agrees (List.zipWith (fun pc (w : Word) => w.bytes pc.length) (pieces (passKind sp t) bs) ws).flatten
+      bs := by
+  conv => rhs; rw [← pieces_flatten hl hk]
+  generalize pieces (passKind sp t) bs = pcs at hw
+  induction pcs generalizing ws with
+  | nil =>
+    have : ws = [] := List.eq_nil_of_length_eq_zero hw.1
+    subst this
+    exact ⟨rfl, fun _ _ h => by simp at h⟩
+  | cons pc pcs ih =>
+    cases ws with
+    | nil => exact absurd hw.1 (by simp)
+    | cons w ws =>
+      simp only [List.zipWith_cons_cons, List.flatten_cons]
+      have h0 : w.Holds pc := hw.2 0 pc w rfl rfl
+      have hr : Word.HoldAll pcs ws :=
+        ⟨by simpa using hw.1, fun i q v hq hv => hw.2 (i + 1) q v (by simpa using hq) (by simpa using hv)⟩
+      exact (Word.holds_bytes h0).append (ih hr)
+
+/-- **A pointer leaf keeps its provenance**: in a composite passed as words that doesn't split a
+pointer (`Ty.splitsPtr`, which instruction selection refuses), a pointer leaf at offset `o` whose
+bytes are its eight fragments is in register `o / 8` as that pointer, whatever the other pieces
+hold, and so is stored back as those fragments (`Word.holds_bytes`). -/
+theorem ptrLeaf_inReg {sp : SpaceCfg} {t : Ty} {bs : List Byte} {n : Nat} {e : Bool}
+    (hk : passKind sp t = .words n e) (hs : t.splitsPtr sp = false) (hl : bs.length = t.size sp)
+    {o : Nat} (ho : (o, Ty.ptr) ∈ t.leaves sp) {p : Ptr}
+    (hb : (bs.drop o).take 8 = (List.range 8).map (.frag p))
+    {ws : List Word} (hw : Word.HoldAll (pieces (passKind sp t) bs) ws) :
+    ws[o / 8]? = some (.ptr p) := by
+  have h8 : o % 8 = 0 := by
+    unfold Ty.splitsPtr at hs
+    rw [hk] at hs
+    simp only [Bool.true_and, List.any_eq_false] at hs
+    have := hs _ ho
+    simp at this
+    exact this
+  have hn : n = (t.size sp + 7) / 8 := by
+    revert hk; unfold passKind
+    split <;> (try split) <;> (try split) <;> (try split) <;> intro hk <;> cases hk <;> rfl
+  have hfit : o + 8 ≤ bs.length := by
+    have := congrArg List.length hb
+    simp only [List.length_take, List.length_drop, List.length_map, List.length_range] at this
+    omega
+  have hk8 : o / 8 < n := by omega
+  have hpc : (pieces (passKind sp t) bs)[o / 8]? = some ((List.range 8).map (.frag p)) := by
+    rw [hk]; simp only [pieces]
+    rw [chunks_getElem? 8 n (o / 8) bs hk8, ← hb]
+    congr 3; omega
+  have hlt : o / 8 < ws.length := by
+    rw [hw.1]
+    rcases Nat.lt_or_ge (o / 8) (pieces (passKind sp t) bs).length with h | h
+    · exact h
+    · rw [List.getElem?_eq_none h] at hpc; cases hpc
+  have hh := hw.2 (o / 8) _ ws[o / 8] hpc (List.getElem?_eq_getElem hlt)
+  rw [List.getElem?_eq_getElem hlt]
+  revert hh
+  cases ws[o / 8] with
+  | ptr q =>
+    intro hh
+    have := (show ptrOfFrags? 8 _ = some q from hh)
+    rw [frags_ptrOfFrags] at this
+    rw [Option.some.inj this]
+  | bits b =>
+    intro hh
+    have := hh.1
+    rw [frags_ptrOfFrags] at this
+    cases this
 
 end Fir.AArch64
