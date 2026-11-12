@@ -161,6 +161,9 @@ inductive OpKind where
   | const (n : Int)
   | poison
   | freeze
+  /-- `copy %x`: the same value, of any type. Rewrites produce it (store-to-load forwarding
+  turns a load into a copy of the stored value), and copy propagation removes it. -/
+  | copy
   /-- `select %c, %a, %b` -/
   | select
   | arith (op : ArithOp) (ovf : Ovf)

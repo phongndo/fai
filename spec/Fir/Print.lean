@@ -46,6 +46,7 @@ def OpKind.name : OpKind → String
   | .const _ => "int.const"
   | .poison => "poison"
   | .freeze => "freeze"
+  | .copy => "copy"
   | .select => "select"
   | .arith op o =>
     let n := match op with | .add => "add" | .sub => "sub" | .mul => "mul"

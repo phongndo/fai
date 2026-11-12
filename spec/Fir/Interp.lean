@@ -485,6 +485,7 @@ def evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVa
   | .poison, [r], [] => pure [.int r.ty.width .poison]
   | .freeze, [_], [.int w .poison] => pure [.int w (.bits (BitVec.ofInt w (← choose)))]
   | .freeze, [_], [v] => pure [v]
+  | .copy, [_], [v] => pure [v]
   | .select, [r], [c, a, b] =>
     pure [.int _ (Sem.select (← asInt loc 1 c) (← asInt loc r.ty.width a) (← asInt loc r.ty.width b))]
   | .arith op ovf, [r], [a, b] =>

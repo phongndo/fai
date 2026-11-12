@@ -226,6 +226,7 @@ def opKind (name : String) : Option OpKind :=
   | ["int", "const"] => some (.const 0)
   | ["poison"] => some .poison
   | ["freeze"] => some .freeze
+  | ["copy"] => some .copy
   | ["select"] => some .select
   | "int" :: "add" :: m => (ovf m).map (.arith .add)
   | "int" :: "sub" :: m => (ovf m).map (.arith .sub)
@@ -272,7 +273,7 @@ def opKind (name : String) : Option OpKind :=
 /-- How many operands an op without regions takes, or `none` if variadic. -/
 def arity : OpKind → Option Nat
   | .const _ | .poison | .ptrNull => some 0
-  | .freeze | .zext | .sext | .trunc _ | .ptrAddr | .ptrExpose | .ptrFromExposed => some 1
+  | .freeze | .copy | .zext | .sext | .trunc _ | .ptrAddr | .ptrExpose | .ptrFromExposed => some 1
   | .select => some 3
   | .yield | .brk | .cont | .ret => none
   | _ => some 2

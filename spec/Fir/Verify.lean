@@ -127,6 +127,9 @@ def checkSimple (loc : Option Loc) (k : OpKind) (ins outs : List Ty) : VM Unit :
     let [t] := ins | verr loc "freeze takes one operand"
     ints [t]
     one t
+  | .copy =>
+    let [t] := ins | verr loc "copy takes one operand"
+    one t
   | .select =>
     let [c, a, b] := ins | verr loc "select takes three operands"
     expectTys loc "select" [c, b] [.int 1, a]
