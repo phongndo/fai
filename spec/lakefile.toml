@@ -1,6 +1,6 @@
 name = "fir"
 version = "0.1.0"
-defaultTargets = ["Fir", "fir-ref", "gen-rust", "gen-builder"]
+defaultTargets = ["Fir", "fir-ref", "gen-rust", "gen-builder", "fir-audit"]
 
 [[lean_lib]]
 name = "Fir"
@@ -16,3 +16,14 @@ root = "GenRust"
 [[lean_exe]]
 name = "gen-builder"
 root = "GenBuilder"
+
+# The proof audit links the Lean compiler (it reads the environment), so it lives apart from
+# `Fir`, which imports only `Init` and core libraries.
+[[lean_lib]]
+name = "Audit"
+roots = ["Audit.Claims"]
+
+[[lean_exe]]
+name = "fir-audit"
+root = "Audit"
+supportInterpreter = true
