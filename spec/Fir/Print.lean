@@ -215,7 +215,9 @@ def Extern.render (x : Extern) : String :=
   s!"extern func @{x.name}({commas (x.params.map toString)}){rets} effects[{commas (x.effects.map ExtEffect.render)}] {x.trust.name}\n"
 
 def Module.render (m : Module) (showLocs := true) : String :=
-  let header := if m.space == {} then "" else m.space.render ++ "\n"
+  let layer := if m.layer == .hfir then "" else s!"layer {m.layer.render}\n"
+  let space := if m.space == {} then "" else m.space.render
+  let header := if layer.isEmpty && space.isEmpty then "" else layer ++ space ++ "\n"
   let globals := if m.globals.isEmpty then "" else
     String.join (m.globals.map Global.render) ++ "\n"
   let externs := if m.externs.isEmpty then "" else

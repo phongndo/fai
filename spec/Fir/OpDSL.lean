@@ -53,6 +53,12 @@ around them.
 **Effects and tier.** Declared as data (decisions: Effects, Effect soundness, Extensibility).
 Nothing consumes them yet.
 
+**Layers and dialect.** `layers hfir mfir` names the layers whose modules may contain the op
+(`hfir`, `mfir`, `lfir`); without the clause an op is in HFIR and MFIR. In `layer lfir T`, an op
+of a target's dialect must be of `T`'s (see `Layer.allows` in `Fir.Syntax`). The op's dialect is
+the namespace of its names, before the first dot (`int` for `int.add.nsw`); every name must have
+it. A name without a dot needs a `dialect value` clause.
+
 `fir_ops` is a macro that uses only `Init`: importing `Lean` here would link the whole Lean
 compiler into `fir-ref` (115 MB instead of 6) and initialize it on every run.
 -/
@@ -204,6 +210,16 @@ inductive Effect where
   | read | write | alloc | free | trap | diverge | unwind | sync | extern
   deriving DecidableEq, Repr, Inhabited
 
+/-- The layers an op can be allowed in (decision: Layers). -/
+inductive LayerKind where
+  | hfir | mfir | lfir
+  deriving DecidableEq, Repr, Inhabited
+
+def LayerKind.name : LayerKind → String
+  | .hfir => "hfir"
+  | .mfir => "mfir"
+  | .lfir => "lfir"
+
 /-- How far an op's declared effects are trusted (decision: Effect soundness): proved against its
 Lean semantics, checked automatically, or assumed to be anything (`extern`). Core ops are
 `verified`: their semantics is the Lean interpreter. -/
@@ -212,7 +228,8 @@ inductive Tier where
   deriving DecidableEq, Repr, Inhabited
 
 /-- What `fir_ops` records about an op. The parser, printer, and verifier read `fields`,
-`items`, `terminator`, and `rule`; `effects` and `tier` are declared but not yet read. -/
+`items`, `terminator`, and `rule`, and the verifier `layers` and `dialect`; `effects` and `tier`
+are declared but not yet read. -/
 structure OpDecl where
   /-- The Lean constructor. -/
   ctor : String
@@ -226,6 +243,10 @@ structure OpDecl where
   rule : Option (List Check)
   effects : List Effect
   tier : Tier
+  /-- The layers whose modules may contain the op. -/
+  layers : List LayerKind := [.hfir, .mfir]
+  /-- The op group it belongs to: `int`, `mem`, … (decision: Dialects). -/
+  dialect : String
   deriving Repr, Inhabited
 
 def OpDecl.imms (d : OpDecl) : List Field := d.fields.filter (·.ty.isImm)
@@ -268,6 +289,8 @@ syntax &"format" str : firClause
 syntax &"terminator" : firClause
 syntax &"rust" ident : firClause
 syntax withPosition(&"effects" (colGt ident)*) : firClause
+syntax withPosition(&"layers" (colGt ident)+) : firClause
+syntax &"dialect" ident : firClause
 syntax &"rule" many1Indent(firCheck) : firClause
 
 declare_syntax_cat firOp (behavior := both)
@@ -295,6 +318,8 @@ structure Decl where
   rust : Option String
   effects : List String
   rule : Option (Array (TSyntax `firCheck))
+  layers : Option (Array Ident) := none
+  dialect : Option Ident := none
 
 def fieldTy : String → FieldTy
   | "Int" => .int
@@ -363,6 +388,8 @@ def parseDecl (stx : TSyntax `firOp) : MacroM Decl := do
     | `(firClause| effects $es:ident*) =>
       d := { d with effects := es.toList.map (·.getId.toString) }
     | `(firClause| rule $checks:firCheck*) => d := { d with rule := some checks }
+    | `(firClause| layers $ls:ident*) => d := { d with layers := some ls }
+    | `(firClause| dialect $n:ident) => d := { d with dialect := some n }
     | _ => Macro.throwErrorAt c "bad clause"
   pure d
 
@@ -490,6 +517,31 @@ def immCtor : FieldTy → Name
   | .cases => `Imm.cases
   | _ => `Imm.flag
 
+/-- The namespace of a name template, before its first dot, if it has one. -/
+def namespace? (n : NameLine) : Option String :=
+  match n.parts.head!.splitOn "." with
+  | ns :: _ :: _ => some ns
+  | _ => none
+
+/-- The op's dialect: its `dialect` clause, or the namespace of its names. -/
+def dialectOf (d : Decl) : MacroM String := do
+  let ctor := d.ctor.getId.toString
+  let ns := d.names.filterMap namespace?
+  let dialect ← match d.dialect, ns with
+    | some n, _ => pure n.getId.toString
+    | none, n :: _ => pure n
+    | none, [] => Macro.throwErrorAt d.ctor s!"{ctor}: a name without a dot needs a dialect clause"
+  unless ns.all (· == dialect) do
+    Macro.throwErrorAt d.ctor s!"{ctor}: every name must start with the dialect '{dialect}.'"
+  pure dialect
+
+def layerKind (id : Ident) : MacroM Term :=
+  match id.getId.toString with
+  | "hfir" => `(LayerKind.hfir)
+  | "mfir" => `(LayerKind.mfir)
+  | "lfir" => `(LayerKind.lfir)
+  | s => Macro.throwErrorAt id s!"unknown layer '{s}': expected hfir, mfir, or lfir"
+
 def validate (d : Decl) : MacroM Unit := do
   let ctor := d.ctor.getId.toString
   let items ← match parseFormat d.format with
@@ -534,6 +586,13 @@ def validate (d : Decl) : MacroM Unit := do
           (fieldNamed r).isSome
         unless ok do Macro.throwErrorAt c s!"{ctor}: '{r}' is not bound"
       bound := bound ++ binds
+  -- Layers are listed once each; the names share the dialect.
+  if let some ls := d.layers then
+    let names := ls.toList.map (·.getId.toString)
+    if names.eraseDups.length != names.length then
+      Macro.throwErrorAt d.ctor s!"{ctor}: a layer is listed twice"
+    for l in ls do discard (layerKind l)
+  discard (dialectOf d)
 
 @[macro firOps] def expandFirOps : Macro := fun stx => do
   let mut cmds : Array Syntax := #[]
@@ -569,10 +628,13 @@ def validate (d : Decl) : MacroM Unit := do
     let doc := match d.doc with
       | some doc => doc.getDocString.trimAscii.toString
       | none => ""
+    let layers ← match d.layers with
+      | some ls => do `([$(← ls.mapM layerKind),*])
+      | none => `([LayerKind.hfir, LayerKind.mfir])
     `({ ctor := $(quote d.ctor.getId.toString), rust := $(quote (rustName d)),
         doc := $(quote doc), fields := [$fields,*], format := $(quote d.format),
         terminator := $(quote d.terminator), rule := $rule, effects := [$effects,*],
-        tier := .verified : OpDecl })
+        tier := .verified, layers := $layers, dialect := $(quote (← dialectOf d)) : OpDecl })
   cmds := cmds.push (← `(def opDecls : Array OpDecl := #[$declTerms,*]))
   let pats ← decls.mapM any
   let idxs := (Array.range decls.size).map fun i => (quote i : Term)

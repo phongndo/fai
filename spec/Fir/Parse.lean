@@ -45,6 +45,12 @@ arguments being among the operands. Operand and region counts aren't checked her
 checks them. The printer uses the readable form whenever the op's shape fits it, and the generic
 form otherwise.
 
+## Modules
+
+A module is a sequence of `layer`, `memspace`, `global`, `extern`, and `func` declarations. `layer
+hfir`, `layer mfir`, or `layer lfir aarch64` names its layer (decision: Layers), at most once;
+without it the module is HFIR. An LFIR target must be one of `targets`.
+
 ## Blocks
 
 `cf.blocks` holds labeled blocks, and branches name them:
@@ -555,17 +561,40 @@ def extern : P Extern := do
   let effects ← sepBy extEffect "]"
   pure { name, params, rets, effects, trust := ← trust }
 
+/-- `hfir`, `mfir`, or `lfir TARGET`, after `layer`. -/
+def layer : P Layer := do
+  match ← peek with
+  | .ident "hfir" => discard next; pure .hfir
+  | .ident "mfir" => discard next; pure .mfir
+  | .ident "lfir" =>
+    discard next
+    match ← peek with
+    | .ident t =>
+      unless targets.contains t do
+        fail s!"unknown target '{t}': expected {", ".intercalate targets}"
+      discard next
+      pure (.lfir t)
+    | t => fail s!"expected a target after lfir but found {t.describe}"
+  | .ident s => fail s!"unknown layer '{s}': expected hfir, mfir, or lfir"
+  | t => fail s!"expected a layer but found {t.describe}"
+
 def module : P Module := do
   let mut funcs := #[]
   let mut globals := #[]
   let mut externs := #[]
   let mut space : SpaceCfg := {}
+  let mut layer? : Option Layer := none
   while (← peek) != .eof do
-    if ← tryIdent "memspace" then space ← memspace
+    if (← peek) == .ident "layer" then
+      if layer?.isSome then fail "the module's layer is declared more than once"
+      discard next
+      layer? := some (← layer)
+    else if ← tryIdent "memspace" then space ← memspace
     else if ← tryIdent "global" then globals := globals.push (← global)
     else if ← tryIdent "extern" then externs := externs.push (← extern)
     else funcs := funcs.push (← func)
-  pure { space, globals := globals.toList, externs := externs.toList, funcs := funcs.toList }
+  pure { layer := layer?.getD .hfir, space, globals := globals.toList, externs := externs.toList,
+         funcs := funcs.toList }
 
 end P
 

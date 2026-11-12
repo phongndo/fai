@@ -361,6 +361,7 @@ fir_ops
   /-- `poison`: an integer `poison` value. -/
   op poison
     name "poison"
+    dialect value
     format ""
     rule
       operands []
@@ -369,6 +370,7 @@ fir_ops
   /-- `freeze %x`: `%x`, or an arbitrary value if it is `poison`. -/
   op freeze
     name "freeze"
+    dialect value
     format "%"
     rule
       operands t "freeze takes one operand"
@@ -378,6 +380,7 @@ fir_ops
   turns a load into a copy of the stored value), and copy propagation removes it. -/
   op copy
     name "copy"
+    dialect value
     format "%"
     rule
       operands t "copy takes one operand"
@@ -385,6 +388,7 @@ fir_ops
   /-- `select %c, %a, %b` -/
   op select
     name "select"
+    dialect value
     format "%, %, %"
     rule
       operands c a b "select takes three operands"
@@ -607,6 +611,7 @@ fir_ops
     name "func.ret"
     format "%*"
     terminator
+    layers hfir mfir lfir
   /-- `cf.blocks [progress] { ^entry: … ^b(%x: i32): … }`: labeled blocks, entered at the first
   (which has no parameters), with jumps between them. Each block ends with a terminator:
   `cf.yield` leaves with the op's results; `cf.br`, `cf.cond_br`, and `cf.switch` jump. With
@@ -661,6 +666,7 @@ fir_ops
   op ptrField (inbounds : Bool) (ty : Ty) (index : Index)
     name "ptr.field.{inbounds : offsetModes}"
     format "{ty} %, {index}"
+    layers hfir
     rule
       field ty index
       operands [ptr]
@@ -671,6 +677,7 @@ fir_ops
   op ptrIndex (inbounds : Bool) (ty : Ty)
     name "ptr.index.{inbounds : offsetModes}"
     format "{ty} %, %"
+    layers hfir
     rule
       sized ty
       operands [ptr, addr]
@@ -728,6 +735,64 @@ def OpKind.name (k : OpKind) : String :=
   match opNames.find? (·.value == e) with
   | some s => s.text
   | none => "?"
+
+/-! ## Layers
+
+A module's layer (decision: Layers): `layer hfir`, `layer mfir`, or `layer lfir aarch64`, where
+LFIR names its target. Each op's declaration lists the layers that allow it; HFIR and MFIR allow
+today's core ops, except that `ptr.field` and `ptr.index` are HFIR only (MFIR addresses with
+`ptr.offset` by computed offsets; decision: Layout). LFIR allows its target's dialect and, of the
+core ops, only `func.ret`, which ends a function. -/
+
+/-- The LFIR target dialects. A target's ops are declared with `fir_ops`, in its dialect and with
+`layers lfir`. -/
+def targets : List String := ["aarch64"]
+
+/-- A module's layer. -/
+inductive Layer where
+  | hfir
+  | mfir
+  /-- LFIR for a target, one of `targets`. -/
+  | lfir (target : String)
+  deriving DecidableEq, Repr, Inhabited
+
+def Layer.kind : Layer → LayerKind
+  | .hfir => .hfir
+  | .mfir => .mfir
+  | .lfir _ => .lfir
+
+def Layer.render : Layer → String
+  | .lfir t => s!"lfir {t}"
+  | l => l.kind.name
+
+/-- Whether a module of layer `l` may contain the op: the op lists the layer, and in LFIR, an op
+of a target's dialect belongs to the module's target. -/
+def Layer.allows (l : Layer) (d : OpDecl) : Bool :=
+  d.layers.contains l.kind &&
+    match l with
+    | .lfir t => d.dialect == t || !targets.contains d.dialect
+    | _ => true
+
+/-- The layers that allow the op, for messages: `hfir, mfir`, or `lfir aarch64` for a target's
+op. -/
+def OpDecl.layersText (d : OpDecl) : String :=
+  ", ".intercalate <| d.layers.map fun
+    | .lfir => if targets.contains d.dialect then s!"lfir {d.dialect}" else "lfir"
+    | k => k.name
+
+/-! No target has ops yet, so the target rule is checked on a made-up AArch64 op: allowed only in
+LFIR for AArch64, while LFIR for any target keeps `func.ret` and nothing else of the core. -/
+
+private def aarch64Op : OpDecl :=
+  { ctor := "nop", rust := "Nop", doc := "", fields := [], format := "", terminator := false,
+    rule := none, effects := [], tier := .verified, layers := [.lfir], dialect := "aarch64" }
+
+#guard (Layer.lfir "aarch64").allows aarch64Op
+#guard !(Layer.lfir "x86").allows aarch64Op
+#guard !Layer.mfir.allows aarch64Op && !Layer.hfir.allows aarch64Op
+#guard aarch64Op.layersText == "lfir aarch64"
+#guard (Layer.lfir "aarch64").allows OpKind.ret.decl
+#guard !(Layer.lfir "aarch64").allows (OpKind.const 0).decl
 
 /-- An operand: a value, or a hole `?name: T` standing for a value not written yet. -/
 inductive Operand where
@@ -847,6 +912,8 @@ structure Extern where
 def Extern.ty (x : Extern) : Ty := .func x.params x.rets
 
 structure Module where
+  /-- `layer …`; HFIR when the module doesn't say. -/
+  layer : Layer := .hfir
   /-- The default memory space. -/
   space : SpaceCfg := {}
   globals : List Global := []

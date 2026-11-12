@@ -183,6 +183,22 @@ def rustRule (d : OpDecl) (checks : List Check) : Except String (List String) :=
   if env.length > 4 then throw s!"{d.ctor}: a rule names at most 4 types"
   pure out
 
+/-! Layers and dialects (decisions: Layers, Dialects). -/
+
+/-- The `layers` and `dialect` fields of a declaration. A target's ops are never in HFIR. -/
+def rustLayerFields (d : OpDecl) : Except String (List String) := do
+  if targets.contains d.dialect && d.layers.contains .hfir then
+    throw s!"{d.ctor}: an op of the target {d.dialect} can't be in HFIR"
+  let has (k : LayerKind) := toString (d.layers.contains k)
+  pure [s!"        layers: crate::decl::Layers \{ hfir: {has .hfir}, mfir: {has .mfir}, lfir: {has .lfir} },",
+    s!"        dialect: {rustStr d.dialect},"]
+
+/-- The LFIR targets. -/
+def rustTargets : String :=
+  s!"/// The LFIR target dialects (Lean's `Fir.targets`).
+pub static TARGETS: [&str; {targets.length}] = [{", ".intercalate (targets.map rustStr)}];
+"
+
 def rustDecl (d : OpDecl) : Except String String := do
   let imms := d.imms.map fun f =>
     s!"Field \{ name: {rustStr f.name}, ty: FieldTy::{f.ty.rustDecl} }"
@@ -194,7 +210,8 @@ def rustDecl (d : OpDecl) : Except String String := do
       pure ("Some(&[\n" ++ String.join (cs.map (s!"            {·},\n")) ++ "        ])")
   let effects := d.effects.map fun e => s!"Effect::{capitalize (reprStr e |>.drop 11 |>.toString)}"
   let tier := s!"Tier::{capitalize (reprStr d.tier |>.drop 9 |>.toString)}"
-  pure <| String.intercalate "\n" [
+  let layers ← rustLayerFields d
+  pure <| String.intercalate "\n" <| [
     "    OpDecl {",
     s!"        ctor: {rustStr d.ctor},",
     s!"        imms: &[{", ".intercalate imms}],",
@@ -202,7 +219,7 @@ def rustDecl (d : OpDecl) : Except String String := do
     s!"        terminator: {d.terminator},",
     s!"        rule: {rule},",
     s!"        effects: &[{", ".intercalate effects}],",
-    s!"        tier: {tier},",
+    s!"        tier: {tier},"] ++ layers ++ [
     "    },"]
 
 def generate : Except String String := do
@@ -288,6 +305,7 @@ pub fn op_kind(name: &str) -> Option<OpKind> {
     })
 }
 "
+  out := emit out rustTargets
   out := emit out s!"static DECLS: [OpDecl; {decls.length}] = ["
   for d in decls do out := emit out (← rustDecl d)
   out := emit out "];"

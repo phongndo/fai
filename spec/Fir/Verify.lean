@@ -23,6 +23,8 @@ interpreter.
   definition, in the same region or a nested one). The blocks of `cf.blocks` are regions too: a
   value defined in a block is visible only in that block, and values from outside the
   `cf.blocks` in all of them; block arguments carry values from one block to another.
+* Layers: every op is allowed in the module's layer (`Layer.allows`), checked before anything
+  else about the op.
 * Ops: operand counts and types match the op; constants and facts fit their type; alignments
   are powers of two; calls match the callee's signature.
 * Control flow: a terminator is the last op of its region. `cf.yield` ends a `cf.if` region or
@@ -61,6 +63,7 @@ structure VState where
   defined : Std.HashSet String := {}
   holes : Array Hole := #[]
   space : SpaceCfg := {}
+  layer : Layer := .hfir
   /-- Each function's parameter and return types. -/
   sigs : Std.HashMap String (List Ty × List Ty) := {}
   globals : Std.HashSet String := {}
@@ -278,6 +281,9 @@ mutual
 
   partial def verifyOp (ctx : List RegionCtx) (scope : VScope) (op : Op) : VM VScope := do
     let loc := op.loc
+    let layer := (← get).layer
+    unless layer.allows op.kind.decl do
+      verr loc s!"{op.kind.name} is not allowed in layer {layer.render}; it is allowed in {op.kind.decl.layersText}"
     let ins ← op.args.mapM (operandTy loc scope)
     let outs := op.results.map (·.ty)
     match op.kind, op.regions with
@@ -413,7 +419,7 @@ def verifyModule (m : Module) : Except String (Array Hole) := do
     names := names.insert f.name
     sigs := sigs.insert f.name (f.params.map (·.ty), f.rets)
   -- Globals.
-  let st : VState := { space := sp, sigs, globals }
+  let st : VState := { space := sp, layer := m.layer, sigs, globals }
   for g in m.globals do
     let r := (do
       checkSized none g.ty
