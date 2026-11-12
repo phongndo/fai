@@ -22,8 +22,10 @@
 //! every kind of initializer, some `const` (and sometimes written anyway), and sometimes a data
 //! layout of their own. Functions' addresses are taken, stored, compared, exposed, and called
 //! through, usually with the right signature and sometimes with another, or through a data, null,
-//! offset, or poison pointer; globals hold function tables that calls dispatch through. Each
-//! program comes with argument lists and fuel limits.
+//! offset, or poison pointer; globals hold function tables that calls dispatch through. External
+//! functions (`@x0`, …) with random effects are called directly and through pointers and tables,
+//! so their events, the exposure of what they reach, and the facts on their results are
+//! covered. Each program comes with argument lists and fuel limits.
 
 use std::fmt::Write;
 
@@ -263,7 +265,10 @@ struct Gen<'r> {
     rng: &'r mut Rng,
     out: String,
     line: u32,
+    /// The functions' signatures, then the external functions'.
     sigs: Vec<Sig>,
+    /// How many functions there are; the rest of `sigs` are external functions.
+    nfuncs: usize,
     func: usize,
     /// The values visible here, with their types.
     scope: Vec<(String, T)>,
@@ -287,6 +292,64 @@ struct Gen<'r> {
 }
 
 impl Gen<'_> {
+    /// The name of function `k`: `f0`, `f1`, …, then the external functions `x0`, `x1`, ….
+    fn fn_name(&self, k: usize) -> String {
+        if k < self.nfuncs {
+            format!("f{k}")
+        } else {
+            format!("x{}", k - self.nfuncs)
+        }
+    }
+
+    /// The external functions, with random effects. Pointers passed to them are exposed along
+    /// with what their effects let them reach, so later `ptr.from_exposed` can find more.
+    fn declare_externs(&mut self) {
+        for k in self.nfuncs..self.sigs.len() {
+            let sig = &self.sigs[k];
+            let ps: Vec<String> = sig.params.iter().map(T::to_string).collect();
+            let rs: Vec<String> = sig.rets.iter().map(T::to_string).collect();
+            let rets = match rs.len() {
+                0 => String::new(),
+                1 => format!(" -> {}", rs[0]),
+                _ => format!(" -> ({})", rs.join(", ")),
+            };
+            let mut all = vec![
+                "read(args)",
+                "write(args)",
+                "read(exposed)",
+                "write(exposed)",
+                "read(globals)",
+                "write(globals)",
+                "alloc",
+                "free",
+                "trap",
+                "diverge",
+            ];
+            let mut effects = Vec::new();
+            while !all.is_empty() && self.rng.chance(55) {
+                let i = self.rng.below(all.len() as u64) as usize;
+                effects.push(all.remove(i));
+            }
+            let trust = if self.rng.chance(80) {
+                "assume"
+            } else {
+                "check"
+            };
+            let name = self.fn_name(k);
+            write!(
+                self.out,
+                "extern func @{name}({}){rets} effects[{}] {trust}",
+                ps.join(", "),
+                effects.join(", ")
+            )
+            .unwrap();
+            self.newline();
+        }
+        if self.sigs.len() > self.nfuncs {
+            self.newline();
+        }
+    }
+
     fn fresh(&mut self) -> String {
         self.next += 1;
         format!("v{}", self.next)
@@ -1451,7 +1514,8 @@ impl Gen<'_> {
     /// `func.addr` of any function; sometimes its address goes through an integer and back.
     fn func_addr(&mut self) {
         let k = self.rng.below(self.sigs.len() as u64) as usize;
-        let mut name = self.def(T::P, &format!("func.addr @f{k}"));
+        let f = self.fn_name(k);
+        let mut name = self.def(T::P, &format!("func.addr @{f}"));
         match self.rng.below(10) {
             0..=1 => {
                 let a = self.def(T::I(self.addr), &format!("ptr.expose %{name}"));
@@ -1497,7 +1561,10 @@ impl Gen<'_> {
                 self.rng.below(self.sigs.len() as u64) as usize
             };
             (
-                format!("%{}", self.def(T::P, &format!("func.addr @f{k}"))),
+                format!("%{}", {
+                    let f = self.fn_name(k);
+                    self.def(T::P, &format!("func.addr @{f}"))
+                }),
                 k,
             )
         } else {
@@ -1573,7 +1640,10 @@ impl Gen<'_> {
             Agg::Scalar(T::P) => match self.rng.below(3) {
                 0 => "null".to_owned(),
                 1 if n > 0 => format!("@g{}", self.rng.below(n as u64)),
-                _ => format!("@f{}", self.rng.below(self.sigs.len() as u64)),
+                _ => {
+                    let k = self.rng.below(self.sigs.len() as u64) as usize;
+                    format!("@{}", self.fn_name(k))
+                }
             },
             Agg::Struct(_, fs) => {
                 let items: Vec<String> = fs.iter().map(|f| self.init(f, n)).collect();
@@ -1600,7 +1670,10 @@ impl Gen<'_> {
                 let ks: Vec<usize> = (0..1 + self.rng.below(3))
                     .map(|_| self.rng.below(self.sigs.len() as u64) as usize)
                     .collect();
-                let items: Vec<String> = ks.iter().map(|k| format!("@f{k}")).collect();
+                let items: Vec<String> = ks
+                    .iter()
+                    .map(|&k| format!("@{}", self.fn_name(k)))
+                    .collect();
                 let agg = Agg::Array(ks.len() as u64, Box::new(Agg::Scalar(T::P)));
                 (agg, format!("{{{}}}", items.join(", ")), Some(ks))
             } else {
@@ -1639,13 +1712,23 @@ impl Gen<'_> {
         let params = self.sigs[callee].params.clone();
         let rets = self.sigs[callee].rets.clone();
         let args: Vec<String> = params.iter().map(|t| self.operand(*t)).collect();
+        // An external function's results sometimes carry facts, which the world's zeros may
+        // break: UB after the event.
+        let external = callee >= self.nfuncs;
         let results: Vec<(String, T, String)> = rets
             .iter()
-            .map(|t| (self.fresh(), *t, String::new()))
+            .map(|t| {
+                let facts = if external && self.rng.chance(15) {
+                    self.fact(*t, false)
+                } else {
+                    String::new()
+                };
+                (self.fresh(), *t, facts)
+            })
             .collect();
         self.op(
             &results,
-            &format!("func.call @f{callee}({})", args.join(", ")),
+            &format!("func.call @{}({})", self.fn_name(callee), args.join(", ")),
         );
     }
 
@@ -1769,6 +1852,26 @@ pub fn program(rng: &mut Rng) -> Program {
             .collect();
         sigs.push(Sig { params, rets });
     }
+    // External functions: their parameters are often pointers, so calls expose memory.
+    for _ in 0..rng.pick(&[0, 0, 1, 1, 2, 3]) {
+        let params: Vec<T> = (0..rng.below(4))
+            .map(|_| {
+                if rng.chance(55) {
+                    T::P
+                } else {
+                    T::I(rng.pick(&[1, 8, 32, 64, 128]))
+                }
+            })
+            .collect();
+        let rets: Vec<T> = (0..rng.below(3))
+            .map(|_| match rng.below(10) {
+                0..=2 => T::P,
+                3 => T::B(rng.pick(&[8, 32])),
+                _ => T::I(rng.pick(&[1, 8, 32, 64, 65, 128])),
+            })
+            .collect();
+        sigs.push(Sig { params, rets });
+    }
     let entry_params = sigs[0].params.clone();
     // The data layout: usually the default alignments, sometimes others.
     let natural = 1u64 << (u64::from(ptr_size) / 8).max(1).ilog2();
@@ -1793,6 +1896,7 @@ pub fn program(rng: &mut Rng) -> Program {
         out: String::new(),
         line: 1,
         sigs,
+        nfuncs,
         func: 0,
         scope: Vec::new(),
         mems: Vec::new(),
@@ -1823,6 +1927,7 @@ pub fn program(rng: &mut Rng) -> Program {
         g.newline();
     }
     g.declare_globals();
+    g.declare_externs();
     for i in 0..nfuncs {
         g.func(i);
     }

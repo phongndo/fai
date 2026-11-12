@@ -2,7 +2,11 @@
 //! always answers `0` (the one `fir-ref run` uses): `freeze` of `poison` gives `0`, allocations
 //! succeed, allocation ids and tags count up from 1, addresses are assigned first-fit from
 //! `0x1000`, and comparing a one-past-the-end pointer with a pointer into another allocation
-//! gives "not equal". [`run`] prints the same one-line outcome as `fir-ref run`.
+//! gives "not equal"; and for the world that answers every external call with zeros and changes
+//! nothing (Lean's `World.zero`). [`run`] prints the same one-line outcome as `fir-ref run`: the
+//! run's events (external calls), then how it ended. An external call exposes what the callee can
+//! reach, as in Lean, and returns its results one step later (`Frame::ExternRet`, Lean's
+//! synthesized `func.ret`), so the caller checks them as it checks any callee's.
 //!
 //! The machine follows the crate's data-oriented rules (see [`crate::Body`]):
 //!
@@ -28,7 +32,7 @@
 use std::fmt::Write;
 
 use num_bigint::{BigInt, BigUint};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::body::{Body, Int, OpId, Operand, OperandKind, RegionId, Succ, ValueId};
 use crate::ir::*;
@@ -128,6 +132,9 @@ enum Frame {
         progress: bool,
         allocs: u32,
     },
+    /// An external call that has returned, about to bind its results: Lean's synthesized
+    /// `func.ret` block and the call frame under it. `ext` is the external function's index.
+    ExternRet { op: OpId, ext: u32 },
     /// A call: the call op (`None` for the call from outside), the caller's function and slots,
     /// and where the callee's scopes and allocations start.
     Call {
@@ -204,7 +211,8 @@ enum Kind {
     Heap(u32),
     /// A global, by index in the module.
     Global(u32),
-    /// A function, by index in the module.
+    /// A function: its index in the module's functions, or, from the number of functions on, in
+    /// its external functions.
     Func(u32),
 }
 
@@ -382,7 +390,12 @@ pub fn run(m: &Module, name: &str, args: &[&str], fuel: u64) -> Result<String, S
 
 struct Machine<'m> {
     module: &'m Module,
+    /// Functions, then external functions, by name: an index like `Kind::Func`'s.
     funcs: FxHashMap<&'m str, u32>,
+    /// How many functions the module has (external functions are numbered after them).
+    nfuncs: u32,
+    /// The events so far, each followed by `; `, as the outcome line shows them.
+    trace: String,
     space: &'m SpaceCfg,
     /// Pointers (indices into `ptrs`) to the globals, by name.
     globals: FxHashMap<&'m str, u32>,
@@ -423,6 +436,10 @@ impl<'m> Machine<'m> {
         for (i, f) in module.funcs.iter().enumerate() {
             funcs.insert(f.name.as_str(), i as u32);
         }
+        let nfuncs = module.funcs.len() as u32;
+        for (i, x) in module.externs.iter().enumerate() {
+            funcs.insert(x.name.as_str(), nfuncs + i as u32);
+        }
         let mut allocs = Allocs::default();
         allocs.size.push(0);
         allocs.align.push(1);
@@ -435,9 +452,11 @@ impl<'m> Machine<'m> {
         let mut m = Machine {
             module,
             funcs,
+            nfuncs,
+            trace: String::new(),
             space: &module.space,
             globals: FxHashMap::default(),
-            fn_ptrs: vec![NONE; module.funcs.len()],
+            fn_ptrs: vec![NONE; module.funcs.len() + module.externs.len()],
             slots: Vec::new(),
             wides: Vec::new(),
             byte_vals: Vec::new(),
@@ -576,6 +595,15 @@ impl<'m> Machine<'m> {
 
     fn body(&self) -> &'m Body {
         &self.module.funcs[self.func as usize].body
+    }
+
+    /// The name of function `f` (an index like `Kind::Func`'s).
+    fn fn_name(&self, f: u32) -> &'m str {
+        let module: &'m Module = self.module;
+        match module.funcs.get(f as usize) {
+            Some(func) => &func.name,
+            None => &module.externs[(f - self.nfuncs) as usize].name,
+        }
     }
 
     // Values
@@ -986,19 +1014,23 @@ impl<'m> Machine<'m> {
     fn ptr_expose(&mut self, loc: Option<Loc>, p: u32) -> R<u64> {
         let addr = self.ptr_addr(loc, p)?;
         if let Ptr::Rel { alloc, tag, .. } = self.ptrs[p as usize] {
-            let mut cur = self.allocs.exposed[alloc as usize];
-            while cur != NONE {
-                let (t, next) = self.exposures[cur as usize];
-                if t == tag {
-                    return Ok(addr);
-                }
-                cur = next;
-            }
-            self.exposures
-                .push((tag, self.allocs.exposed[alloc as usize]));
-            self.allocs.exposed[alloc as usize] = (self.exposures.len() - 1) as u32;
+            self.add_exposure(alloc, tag);
         }
         Ok(addr)
+    }
+
+    /// Record that allocation `a`'s tag `tag` is exposed, if it isn't yet.
+    fn add_exposure(&mut self, a: u32, tag: u32) {
+        let mut cur = self.allocs.exposed[a as usize];
+        while cur != NONE {
+            let (t, next) = self.exposures[cur as usize];
+            if t == tag {
+                return;
+            }
+            cur = next;
+        }
+        self.exposures.push((tag, self.allocs.exposed[a as usize]));
+        self.allocs.exposed[a as usize] = (self.exposures.len() - 1) as u32;
     }
 
     /// A pointer from an address: every exposed `(allocation, tag)` whose allocation is live and
@@ -1112,7 +1144,7 @@ impl<'m> Machine<'m> {
             return ub(UbKind::UseAfterFree, loc, self.dead_note(a));
         }
         if let Kind::Func(f) = self.allocs.kind[ai] {
-            let f = &self.module.funcs[f as usize].name;
+            let f = self.fn_name(f);
             return ub(UbKind::FuncAccess, loc, format!("@{f} is a function"));
         }
         let asize = self.allocs.size[ai];
@@ -1441,7 +1473,7 @@ impl<'m> Machine<'m> {
                 Kind::Global(g) => {
                     format!("@{} is a global", self.module.globals.name(g as usize))
                 }
-                Kind::Func(f) => format!("@{} is a function", self.module.funcs[f as usize].name),
+                Kind::Func(f) => format!("@{} is a function", self.fn_name(f)),
             };
             return ub(UbKind::BadFree, loc, note);
         }
@@ -1893,42 +1925,220 @@ impl<'m> Machine<'m> {
         let Kind::Func(f) = self.allocs.kind[a as usize] else {
             return ub(UbKind::BadCall, loc, format!("#{a} is not a function"));
         };
-        let callee = &self.module.funcs[f as usize];
+        let name = self.fn_name(f);
         if off != 0 {
             return ub(
                 UbKind::BadCall,
                 loc,
-                format!("offset {off} is not the start of @{}", callee.name),
+                format!("offset {off} is not the start of @{name}"),
             );
         }
-        let cb = &callee.body;
-        let params = cb.params(cb.entry()).map(|v| cb.ty(v));
-        let ok = match self.body().types().shape_of(sig) {
-            Some(Shape::Func(ps, rs)) => {
-                params.len() == ps.len()
-                    && params.clone().eq(ps.iter().copied())
-                    && callee.rets == rs
+        // Parameter and result types; they are value types, which need no table.
+        let module: &'m Module = self.module;
+        let mut params = Vec::new();
+        let rets: &[Ty] = match module.funcs.get(f as usize) {
+            Some(callee) => {
+                let cb = &callee.body;
+                params.extend(cb.params(cb.entry()).map(|v| cb.ty(v)));
+                &callee.rets
             }
+            None => {
+                let x = &module.externs[(f - self.nfuncs) as usize];
+                params.extend_from_slice(&x.params);
+                &x.rets
+            }
+        };
+        let ok = match self.body().types().shape_of(sig) {
+            Some(Shape::Func(ps, rs)) => params == ps && rets == rs,
             _ => false,
         };
         if !ok {
             let mut t = String::from("func<(");
-            for (i, p) in params.enumerate() {
+            for (i, p) in params.iter().enumerate() {
                 if i > 0 {
                     t.push_str(", ");
                 }
                 write!(t, "{p}").unwrap();
             }
             t.push(')');
-            crate::types::write_rets(&mut t, &callee.rets, |out, r| write!(out, "{r}").unwrap());
+            crate::types::write_rets(&mut t, rets, |out, r| write!(out, "{r}").unwrap());
             t.push('>');
-            return ub(
-                UbKind::BadCall,
-                loc,
-                format!("@{} has type {t}", callee.name),
-            );
+            return ub(UbKind::BadCall, loc, format!("@{name} has type {t}"));
         }
         Ok(f)
+    }
+
+    // External calls
+
+    /// The zero value of a value type (Lean's `Ty.zero`).
+    fn zero(&mut self, t: Ty) -> Value {
+        match t {
+            Ty::Int(w) if w <= 64 => Value::Int { w, bits: 0 },
+            Ty::Int(w) => {
+                self.wides.push(BigUint::default());
+                Value::Wide {
+                    w,
+                    id: (self.wides.len() - 1) as u32,
+                }
+            }
+            Ty::Ptr => Value::Ptr(NULL),
+            Ty::Byte(w) => {
+                let start = self.byte_vals.len() as u32;
+                let n = w / 8;
+                self.byte_vals
+                    .extend(std::iter::repeat_n(Byte::Bits(0), n as usize));
+                Value::Bytes { start, len: n }
+            }
+            Ty::Agg(_) => Value::Bytes { start: 0, len: 0 },
+        }
+    }
+
+    /// The `(allocation, tag)` pairs pointer `p` may access memory through (Lean's
+    /// `Ptr.pairs`).
+    fn push_pairs(&self, p: u32, out: &mut Vec<(u32, u32)>) {
+        match self.ptrs[p as usize] {
+            Ptr::Rel { alloc, tag, .. } => out.push((alloc, tag)),
+            Ptr::Abs { cands, .. } => out.extend_from_slice(self.cands(cands)),
+        }
+    }
+
+    /// Whether an external function may access allocation `a` for `how` (Lean's `mayAccess`).
+    fn may_access(
+        &self,
+        x: &Extern,
+        how: fn(MemClass) -> ExtEffect,
+        arg_allocs: &[u32],
+        reach: &FxHashSet<u32>,
+        a: u32,
+    ) -> bool {
+        let ai = a as usize;
+        let kind = self.allocs.kind[ai];
+        let global = matches!(kind, Kind::Global(_));
+        let constant = matches!(kind, Kind::Global(g) if self.module.globals.is_const(g as usize));
+        self.allocs.live[ai]
+            && !matches!(kind, Kind::Func(_))
+            && !(how(MemClass::Args) == ExtEffect::Write(MemClass::Args) && constant)
+            && ((x.has(how(MemClass::Args)) && arg_allocs.contains(&a))
+                || (x.has(how(MemClass::Globals)) && global)
+                || (x.has(how(MemClass::Exposed)) && reach.contains(&a)))
+    }
+
+    /// What an external call can reach (Lean's `externReach`): its roots, then the pointers
+    /// stored in memory it may read, until nothing new turns up.
+    fn extern_reach(&self, x: &Extern, vs: &[Value]) -> Vec<(u32, u32)> {
+        let names = |m| x.has(ExtEffect::Read(m)) || x.has(ExtEffect::Write(m));
+        let mut found = Vec::new();
+        for &v in vs {
+            if let Value::Ptr(p) = v {
+                self.push_pairs(p, &mut found);
+            }
+        }
+        let arg_allocs: Vec<u32> = found.iter().map(|&(a, _)| a).collect();
+        if names(MemClass::Globals) {
+            found.extend((1..=self.module.globals.len() as u32).map(|a| (a, a)));
+        }
+        if names(MemClass::Exposed) {
+            for a in 1..self.allocs.size.len() {
+                if self.allocs.live[a] {
+                    let mut cur = self.allocs.exposed[a];
+                    while cur != NONE {
+                        let (t, next) = self.exposures[cur as usize];
+                        found.push((a as u32, t));
+                        cur = next;
+                    }
+                }
+            }
+        }
+        let mut reach = Vec::new();
+        let mut seen = FxHashSet::default();
+        for pair in found.drain(..) {
+            if seen.insert(pair) {
+                reach.push(pair);
+            }
+        }
+        loop {
+            let allocs: FxHashSet<u32> = reach.iter().map(|&(a, _)| a).collect();
+            let mut done = FxHashSet::default();
+            for &(a, _) in &reach {
+                if !done.insert(a) || !self.may_access(x, ExtEffect::Read, &arg_allocs, &allocs, a)
+                {
+                    continue;
+                }
+                let size = self.allocs.size[a as usize];
+                let frag = |b: Byte, found: &mut Vec<(u32, u32)>| {
+                    if let Byte::Frag { ptr, .. } = b {
+                        self.push_pairs(ptr, found);
+                    }
+                };
+                match &self.allocs.bytes[a as usize] {
+                    Mem::Dense(v) => {
+                        for &b in v.iter().take(size as usize) {
+                            frag(b, &mut found);
+                        }
+                    }
+                    Mem::Sparse(m) => {
+                        let mut offs: Vec<u64> = m.keys().copied().filter(|&o| o < size).collect();
+                        offs.sort_unstable();
+                        for o in offs {
+                            frag(m[&o], &mut found);
+                        }
+                    }
+                }
+            }
+            let before = reach.len();
+            for pair in found.drain(..) {
+                if seen.insert(pair) {
+                    reach.push(pair);
+                }
+            }
+            if reach.len() == before {
+                return reach;
+            }
+        }
+    }
+
+    /// Call external function `x` (Lean's `callExtern`, in the world that answers zeros and
+    /// changes nothing): check the arguments, expose everything the callee can reach, record the
+    /// event, and return the results through an `ExternRet` frame, one step later.
+    fn call_extern(&mut self, op: OpId, loc: Option<Loc>, x: u32, vs: &[Value]) -> R<()> {
+        let module: &'m Module = self.module;
+        let ext = &module.externs[x as usize];
+        if vs.len() != ext.params.len()
+            || !vs.iter().zip(&ext.params).all(|(&v, &t)| self.has_ty(v, t))
+        {
+            return stuck(loc, format!("wrong arguments for @{}", ext.name));
+        }
+        for (a, t) in self.extern_reach(ext, vs) {
+            if self.allocs.live[a as usize] {
+                self.realize(loc, a)?;
+                self.add_exposure(a, t);
+            }
+        }
+        let mut trace = std::mem::take(&mut self.trace);
+        trace.push('@');
+        trace.push_str(&ext.name);
+        trace.push('(');
+        for (i, &v) in vs.iter().enumerate() {
+            if i > 0 {
+                trace.push_str(", ");
+            }
+            self.render_value(v, &mut trace);
+        }
+        trace.push_str(") -> ");
+        if ext.rets.is_empty() {
+            trace.push_str("()");
+        }
+        for (i, &t) in ext.rets.iter().enumerate() {
+            if i > 0 {
+                trace.push_str(", ");
+            }
+            let v = self.zero(t);
+            self.render_value(v, &mut trace);
+        }
+        trace.push_str("; ");
+        self.trace = trace;
+        self.frames.push(Frame::ExternRet { op, ext: x });
+        Ok(())
     }
 
     /// The heap allocations still live, for the leak report.
@@ -2200,6 +2410,11 @@ impl<'m> Machine<'m> {
                     OpKind::CallIndirect(sig) => (self.call_target(loc, sig, &vs)?, 1),
                     _ => unreachable!(),
                 };
+                if f >= self.nfuncs {
+                    self.call_extern(op, loc, f - self.nfuncs, &vs[args..])?;
+                    self.scratch = vs;
+                    return Ok(());
+                }
                 let (caller, caller_base) = (self.func, self.base);
                 let scopes = self.scopes.len() as u32;
                 self.func = f;
@@ -2266,6 +2481,21 @@ impl<'m> Machine<'m> {
 
     /// One step of the machine (Lean's `step`).
     fn step(&mut self) -> R<()> {
+        if let Some(&Frame::ExternRet { op, ext }) = self.frames.last() {
+            // The synthesized `func.ret`: bind the results as any callee's are bound.
+            self.frames.pop();
+            let module: &'m Module = self.module;
+            let mut vs = std::mem::take(&mut self.scratch);
+            vs.clear();
+            for &t in &module.externs[ext as usize].rets {
+                let v = self.zero(t);
+                vs.push(v);
+            }
+            let body = self.body();
+            let r = self.bind(body.loc(op), body.results(op), &vs);
+            self.scratch = vs;
+            return r;
+        }
         let Some(&Frame::Block { next, allocs }) = self.frames.last() else {
             return stuck(None, "no block to run");
         };
@@ -2316,10 +2546,10 @@ impl<'m> Machine<'m> {
                     )
                 });
                 let tail = if progress { " in a progress loop" } else { "" };
-                return format!("out of fuel after {fuel} steps{tail}");
+                return format!("{}out of fuel after {fuel} steps{tail}", self.trace);
             }
             if let Err(h) = self.step() {
-                return h.render();
+                return format!("{}{}", self.trace, h.render());
             }
             steps += 1;
         }

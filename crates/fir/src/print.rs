@@ -531,6 +531,32 @@ impl Module {
         if !g.is_empty() {
             out.push('\n');
         }
+        for x in &self.externs {
+            out.push_str("extern func @");
+            out.push_str(&x.name);
+            out.push('(');
+            for (i, &t) in x.params.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                push_ty(&mut out, &g.types, t);
+            }
+            out.push(')');
+            write_rets(&mut out, &x.rets, |out, t| push_ty(out, &g.types, *t));
+            out.push_str(" effects[");
+            for (i, e) in x.effects.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write!(out, "{e}").unwrap();
+            }
+            out.push_str("] ");
+            out.push_str(x.trust.name());
+            out.push('\n');
+        }
+        if !self.externs.is_empty() {
+            out.push('\n');
+        }
         for (i, f) in self.funcs.iter().enumerate() {
             if i > 0 {
                 out.push('\n');

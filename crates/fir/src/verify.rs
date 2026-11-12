@@ -72,6 +72,14 @@ pub fn verify_module(m: &Module) -> Result<Vec<Hole>, String> {
         }
     }
     let mut sigs = FxHashMap::default();
+    for x in &m.externs {
+        if sigs.contains_key(x.name.as_str())
+            || (!globals.is_empty() && globals.contains(x.name.as_str()))
+        {
+            return Err(format!("function @{} is defined more than once", x.name));
+        }
+        sigs.insert(x.name.as_str(), (x.params.clone(), x.rets.clone()));
+    }
     for f in &m.funcs {
         if sigs.contains_key(f.name.as_str())
             || (!globals.is_empty() && globals.contains(f.name.as_str()))
@@ -92,6 +100,35 @@ pub fn verify_module(m: &Module) -> Result<Vec<Hole>, String> {
         }
         let named = |s: &str| globals.contains(s) || sigs.contains_key(s);
         check_init(gs, &named, sp, name, t, gs.init(i))?;
+    }
+    // External functions.
+    for x in &m.externs {
+        for &t in x.params.iter().chain(&x.rets) {
+            if !t.is_value() {
+                return Err(format!(
+                    "extern @{}: {} is not a value type",
+                    x.name,
+                    gs.types.show(t)
+                ));
+            }
+        }
+        for (i, e) in x.effects.iter().enumerate() {
+            if x.effects[..i].contains(e) {
+                return Err(format!("extern @{}: {e} is listed twice", x.name));
+            }
+            if *e == ExtEffect::Unwind {
+                return Err(format!(
+                    "extern @{}: unwinding out of an external function is not supported yet",
+                    x.name
+                ));
+            }
+        }
+        if x.trust == Trust::Proved {
+            return Err(format!(
+                "extern @{}: the effects of an external function can be assumed or checked, not proved",
+                x.name
+            ));
+        }
     }
     // Signatures, so that calls only ever compare value types.
     for f in &m.funcs {

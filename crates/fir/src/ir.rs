@@ -224,11 +224,74 @@ pub enum AllocFail {
     Trap,
 }
 
-/// A module: the default memory space, globals, and functions.
+/// Memory an external function's effects can name (Lean's `MemClass`): the allocations its
+/// pointer arguments point into, every exposed allocation, or the module's globals.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum MemClass {
+    Args,
+    Exposed,
+    Globals,
+}
+
+impl MemClass {
+    pub fn name(self) -> &'static str {
+        match self {
+            MemClass::Args => "args",
+            MemClass::Exposed => "exposed",
+            MemClass::Globals => "globals",
+        }
+    }
+}
+
+/// What an external function may do (Lean's `ExtEffect`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ExtEffect {
+    Read(MemClass),
+    Write(MemClass),
+    Alloc,
+    Free,
+    Trap,
+    Diverge,
+    Unwind,
+}
+
+impl fmt::Display for ExtEffect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExtEffect::Read(m) => write!(f, "read({})", m.name()),
+            ExtEffect::Write(m) => write!(f, "write({})", m.name()),
+            ExtEffect::Alloc => f.write_str("alloc"),
+            ExtEffect::Free => f.write_str("free"),
+            ExtEffect::Trap => f.write_str("trap"),
+            ExtEffect::Diverge => f.write_str("diverge"),
+            ExtEffect::Unwind => f.write_str("unwind"),
+        }
+    }
+}
+
+/// `extern func @puts(ptr) -> i32 effects[read(args)] assume`: a function outside the module.
+/// Its types are in the module's [`Globals::types`] table.
+#[derive(Clone, Debug)]
+pub struct Extern {
+    pub name: String,
+    pub params: Vec<Ty>,
+    pub rets: Vec<Ty>,
+    pub effects: Vec<ExtEffect>,
+    pub trust: Trust,
+}
+
+impl Extern {
+    pub fn has(&self, e: ExtEffect) -> bool {
+        self.effects.contains(&e)
+    }
+}
+
+/// A module: the default memory space, globals, external functions, and functions.
 #[derive(Clone, Debug, Default)]
 pub struct Module {
     pub space: SpaceCfg,
     pub globals: Globals,
+    pub externs: Vec<Extern>,
     pub funcs: Vec<Func>,
 }
 

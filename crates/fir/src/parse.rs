@@ -1036,6 +1036,94 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// `args`, `exposed`, or `globals`.
+    fn mem_class(&mut self) -> PResult<MemClass> {
+        match self.ident()? {
+            "args" => Ok(MemClass::Args),
+            "exposed" => Ok(MemClass::Exposed),
+            "globals" => Ok(MemClass::Globals),
+            s => self.fail(format!(
+                "expected args, exposed, or globals but found '{s}'"
+            )),
+        }
+    }
+
+    /// `read(args)`, `write(exposed)`, `alloc`, `free`, `trap`, `diverge`, or `unwind`.
+    fn ext_effect(&mut self) -> PResult<ExtEffect> {
+        let name = self.ident()?;
+        Ok(match name {
+            "read" | "write" => {
+                self.expect_sym(Sym::LParen)?;
+                let m = self.mem_class()?;
+                self.expect_sym(Sym::RParen)?;
+                if name == "read" {
+                    ExtEffect::Read(m)
+                } else {
+                    ExtEffect::Write(m)
+                }
+            }
+            "alloc" => ExtEffect::Alloc,
+            "free" => ExtEffect::Free,
+            "trap" => ExtEffect::Trap,
+            "diverge" => ExtEffect::Diverge,
+            "unwind" => ExtEffect::Unwind,
+            s => return self.fail(format!("unknown effect '{s}'")),
+        })
+    }
+
+    /// `extern func @name(T, …) [-> T | -> (T, …)] effects[E, …] TRUST`, after `extern`. The
+    /// types go in the module's table.
+    fn extern_decl(&mut self) -> PResult<Extern> {
+        if !self.try_ident("func")? {
+            return self.fail("expected 'func' after 'extern'");
+        }
+        let name = match self.peek() {
+            Tok::Global(s) => {
+                self.bump()?;
+                s.to_owned()
+            }
+            t => {
+                return self.fail(format!(
+                    "expected a function name like @main but found {}",
+                    t.describe()
+                ));
+            }
+        };
+        self.in_globals = true;
+        let sig = self.extern_sig();
+        self.in_globals = false;
+        let (params, rets) = sig?;
+        if !self.try_ident("effects")? {
+            return self.fail("expected 'effects' after an external function's signature");
+        }
+        self.expect_sym(Sym::LBracket)?;
+        let effects = self.sep_by(Self::ext_effect, Sym::RBracket)?;
+        let trust = self.trust()?;
+        Ok(Extern {
+            name,
+            params,
+            rets,
+            effects,
+            trust,
+        })
+    }
+
+    /// `(T, …) [-> T | -> (T, …)]`
+    fn extern_sig(&mut self) -> PResult<(Vec<Ty>, Vec<Ty>)> {
+        self.expect_sym(Sym::LParen)?;
+        let params = self.sep_by(Self::ty, Sym::RParen)?;
+        let rets = if self.try_sym(Sym::Arrow)? {
+            if self.try_sym(Sym::LParen)? {
+                self.sep_by(Self::ty, Sym::RParen)?
+            } else {
+                vec![self.ty()?]
+            }
+        } else {
+            Vec::new()
+        };
+        Ok((params, rets))
+    }
+
     fn module(&mut self) -> PResult<Module> {
         let mut m = Module::default();
         while self.peek() != Tok::Eof {
@@ -1043,6 +1131,9 @@ impl<'a> Parser<'a> {
                 m.space = self.memspace()?;
             } else if self.try_ident("global")? {
                 self.global()?;
+            } else if self.try_ident("extern")? {
+                let x = self.extern_decl()?;
+                m.externs.push(x);
             } else {
                 m.funcs.push(self.func()?);
             }

@@ -1,6 +1,6 @@
 //! Differential fuzzing of the interpreter: random well-typed programs (see `progs`) are run by
 //! this crate's interpreter and by `fir-ref run`, with random arguments and fuel limits, and the
-//! outcomes must be identical.
+//! outcomes must be identical, events included.
 //!
 //! By default 200 programs run. `FIR_FUZZ=N` runs N, and `FIR_FUZZ_SEED=S` picks another seed;
 //! program `k` of seed `S` is always the same, so a failure names the program to replay. Failing
@@ -49,9 +49,19 @@ fn theirs(tool: &Path, file: &Path, args: &[String], fuel: u64) -> Printed {
     )
 }
 
-/// The kind of outcome, for the statistics: `returned`, `ub noalias`, `out of fuel`, ...
+/// The number of events a run printed before its outcome.
+fn events(p: &Printed) -> usize {
+    p.0.split("; ").take_while(|s| s.starts_with('@')).count()
+}
+
+/// The kind of outcome, after any events, for the statistics: `returned`, `ub noalias`, `out of
+/// fuel`, ...
 fn kind(p: &Printed) -> String {
-    let line = if p.2 == 0 { &p.0 } else { "error" };
+    let line = if p.2 == 0 {
+        p.0.split("; ").find(|s| !s.starts_with('@')).unwrap_or("")
+    } else {
+        "error"
+    };
     let words: Vec<&str> = line.split_whitespace().collect();
     match words.as_slice() {
         ["returned", ..] => "returned".to_owned(),
@@ -100,7 +110,14 @@ fn interpreter_matches_reference_on_random_programs() {
                     let mut keep = false;
                     for (args, fuel) in &prog.runs {
                         let (a, b) = (ours(&m, args, *fuel), theirs(&tool, &file, args, *fuel));
-                        *stats.lock().unwrap().entry(kind(&b)).or_default() += 1;
+                        let mut st = stats.lock().unwrap();
+                        *st.entry(kind(&b)).or_default() += 1;
+                        let n = events(&b) as u64;
+                        if n > 0 {
+                            *st.entry("(runs with events)".to_owned()).or_default() += 1;
+                            *st.entry("(events)".to_owned()).or_default() += n;
+                        }
+                        drop(st);
                         if show.as_ref().is_some_and(|k| b.0.starts_with(k)) {
                             keep = true;
                             eprintln!(
@@ -129,7 +146,11 @@ fn interpreter_matches_reference_on_random_programs() {
         }
     });
     let stats = stats.into_inner().unwrap();
-    let runs: u64 = stats.values().sum();
+    let runs: u64 = stats
+        .iter()
+        .filter(|(k, _)| !k.starts_with('('))
+        .map(|(_, n)| n)
+        .sum();
     eprintln!("{count} programs, {runs} runs (seed {seed}); outcomes:");
     for (k, n) in &stats {
         eprintln!("  {n:6}  {k}");
