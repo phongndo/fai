@@ -107,7 +107,8 @@ blocks. Every op carries its C construct's `@line:col` (the expansion location f
 every function its file.
 
 A struct is `struct<C>{…}` with its members in order; the bytes of bitfields and any gap are
-`array<k x i8>` padding, and a struct Clang aligns more than its members (bitfields, `_Alignas`)
+`array<k x i8>` padding (explicit for bitfields even where FIR's alignment would leave the bytes
+implicit, so a global's initializer can set them), and a struct Clang aligns more than its members (bitfields, `_Alignas`)
 starts with an `array<0 x iN>` that carries the alignment. A union is a struct of its size and
 alignment, read and written through pointers. Every struct's size, alignment, and member offsets
 are checked against Clang's `ASTRecordLayout` with `fir_type_layout` and `fir_type_field_offset`;

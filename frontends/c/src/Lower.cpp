@@ -310,6 +310,10 @@ private:
       unsupported(def->getLocation(), "alignments above 16");
     unsigned firAlign = 1;
     uint64_t cur = 0;
+    // Whether bitfields lie between `cur` and the next member (or the end): their bytes get an
+    // explicit padding slot even where FIR's layout would leave them implicit, since a global's
+    // initializer only sets the bytes of its fields (FIR zeroes the rest).
+    bool bitsPending = false;
     auto pad = [&](uint64_t from, uint64_t len) {
       FirType t = ck(fir_type_array(m, len, fir_type_int(8)), "fir_type_array");
       info.slots.push_back({Slot::Pad, nullptr, from, len, t});
@@ -323,6 +327,7 @@ private:
         if (bits(fd->getType()) > 64)
           unsupported(fd->getLocation(), "bitfields wider than 64 bits");
         info.bits[fd] = {bitOff, w};
+        bitsPending = true;
         continue;
       }
       if (info.isUnion) {
@@ -334,11 +339,11 @@ private:
       uint32_t falign;
       layoutOf(ft, fsize, falign);
       uint64_t off = bitOff / 8;
-      if (alignUp(cur, falign) != off) {
-        if (off < cur || off % falign != 0)
-          layoutMismatch(def, "field '" + fd->getName().str() + "'");
+      if (off < cur || off % falign != 0)
+        layoutMismatch(def, "field '" + fd->getName().str() + "'");
+      if (bitsPending || alignUp(cur, falign) != off)
         pad(cur, off - cur);
-      }
+      bitsPending = false;
       info.index[fd] = (uint32_t)info.slots.size();
       info.slots.push_back({Slot::Member, fd, off, fsize, ft});
       cur = off + fsize;
@@ -354,7 +359,7 @@ private:
       for (auto &e : info.index)
         e.second++;
     }
-    if (alignUp(cur, info.align) != info.size)
+    if (bitsPending || alignUp(cur, info.align) != info.size)
       pad(cur, info.size - cur);
     std::vector<FirType> tys;
     for (const Slot &s : info.slots)
