@@ -5,8 +5,10 @@
 //! compiler: `$FIR_CC`, `cc` on AArch64, else `aarch64-unknown-linux-gnu-cc`, at `-O1`, with
 //! `-ffp-contract=off`: `fai-cc` never fuses `a * b + c` into an `fma`), by `fai-cc`, and by
 //! `fai-cc -O`. Each binary is linked with the output helpers of
-//! `frontends/c/tests/runtime/fai_runtime.c` and libm, and run (under `qemu-aarch64` off
-//! AArch64), and the three must print the same and exit with the same code. Each program's HFIR
+//! `frontends/c/tests/runtime/fai_runtime.c` and libm, and with `frontends/c/tests/extern/NAME.c`
+//! compiled by the reference compiler if the program has one (C functions it calls, and that
+//! call it, compiled separately), and run (under `qemu-aarch64` off AArch64), and the three must
+//! print the same and exit with the same code. Each program's HFIR
 //! (`fai-cc --emit hfir`) also runs in the interpreter, under Arm's NaN choice (the NaNs the
 //! hardware gives, as the backend's harness does), whose calls of the output helpers (events)
 //! must spell the same text and whose result the same exit code; a program that calls other
@@ -190,6 +192,8 @@ fn run_native(tc: &Toolchain, exe: &Path) -> Result<Behavior, String> {
         }
         None => Command::new(exe),
     };
+    // In the binary's directory, where a crash's core file (qemu writes one) belongs.
+    cmd.current_dir(exe.parent().unwrap());
     let out = run_limited(&mut cmd, Duration::from_secs(60))?;
     match out.status.code() {
         Some(code) => Ok(Behavior {
@@ -290,12 +294,38 @@ fn one(file: &Path, fai: &Path, tc: &Toolchain, rt: &Path, out: &Path, tally: &M
             .failures
             .push(format!("{name}: {msg}"))
     };
+    // The program's separately compiled C functions, if it has any.
+    let helper = file
+        .parent()
+        .unwrap()
+        .join("extern")
+        .join(format!("{name}.c"));
+    let mut objs = vec![rt.to_path_buf()];
+    if helper.is_file() {
+        let obj = out.join(format!("{name}.extern.o"));
+        let built = Command::new(&tc.cc)
+            .args(["-O1", "-w", "-std=gnu17", "-ffp-contract=off", "-c", "-I"])
+            .arg(&inc)
+            .arg(&helper)
+            .arg("-o")
+            .arg(&obj)
+            .output()
+            .unwrap();
+        if !built.status.success() {
+            return fail(format!(
+                "the reference compiler failed on {}:\n{}",
+                helper.display(),
+                String::from_utf8_lossy(&built.stderr)
+            ));
+        }
+        objs.push(obj);
+    }
     let reference = out.join(format!("{name}.ref"));
     let built = Command::new(&tc.cc)
         .args(["-O1", "-w", "-std=gnu17", "-ffp-contract=off", "-I"])
         .arg(&inc)
         .arg(file)
-        .arg(rt)
+        .args(&objs)
         .arg("-lm")
         .arg("-o")
         .arg(&reference)
@@ -318,7 +348,7 @@ fn one(file: &Path, fai: &Path, tc: &Toolchain, rt: &Path, out: &Path, tally: &M
         cmd.arg(file)
             .arg("-I")
             .arg(&inc)
-            .arg(rt)
+            .args(&objs)
             .arg("-lm")
             .arg("-o")
             .arg(&exe);
