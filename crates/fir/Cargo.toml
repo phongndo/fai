@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 num-bigint = "0.4"
 rustc-hash = "2"
+rustc_apfloat = "0.2.3"

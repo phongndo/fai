@@ -1,16 +1,20 @@
 //! Floats, mirroring `spec/Fir/Float.lean` and `spec/Fir/FloatText.lean` for the oracle that
 //! always answers 0 (decisions: Floats, Float ops, Float semantics, NaN determinism).
 //!
-//! A float value is its bits in a `u64`. Arithmetic uses the host's IEEE 754 operations, which
-//! round to nearest, ties to even, exactly as Lean's one rounding function does; the host's NaN
-//! results differ between machines (x86-64 makes a negative NaN, AArch64 propagates an input), so
-//! every NaN an arithmetic op produces is replaced by the canonical NaN, the choice of the oracle
-//! that always answers 0 (`Float.nanResult`). The ops that only copy bits (`neg`, `abs`,
-//! `copysign`) keep payloads. Conversions from integers wider than 128 bits, and the reading and
-//! writing of decimals, have no exact host operation: they follow Lean's `round` and `shortest`
-//! on big integers.
+//! A float value is its bits in a `u64`. Nothing here uses the host's float arithmetic, whose
+//! results depend on the calling thread's floating-point environment (a C caller's `fesetround`,
+//! or flush-to-zero and denormals-are-zero in x86-64's MXCSR or AArch64's FPCR): arithmetic and
+//! conversions use `rustc_apfloat` (LLVM's APFloat in software, as Miri uses it), rounding to
+//! nearest, ties to even, exactly as Lean's one rounding function does; `sqrt` follows Lean's
+//! integer square root and `round` on big integers, comparisons compare bits as integers. Every
+//! NaN an arithmetic op produces is replaced by the canonical NaN, the choice of the oracle that
+//! always answers 0 (`Float.nanResult`). The ops that only copy bits (`neg`, `abs`, `copysign`)
+//! keep payloads. Conversions from integers wider than 128 bits, and the reading and writing of
+//! decimals, follow Lean's `round` and `shortest` on big integers.
 
 use num_bigint::{BigInt, BigUint, Sign};
+use rustc_apfloat::ieee::{Double, Single};
+use rustc_apfloat::{Float, FloatConvert, Round};
 
 use crate::ir::{CvtEdge, FBinOp, FPred, FUnOp, FloatTy};
 use crate::sem::{Bits, Out, TrapReason, UbKind, mask};
@@ -109,28 +113,33 @@ pub fn is_nan(f: FloatTy, x: u64) -> bool {
     fmt(f).is_nan(x)
 }
 
-fn of_host32(x: f32) -> u64 {
+// Software arithmetic: a `Single` or `Double` holds a `f32` or `f64`'s bits.
+
+const RNE: Round = Round::NearestTiesToEven;
+
+fn sw<T: Float>(x: u64) -> T {
+    T::from_bits(u128::from(x))
+}
+
+/// A result's bits, with every NaN made the canonical one.
+fn of_sw<T: Float>(f: FloatTy, x: T) -> u64 {
     if x.is_nan() {
-        fmt(FloatTy::F32).canon_nan()
+        fmt(f).canon_nan()
     } else {
-        u64::from(x.to_bits())
+        x.to_bits() as u64
     }
 }
 
-fn of_host64(x: f64) -> u64 {
-    if x.is_nan() {
-        fmt(FloatTy::F64).canon_nan()
-    } else {
-        x.to_bits()
-    }
-}
-
-fn h32(x: u64) -> f32 {
-    f32::from_bits(x as u32)
-}
-
-fn h64(x: u64) -> f64 {
-    f64::from_bits(x)
+fn bin_sw<T: Float>(f: FloatTy, op: FBinOp, a: u64, b: u64) -> u64 {
+    let (a, b) = (sw::<T>(a), sw::<T>(b));
+    let r = match op {
+        FBinOp::Add => a.add_r(b, RNE),
+        FBinOp::Sub => a.sub_r(b, RNE),
+        FBinOp::Mul => a.mul_r(b, RNE),
+        FBinOp::Div => a.div_r(b, RNE),
+        FBinOp::Copysign => unreachable!(),
+    };
+    of_sw(f, r.value)
 }
 
 /// `float.add` and friends on defined bits.
@@ -141,26 +150,8 @@ pub fn bin(f: FloatTy, op: FBinOp, a: u64, b: u64) -> u64 {
         return (a & !sm) | (b & sm);
     }
     match f {
-        FloatTy::F32 => {
-            let (a, b) = (h32(a), h32(b));
-            of_host32(match op {
-                FBinOp::Add => a + b,
-                FBinOp::Sub => a - b,
-                FBinOp::Mul => a * b,
-                FBinOp::Div => a / b,
-                FBinOp::Copysign => unreachable!(),
-            })
-        }
-        FloatTy::F64 => {
-            let (a, b) = (h64(a), h64(b));
-            of_host64(match op {
-                FBinOp::Add => a + b,
-                FBinOp::Sub => a - b,
-                FBinOp::Mul => a * b,
-                FBinOp::Div => a / b,
-                FBinOp::Copysign => unreachable!(),
-            })
-        }
+        FloatTy::F32 => bin_sw::<Single>(f, op, a, b),
+        FloatTy::F64 => bin_sw::<Double>(f, op, a, b),
     }
 }
 
@@ -170,26 +161,77 @@ pub fn un(f: FloatTy, op: FUnOp, a: u64) -> u64 {
     match op {
         FUnOp::Neg => a ^ sm,
         FUnOp::Abs => a & !sm,
-        FUnOp::Sqrt => match f {
-            FloatTy::F32 => of_host32(h32(a).sqrt()),
-            FloatTy::F64 => of_host64(h64(a).sqrt()),
-        },
+        FUnOp::Sqrt => sqrt(s, a),
     }
+}
+
+/// `float.sqrt`, exact with integers: a positive finite `M · 2^E` (`M` normalized to `m + 1` or
+/// `m + 2` bits, `E` even) has the root `√(M · 2^2k) · 2^((E - 2k) / 2)`; `r = ⌊√(M · 2^2k)⌋` has at
+/// least two bits beyond the significand's `m + 1`, and with a sticky bit for an inexact root it
+/// rounds as the true root does. The root of a positive float is always normal. (Lean's `sqrt`,
+/// on units and big integers, is the test's oracle.)
+fn sqrt(s: Fmt, a: u64) -> u64 {
+    let (e, t) = (s.exp(a), s.man(a));
+    if e == s.special() {
+        return if t != 0 || s.sign(a) {
+            s.canon_nan()
+        } else {
+            a
+        };
+    }
+    if e == 0 && t == 0 {
+        return a;
+    }
+    if s.sign(a) {
+        return s.canon_nan();
+    }
+    let bias = (1i64 << (s.e - 1)) - 1;
+    let m = i64::from(s.m);
+    let (mut sig, mut exp) = if e == 0 {
+        (u128::from(t), 1 - bias - m)
+    } else {
+        (u128::from(t | 1 << s.m), e as i64 - bias - m)
+    };
+    let lz = m - i64::from(127 - sig.leading_zeros());
+    sig <<= lz;
+    exp -= lz;
+    if exp % 2 != 0 {
+        sig <<= 1;
+        exp -= 1;
+    }
+    let k2 = (m + 7) & !1; // even, at least m + 6
+    let x = sig << k2;
+    let r = x.isqrt();
+    let sticky = r * r != x;
+    let shift = i64::from(128 - r.leading_zeros()) - (m + 1);
+    let mut q = r >> shift;
+    let rem = r & ((1 << shift) - 1);
+    let half = 1u128 << (shift - 1);
+    if rem > half || (rem == half && (sticky || q & 1 == 1)) {
+        q += 1;
+    }
+    let mut pow = (exp - k2) / 2 + shift;
+    if q == 1 << (m + 1) {
+        q >>= 1;
+        pow += 1;
+    }
+    s.pack(false, (pow + m + bias) as u64, (q as u64) & mask(s.m))
+}
+
+fn fma_sw<T: Float>(f: FloatTy, a: u64, b: u64, c: u64) -> u64 {
+    of_sw(f, sw::<T>(a).mul_add_r(sw(b), sw(c), RNE).value)
 }
 
 pub fn fma(f: FloatTy, a: u64, b: u64, c: u64) -> u64 {
     match f {
-        FloatTy::F32 => of_host32(h32(a).mul_add(h32(b), h32(c))),
-        FloatTy::F64 => of_host64(h64(a).mul_add(h64(b), h64(c))),
+        FloatTy::F32 => fma_sw::<Single>(f, a, b, c),
+        FloatTy::F64 => fma_sw::<Double>(f, a, b, c),
     }
 }
 
 pub fn cmp(f: FloatTy, p: FPred, a: u64, b: u64) -> bool {
-    let (x, y) = match f {
-        FloatTy::F32 => (f64::from(h32(a)), f64::from(h32(b))),
-        FloatTy::F64 => (h64(a), h64(b)),
-    };
-    if x.is_nan() || y.is_nan() {
+    let s = fmt(f);
+    if s.is_nan(a) || s.is_nan(b) {
         return matches!(
             p,
             FPred::Ueq
@@ -201,6 +243,14 @@ pub fn cmp(f: FloatTy, p: FPred, a: u64, b: u64) -> bool {
                 | FPred::Uno
         );
     }
+    // Lean's `Num.ord`: a non-NaN value's magnitude bits grow with its magnitude (infinities
+    // last), and both zeros are 0.
+    let sm = 1u64 << (s.e + s.m);
+    let ord = |x: u64| {
+        let v = (x & !sm) as i64;
+        if x & sm != 0 { -v } else { v }
+    };
+    let (x, y) = (ord(a), ord(b));
     match p {
         FPred::Oeq | FPred::Ueq => x == y,
         FPred::One | FPred::Une => x != y,
@@ -213,14 +263,33 @@ pub fn cmp(f: FloatTy, p: FPred, a: u64, b: u64) -> bool {
     }
 }
 
+fn cvt_sw<T: Float + FloatConvert<U>, U: Float>(g: FloatTy, a: u64) -> u64 {
+    of_sw(g, sw::<T>(a).convert_r(RNE, &mut false).value)
+}
+
 /// `float.ext` and `float.trunc`: a value of type `f` as a `g`, rounded.
 pub fn cvt(f: FloatTy, g: FloatTy, a: u64) -> u64 {
     match (f, g) {
-        (FloatTy::F32, FloatTy::F64) => of_host64(f64::from(h32(a))),
-        (FloatTy::F64, FloatTy::F32) => of_host32(h64(a) as f32),
-        (FloatTy::F32, FloatTy::F32) => of_host32(h32(a)),
-        (FloatTy::F64, FloatTy::F64) => of_host64(h64(a)),
+        (FloatTy::F32, FloatTy::F64) => cvt_sw::<Single, Double>(g, a),
+        (FloatTy::F64, FloatTy::F32) => cvt_sw::<Double, Single>(g, a),
+        (FloatTy::F32, FloatTy::F32) => cvt_sw::<Single, Single>(g, a),
+        (FloatTy::F64, FloatTy::F64) => cvt_sw::<Double, Double>(g, a),
     }
+}
+
+fn from_int_sw<T: Float>(g: FloatTy, signed: bool, w: u32, raw: u128) -> u64 {
+    let r = if signed {
+        let v = if w == 128 {
+            raw as i128
+        } else {
+            let s = 128 - w;
+            ((raw << s) as i128) >> s
+        };
+        T::from_i128_r(v, RNE)
+    } else {
+        T::from_u128_r(raw, RNE)
+    };
+    of_sw(g, r.value)
 }
 
 /// `int.to_float`: the `w`-bit integer `x`, signed or unsigned, rounded to a `g`.
@@ -230,21 +299,9 @@ pub(crate) fn from_int(g: FloatTy, signed: bool, w: u32, x: &Bits) -> u64 {
             Bits::Small(v) => u128::from(*v),
             Bits::Big(v) => u128::try_from(v).unwrap_or(0),
         };
-        if signed {
-            let v = if w == 128 {
-                raw as i128
-            } else {
-                let s = 128 - w;
-                ((raw << s) as i128) >> s
-            };
-            return match g {
-                FloatTy::F32 => u64::from((v as f32).to_bits()),
-                FloatTy::F64 => (v as f64).to_bits(),
-            };
-        }
         return match g {
-            FloatTy::F32 => u64::from((raw as f32).to_bits()),
-            FloatTy::F64 => (raw as f64).to_bits(),
+            FloatTy::F32 => from_int_sw::<Single>(g, signed, w, raw),
+            FloatTy::F64 => from_int_sw::<Double>(g, signed, w, raw),
         };
     }
     let v = if signed {
@@ -619,6 +676,314 @@ mod tests {
         assert_eq!(render(FloatTy::F32, lit(FloatTy::F32, "1e-45")), "1e-45");
         assert_eq!(lit(FloatTy::F32, "0.1"), 0x3dcccccd);
         assert_eq!(lit(FloatTy::F64, "0.1"), 0.1f64.to_bits());
+    }
+
+    // Lean's definitions on big integers, as a check on the software arithmetic.
+
+    enum Num {
+        Nan,
+        Inf(bool),
+        Fin(bool, BigUint),
+    }
+
+    fn decode(s: Fmt, x: u64) -> Num {
+        if s.exp(x) == s.special() {
+            if s.man(x) != 0 {
+                Num::Nan
+            } else {
+                Num::Inf(s.sign(x))
+            }
+        } else {
+            Num::Fin(s.sign(x), s.units(x))
+        }
+    }
+
+    fn sval(neg: bool, n: &BigUint) -> BigInt {
+        BigInt::from_biguint(if neg { Sign::Minus } else { Sign::Plus }, n.clone())
+    }
+
+    fn signed_round(s: Fmt, v: &BigInt, zero_neg: bool, d: &BigUint) -> u64 {
+        if v.sign() == Sign::NoSign {
+            s.pack(zero_neg, 0, 0)
+        } else {
+            round(s, v.sign() == Sign::Minus, v.magnitude(), d)
+        }
+    }
+
+    fn exact_bin(s: Fmt, op: FBinOp, x: u64, y: u64) -> u64 {
+        let nan = s.canon_nan();
+        let inf = |n: bool| s.pack(n, s.special(), 0);
+        let q = one() << s.qneg;
+        match (decode(s, x), decode(s, y), op) {
+            (Num::Nan, _, _) | (_, Num::Nan, _) => nan,
+            (Num::Inf(a), Num::Inf(b), FBinOp::Add) => {
+                if a == b {
+                    inf(a)
+                } else {
+                    nan
+                }
+            }
+            (Num::Inf(a), Num::Inf(b), FBinOp::Sub) => {
+                if a != b {
+                    inf(a)
+                } else {
+                    nan
+                }
+            }
+            (Num::Inf(a), Num::Fin(..), FBinOp::Add | FBinOp::Sub) => inf(a),
+            (Num::Fin(..), Num::Inf(b), FBinOp::Add) => inf(b),
+            (Num::Fin(..), Num::Inf(b), FBinOp::Sub) => inf(!b),
+            (Num::Fin(a, n), Num::Fin(b, k), FBinOp::Add | FBinOp::Sub) => {
+                let b = b != (op == FBinOp::Sub);
+                signed_round(s, &(sval(a, &n) + sval(b, &k)), a && b, &one())
+            }
+            (Num::Inf(a), Num::Inf(b), FBinOp::Mul) => inf(a != b),
+            (Num::Inf(a), Num::Fin(b, n), FBinOp::Mul)
+            | (Num::Fin(b, n), Num::Inf(a), FBinOp::Mul) => {
+                if is_zero(&n) {
+                    nan
+                } else {
+                    inf(a != b)
+                }
+            }
+            (Num::Fin(a, n), Num::Fin(b, k), FBinOp::Mul) => round(s, a != b, &(n * k), &q),
+            (Num::Inf(_), Num::Inf(_), FBinOp::Div) => nan,
+            (Num::Inf(a), Num::Fin(b, _), FBinOp::Div) => inf(a != b),
+            (Num::Fin(a, _), Num::Inf(b), FBinOp::Div) => s.pack(a != b, 0, 0),
+            (Num::Fin(a, n), Num::Fin(b, k), FBinOp::Div) => {
+                if is_zero(&k) {
+                    if is_zero(&n) { nan } else { inf(a != b) }
+                } else {
+                    round(s, a != b, &(n << s.qneg), &k)
+                }
+            }
+            (_, _, FBinOp::Copysign) => unreachable!(),
+        }
+    }
+
+    fn exact_fma(s: Fmt, x: u64, y: u64, z: u64) -> u64 {
+        let nan = s.canon_nan();
+        let inf = |n: bool| s.pack(n, s.special(), 0);
+        let (a, b, c) = (decode(s, x), decode(s, y), decode(s, z));
+        let parts = |v: &Num| match v {
+            Num::Nan => unreachable!(),
+            Num::Inf(n) => (*n, None),
+            Num::Fin(n, k) => (*n, Some(k.clone())),
+        };
+        if matches!(a, Num::Nan) || matches!(b, Num::Nan) || matches!(c, Num::Nan) {
+            return nan;
+        }
+        let ((na, ka), (nb, kb), (nc, kc)) = (parts(&a), parts(&b), parts(&c));
+        let sp = na != nb;
+        let zero = |k: &Option<BigUint>| k.as_ref().is_some_and(is_zero);
+        if (zero(&ka) && kb.is_none()) || (ka.is_none() && zero(&kb)) {
+            return nan;
+        }
+        if ka.is_none() || kb.is_none() {
+            return match kc {
+                None if nc != sp => nan,
+                _ => inf(sp),
+            };
+        }
+        let Some(kc) = kc else { return inf(nc) };
+        let v = sval(sp, &(ka.unwrap() * kb.unwrap())) + sval(nc, &(kc << s.qneg));
+        signed_round(s, &v, sp && nc, &(one() << s.qneg))
+    }
+
+    fn exact_sqrt(s: Fmt, x: u64) -> u64 {
+        match decode(s, x) {
+            Num::Nan | Num::Inf(true) => s.canon_nan(),
+            Num::Inf(false) => x,
+            Num::Fin(_, n) if is_zero(&n) => x,
+            Num::Fin(true, _) => s.canon_nan(),
+            Num::Fin(false, n) => {
+                let x = n << (s.qneg + 2);
+                let r = x.sqrt();
+                let sticky = u32::from(&r * &r != x);
+                round(s, false, &((r << 1u32) + sticky), &BigUint::from(4u32))
+            }
+        }
+    }
+
+    fn exact_cvt(f: Fmt, g: Fmt, x: u64) -> u64 {
+        match decode(f, x) {
+            Num::Nan => g.canon_nan(),
+            Num::Inf(n) => g.pack(n, g.special(), 0),
+            Num::Fin(n, k) if f.qneg <= g.qneg => round(g, n, &(k << (g.qneg - f.qneg)), &one()),
+            Num::Fin(n, k) => round(g, n, &k, &(one() << (f.qneg - g.qneg))),
+        }
+    }
+
+    /// Bits that hit the edge cases: zeros, subnormals, the normal limits, near-ties, infinities,
+    /// and NaNs, with random significands.
+    struct Gen(u64);
+
+    impl Gen {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn float(&mut self, s: Fmt) -> u64 {
+            let r = self.next();
+            let sp = s.special();
+            let e = match r % 8 {
+                0 => 0,
+                1 => 1 + (r >> 8) % 3,
+                2 => sp - 1 - (r >> 8) % 3,
+                3 => sp,
+                4 => (sp >> 1) + (r >> 8) % 8 - 4,
+                _ => (r >> 8) % (sp + 1),
+            };
+            let t = match (r >> 20) % 6 {
+                0 => 0,
+                1 => 1 + (r >> 24) % 4,
+                2 => mask(s.m) - (r >> 24) % 4,
+                _ => self.next() & mask(s.m),
+            };
+            s.pack((r >> 40) & 1 == 1, e, t)
+        }
+    }
+
+    fn host(f: FloatTy, x: f64) -> u64 {
+        if x.is_nan() {
+            canonical_nan(f)
+        } else {
+            match f {
+                FloatTy::F32 => u64::from((x as f32).to_bits()),
+                FloatTy::F64 => x.to_bits(),
+            }
+        }
+    }
+
+    #[test]
+    fn arithmetic_agrees_with_lean_and_the_host() {
+        let mut g = Gen(0x9e37_79b9_7f4a_7c15);
+        for f in [FloatTy::F32, FloatTy::F64] {
+            let s = fmt(f);
+            let hf = |x: u64| match f {
+                FloatTy::F32 => f64::from(f32::from_bits(x as u32)),
+                FloatTy::F64 => f64::from_bits(x),
+            };
+            for _ in 0..20000 {
+                let (a, b, c) = (g.float(s), g.float(s), g.float(s));
+                for op in [FBinOp::Add, FBinOp::Sub, FBinOp::Mul, FBinOp::Div] {
+                    let ours = bin(f, op, a, b);
+                    assert_eq!(ours, exact_bin(s, op, a, b), "{op:?} {a:#x} {b:#x}");
+                    // The host, in its default environment, as a second opinion.
+                    let host = match f {
+                        FloatTy::F32 => {
+                            let (x, y) = (f32::from_bits(a as u32), f32::from_bits(b as u32));
+                            f64::from(match op {
+                                FBinOp::Add => x + y,
+                                FBinOp::Sub => x - y,
+                                FBinOp::Mul => x * y,
+                                _ => x / y,
+                            })
+                        }
+                        FloatTy::F64 => {
+                            let (x, y) = (hf(a), hf(b));
+                            match op {
+                                FBinOp::Add => x + y,
+                                FBinOp::Sub => x - y,
+                                FBinOp::Mul => x * y,
+                                _ => x / y,
+                            }
+                        }
+                    };
+                    assert_eq!(ours, self::host(f, host), "{op:?} {a:#x} {b:#x}");
+                }
+                assert_eq!(
+                    fma(f, a, b, c),
+                    exact_fma(s, a, b, c),
+                    "fma {a:#x} {b:#x} {c:#x}"
+                );
+                let host_fma = match f {
+                    FloatTy::F32 => f64::from(
+                        f32::from_bits(a as u32)
+                            .mul_add(f32::from_bits(b as u32), f32::from_bits(c as u32)),
+                    ),
+                    FloatTy::F64 => hf(a).mul_add(hf(b), hf(c)),
+                };
+                assert_eq!(
+                    fma(f, a, b, c),
+                    host(f, host_fma),
+                    "fma {a:#x} {b:#x} {c:#x}"
+                );
+                let host_sqrt = match f {
+                    FloatTy::F32 => f64::from(f32::from_bits(a as u32).sqrt()),
+                    FloatTy::F64 => hf(a).sqrt(),
+                };
+                assert_eq!(un(f, FUnOp::Sqrt, a), exact_sqrt(s, a), "sqrt {a:#x}");
+                assert_eq!(un(f, FUnOp::Sqrt, a), host(f, host_sqrt), "sqrt {a:#x}");
+                for p in [FPred::Oeq, FPred::Olt, FPred::Ole, FPred::Une, FPred::Uge] {
+                    let (x, y) = (hf(a), hf(b));
+                    let host_cmp = match p {
+                        FPred::Oeq => x == y,
+                        FPred::Olt => x < y,
+                        FPred::Ole => x <= y,
+                        FPred::Une => x != y,
+                        _ => x.partial_cmp(&y) != Some(std::cmp::Ordering::Less),
+                    };
+                    assert_eq!(cmp(f, p, a, b), host_cmp, "{p:?} {a:#x} {b:#x}");
+                }
+                let other = match f {
+                    FloatTy::F32 => FloatTy::F64,
+                    FloatTy::F64 => FloatTy::F32,
+                };
+                assert_eq!(cvt(f, other, a), exact_cvt(s, fmt(other), a), "cvt {a:#x}");
+                assert_eq!(cvt(f, f, a), exact_cvt(s, s, a), "cvt {a:#x}");
+                let w = 1 + (g.next() % 128) as u32;
+                let raw = (u128::from(g.next()) << 64 | u128::from(g.next())) >> (128 - w);
+                let x = if w <= 64 {
+                    Bits::Small(raw as u64)
+                } else {
+                    Bits::Big(BigUint::from(raw))
+                };
+                for signed in [false, true] {
+                    let v = if signed {
+                        x.to_int(w)
+                    } else {
+                        BigInt::from(x.to_nat())
+                    };
+                    let exact = signed_round(s, &(v << s.qneg), false, &one());
+                    assert_eq!(
+                        from_int(f, signed, w, &x),
+                        exact,
+                        "from_int {signed} {w} {raw:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sqrt_agrees_with_the_host() {
+        // Every 509th f32 (subnormals, normals, and the specials around them), and f64s spread
+        // over every exponent.
+        for x in (0..=u32::MAX)
+            .step_by(509)
+            .chain([1, 0x007f_ffff, 0x7f7f_ffff])
+        {
+            let host = f32::from_bits(x).sqrt();
+            let want = if host.is_nan() {
+                canonical_nan(FloatTy::F32)
+            } else {
+                u64::from(host.to_bits())
+            };
+            assert_eq!(un(FloatTy::F32, FUnOp::Sqrt, u64::from(x)), want, "{x:#x}");
+        }
+        let mut g = Gen(0x2545_f491_4f6c_dd1d);
+        for _ in 0..200_000 {
+            let x = g.next();
+            assert_eq!(
+                un(FloatTy::F64, FUnOp::Sqrt, x),
+                host(FloatTy::F64, f64::from_bits(x).sqrt()),
+                "{x:#x}"
+            );
+        }
     }
 
     #[test]
