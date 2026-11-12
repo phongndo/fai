@@ -23,9 +23,9 @@
 //! layout of their own. Functions' addresses are taken, stored, compared, exposed, and called
 //! through, usually with the right signature and sometimes with another, or through a data, null,
 //! offset, or poison pointer; globals hold function tables that calls dispatch through. External
-//! functions (`@x0`, …) with random effects are called directly and through pointers and tables,
-//! so their events, the exposure of what they reach, and the facts on their results are
-//! covered. Programs sometimes declare their layer: `layer hfir`, or `layer mfir`, where field and
+//! functions (`@x0`, …) with random effects, taking and giving structs and arrays by value too,
+//! are called directly and through pointers and tables, so their events, the exposure of what
+//! they reach, and the facts on their results are covered. Programs sometimes declare their layer: `layer hfir`, or `layer mfir`, where field and
 //! element addresses are `ptr.offset` by `ty.offset` or a multiplied stride instead of `ptr.field`
 //! and `ptr.index`. Stores are sometimes followed at once by another store or a load through the
 //! same pointer, and copies come in chains, so the passes' patterns occur.
@@ -49,7 +49,8 @@
 //!
 //! Varargs: functions (the entry included) and external functions are sometimes variadic, each
 //! with a list of variadic argument types its calls usually pass (integers of 8 to 64 bits,
-//! pointers, and floats, sometimes more than eight of a class), so most runs stay defined;
+//! pointers, floats, sometimes more than eight of a class, and except for the entry, C structs
+//! and arrays), so most runs stay defined;
 //! direct and indirect calls pass them after `...`, sometimes other types or another number.
 //! Variadic bodies read their arguments with `va.arg` (usually of the passed type, sometimes of
 //! another width of its class or of the other class, or past the end), restart with `va.start`,
@@ -244,22 +245,69 @@ struct Sig {
     va: Option<Vec<T>>,
 }
 
+/// Whether calls pass a value of this type whole outside HFIR (decision: C ABI for aggregates):
+/// a struct or array of scalars and of such types.
+fn composite(t: T) -> bool {
+    match t {
+        T::V(i) => match vty(i) {
+            VTy::Struct(_, fs) => fs.iter().all(|&f| !matches!(f, T::V(_)) || composite(f)),
+            VTy::Array(_, e) => !matches!(e, T::V(_)) || composite(e),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether a variadic argument can be this composite: a nonempty `struct<C>` or array of scalars
+/// and such composites.
+fn c_composite(t: T) -> bool {
+    let part = |f: T| !matches!(f, T::V(_)) || c_composite(f);
+    match t {
+        T::V(i) => match vty(i) {
+            VTy::Struct("C", fs) => !fs.is_empty() && fs.iter().all(|&f| part(f)),
+            VTy::Array(n, e) => n > 0 && part(e),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// A composite of the program's value types, sometimes, if it has one (`c` for a variadic
+/// argument's).
+fn pick_composite(rng: &mut Rng, p: u64, c: bool) -> Option<T> {
+    let ts: Vec<T> = (0..num_vtys() as u8)
+        .map(T::V)
+        .filter(|&t| if c { c_composite(t) } else { composite(t) })
+        .collect();
+    (!ts.is_empty() && rng.chance(p)).then(|| rng.pick(&ts))
+}
+
 /// The types of a list of variadic arguments: up to `max` integers of 8 to 64 bits, pointers
-/// (if they take at most 64 bits, `ptr_size`), and floats.
-fn va_tys(rng: &mut Rng, max: u64, ptr_size: u32) -> Vec<T> {
+/// (if they take at most 64 bits, `ptr_size`), and floats, and with `aggs` sometimes C structs
+/// and arrays (which the entry's run lines can't write).
+fn va_tys(rng: &mut Rng, max: u64, ptr_size: u32, aggs: bool) -> Vec<T> {
     (0..rng.below(max + 1))
-        .map(|_| match rng.below(10) {
-            0..=3 => T::I(rng.pick(&[8, 16, 32, 64, 64])),
-            4..=5 if ptr_size <= 64 => T::P,
-            4..=5 => T::I(64),
-            _ => T::F(rng.pick(&[32, 64, 64])),
-        })
+        .map(
+            |_| match pick_composite(rng, if aggs { 12 } else { 0 }, true) {
+                Some(t) => t,
+                None => match rng.below(10) {
+                    0..=3 => T::I(rng.pick(&[8, 16, 32, 64, 64])),
+                    4..=5 if ptr_size <= 64 => T::P,
+                    4..=5 => T::I(64),
+                    _ => T::F(rng.pick(&[32, 64, 64])),
+                },
+            },
+        )
         .collect()
 }
 
-/// Whether two variadic argument types are of the same class (integer and pointer, or float).
+/// Whether two variadic argument types are of the same class (integer and pointer, or float;
+/// a composite is a class of its own).
 fn same_class(a: T, b: T) -> bool {
-    matches!(a, T::F(_)) == matches!(b, T::F(_))
+    match (a, b) {
+        (T::V(_), _) | (_, T::V(_)) => a == b,
+        _ => matches!(a, T::F(_)) == matches!(b, T::F(_)),
+    }
 }
 
 /// A struct or array type, or a value type inside one.
@@ -2091,7 +2139,7 @@ impl Gen<'_> {
         if self.sigs[sig].va.is_some() {
             let mut tys = self.sigs[k].va.clone().unwrap_or_default();
             if self.rng.chance(10) {
-                tys = va_tys(self.rng, 6, self.ptr_size);
+                tys = va_tys(self.rng, 6, self.ptr_size, true);
             } else if self.rng.chance(5) && !tys.is_empty() {
                 tys.pop();
             }
@@ -2135,7 +2183,7 @@ impl Gen<'_> {
                 let t = if self.rng.chance(85) {
                     want
                 } else {
-                    let others = va_tys(self.rng, 3, self.ptr_size);
+                    let others = va_tys(self.rng, 3, self.ptr_size, true);
                     match others
                         .iter()
                         .find(|&&o| self.rng.chance(70) == same_class(o, want))
@@ -2758,14 +2806,17 @@ pub fn program(rng: &mut Rng) -> Program {
             .collect();
         let va = rng
             .chance(if i == 0 { 15 } else { 25 })
-            .then(|| va_tys(rng, 6, ptr_size));
+            .then(|| va_tys(rng, 6, ptr_size, i > 0));
         sigs.push(Sig { params, rets, va });
     }
-    // External functions: their parameters are often pointers, so calls expose memory.
+    // External functions: their parameters are often pointers, so calls expose memory; they
+    // take and give structs and arrays by value too (decision: C ABI for aggregates).
     for _ in 0..rng.pick(&[0, 0, 1, 1, 2, 3]) {
         let params: Vec<T> = (0..rng.below(4))
             .map(|_| {
-                if rng.chance(55) {
+                if let Some(t) = pick_composite(rng, 15, false) {
+                    t
+                } else if rng.chance(55) {
                     T::P
                 } else if rng.chance(10) {
                     T::F(rng.pick(&[32, 64]))
@@ -2782,8 +2833,12 @@ pub fn program(rng: &mut Rng) -> Program {
                 _ => T::I(rng.width(&[1, 8, 32, 64, 65, 128])),
             })
             .collect();
+        let rets = match pick_composite(rng, 10, false) {
+            Some(t) => vec![t],
+            None => rets,
+        };
         // Sometimes variadic, with more than eight arguments of a class.
-        let va = rng.chance(30).then(|| va_tys(rng, 12, ptr_size));
+        let va = rng.chance(30).then(|| va_tys(rng, 12, ptr_size, true));
         sigs.push(Sig { params, rets, va });
     }
     let entry_params = sigs[0].params.clone();
