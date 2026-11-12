@@ -938,7 +938,14 @@ mod tests {
     }
 
     fn host(f: FloatTy, x: f64) -> u64 {
-        if x.is_nan() {
+        // Whether the host gave a NaN, read off its bits behind an optimization barrier: in
+        // release builds the float comparison `is_nan` after a host `sqrt` was optimized into one
+        // that missed the NaN of a negative operand.
+        let x = std::hint::black_box(x);
+        let bits = x.to_bits();
+        if bits & 0x7ff0_0000_0000_0000 == 0x7ff0_0000_0000_0000
+            && bits & 0x000f_ffff_ffff_ffff != 0
+        {
             canonical_nan(f)
         } else {
             match f {
@@ -1057,8 +1064,9 @@ mod tests {
             .step_by(509)
             .chain([1, 0x007f_ffff, 0x7f7f_ffff])
         {
-            let host = f32::from_bits(x).sqrt();
-            let want = if host.is_nan() {
+            let host = std::hint::black_box(f32::from_bits(x).sqrt());
+            let hb = host.to_bits();
+            let want = if hb & 0x7f80_0000 == 0x7f80_0000 && hb & 0x007f_ffff != 0 {
                 canonical_nan(FloatTy::F32)
             } else {
                 u64::from(host.to_bits())
