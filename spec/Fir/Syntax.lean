@@ -1,4 +1,5 @@
 import Fir.OpDSL
+import Fir.AArch64Syntax
 
 /-!
 # Syntax
@@ -341,6 +342,7 @@ inductive Imm where
   | flag (b : Bool)
   | succ (s : Succ)
   | cases (cs : Cases)
+  | reg (r : Reg)
   deriving DecidableEq, Repr
 
 /-! ## Ops
@@ -728,6 +730,196 @@ fir_ops
     effects read write alloc free trap diverge
     rule
       sig sig
+  -- AArch64 (LFIR): the `aarch64` dialect, in machine form. Instructions name their registers
+  -- as immediates, a function's code is `aarch64.code`, and blocks end in explicit branches
+  -- (decision: LFIR for AArch64). Semantics: `Fir.AArch64` (the instructions) and
+  -- `Fir.AArch64Machine` (the machine that runs them).
+  /-- `aarch64.code { ^entry: … ^b1: … }`: a function's machine code, as labeled blocks entered
+  at the first. Each block ends with a branch, `aarch64.ret`, or `aarch64.trap`. It is the whole
+  body of an LFIR function, which finds its arguments where the calling convention puts them. -/
+  op a64Code
+    name "aarch64.code"
+    format "blocks"
+    terminator
+    layers lfir
+  /-- `aarch64.add.x x0, x1, x2` and friends: three-register data processing; see `AluOp`. -/
+  op a64Alu (op : AluOp) (sf : Sf) (d n m : Reg)
+    name "aarch64.{op}.{sf}"
+    format "{d}, {n}, {m}"
+    layers lfir
+    rule
+      deny ["aarch64.smulh.w", "aarch64.umulh.w"] "smulh and umulh are 64-bit only"
+      operands []
+      noResults
+  /-- `aarch64.add.imm.x x0, x1, 16`: data processing with an immediate; see `AluImmOp`. -/
+  op a64AluImm (op : AluImmOp) (sf : Sf) (d n : Reg) (imm : Int)
+    name "aarch64.{op}.imm.{sf}"
+    format "{d}, {n}, {imm}"
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.lsl.imm.x x0, x1, 3`: a shift by an immediate below the size. -/
+  op a64ShiftImm (op : ShiftImmOp) (sf : Sf) (d n : Reg) (amount : Index)
+    name "aarch64.{op}.imm.{sf}"
+    format "{d}, {n}, {amount}"
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.sbfx.x x0, x1, 8`: the low `width` bits (1 to the size), sign-extended (`sbfx`) or
+  zero-extended (`ubfx`). -/
+  op a64Ext (signed : Bool) (sf : Sf) (d n : Reg) (width : Index)
+    name "aarch64.{signed : extModes}.{sf}"
+    format "{d}, {n}, {width}"
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.mov.x x0, x1`: copy a register (`sp` included). -/
+  op a64Mov (sf : Sf) (d n : Reg)
+    name "aarch64.mov.{sf}"
+    format "{d}, {n}"
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.movz.x x0, 4660, 16`: a 16-bit immediate shifted left by `hw` (0, 16, 32, or 48):
+  zero elsewhere (`movz`), inverted (`movn`), or inserted into the register (`movk`). -/
+  op a64MovWide (op : MovOp) (sf : Sf) (d : Reg) (imm hw : Index)
+    name "aarch64.{op}.{sf}"
+    format "{d}, {imm}, {hw}"
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.csel.eq.x x0, x1, x2`: `x1` if the condition holds, else `x2` (incremented,
+  inverted, or negated for `csinc`, `csinv`, `csneg`). -/
+  op a64Csel (op : CselOp) (c : Cond) (sf : Sf) (d n m : Reg)
+    name "aarch64.{op}.{c}.{sf}"
+    format "{d}, {n}, {m}"
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.ldr.w x0, x1, 8`: load 1, 2, 4, or 8 bytes from `x1 + 8`, zero-extended. -/
+  op a64Ldr (size : MemSize) (d base : Reg) (off : Int)
+    name "aarch64.ldr.{size}"
+    format "{d}, {base}, {off}"
+    effects read
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.str.w x0, x1, 8`: store the low 1, 2, 4, or 8 bytes of `x0` at `x1 + 8`. -/
+  op a64Str (size : MemSize) (s base : Reg) (off : Int)
+    name "aarch64.str.{size}"
+    format "{s}, {base}, {off}"
+    effects write
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.adrl x0, @g`: the address of a global (`adrp` and `add`). -/
+  op a64Adrl (d : Reg) (global : Global)
+    name "aarch64.adrl"
+    format "{d}, {global}"
+    layers lfir
+    rule
+      global global
+      operands []
+      noResults
+  /-- `aarch64.adrl.func x0, @f`: the address of a function (`adrp` and `add`, or a GOT load for
+  an external one). -/
+  op a64AdrlFunc (d : Reg) (callee : Func)
+    name "aarch64.adrl.func"
+    format "{d}, {callee}"
+    layers lfir
+    rule
+      func callee
+      operands []
+      noResults
+  /-- `aarch64.b ^b`: jump to a block of the enclosing `aarch64.code`. -/
+  op a64B (dest : Succ)
+    name "aarch64.b"
+    format "{dest}"
+    terminator
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.b.eq ^t, ^f`: jump to `^t` if the condition holds, otherwise to `^f`. -/
+  op a64BCond (c : Cond) (t f : Succ)
+    name "aarch64.b.{c}"
+    format "{t}, {f}"
+    terminator
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.ret`: return to the caller, with the results where the calling convention puts
+  them. -/
+  op a64Ret
+    name "aarch64.ret"
+    format ""
+    terminator
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.trap.div0`: trap with a reason (a call to `__fir_trap` with the reason and the
+  op's location). -/
+  op a64Trap (reason : TrapReason)
+    name "aarch64.trap.{reason}"
+    format ""
+    terminator
+    effects trap
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.bl @f`: call a function; the arguments and results are where the calling
+  convention puts them for `@f`'s signature, and the call clobbers the caller-saved
+  registers. -/
+  op a64Bl (callee : Func)
+    name "aarch64.bl"
+    format "{callee}"
+    effects read write alloc free trap diverge
+    layers lfir
+    rule
+      func callee
+      operands []
+      noResults
+  /-- `aarch64.blr func<(i32) -> i32> x9`: call the function `x9` points to, which has that
+  signature. -/
+  op a64Blr (sig : Ty) (n : Reg)
+    name "aarch64.blr"
+    format "{sig} {n}"
+    effects read write alloc free trap diverge
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.bl.alloc c.malloc, align 16`: allocate `x0` bytes from the family's allocator;
+  `x0` is the memory, or null if allocation failed (a call to `malloc` or `aligned_alloc`). -/
+  op a64BlAlloc (family : Symbol) (align : Align)
+    name "aarch64.bl.alloc"
+    format "{family}, align {align}"
+    effects alloc
+    layers lfir
+    rule
+      pow2 align
+      operands []
+      noResults
+  /-- `aarch64.bl.free c.malloc`: free `x0` (a call to `free`). -/
+  op a64BlFree (family : Symbol)
+    name "aarch64.bl.free"
+    format "{family}"
+    effects free
+    layers lfir
+    rule
+      operands []
+      noResults
 
 /-- The op's name with its modifiers, as printed. -/
 def OpKind.name (k : OpKind) : String :=
@@ -780,8 +972,8 @@ def OpDecl.layersText (d : OpDecl) : String :=
     | .lfir => if targets.contains d.dialect then s!"lfir {d.dialect}" else "lfir"
     | k => k.name
 
-/-! No target has ops yet, so the target rule is checked on a made-up AArch64 op: allowed only in
-LFIR for AArch64, while LFIR for any target keeps `func.ret` and nothing else of the core. -/
+/-! The target rule, on a made-up AArch64 op and a real one: allowed only in LFIR for AArch64,
+while LFIR for any target keeps `func.ret` and nothing else of the core. -/
 
 private def aarch64Op : OpDecl :=
   { ctor := "nop", rust := "Nop", doc := "", fields := [], format := "", terminator := false,
@@ -793,6 +985,8 @@ private def aarch64Op : OpDecl :=
 #guard aarch64Op.layersText == "lfir aarch64"
 #guard (Layer.lfir "aarch64").allows OpKind.ret.decl
 #guard !(Layer.lfir "aarch64").allows (OpKind.const 0).decl
+#guard (Layer.lfir "aarch64").allows OpKind.a64Ret.decl && !Layer.mfir.allows OpKind.a64Ret.decl
+#guard OpKind.a64Ret.decl.dialect == "aarch64"
 
 /-- An operand: a value, or a hole `?name: T` standing for a value not written yet. -/
 inductive Operand where

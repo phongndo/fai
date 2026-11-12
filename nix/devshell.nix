@@ -6,6 +6,12 @@ let
   # One LLVM release for the C compiler, linker, debugger, and C tooling. Clang
   # builds the C test programs and C API consumers, and links the Rust compiler.
   llvm = pkgs.llvmPackages_23;
+
+  # The AArch64 backend's tests run compiled binaries. On AArch64 hosts they run natively; on
+  # x86-64 Linux they're linked by a cross toolchain (GCC driver and glibc for aarch64 Linux)
+  # and run under qemu-user.
+  cross = pkgs.pkgsCross.aarch64-multiplatform;
+  needsCross = stdenv.hostPlatform.isLinux && !stdenv.hostPlatform.isAarch64;
 in
 (pkgs.mkShell.override { stdenv = llvm.stdenv; }) {
   name = "fir-dev";
@@ -55,6 +61,11 @@ in
     pkgs.gdb
     pkgs.valgrind
     pkgs.mold
+  ]
+  # AArch64 backend tests on x86-64 Linux: `aarch64-unknown-linux-gnu-cc` and `qemu-aarch64`.
+  ++ lib.optionals needsCross [
+    cross.stdenv.cc
+    pkgs.qemu-user
   ];
 
   # rust-analyzer needs the standard library sources for go-to-definition and completion.

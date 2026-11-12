@@ -46,6 +46,7 @@
 //! # Ok::<(), fir::BuildError>(())
 //! ```
 
+pub mod backend;
 mod body;
 pub mod builder;
 #[path = "generated/builder.rs"]
@@ -79,5 +80,6 @@ pub use globals::Run;
 pub use ir::*;
 pub use ops::{TARGETS, op_kind};
 pub use parse::parse_module;
+pub use sem::TrapReason;
 pub use types::align_up;
 pub use verify::{Hole, render_loc, verify_module};

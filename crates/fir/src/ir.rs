@@ -9,7 +9,11 @@ use std::fmt;
 
 use crate::body::IntId;
 pub use crate::globals::{Globals, Init};
+pub use crate::backend::aarch64::syntax::{
+    AluImmOp, AluOp, Cond, CselOp, MemSize, MovOp, Reg, Sf, ShiftImmOp,
+};
 pub use crate::ops::OpKind;
+pub use crate::sem::TrapReason;
 pub use crate::types::{Policy, Shape, TyId, Types};
 
 /// A source location, `@line:col`.

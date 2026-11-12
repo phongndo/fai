@@ -17,7 +17,7 @@ pub(crate) enum Bits {
 }
 
 /// Why a trap happened (Lean's `TrapReason`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum TrapReason {
     Div0,
     Overflow,

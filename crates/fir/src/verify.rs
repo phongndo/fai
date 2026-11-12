@@ -12,6 +12,7 @@ use num_bigint::{BigInt, Sign};
 
 use crate::body::{Body, Int, OpId, Operand, OperandKind, RegionId, Succ, ValueId};
 use crate::decl::{Check, Imm, Layer, TyE};
+use crate::ops::TARGETS;
 use crate::ir::*;
 use crate::types::Shape;
 
@@ -279,6 +280,11 @@ enum RegionCtx<'a> {
     Block {
         blocks: Vec<(&'a str, Vec<Ty>)>,
         results: Vec<Ty>,
+    },
+    /// A block of a target's code op (`aarch64.code`): the op's name and its blocks' labels.
+    Code {
+        name: &'static str,
+        labels: Vec<&'a str>,
     },
 }
 
@@ -881,7 +887,7 @@ impl<'a> FuncVerifier<'a> {
                     "a loop body must end with cf.break or cf.continue",
                 );
             }
-            Some(RegionCtx::Block { .. }) => {
+            Some(RegionCtx::Block { .. } | RegionCtx::Code { .. }) => {
                 return verr(region_loc, "a block must end with a terminator");
             }
             _ => return verr(region_loc, "the function body must end with func.ret"),
@@ -903,6 +909,43 @@ impl<'a> FuncVerifier<'a> {
             RegionCtx::Block { blocks, .. } => Some(&blocks[..]),
             _ => None,
         })
+    }
+
+    /// The nearest enclosing target code op's name and labels (Lean's `nearestCode`).
+    fn nearest_code(&self) -> Option<(&'static str, &[&'a str])> {
+        self.ctx.iter().rev().find_map(|c| match c {
+            RegionCtx::Code { name, labels } => Some((*name, &labels[..])),
+            _ => None,
+        })
+    }
+
+    /// A target's code op: labeled blocks without parameters, as a function's whole body.
+    fn code(&mut self, loc: Option<Loc>, kind: OpKind, rs: &[RegionId]) -> VResult<()> {
+        let body = self.body;
+        let name = kind.mnemonic();
+        if !matches!(&self.ctx[..], [RegionCtx::Func(_)]) {
+            return verr(loc, format!("{name} must be a function's whole body"));
+        }
+        let mut labels: Vec<&'a str> = Vec::with_capacity(rs.len());
+        for &r in rs {
+            let Some(l) = body.label(r) else {
+                return verr(loc, format!("every block of {name} needs a label"));
+            };
+            let l = body.str(l);
+            if labels.contains(&l) {
+                return verr(loc, format!("block ^{l} is defined more than once"));
+            }
+            if body.params(r).len() != 0 {
+                return verr(loc, format!("blocks of {name} have no parameters"));
+            }
+            labels.push(l);
+        }
+        self.ctx.push(RegionCtx::Code { name, labels });
+        for &r in rs {
+            self.ops(r, loc)?;
+        }
+        self.ctx.pop();
+        Ok(())
     }
 
     /// Check a jump to `s` with arguments of types `args` (Lean's `checkSucc`).
@@ -1033,7 +1076,12 @@ impl<'a> FuncVerifier<'a> {
                 };
                 expect_tys(body.types(), loc, "cf.continue", &ins, ps)?;
             }
-            (OpKind::Ret, []) => expect_tys(body.types(), loc, "func.ret", &ins, self.func_rets())?,
+            (OpKind::Ret, []) => {
+                if let Some((name, _)) = self.nearest_code() {
+                    return verr(loc, format!("func.ret can't be inside {name}"));
+                }
+                expect_tys(body.types(), loc, "func.ret", &ins, self.func_rets())?
+            }
             (OpKind::Br { dest }, []) => {
                 if self.nearest_blocks().is_none() {
                     return verr(loc, "cf.br outside cf.blocks");
@@ -1130,13 +1178,44 @@ impl<'a> FuncVerifier<'a> {
                 self.ctx.pop();
                 self.restore(mark);
             }
+            (k, []) if k.is_terminator() && k.decl().rule.is_some() => {
+                // A target's branch, return, or trap: it ends a block of the target's code.
+                let Some((name, labels)) = self.nearest_code() else {
+                    return verr(
+                        loc,
+                        format!("{} must be inside a block of a target's code", k.mnemonic()),
+                    );
+                };
+                check_simple(&self.cx, body, loc, k, &ins, &outs)?;
+                for i in 0..k.decl().imms.len() {
+                    if let Some(Imm::Succ(s)) = k.imm(i) {
+                        let label = body.str(body.succ(s).label);
+                        if !labels.contains(&label) {
+                            return verr(loc, format!("no block ^{label} in the enclosing {name}"));
+                        }
+                    }
+                }
+            }
             (k, []) => {
                 if k.is_terminator() || matches!(k, OpKind::If | OpKind::Loop { .. }) {
                     return verr(loc, "malformed op");
                 }
+                if TARGETS.contains(&k.decl().dialect)
+                    && !matches!(self.ctx.last(), Some(RegionCtx::Code { .. }))
+                {
+                    return verr(
+                        loc,
+                        format!("{} must be inside a block of a target's code", k.mnemonic()),
+                    );
+                }
                 check_simple(&self.cx, body, loc, k, &ins, &outs)?;
             }
-            _ => return verr(loc, "malformed op"),
+            (k, rs) => {
+                if !(k.decl().has_blocks() && ins.is_empty() && outs.is_empty()) {
+                    return verr(loc, "malformed op");
+                }
+                self.code(loc, k, rs)?;
+            }
         }
         for v in body.results(op) {
             self.define(loc, v, false)?;

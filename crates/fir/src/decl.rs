@@ -110,6 +110,8 @@ pub enum FieldTy {
     Succ,
     /// `cf.switch`'s cases, `[k: ^b(…), …]`, [`Imm::Cases`].
     Cases,
+    /// A target register, `x3` or `v12`, [`Imm::Reg`].
+    Reg,
 }
 
 /// An immediate's value.
@@ -124,6 +126,7 @@ pub enum Imm {
     Flag(bool),
     Succ(SuccId),
     Cases(CasesId),
+    Reg(crate::ir::Reg),
 }
 
 /// One piece of an op's readable format (Lean's `Item`).

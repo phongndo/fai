@@ -57,6 +57,7 @@ def Imm.render (f : Field) : Imm → String
   | .flag b => toString b
   | .succ s => s.renderGeneric
   | .cases cs => "[" ++ commas (cs.map fun (k, s) => s!"{k}: {s.renderGeneric}") ++ "]"
+  | .reg r => r.render
 
 /-- How many of an op's operands are its branch targets' arguments. -/
 def OpKind.succArgs (k : OpKind) : Nat :=

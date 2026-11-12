@@ -141,6 +141,25 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A target register: `x0`…`x30`, `sp`, `xzr`, or `v` and a number.
+    fn reg(&mut self) -> PResult<Reg> {
+        match self.peek() {
+            Tok::Ident(s) => match Reg::parse(s) {
+                Some(r) => {
+                    self.bump()?;
+                    Ok(r)
+                }
+                None => self.fail(format!(
+                    "expected a register like x0 or v1 but found '{s}'"
+                )),
+            },
+            t => self.fail(format!(
+                "expected a register like x0 or v1 but found {}",
+                t.describe()
+            )),
+        }
+    }
+
     fn label(&mut self) -> PResult<&'a str> {
         match self.peek() {
             Tok::Label(s) => {
@@ -637,6 +656,7 @@ impl<'a> Parser<'a> {
                 Imm::Succ(self.body.add_succ(s))
             }
             FieldTy::Cases => Imm::Cases(self.cases(true)?),
+            FieldTy::Reg => Imm::Reg(self.reg()?),
         })
     }
 

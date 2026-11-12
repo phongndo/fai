@@ -52,6 +52,7 @@ def _root_.Fir.FieldTy.rust : FieldTy → String
   | .ty => "Ty"
   | .succ => "SuccId"
   | .cases => "CasesId"
+  | .reg => "Reg"
   | .flag | .mod "Bool" => "bool"
   | .mod t => t
 
@@ -64,6 +65,7 @@ def _root_.Fir.FieldTy.placeholder : FieldTy → String
   | .ty => "Ty::Ptr"
   | .succ => "SuccId::PLACEHOLDER"
   | .cases => "CasesId::EMPTY"
+  | .reg => "Reg::XZR"
   | _ => "false"
 
 def _root_.Fir.FieldTy.immVariant : FieldTy → String
@@ -75,6 +77,7 @@ def _root_.Fir.FieldTy.immVariant : FieldTy → String
   | .ty => "Ty"
   | .succ => "Succ"
   | .cases => "Cases"
+  | .reg => "Reg"
   | _ => "Flag"
 
 def _root_.Fir.FieldTy.rustDecl : FieldTy → String
@@ -88,12 +91,15 @@ def _root_.Fir.FieldTy.rustDecl : FieldTy → String
   | .ty => "Ty"
   | .succ => "Succ"
   | .cases => "Cases"
+  | .reg => "Reg"
   | _ => "Flag"
 
-/-- A variant names its fields when one is a `bool`, a number, a string, or a branch target. -/
+/-- A variant names its fields when one is a `bool`, a number, a string, a branch target, or a
+register. -/
 def _root_.Fir.OpDecl.isStruct (d : OpDecl) : Bool :=
   d.fields.any fun f => match f.ty with
-    | .nat | .align | .index | .symbol | .func | .global | .flag | .mod "Bool" | .succ | .cases => true
+    | .nat | .align | .index | .symbol | .func | .global | .flag | .mod "Bool" | .succ | .cases
+    | .reg => true
     | _ => false
 
 /-- `Variant(a, b)` or `Variant { x: a, y: b }` from each field's text; `rest` ends a struct

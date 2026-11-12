@@ -35,6 +35,10 @@ interpreter.
   `cf.cond_br`, and `cf.switch` appear inside `cf.blocks` (possibly inside `cf.if` and `cf.loop`
   regions there) and name blocks of the nearest one, with arguments of the blocks' parameter
   types. A switch is on an integer, with keys that fit its type and differ modulo `2^N`.
+* Target code (LFIR): a target's code op (`aarch64.code`) is a function's whole body. It has at
+  least one block; every block has a label, unique in it, and no parameters, and ends with a
+  terminator. The target's other ops appear directly in its blocks, its branches name blocks of
+  it, and `func.ret` doesn't appear in it.
 * Facts: ranges apply to integers, `nonnull` and `align` to pointers, and `noalias` and
   `readonly` only to pointer parameters of functions.
 * Signatures: every function's parameter and result types are value types. This is checked
@@ -53,6 +57,8 @@ inductive RegionCtx where
   /-- A block of `cf.blocks`: the labels of its blocks with their parameter types, and the
   `cf.blocks`'s results. -/
   | block (blocks : List (String × List Ty)) (results : List Ty)
+  /-- A block of a target's code op (`aarch64.code`): the op's name and its blocks' labels. -/
+  | code (name : String) (labels : List String)
 
 structure Hole where
   name : String
@@ -257,6 +263,12 @@ def splitArgs : List Succ → List Ty → List (Succ × List Ty)
   | [], _ => []
   | s :: ss, ts => (s, ts.take s.nargs) :: splitArgs ss (ts.drop s.nargs)
 
+/-- The nearest enclosing target code op's name and labels. -/
+def nearestCode : List RegionCtx → Option (String × List String)
+  | [] => none
+  | .code n ls :: _ => some (n, ls)
+  | _ :: rest => nearestCode rest
+
 def funcRets : List RegionCtx → List Ty
   | [] => []
   | [.func rets] => rets
@@ -271,7 +283,7 @@ mutual
       | .ifBranch [] :: _ => pure ()
       | .ifBranch _ :: _ => verr regionLoc "this cf.if region must end with cf.yield"
       | .loopBody .. :: _ => verr regionLoc "a loop body must end with cf.break or cf.continue"
-      | .block .. :: _ => verr regionLoc "a block must end with a terminator"
+      | .block .. :: _ | .code .. :: _ => verr regionLoc "a block must end with a terminator"
       | _ => verr regionLoc "the function body must end with func.ret"
     | op :: rest => do
       let scope ← verifyOp ctx scope op
@@ -297,7 +309,9 @@ mutual
     | .cont, [] =>
       let some (ps, _) := nearestLoop ctx | verr loc "cf.continue outside a loop"
       expectTys loc "cf.continue" ins ps
-    | .ret, [] => expectTys loc "func.ret" ins (funcRets ctx)
+    | .ret, [] =>
+      if let some (name, _) := nearestCode ctx then verr loc s!"func.ret can't be inside {name}"
+      expectTys loc "func.ret" ins (funcRets ctx)
     | .br dest, [] =>
       let some bs := nearestBlocks ctx | verr loc "cf.br outside cf.blocks"
       unless ins.length == dest.nargs do verr loc "malformed op"
@@ -347,10 +361,30 @@ mutual
       for r in body.params do inner ← define loc inner r
       verifyOps (.loopBody ps outs :: ctx) inner loc body.ops
     | k, [] =>
-      if k.isTerminator || k matches .if_ || k matches .loop _ then
-        verr loc "malformed op"
-      checkSimple loc k ins outs
-    | _, _ => verr loc "malformed op"
+      if k.isTerminator && k.decl.rule.isSome then
+        -- A target's branch, return, or trap: it ends a block of the target's code.
+        let some (name, labels) := nearestCode ctx | verr loc s!"{k.name} must be inside a block of a target's code"
+        checkSimple loc k ins outs
+        for f in k.decl.imms do
+          if let some (.succ s) := k.imm f.name then
+            unless labels.contains s.label do verr loc s!"no block ^{s.label} in the enclosing {name}"
+      else
+        if k.isTerminator || k matches .if_ || k matches .loop _ then
+          verr loc "malformed op"
+        if targets.contains k.decl.dialect && !(ctx.head? matches some (.code ..)) then
+          verr loc s!"{k.name} must be inside a block of a target's code"
+        checkSimple loc k ins outs
+    | k, rs =>
+      -- A target's code op: labeled blocks without parameters, as a function's whole body.
+      unless k.decl.hasBlocks && ins.isEmpty && outs.isEmpty do verr loc "malformed op"
+      unless ctx matches [.func _] do verr loc s!"{k.name} must be a function's whole body"
+      let mut labels : List String := []
+      for r in rs do
+        let some l := r.label | verr loc s!"every block of {k.name} needs a label"
+        if labels.contains l then verr loc s!"block ^{l} is defined more than once"
+        unless r.params.isEmpty do verr loc s!"blocks of {k.name} have no parameters"
+        labels := labels ++ [l]
+      for r in rs do verifyOps (.code k.name labels :: ctx) scope loc r.ops
     let mut scope := scope
     for r in op.results do scope ← define loc scope r
     pure scope

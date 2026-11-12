@@ -28,8 +28,9 @@ same tables, and the Rust `OpKind`, to `crates/fir/src/generated/ops.rs`.
 `u32`), `Index` (a field index, a `Nat`; Rust `u32`), `Symbol` (a dotted name such as
 `c.malloc`; a `String`), `Func` (a function, `@f`; a `String`), `Global` (a global, `@g`; a
 `String`), `Ty`, `Flag` (a `Bool` written as a keyword named after the field), `Succ` (a branch
-target `^b(%x, …)`, whose operands are the op's; Rust: an id into a side table), and `Cases`
-(`cf.switch`'s `[k: ^b(…), …]`). Fields of any other type (`Bool` or an enum) are *modifiers*,
+target `^b(%x, …)`, whose operands are the op's; Rust: an id into a side table), `Cases`
+(`cf.switch`'s `[k: ^b(…), …]`), and `Reg` (a target register such as `x3` or `v12`; Rust: a
+`u32`). Fields of any other type (`Bool` or an enum) are *modifiers*,
 spelled in the op's name. The Rust variant names its fields when one is a `Bool`, a number, a
 string, or a branch target; otherwise it is a tuple.
 
@@ -96,6 +97,8 @@ inductive FieldTy where
   | succ
   /-- `cf.switch`'s cases, `[k: ^b(…), …]`. -/
   | cases
+  /-- A target register, `x3` or `v12` (`Fir.Reg`). -/
+  | reg
   /-- A modifier: `Bool` or an enum, named here. -/
   | mod (type : String)
   deriving DecidableEq, Repr, Inhabited
@@ -333,6 +336,7 @@ def fieldTy : String → FieldTy
   | "Flag" => .flag
   | "Succ" => .succ
   | "Cases" => .cases
+  | "Reg" => .reg
   | t => .mod t
 
 /-- The Lean type of a field type. -/
@@ -492,6 +496,7 @@ def fieldTyTerm : FieldTy → MacroM Term
   | .flag => `(FieldTy.flag)
   | .succ => `(FieldTy.succ)
   | .cases => `(FieldTy.cases)
+  | .reg => `(FieldTy.reg)
   | .mod t => `(FieldTy.mod $(quote t))
 
 /-- The value a field of the name table's kinds holds when the name doesn't set it. -/
@@ -505,6 +510,7 @@ def defaultTerm : FieldTy → MacroM Term
   | .flag => `(false)
   | .succ => `(({ label := "", nargs := 0 } : Succ))
   | .cases => `(([] : Cases))
+  | .reg => `(Reg.xzr)
   | .mod _ => Macro.throwError "a modifier field must be set by the name"
 
 /-- The `Imm` constructor for an immediate field. -/
@@ -515,6 +521,7 @@ def immCtor : FieldTy → Name
   | .ty => `Imm.ty
   | .succ => `Imm.succ
   | .cases => `Imm.cases
+  | .reg => `Imm.reg
   | _ => `Imm.flag
 
 /-- The namespace of a name template, before its first dot, if it has one. -/

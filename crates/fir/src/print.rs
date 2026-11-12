@@ -200,6 +200,10 @@ impl Printer<'_> {
             }
             Imm::Ty(t) => push_ty(self.out, self.body.types(), t),
             Imm::Flag(b) => self.out.push_str(if b { "true" } else { "false" }),
+            Imm::Reg(r) => {
+                use std::fmt::Write;
+                let _ = write!(self.out, "{r}");
+            }
             Imm::Succ(s) => self.generic_succ(self.body.succ(s)),
             Imm::Cases(c) => {
                 self.out.push('[');
