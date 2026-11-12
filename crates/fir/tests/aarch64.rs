@@ -27,7 +27,12 @@
 //!   (which taint their whole function); `freeze` of what may be `poison` is the oracle's
 //!   choice too. A run whose output differs only in tainted values, and only in their numbers,
 //!   or where one run ends in an arithmetic or conversion trap at a tainted location and the
-//!   other ends otherwise, is counted, not failed.
+//!   other ends otherwise, is counted, not failed. Each comparable run is also made under other
+//!   address layouts the semantics allows (`fir::interp::Addresses::From`): a result one of them
+//!   gives matches, and a tainted integer that those layouts move may differ only within the span
+//!   of bits they moved (so `addr & 255` can't come out as 256, and an aligned address stays
+//!   aligned); tainted values no layout moves (the oracle's `freeze`) are left to the taint
+//!   analysis.
 //! * Where `fir run` prints `poison` or a byte of a `va_list` cursor, any value matches; a
 //!   non-null pointer prints as `ptr ?`
 //!   (allocation numbers are the interpreter's); leak notes are dropped (counted).
@@ -47,10 +52,23 @@
 //! For the fixtures and the first `FIR_FUZZ_LEAN` (default 100) random programs, the Lean
 //! reference tool runs the LFIR text too, and must print exactly what `fir run` prints.
 //!
+//! Coverage counts dispatches only in runs that agreed. For native runs it uses the executed
+//! interpreter profile of the exact module compiled (including `-O` and direct HFIR), on the
+//! same arguments, only when that profiled outcome matches the native result. This is a proxy
+//! for native execution, not a hardware trace. An address comparison that only matches mixed
+//! tokens from several layouts contributes no profile unless one complete layout run matches.
+//!
+//! A run whose functions the backend can't compile is skipped only for a limitation it declares
+//! (holes, integers wider than 64 bits, data layouts other than 64-bit, offsets the lowering
+//! can't represent); any other failure to compile, a register allocation the validator refuses
+//! included, fails the test.
+//!
 //! `FIR_FUZZ=N` sets the number of random programs (default 100), `FIR_FUZZ_SEED` the seed;
 //! `FIR_SHOW_ADDRESS_DIFFS=1` prints the runs that differ only in address-dependent outcomes.
 //! Without a toolchain (`$FIR_CC`, `cc` on AArch64, else `aarch64-unknown-linux-gnu-cc`) or a
-//! way to run the binaries, the native half is skipped with a note; the LFIR half always runs.
+//! way to run the binaries, the native half is skipped with a note (a failure under
+//! `FIR_REQUIRE_FULL=1`); the LFIR half always runs. Each test writes its counts to the
+//! evidence (`common::evidence`).
 
 #[allow(dead_code)]
 mod common;
@@ -680,6 +698,64 @@ fn normalize(reference: &str) -> Result<(String, bool), String> {
     Ok((out, leaks))
 }
 
+/// The address layouts besides the reference's that each comparable run is also made under. The
+/// first two start from bitwise complements (`0101…` and `1010…` over 48 bits), so between them
+/// every address bit above an allocation's alignment takes both values. The third is where
+/// qemu-user puts the stack.
+const LAYOUTS: [u64; 3] = [0x5555_5555_5555, 0xaaaa_aaaa_aaaa, 0x7ffd_9a3c_5a40];
+
+/// Why a compile failure is a declared limitation of the backend, if it is one.
+fn known_limit(e: &str) -> Option<&'static str> {
+    [
+        ("can't be compiled", "holes"),
+        ("wider than 64 bits", "integers wider than 64 bits"),
+        ("needs 64-bit pointers", "a data layout other than 64-bit"),
+        ("cannot lower:", "an offset the lowering can't represent"),
+    ]
+    .into_iter()
+    .find(|(k, _)| e.contains(k))
+    .map(|(_, why)| why)
+}
+
+fn toks(s: &str) -> Vec<&str> {
+    s.split([' ', ',', ';', '(', ')'])
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Whether each integer of `got` that differs from `want` at a position some address layout
+/// (`alts`, the same run under [`LAYOUTS`]) moves stays within the span of bits that moved: from
+/// the lowest bit a layout changed to the highest. Bits below the span are forced (an alignment),
+/// bits above it too (a mask, the address space's size). Positions no layout moves, and results
+/// whose shape differs from `want`'s, are left to the taint analysis.
+fn within_moved_bits(want: &str, alts: &[String], got: &str) -> bool {
+    let (w, g) = (toks(want), toks(got));
+    if w.len() != g.len() {
+        return true;
+    }
+    let alts: Vec<Vec<&str>> = alts
+        .iter()
+        .map(|a| toks(a))
+        .filter(|a| a.len() == w.len())
+        .collect();
+    let int = |t: &str| t.parse::<i128>().ok().map(|x| x as u64);
+    w.iter().zip(&g).enumerate().all(|(i, (a, b))| {
+        let (Some(w0), Some(got)) = (int(a), int(b)) else {
+            return true;
+        };
+        let moved = alts
+            .iter()
+            .filter_map(|alt| int(alt[i]))
+            .fold(0, |m, x| m | (x ^ w0));
+        if moved == 0 {
+            return true;
+        }
+        let (lo, hi) = (moved.trailing_zeros(), 63 - moved.leading_zeros());
+        let span = (u64::MAX >> (63 - hi)) & (u64::MAX << lo);
+        (got ^ w0) & !span == 0
+    })
+}
+
 /// The LFIR of a module, before and after register allocation, verified.
 fn lfir_modules(m: &Module) -> Result<[Module; 2], String> {
     let mut mm = a64::select(m)?;
@@ -695,6 +771,30 @@ fn lfir_modules(m: &Module) -> Result<[Module; 2], String> {
 /// The machine code takes more steps than the source: give it plenty.
 fn lfir_fuel(fuel: u64) -> u64 {
     fuel.saturating_mul(64)
+}
+
+/// A native execution proxy from a complete, agreeing run of the exact compiled module. A
+/// relaxed comparison that mixes tokens from several layouts has no single execution profile.
+fn native_profile(
+    m: &Module,
+    f: &str,
+    args: &[String],
+    fuel: u64,
+    got: &str,
+) -> Option<fir::interp::ExecutionProfile> {
+    let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    for addrs in std::iter::once(fir::interp::Addresses::Low)
+        .chain(LAYOUTS.iter().copied().map(fir::interp::Addresses::From))
+    {
+        let r =
+            fir::interp::run_detail_in(m, f, &a, fuel, m.layer == fir::Layer::Hfir, addrs).unwrap();
+        if let Ok((line, _)) = normalize(&r.line)
+            && matches(&line, got)
+        {
+            return Some(r.profile);
+        }
+    }
+    None
 }
 
 #[derive(Default)]
@@ -757,7 +857,7 @@ fn blocks_used(m: &Module) -> Vec<&'static str> {
 }
 
 /// Check one module's runs: `(function, args, fuel)`. An HFIR module is lowered first, as
-/// `fir compile` does.
+/// `fir compile` does. `out` takes the statistics and the evidence (native, LFIR).
 fn check_module(
     tc: Option<&Toolchain>,
     lean: Option<&Path>,
@@ -765,16 +865,25 @@ fn check_module(
     runs: &[(String, Vec<String>, u64)],
     dir: &Path,
     name: &str,
-    tally: &Mutex<Tally>,
+    out: (
+        &Mutex<Tally>,
+        &common::evidence::Evidence,
+        &common::evidence::Evidence,
+    ),
 ) -> bool {
+    let (tally, ev_native, ev_lfir) = out;
     let lowered = src.layer == fir::Layer::Hfir;
     let m = match fir::backend::prepare(src, false) {
         Ok(m) => m,
         Err(e) => {
-            tally.lock().unwrap().count(format!(
-                "not lowered: {}",
-                e.rsplit(':').next().unwrap_or(&e).trim()
-            ));
+            let mut t = tally.lock().unwrap();
+            match known_limit(&e) {
+                Some(why) => t.count(format!("not lowered: {why}")),
+                None => {
+                    t.fails.push(format!("{name}: not lowered: {e}"));
+                    return false;
+                }
+            }
             return true;
         }
     };
@@ -809,7 +918,23 @@ fn check_module(
                 if leaks {
                     tally.lock().unwrap().count("(leak notes dropped)");
                 }
-                comparable.push((f.clone(), args.clone(), *fuel, want));
+                // The same run under the other address layouts, where it is comparable too.
+                let alts: Vec<String> = LAYOUTS
+                    .iter()
+                    .filter_map(|&base| {
+                        let r = fir::interp::run_detail_in(
+                            src,
+                            f,
+                            &a,
+                            *fuel,
+                            lowered,
+                            fir::interp::Addresses::From(base),
+                        )
+                        .ok()?;
+                        normalize(&r.line).ok().map(|x| x.0)
+                    })
+                    .collect();
+                comparable.push((f.clone(), args.clone(), *fuel, want, alts));
             }
             Err(why) => tally.lock().unwrap().count(format!("skipped: {why}")),
         }
@@ -825,29 +950,43 @@ fn check_module(
             .unwrap()
             .count("(modules with address-dependent outcomes)");
     }
-    // A difference only in what may depend on addresses isn't a failure.
-    let differs = |f: &str, want: &str, got: &str, what: &str| -> bool {
-        if taint.exempt(f, want, got) {
+    // A difference only in what may depend on addresses isn't a failure: another legal layout's
+    // result, or a tainted outcome whose moving integers stay within the bits the layouts moved.
+    let differs = |f: &str, want: &str, alts: &[String], got: &str, what: &str| -> bool {
+        if alts.iter().any(|a| matches(a, got)) {
             tally
                 .lock()
                 .unwrap()
-                .count(format!("{what} differs in address-dependent outcomes"));
-            if std::env::var_os("FIR_SHOW_ADDRESS_DIFFS").is_some() {
-                eprintln!("{name}: {what}\n  want {want}\n  got  {got}");
-            }
-            false
-        } else {
-            true
+                .count(format!("{what} matches another address layout"));
+            return false;
         }
+        if !taint.exempt(f, want, got) {
+            return true;
+        }
+        if !within_moved_bits(want, alts, got) {
+            return true;
+        }
+        tally
+            .lock()
+            .unwrap()
+            .count(format!("{what} differs in address-dependent outcomes"));
+        if std::env::var_os("FIR_SHOW_ADDRESS_DIFFS").is_some() {
+            eprintln!("{name}: {what}\n  want {want}\n  alts {alts:?}\n  got  {got}");
+        }
+        false
     };
     // The LFIR in the interpreter, and in the Lean reference tool when there is one.
     let modules = match lfir_modules(m) {
         Ok(ms) => ms,
         Err(e) => {
-            tally.lock().unwrap().count(format!(
-                "not compiled: {}",
-                e.rsplit(':').next().unwrap_or(&e).trim()
-            ));
+            let mut t = tally.lock().unwrap();
+            match known_limit(&e) {
+                Some(why) => t.count(format!("not compiled: {why}")),
+                None => {
+                    t.fails.push(format!("{name}: not compiled: {e}"));
+                    return false;
+                }
+            }
             return true;
         }
     };
@@ -863,16 +1002,12 @@ fn check_module(
             .collect(),
         None => Vec::new(),
     };
-    for (f, args, fuel, want) in &comparable {
+    for (f, args, fuel, want, alts) in &comparable {
         let a: Vec<&str> = args.iter().map(String::as_str).collect();
         // The lowering takes up to 16 times the steps of the HFIR program.
         let fuel = if lowered { 16 * *fuel } else { *fuel };
-        let run = |lm: &Module| fir::interp::run(lm, f, &a, lfir_fuel(fuel));
-        match modules
-            .iter()
-            .map(run)
-            .collect::<Result<Vec<String>, String>>()
-        {
+        let run = |lm: &Module| fir::interp::run_detail(lm, f, &a, lfir_fuel(fuel), false);
+        match modules.iter().map(run).collect::<Result<Vec<_>, String>>() {
             Ok(got) => {
                 if let Some(tool) = lean {
                     for (file, g) in files.iter().zip(&got) {
@@ -885,29 +1020,33 @@ fn check_module(
                             .output()
                             .unwrap();
                         let r = String::from_utf8_lossy(&out.stdout).trim_end().to_owned();
-                        if &r == g {
+                        if out.status.success() && out.stderr.is_empty() && r == g.line {
+                            ev_lfir.executed(&g.profile);
                             tally.lock().unwrap().count("LFIR: fir-ref run agrees");
                         } else {
                             ok = false;
                             tally.lock().unwrap().fails.push(format!(
-                                "{}: @{f}({}): fir-ref run {r:?}, fir run {g:?}",
+                                "{}: @{f}({}): fir-ref run {r:?} (exit {}, stderr {:?}), fir run {:?}",
                                 file.display(),
-                                args.join(", ")
+                                args.join(", "), out.status,
+                                String::from_utf8_lossy(&out.stderr), g.line
                             ));
                         }
                     }
                 }
                 for (stage, g) in ["vregs", "allocated"].iter().zip(&got) {
-                    let g = normalize(g).map(|x| x.0).unwrap_or_else(|_| g.clone());
+                    let g = normalize(&g.line)
+                        .map(|x| x.0)
+                        .unwrap_or_else(|_| g.line.clone());
                     if matches(want, &g) {
                         tally
                             .lock()
                             .unwrap()
                             .count(format!("LFIR ({stage}) matches"));
-                    } else if differs(f, want, &g, &format!("LFIR ({stage})")) {
+                    } else if differs(f, want, alts, &g, &format!("LFIR ({stage})")) {
                         ok = false;
                         tally.lock().unwrap().fails.push(format!(
-                            "{name} @{f}({}): LFIR ({stage})\n  want {want}\n  got  {g}",
+                            "{name} @{f}({}): LFIR ({stage})\n  want {want}\n  alts {alts:?}\n  got  {g}",
                             args.join(", ")
                         ));
                     }
@@ -939,7 +1078,7 @@ fn check_module(
     }
     let runs: Vec<(String, Vec<String>)> = comparable
         .iter()
-        .map(|(f, a, _, _)| (f.clone(), a.clone()))
+        .map(|(f, a, _, _, _)| (f.clone(), a.clone()))
         .collect();
     // The program as compiled, and with `-O` when that changes it.
     let mut builds = vec![("native", m.clone())];
@@ -951,11 +1090,18 @@ fn check_module(
             return false;
         }
     }
+    // HFIR whose only building blocks are `ptr.field` and `ptr.index` (no aggregate values, no
+    // `cf.try`) also compiles without lowering: instruction selection handles those two itself.
+    // Nothing else reaches those cases, so run it too.
+    if lowered && a64::select(src).is_ok() && fir::backend::aarch64::isel::check_module(src).is_ok()
+    {
+        builds.push(("native, HFIR selected directly", src.clone()));
+    }
     for (what, bm) in &builds {
-        let bname = if *what == "native" {
-            name.to_owned()
-        } else {
-            format!("{name}-O")
+        let bname = match *what {
+            "native" => name.to_owned(),
+            "native -O" => format!("{name}-O"),
+            _ => format!("{name}-hfir"),
         };
         let bin = match build(tc, bm, &runs, dir, &bname) {
             Ok(b) => b,
@@ -968,8 +1114,10 @@ fn check_module(
                 return false;
             }
         };
-        for (k, (f, args, _, want)) in comparable.iter().enumerate() {
+        ev_native.fact("execution coverage", "interpreter profile of the exact compiled module, same arguments; native proxy, not a hardware trace");
+        for (k, (f, args, fuel, want, alts)) in comparable.iter().enumerate() {
             let got = run_native(tc, &bin, k);
+            let mut agreed = true;
             if matches(want, &got) {
                 let mut t = tally.lock().unwrap();
                 t.count(format!("{what} matches"));
@@ -994,16 +1142,49 @@ fn check_module(
                 if want.contains("threw ") {
                     t.count(format!("{what} matches (threw)"));
                 }
-            } else if differs(f, want, &got, what) {
+            } else if differs(f, want, alts, &got, what) {
+                agreed = false;
                 ok = false;
                 tally.lock().unwrap().fails.push(format!(
-                    "{name} @{f}({}): {what}\n  want {want}\n  got  {got}",
+                    "{name} @{f}({}): {what}\n  want {want}\n  alts {alts:?}\n  got  {got}",
                     args.join(", ")
                 ));
+            }
+            if agreed {
+                // Profile the module that was actually compiled, not the HFIR source of an
+                // optimized/lowered build. Other layouts can take different branches, so use
+                // only the first complete profiled result that matches this native run.
+                let fuel = if lowered { 16 * *fuel } else { *fuel };
+                if let Some(profile) = native_profile(bm, f, args, fuel, &got) {
+                    ev_native.executed(&profile);
+                    ev_native.count("native runs with execution profile", 1);
+                } else {
+                    ev_native.count("native runs without a matching execution profile", 1);
+                }
             }
         }
     }
     ok
+}
+
+#[test]
+fn native_profiles_require_agreement_and_use_the_compiled_module() {
+    let m = fir::parse_module(
+        "func @f(%x: i32) -> i32 {
+  %dead: i32 = int.mul.wrap %x, %x
+  func.ret %x
+}",
+    )
+    .unwrap();
+    fir::verify_module(&m).unwrap();
+    let optimized = fir::backend::prepare(&m, true).unwrap();
+    let args = vec!["3".to_owned()];
+    let before = native_profile(&m, "f", &args, 100, "returned i32 3").unwrap();
+    assert!(before.counts().any(|(k, n)| k == "int.mul.wrap" && n == 1));
+    let after = native_profile(&optimized, "f", &args, 100, "returned i32 3").unwrap();
+    assert!(!after.counts().any(|(k, _)| k == "int.mul.wrap"));
+    assert!(native_profile(&optimized, "f", &args, 100, "returned i32 9").is_none());
+    assert!(native_profile(&optimized, "f", &args, 0, "returned i32 3").is_none());
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -1012,11 +1193,14 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-fn report(what: &str, tally: Tally) {
+fn report(what: &str, tally: Tally, ev: &common::evidence::Evidence) {
     eprintln!("{what}:");
     for (k, n) in &tally.stats {
         eprintln!("  {n:6}  {k}");
+        ev.count(k.clone(), *n);
     }
+    ev.count("failures", tally.fails.len() as u64);
+    ev.write();
     assert!(
         tally.fails.is_empty(),
         "{} differences:\n{}",
@@ -1080,10 +1264,10 @@ fn prune(m: &Module, roots: &[&str]) -> Module {
 
 #[test]
 fn fixtures_run_natively() {
+    let ev = common::evidence::Evidence::new("aarch64_fixtures");
+    let ev_lfir = common::evidence::Evidence::new("aarch64_lfir");
     let dir = scratch("aarch64-fixtures");
-    let tc = toolchain(&dir)
-        .map_err(|e| eprintln!("native runs skipped: {e}"))
-        .ok();
+    let tc = native(&dir, &ev);
     let tally = Mutex::new(Tally::default());
     let lean = common::reference();
     let mut modules = 0;
@@ -1112,8 +1296,11 @@ fn fixtures_run_natively() {
             match compiles(&prune(&m, &[&f])) {
                 Ok(()) => kept.push((f, a)),
                 Err(e) => {
-                    eprintln!("  {name}: @{f}: not compiled: {e}");
-                    tally.lock().unwrap().count("run skipped: not compiled");
+                    let mut t = tally.lock().unwrap();
+                    match known_limit(&e) {
+                        Some(why) => t.count(format!("run skipped, not compiled: {why}")),
+                        None => t.fails.push(format!("{name}: @{f}: not compiled: {e}")),
+                    }
                 }
             }
         }
@@ -1129,10 +1316,40 @@ fn fixtures_run_natively() {
             .map(|(f, a)| (f, a, fir::interp::DEFAULT_FUEL))
             .collect();
         let stem = name.replace(['/', '.'], "_");
-        check_module(tc.as_ref(), lean.as_deref(), &m, &runs, &dir, &stem, &tally);
+        check_module(
+            tc.as_ref(),
+            lean.as_deref(),
+            &m,
+            &runs,
+            &dir,
+            &stem,
+            (&tally, &ev, &ev_lfir),
+        );
     }
     eprintln!("{modules} fixture modules compiled");
-    report("fixtures", tally.into_inner().unwrap());
+    ev.count("fixture modules compiled", modules);
+    ev_lfir.write();
+    report("fixtures", tally.into_inner().unwrap(), &ev);
+}
+
+/// The native toolchain, or `None` with a note (a failure when a full run is required), recorded
+/// in the evidence.
+fn native(dir: &Path, ev: &common::evidence::Evidence) -> Option<Toolchain> {
+    match toolchain(dir) {
+        Ok(tc) => {
+            ev.fact(
+                "native",
+                tc.runner.clone().unwrap_or_else(|| "native".to_owned()),
+            );
+            ev.fact("cc", tc.cc.clone());
+            Some(tc)
+        }
+        Err(e) => {
+            common::evidence::require(&format!("native AArch64 runs: {e}"));
+            ev.skip(format!("native runs: {e}"));
+            None
+        }
+    }
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -1144,10 +1361,10 @@ fn env_u64(name: &str, default: u64) -> u64 {
 
 #[test]
 fn random_programs_run_natively() {
+    let ev = common::evidence::Evidence::new("aarch64_fuzz");
+    let ev_lfir = common::evidence::Evidence::new("aarch64_lfir_fuzz");
     let dir = scratch("aarch64-fuzz");
-    let tc = toolchain(&dir)
-        .map_err(|e| eprintln!("native runs skipped: {e}"))
-        .ok();
+    let tc = native(&dir, &ev);
     let count = env_u64("FIR_FUZZ", 100);
     let seed = env_u64("FIR_FUZZ_SEED", 1);
     let lean = common::reference();
@@ -1181,7 +1398,15 @@ fn random_programs_run_natively() {
                     tally.lock().unwrap().count("(programs)");
                     // The Lean reference tool runs the LFIR of the first programs.
                     let lean = lean.as_deref().filter(|_| k < lean_count);
-                    if !check_module(tc.as_ref(), lean, &m, &runs, &dir, &name, &tally) {
+                    if !check_module(
+                        tc.as_ref(),
+                        lean,
+                        &m,
+                        &runs,
+                        &dir,
+                        &name,
+                        (&tally, &ev, &ev_lfir),
+                    ) {
                         std::fs::write(dir.join(format!("{name}.fir")), &prog.text).unwrap();
                     } else {
                         for ext in ["", ".s", ".c", "-O", "-O.s", "-O.c"] {
@@ -1192,10 +1417,76 @@ fn random_programs_run_natively() {
             });
         }
     });
+    ev.fact("seed", seed.to_string());
+    ev_lfir.write();
     report(
         &format!("{count} random programs (seed {seed})"),
         tally.into_inner().unwrap(),
+        &ev,
     );
+}
+
+/// Found in review: an excused integer was any number. Now one that a legal address layout moves
+/// may differ only in the span of bits the layouts moved, so a masked address stays within its
+/// mask.
+#[test]
+fn review_address_exemption_preserves_masked_integer_range() {
+    let m = fir::parse_module("func @f() -> i64 {\n  %p: ptr = mem.stack 1, align 1\n  %a: i64 = ptr.addr %p\n  %mask: i64 = int.const 255\n  %r: i64 = int.and %a, %mask\n  func.ret %r\n}").unwrap();
+    fir::verify_module(&m).unwrap();
+    let result = |addrs| {
+        normalize(
+            &fir::interp::run_detail_in(&m, "f", &[], 100, false, addrs)
+                .unwrap()
+                .line,
+        )
+        .unwrap()
+        .0
+    };
+    let want = result(fir::interp::Addresses::Low);
+    let alts: Vec<_> = LAYOUTS
+        .iter()
+        .map(|&base| result(fir::interp::Addresses::From(base)))
+        .collect();
+    assert_eq!(want, "returned i64 0");
+    assert_eq!(
+        alts,
+        ["returned i64 85", "returned i64 170", "returned i64 64"]
+    );
+    // Another value within the bits that move is a legal address's.
+    assert!(within_moved_bits(&want, &alts, "returned i64 240"));
+    // Every permitted address, including layouts not sampled here, gives a result <= 255.
+    assert!(!within_moved_bits(&want, &alts, "returned i64 256"));
+    // The taint analysis alone would excuse it: only the layouts bound the number.
+    assert!(taint_of("func @f() -> i64 {\n  %p: ptr = mem.stack 1, align 1\n  %a: i64 = ptr.addr %p\n  %mask: i64 = int.const 255\n  %r: i64 = int.and %a, %mask\n  func.ret %r\n}").exempt("f", &want, "returned i64 256"));
+}
+
+/// The layouts are real behaviors of the interpreter: a run that observes an address gives a
+/// different number under each, and an unrelated result stays the same.
+#[test]
+fn layouts_move_only_addresses() {
+    let m = fir::parse_module(
+        "func @f(%x: i32) -> (i64, i32) {
+  %p: ptr = mem.stack 8, align 8
+  %a: i64 = ptr.addr %p
+  %y: i32 = int.mul.wrap %x, %x
+  func.ret %a, %y
+}
+",
+    )
+    .unwrap();
+    fir::verify_module(&m).unwrap();
+    let run = |l| {
+        fir::interp::run_detail_in(&m, "f", &["3"], 1000, false, l)
+            .unwrap()
+            .line
+    };
+    let low = run(fir::interp::Addresses::Low);
+    assert_eq!(low, "returned i64 4096, i32 9");
+    for base in LAYOUTS {
+        let other = run(fir::interp::Addresses::From(base));
+        assert_ne!(other, low);
+        assert!(other.ends_with(", i32 9"), "{other}");
+    }
 }
 
 /// The address-dependence analysis of `text`, on the module the backend compiles.
