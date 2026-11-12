@@ -52,15 +52,24 @@ builds `fai-cc` with CMake (against the static library of the current sources), 
 
 - compiles every program in `tests/*.c` with the reference compiler (`aarch64-unknown-linux-gnu-cc
   -O1 -ffp-contract=off`, or `$FIR_CC`), with `fai-cc`, and with `fai-cc -O`, links each with
-  `tests/runtime/fai_runtime.c` and libm (`-lm`), runs them (under `qemu-aarch64` off AArch64), and
-  requires the same output and exit code;
+  `tests/runtime/fai_runtime.c`, libm (`-lm`), and, if the program has one, `tests/extern/NAME.c`
+  compiled by the reference compiler (C functions it calls and that call it back, compiled
+  separately), runs them (under `qemu-aarch64` off AArch64), and requires the same output and exit
+  code;
 - runs each program's HFIR in FIR's interpreter under Arm's NaN choice (`NanRule::Arm`, the NaNs
   the hardware gives): the calls of the output helpers (events) must spell the same output and
   `main` must return the same code. Programs that call other external functions (libc's `printf`,
   libm) can't be compared there, since the interpreter's world answers them with zeros: they are
   listed with the first such function they call;
 - checks that each program in `tests/errors/` gets exactly the diagnostics its `// expect: LINE:COL:
-  TEXT` lines name, and exit code 1.
+  TEXT` lines name, and exit code 1;
+- runs the ABI torture (`fai_cc_abi_torture`): random signatures of structs and unions (HFAs
+  through arrays, nesting, and unions, small and large composites, bitfields, 16-byte aligned
+  members and `aligned` attributes, empty structs, pointers, more arguments than registers) as
+  two C files, callers and callees, each compiled by `fai-cc`, `fai-cc -O`, or the reference
+  compiler; in every pairing the callees check each member they receive (directly, through a
+  function pointer, and through `...` by `va_arg`) and the callers each member of each result.
+  `FAI_CC_ABI=N` sets the number of signatures (240 by default), `FAI_CC_ABI_SEED` the seed.
 
 It runs by default on Linux; on macOS (whose binaries aren't Linux ones) only with `FAI_CC_TESTS=1`
 (given a Linux AArch64 toolchain in `FIR_CC` and a way to run its binaries), and `FAI_CC_TESTS=0`
@@ -87,7 +96,8 @@ extensions Clang accepts, such as case ranges and `__extension__`):
 - **Types:** `_Bool` (`i8` holding 0 or 1: FIR's `i1` takes no bytes in memory), `char` (unsigned),
   `short`, `int`, `long`, `long long`, their signed and unsigned forms, enums, `float` and `double`
   (`f32` and `f64`), pointers, arrays
-  (multidimensional, flexible array members), structs, unions, bitfields, typedefs, `const`.
+  (multidimensional, flexible array members), structs, unions, bitfields, empty structs and unions
+  (a GNU extension: size 0), typedefs, `const`.
 - **Expressions:** all arithmetic, bitwise, shift, comparison, and logical operators; compound
   assignment; increment and decrement; `&&`, `||`, `?:` (short-circuiting, as `cf.if`); casts;
   pointer arithmetic, differences, and comparisons; `&`, `*`, `.`, `->`, `[]`; `sizeof` and
@@ -102,6 +112,13 @@ extensions Clang accepts, such as case ranges and `__extension__`):
 - **Functions:** definitions, prototypes, recursion, function pointers; calls to functions defined
   elsewhere (libc, libm) as FIR external functions that may do anything; `malloc` and `free` as
   FIR's `c.malloc` heap allocations; `main` returns 0 when it falls off its end.
+- **Structs and unions by value** as AAPCS64 and GCC pass them: parameters and results of
+  functions defined here or elsewhere (libc's `div` and `ldiv`, functions compiled by GCC), direct
+  and indirect calls, variadic arguments and `va_arg`, `return s;`, and call results used in
+  expressions (`f().x`, `f().a[i]`, `g(f())`, `s = f()`, `c ? f() : g()`). Every class works:
+  HFAs of one to four `float`s or `double`s (through arrays, nested structs, and unions), small
+  composites with padding and bitfields, 16-byte aligned ones, larger ones by reference, unions,
+  and empty structs (no argument at all, as GCC's C does).
 - **Varargs:** variadic functions defined here (`int sum(int n, ...)`, and C23's `f(...)`) and
   elsewhere (`printf`, `snprintf`, `sprintf`, `fprintf`, `vprintf`, `vsnprintf`, `vfprintf`, …),
   called directly or through pointers, with C's default argument promotions (`float` to `double`,
@@ -157,6 +174,27 @@ labels, or with a `switch` whose cases are inside other statements, is one `cf.b
 blocks. Every op carries its C construct's `@line:col` (the expansion location for macros), and
 every function its file.
 
+A struct or union passed by value (a parameter, a result, a variadic argument, or `va_arg`'s) is a
+FIR composite value that `mem.load` reads from the C object where it is sent and `mem.store` writes
+into one where it arrives; a call's or `va_arg`'s result goes into a temporary object made at the
+function's entry, whose address the expression then is (so `f().x` is a member access, and `?:`
+can choose between two calls' results). FIR classifies composites by AAPCS64 (decision C ABI for
+aggregates); the value's type is chosen so that the class is the one GCC gives the C type, which
+differs from what the memory type would get in a few places:
+
+- an HFA by GCC's rule (one to four `float`s or `double`s through members, arrays, and unions,
+  no padding, no zero-length array; zero-width bitfields and empty structs don't count) is a
+  `struct<C>` of its floats, read from the object's bytes, so a union of floats, or an HFA with an
+  `aligned` attribute, is one too;
+- another composite of at most 16 bytes is its scalars at their offsets, unions and bitfield
+  storage as bytes, with a leading `array<0 x i128>` exactly when GCC aligns the argument to 16:
+  GCC takes the largest of the fields' alignments (`_Alignas(16)` on a member counts, an `aligned`
+  attribute on the struct itself doesn't), not the type's;
+- a larger one, which travels by reference, is its memory type, or its bytes when that type has
+  an empty struct or a zero-length array in it, which a variadic C composite can't;
+- an empty struct is `struct<C>{}`, which takes no register and no stack; through `...` it is
+  left out, and `va_arg` of one reads nothing, as with GCC.
+
 A struct is `struct<C>{…}` with its members in order; the bytes of bitfields and any gap are
 `array<k x i8>` padding (explicit for bitfields even where FIR's alignment would leave the bytes
 implicit, so a global's initializer can set them), and a struct Clang aligns more than its members (bitfields, `_Alignas`)
@@ -178,9 +216,14 @@ exactly, but has no conversion to integers for C to compute with).
 Each is diagnosed where it appears:
 
 - `long double` (binary128 on AArch64, which FIR doesn't have), `_Complex`, and the other float
-  formats (`_Float16`, `__fp16`, `__bf16`, `_Float128`), so also `printf("%Lf", …)`; structs and
-  unions passed or returned by value, as variadic arguments, or read by `va_arg` (track A), and a
+  formats (`_Float16`, `__fp16`, `__bf16`, `_Float128`), so also `printf("%Lf", …)`; and a
   `va_list` returned by value.
+- Structs and unions by value that FIR can't pass as GCC does: an HFA whose members GCC aligns to
+  16 (`_Alignas(16) double`), which GCC puts on the stack 16-byte aligned while FIR's HFAs keep
+  their floats' alignment; through `...` (as variadic arguments or `va_arg` types), a 16-byte
+  aligned composite, or floats beside a zero-length array, since FIR's variadic composites have
+  no alignment marker or zero-length array; and a struct holding a `va_list` (its bytes would
+  lose the cursor).
 - `<math.h>`'s `isgreater` family, which glibc defines with statement expressions under Clang (the
   `__builtin_isgreater` forms work); float builtins without a FIR op (`__builtin_fmin`, …);
   `#pragma STDC FENV_ACCESS`: FIR's floats round to nearest and have no exception flags, so a
@@ -198,4 +241,5 @@ Each is diagnosed where it appears:
 
 Also: C's `static` functions and globals become global symbols (FIR has no linkage yet), so a
 program can't define a `static` function with a libc function's name; the generated names (`str.0`,
-`zero.1`, `f.counter` for a static local) contain a `.`, so they can't clash with C names.
+`zero.1`, `f.counter` for a static local) contain a `.`, so they can't clash with C names, but they
+clash between two objects `fai-cc` compiled (two files with string literals don't link together).

@@ -511,10 +511,116 @@ Instruction selection, Backend testing, Builder API, API.
   it refuses it now, as HFIR only. `cargo xtask verify full` requires the ABI torture test's
   evidence (240 signatures).
 - **API:** version 1.5 (no new functions; external and MFIR functions take composites).
-- **Not yet:** `fai-cc`'s structs by value (track F2); macOS's stack packing (composites on the
-  stack are a compile error there); integer leaves wider than 64 bits in a passed composite
+- **Not yet:** `fai-cc`'s structs by value (done in track F2c); macOS's stack packing (composites
+  on the stack are a compile error there); integer leaves wider than 64 bits in a passed composite
   (`__int128` fields: the backend rejects them); composites in MFIR region state and memory
   accesses (the lowering never makes them; isel rejects them); other targets' classifications.
+
+### Track F2c: structs and unions by value in fai-cc (done)
+
+Decisions: C frontend (by-value mapping), C struct layout (empty structs), C frontend testing
+(helpers compiled by the reference compiler, the ABI torture); C ABI for aggregates unchanged.
+
+- **Mapping:** a struct or union passed by value (parameter, result, variadic argument,
+  `va_arg`, direct and indirect calls, to and from functions defined here or compiled by GCC) is a
+  FIR composite value: `mem.load` of its ABI type from the C object where it is sent, `mem.store`
+  into one where it arrives. A call's or `va_arg`'s result is stored into a temporary made at the
+  function's entry (as every local is), so `f().x`, `f().a[i]`, `g(f())`, `s = f()`, and
+  `c ? f() : g()` are ordinary accesses to it (Clang's `MaterializeTemporaryExpr` and
+  `ExprWithCleanups` are looked through). The ABI type gives FIR's classification GCC's class
+  for the C type: GCC's HFAs (`aapcs_vfp_sub_candidate`: unions count their largest member,
+  zero-width bitfields and empty structs are ignored, a zero-length array disqualifies, and an
+  `aligned` attribute doesn't matter) are `struct<C>` of their floats read from the object's
+  bytes; other composites of up to 16 bytes are their scalars at their offsets, unions and
+  bitfield storage as bytes, with `array<0 x i128>` exactly when GCC's argument alignment (the
+  fields', `aarch64_function_arg_alignment`; not the type's `aligned` attribute) is 16; larger
+  ones their memory type (by reference), or their bytes when that holds an empty struct or a
+  zero-length array. Empty structs (a GNU extension, rejected before) are `struct<C>{}` of size 0
+  in memory and nothing as arguments, left out of variadic calls and read as nothing by
+  `va_arg`, as GCC does. A function that falls off its end returns the leaves of a fresh object
+  (`poison`), since FIR has no aggregate `poison`.
+- **Rejected with a located diagnostic** (`tests/errors/struct_by_value.c`): an HFA GCC aligns
+  to 16 (`_Alignas(16) double`: GCC aligns it to 16 on the stack, FIR's HFAs keep their floats'
+  alignment); 16-byte aligned composites and floats beside a zero-length array through `...`
+  (FIR's variadic composites have no zero-length arrays, which carry those); structs holding a
+  `va_list` (its bytes would lose the cursor); returning a `va_list`.
+- **Tests:** seven new corpus programs (67 in all): `struct_classes` (every class as parameter
+  and result: HFAs of 1 to 4 `float`s and `double`s through arrays, nesting, a union, an
+  `aligned` attribute, and a zero-width bitfield; 1 to 16 bytes with padding; floats with
+  integers; a 16-byte aligned member (an even register pair) and an `aligned(16)` struct (not
+  one); pointers, arrays, bitfields, unions, empty structs, a flexible array member, a
+  zero-length array; 24- and 96-byte structs by reference, the callee's copy its own; more
+  arguments than registers of each class), `struct_calls` (`f().x`, `g(f())`, chains, `?:` and
+  `,` of calls, assignment chains, results in loops, recursion, a function falling off its end,
+  `goto` and `switch` functions returning structs, function pointers in arrays and structs, every
+  class through `...` past the registers, empty structs through `...`, `va_copy` and a callee
+  taking a `va_list` reading structs), `vec3` (vectors as HFAs, 3x3 matrices by reference,
+  rotations, an inverse, Gram-Schmidt, a ray caster), `complex_math` (complex numbers as HFAs:
+  powers, a Julia set, a 16-point FFT and its inverse, Newton's method), `rational` (a rational
+  library on 16-byte structs: series, continued fractions, Egyptian fractions, exact Gaussian
+  elimination, a 24-byte result struct), `geometry` (segment intersection, bounding boxes, a
+  convex hull returned in a 516-byte struct, area and centroid, closest pair), and
+  `struct_extern`, whose `tests/extern/struct_extern.c` the reference compiler compiles (the
+  harness now links a program's `tests/extern/NAME.c` into all three builds): calls of every
+  class into GCC's code directly, through pointers, and through `...` past the registers, GCC's
+  code calling back directly, through pointers, and variadically, and libc's `div`, `ldiv`,
+  `lldiv`. All 67 match the reference natively without and with `-O`; 57 match in `fir run`
+  (`struct_extern` joins the 9 that call other external functions); 13 error tests. A one-off
+  run of the corpus compiled by Clang 23 (`-O1 -ffp-contract=off` for AArch64, glibc's headers,
+  GCC's linker) printed what GCC's binaries print for all 67.
+- **ABI torture** (`fai_cc_abi_torture` in `crates/fir-capi/tests/fai_cc.rs`): random C
+  signatures (up to 14 parameters and a result; structs and unions of every scalar type, arrays,
+  nesting, bitfields with zero-width ones, HFA candidates through arrays, nesting, and unions,
+  `_Alignas(16)` members, `aligned(8)` and `aligned(16)` attributes, empty structs, pointers)
+  in a callers file and a callees file, each compiled by GCC, `fai-cc`, or `fai-cc -O`; six
+  pairings (gcc/gcc, fai/gcc, fai -O/gcc, gcc/fai, gcc/fai -O, fai/fai -O) must each find every
+  member of every argument (direct, through a function pointer, and through `...` by `va_arg`)
+  and of every result. 240 signatures by default (about 1,150 parameters, 12,000 members per
+  pairing, 5 seconds); 20 seeds of 1,000 signatures each passed: 129,258 record types (61,734
+  of floats only, 21,344 unions, 18,387 with bitfields, 15,641 aligned, 6,984 empty), 93,565
+  parameters (88,454 also through `...`), 1,002,704 members checked in each pairing. It found
+  that a large struct holding an empty struct used its memory type, which FIR can't pass through
+  `...` (now its bytes). Mutations of the mapping (the type's alignment instead of the fields',
+  a union never an HFA, zero-width bitfields not ignored) each fail it.
+- **API:** none needed: version 1.5's composite signatures, `mem.load`/`mem.store` of a struct
+  type, calls, `func.ret`, and `va.arg` of a composite were enough.
+- **API and IR friction:** FIR can't express a 16-byte aligned HFA (an alignment marker is a
+  zero-length array, which makes it not an HFA), nor a 16-byte aligned composite through `...`
+  (variadic composites have no zero-length arrays); a richer alignment on `struct<C>` would
+  cover both. FIR has no unions among composite values, so a union travels as an HFA's floats or
+  its bytes, and its pointers as exposed bytes. A call result needs a temporary in memory (there
+  are no aggregate locals in registers until mem2reg). Two `fai-cc` objects with string literals
+  don't link together (the generated `str.N` names; no linkage yet), so the torture's callees
+  avoid them.
+- **Not yet:** the rejections above; `long double`, `_Complex`, and the other gaps track F2a
+  and F2b list.
+
+## Round status
+
+Against "Done when", item by item:
+
+- **A corpus of C programs compiled by `fai-cc` to AArch64 binaries:** met. 67 programs: integers
+  (`arith_*`, `bigint`, `bit_tricks`, `number_theory`, …), pointers (`pointers`, `linked_list`,
+  `bst`, `pointer_int_casts`), structs (`structs`, `aggregates`, `layouts`, `bitfields`), unions
+  (`unions`, `struct_classes`), arrays (`arrays`, `matrix`, `sieve`), globals (`globals`,
+  `initializers`), string literals (`chars_strings`, `string_routines`), every statement form
+  including `goto` and `switch` (`goto`, `switches`, `duff`, `state_machine`, `loops`), function
+  pointers (`function_pointers`, `struct_calls`), `float`/`double` (`float_*`, `newton`,
+  `mandelbrot`, `integration`, `vec3`, `complex_math`), variadic functions defined and called
+  (`varargs`, `varargs_printf`, `struct_calls`), structs passed and returned by value
+  (`struct_classes`, `struct_calls`, `struct_extern`, `vec3`, `complex_math`, `rational`,
+  `geometry`), and calls to libc including `printf` (`libc_calls`, `printf_*`, `struct_extern`).
+- **Output matching the same programs compiled by clang, under `qemu-aarch64` on Linux:** met,
+  with one substitution: the harness's reference compiler is the dev shell's AArch64 GCC (16.2,
+  decision C frontend testing), and all 67 match it without and with `-O`. Clang compiled the
+  same 67 for AArch64 once (by hand, not in the harness), and its binaries print what GCC's
+  print, so `fai-cc`'s match Clang's too.
+- **Natively on AArch64:** not run here (the host is x86-64); the harness runs the binaries
+  directly when it is on AArch64.
+- **Each program's HFIR also runs in `fir run` with the same output where its run is defined:**
+  met for 57 of 67. The other 10 call external functions whose results the interpreter's world
+  answers with zeros (`printf`, `vsnprintf`, `strlen`, and `struct_extern`'s GCC-compiled
+  helpers), so their runs aren't comparable and are listed, not compared.
 
 ## Not in this round
 
