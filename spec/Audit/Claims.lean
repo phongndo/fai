@@ -108,7 +108,11 @@ def claims : List Claim := [
   { name := ``Fir.AArch64.floatFma_arm, role := "AArch64 float semantics",
     summary := "Under Arm's NaN choice, float.fma a, b, c is fmadd with addend c." },
   { name := ``Fir.AArch64.floatExt_arm, role := "AArch64 float semantics",
-    summary := "Under Arm's NaN choice, float.ext and float.trunc are fcvt." }
+    summary := "Under Arm's NaN choice, float.ext and float.trunc are fcvt." },
+  { name := ``Fir.AArch64.roundTrip, role := "AArch64 C ABI",
+    summary := "A struct or array passed in registers (an HFA or up to 16 bytes) arrives with its defined bytes exactly: its pieces, each loaded into a register and stored back, are its bytes; a word of eight fragments of one pointer stays that pointer. That native code passes exactly these pieces where Fir.AArch64.argLocs says is tested (the ABI torture test), not proved." },
+  { name := ``Fir.AArch64.pieces_flatten, role := "AArch64 C ABI",
+    summary := "The register pieces of a composite passed in registers (8-byte words, or an HFA's members), joined, are its bytes." }
 ]
 
 /-- Theorems the audit would flag that are steps toward claims. -/
@@ -121,6 +125,7 @@ def supporting : List Lean.Name := [
   ``Fir.Behavior.Refines.refl, ``Fir.Behavior.Refines.trans,
   ``Fir.Func.Refines.refl, ``Fir.Func.Refines.trans,
   ``Fir.OpOut.Refines.refl, ``Fir.OpOut.Refines.trans,
-  ``Fir.Lower.Proof.ovf_runs, ``Fir.Lower.Proof.refines_of_rel, ``Fir.Dce.floatPure_kind]
+  ``Fir.Lower.Proof.ovf_runs, ``Fir.Lower.Proof.refines_of_rel, ``Fir.Dce.floatPure_kind,
+  ``Fir.AArch64.Word.bytes_ofBytes]
 
 end Fir.Audit

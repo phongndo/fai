@@ -219,9 +219,10 @@ pub fn check_module(m: &Module) -> Result<()> {
 }
 
 /// What instruction selection does with ops of a kind ([`crate::contract`]): every MFIR op is
-/// selected, and so are `ptr.field` and `ptr.index` (HFIR ops over scalars, so that core-op HFIR
-/// compiles without lowering); the other HFIR building blocks need lowering first, and LFIR is
-/// already selected. Integers wider than 64 bits are a separate, per-type limit
+/// selected, `agg.make`, `agg.extract`, and `agg.insert` included (they regroup the leaves of a
+/// struct or array calls pass whole), and so are `ptr.field` and `ptr.index` (HFIR ops over
+/// scalars, so that core-op HFIR compiles without lowering); the other HFIR building blocks need
+/// lowering first, and LFIR is already selected. Integers wider than 64 bits are a separate, per-type limit
 /// ([`check_module`], `check_ty`).
 #[deny(clippy::wildcard_enum_match_arm)]
 pub fn support(k: OpKind) -> Support {
@@ -294,10 +295,10 @@ pub fn support(k: OpKind) -> Support {
         | OpKind::VaArg
         | OpKind::VaEnd
         | OpKind::InvokeIndirect { .. } => Support::Yes,
-        OpKind::AggMake
-        | OpKind::AggExtract { .. }
-        | OpKind::AggInsert { .. }
-        | OpKind::Overflow { .. }
+        // Structs and arrays that calls pass whole (decision: C ABI for aggregates); `Sel::op`
+        // refuses composites in any other op.
+        OpKind::AggMake | OpKind::AggExtract { .. } | OpKind::AggInsert { .. } => Support::Yes,
+        OpKind::Overflow { .. }
         | OpKind::UnionMake { .. }
         | OpKind::UnionTag
         | OpKind::UnionGet { .. }

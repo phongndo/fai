@@ -15,7 +15,7 @@ Files here:
 | File | What | Made by |
 |---|---|---|
 | `op-contracts.json` | Per op kind (534 kinds, modifiers included): identity, fields, modifiers, layers, typing, declared effects, and the DCE permission with its evidence | `lake exe gen-rust manifest` |
-| `proofs.lock.json` | Reviewed fingerprints of the 33 registered claims: statement, hypothesis count, axioms, and fingerprints of the `Fir` definitions they depend on | `lake exe fir-audit --update` |
+| `proofs.lock.json` | Reviewed fingerprints of the 35 registered claims: statement, hypothesis count, axioms, and fingerprints of the `Fir` definitions they depend on | `lake exe fir-audit --update` |
 | `proofs.md` | The claims as Lean prints them, with axioms and dependency counts | `lake exe fir-audit --report` |
 | `adversarial.md` | The last `cargo xtask mutate` run: each planted defect and the diagnostic that caught it | `cargo xtask mutate` |
 
@@ -101,7 +101,8 @@ verified-only (`tests/contracts.rs` fails on any trusted permission unless
 
 Each Rust component that dispatches on kinds declares what it does with each, next to its code,
 matching every variant with `clippy::wildcard_enum_match_arm` denied:
-`fir::interp::support`, `fir::lower_support` (keep, expand, scalarize, lower exceptions, or
+`fir::interp::support`, `fir::lower_support` (keep, expand, scalarize, scalarize or keep for
+the `agg.*` ops that make and take apart the structs calls pass whole, lower exceptions, or
 refuse, with what backs each), and `fir::backend::aarch64::isel::support`, which instruction
 selection's own error path now uses. `tests/contracts.rs` checks them against the declarations
 (an HFIR-only op the lowering doesn't rewrite, an op instruction selection claims outside MFIR,
@@ -249,6 +250,7 @@ under AddressSanitizer in the full one. No noisy lint groups were enabled.
 | HFIR lowering: scalarization, `cf.try`, the module | **open**; tested | `tests/lower.rs` against `fir-ref lower` and runs |
 | Interpreter (Rust) vs Lean semantics | tested | `tests/run.rs`, `tests/fuzz.rs`, LFIR runs in `tests/aarch64.rs` |
 | Instruction selection | tested | LFIR runs in both interpreters, native runs |
+| C ABI: structs and arrays by value (AAPCS64) | registers carry a composite's defined bytes exactly: **proved** (`Fir.AArch64.roundTrip`, `pieces_flatten`); the classification against C: tested | `tests/abi.rs` (random signatures against GCC, both directions and `...`), `tests/capi/e2e.c`, native fixture runs |
 | Register allocation and frame lowering | checked on every compile (unproved validator, ABI assumptions) | `regcheck::validate` |
 | Assembly text and encoding | tested | native runs under qemu |
 | Effects and tiers in the op declarations | declared only | not read by anything that relies on them; `freeze_changes_core` shows one is incomplete |

@@ -106,6 +106,11 @@ pub enum Lowering {
     Expand,
     /// Scalarizing rewrites it (aggregate, union, and slice values): differential tests only.
     Scalarize,
+    /// Scalarizing rewrites it, except where it makes or takes apart a struct or array that calls
+    /// pass whole, which stays, and which the lowering emits too (`agg.make`, `agg.extract`,
+    /// `agg.insert`, which are MFIR ops as well; decision: C ABI for aggregates): differential
+    /// tests only.
+    ScalarizeOrKeep,
     /// Lowering exceptions rewrites it (`cf.try`): differential tests only.
     LowerExn,
     /// The lowering rejects it (LFIR ops).

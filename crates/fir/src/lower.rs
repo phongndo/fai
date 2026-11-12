@@ -28,8 +28,9 @@ use crate::verify::render_loc;
 
 /// What the lowering does with ops of a kind, and what backs it ([`crate::contract`]): MFIR ops
 /// stay; checked arithmetic, `ptr.field`, and `ptr.index` are expanded (proved:
-/// `Fir.Lower.Proof.Expand.refines`); aggregate, union, and slice ops are scalarized and `cf.try`
-/// is lowered to `cf.blocks` (tested against `fir-ref lower`, not proved); LFIR ops are rejected.
+/// `Fir.Lower.Proof.Expand.refines`); aggregate, union, and slice ops are scalarized (`agg.*`
+/// stay where they make or take apart a composite calls pass whole) and `cf.try` is lowered to
+/// `cf.blocks` (tested against `fir-ref lower`, not proved); LFIR ops are rejected.
 #[deny(clippy::wildcard_enum_match_arm)]
 pub fn support(k: OpKind) -> Lowering {
     match k {
@@ -98,10 +99,10 @@ pub fn support(k: OpKind) -> Lowering {
         OpKind::Overflow { .. } | OpKind::PtrField { .. } | OpKind::PtrIndex { .. } => {
             Lowering::Expand
         }
-        OpKind::AggMake
-        | OpKind::AggExtract { .. }
-        | OpKind::AggInsert { .. }
-        | OpKind::UnionMake { .. }
+        OpKind::AggMake | OpKind::AggExtract { .. } | OpKind::AggInsert { .. } => {
+            Lowering::ScalarizeOrKeep
+        }
+        OpKind::UnionMake { .. }
         | OpKind::UnionTag
         | OpKind::UnionGet { .. }
         | OpKind::SliceMake

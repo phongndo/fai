@@ -61,6 +61,9 @@ fn contradictions(k: OpKind) -> Vec<String> {
         Lowering::Expand | Lowering::Scalarize | Lowering::LowerExn if !hfir_only => bad(format!(
             "the lowering rewrites it ({lowering:?}), but it isn't HFIR only"
         )),
+        Lowering::ScalarizeOrKeep if !(d.layers.hfir && d.layers.mfir) => {
+            bad("the lowering scalarizes or keeps it, but it isn't both HFIR and MFIR".into())
+        }
         Lowering::No(_) if d.layers.hfir => bad("the lowering refuses an HFIR op".into()),
         _ => {}
     }

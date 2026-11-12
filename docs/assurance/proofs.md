@@ -5,7 +5,7 @@ of the Lean development, with its statement as Lean prints it, its transitive ax
 many `Fir` definitions its meaning depends on. A claim is only as strong as its statement:
 read the hypotheses. Open obligations are listed in `docs/assurance/README.md`.
 
-33 claims; 24 supporting lemmas registered; 0 errors; 0 changes needing review.
+35 claims; 25 supporting lemmas registered; 0 errors; 0 changes needing review.
 
 ## `Fir.Dce.dcePerm_sound` (binding: Rust permissions)
 
@@ -16,7 +16,7 @@ Every op kind the generated DCE contract lets the Rust pass delete is pure (Pure
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 1; `Fir` definitions depended on: 972
+- hypotheses: 1; `Fir` definitions depended on: 983
 - bound for the Rust side by `Fir.Audit.Bindings.dce_classification`
 
 ## `Fir.Dce.checkFunc_sound` (binding: proved checker)
@@ -29,7 +29,7 @@ If the DCE checker run by fir-ref check-dce accepts a target function for a Deci
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 2; `Fir` definitions depended on: 2192
+- hypotheses: 2; `Fir` definitions depended on: 2225
 - bound for the Rust side by `Fir.Audit.Bindings.dce_checker`
 
 ## `Fir.Dce.refines` (pass correctness)
@@ -46,7 +46,7 @@ DCE: deleting pure ops whose results no later op of their region reads, anywhere
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 5; `Fir` definitions depended on: 1458
+- hypotheses: 5; `Fir` definitions depended on: 1491
 
 ## `Fir.Dce.freeze_changes_core` (counterexample)
 
@@ -58,7 +58,7 @@ freeze of poison changes the core (it consults the oracle), although its declara
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 0; `Fir` definitions depended on: 938
+- hypotheses: 0; `Fir` definitions depended on: 949
 
 ## `Fir.Dse.refines` (pass correctness)
 
@@ -74,7 +74,7 @@ DSE: deleting a store that the next op overwrites through the same pointer varia
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 5; `Fir` definitions depended on: 1438
+- hypotheses: 5; `Fir` definitions depended on: 1471
 
 ## `Fir.Fwd.refines` (pass correctness)
 
@@ -91,7 +91,7 @@ Store-to-load forwarding: a load right after a store of its type through the sam
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 6; `Fir` definitions depended on: 1441
+- hypotheses: 6; `Fir` definitions depended on: 1474
 
 ## `Fir.CopyProp.refines` (pass correctness)
 
@@ -107,7 +107,7 @@ Copy propagation through straight-line code (up to the first op with regions or 
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 5; `Fir` definitions depended on: 1446
+- hypotheses: 5; `Fir` definitions depended on: 1479
 
 ## `Fir.Lower.Proof.Expand.refines` (lowering correctness)
 
@@ -121,7 +121,7 @@ The HFIR lowering's expansion pass (checked arithmetic, ptr.field, ptr.index) re
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 4; `Fir` definitions depended on: 1674
+- hypotheses: 4; `Fir` definitions depended on: 1707
 
 ## `Fir.Lower.Proof.lowerFunc_refines` (lowering correctness (partial))
 
@@ -137,7 +137,7 @@ The whole lowering of a function refines it where scalarizing and lowering cf.tr
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 6; `Fir` definitions depended on: 1775
+- hypotheses: 6; `Fir` definitions depended on: 1825
 
 ## `Fir.Simulation.refines` (proof framework)
 
@@ -156,7 +156,7 @@ A lockstep simulation from every related start gives refinement of Decided funct
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 4; `Fir` definitions depended on: 1437
+- hypotheses: 4; `Fir` definitions depended on: 1470
 
 ## `Fir.SimulationS.refines` (proof framework)
 
@@ -177,7 +177,7 @@ A simulation with stuttering gives refinement of Decided functions.
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 4; `Fir` definitions depended on: 1437
+- hypotheses: 4; `Fir` definitions depended on: 1470
 
 ## `Fir.Rules.mul_two` (rewrite rule)
 
@@ -233,7 +233,7 @@ The float ops that can't trap (all but float.to_int.*.trap) are pure: a NaN resu
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 2; `Fir` definitions depended on: 959
+- hypotheses: 2; `Fir` definitions depended on: 970
 
 ## `Fir.Dce.evalFloat_oracle` (float semantics)
 
@@ -474,4 +474,43 @@ Under Arm's NaN choice, float.ext and float.trunc are fcvt.
 
 - axioms: propext, Classical.choice, Quot.sound
 - hypotheses: 0; `Fir` definitions depended on: 275
+
+## `Fir.AArch64.roundTrip` (AArch64 C ABI)
+
+A struct or array passed in registers (an HFA or up to 16 bytes) arrives with its defined bytes exactly: its pieces, each loaded into a register and stored back, are its bytes; a word of eight fragments of one pointer stays that pointer. That native code passes exactly these pieces where Fir.AArch64.argLocs says is tested (the ABI torture test), not proved.
+
+```lean
+∀ {sp : Fir.SpaceCfg} {t : Fir.Ty} {bs : List Fir.Byte},
+  bs.length = Fir.Ty.size sp t →
+    ((∃ n e, Fir.AArch64.passKind sp t = Fir.AArch64.PassKind.words n e) ∨
+        ∃ f n, Fir.AArch64.passKind sp t = Fir.AArch64.PassKind.hfa f n) →
+      (∀ (pc : List Fir.Byte),
+          pc ∈ Fir.AArch64.pieces (Fir.AArch64.passKind sp t) bs →
+            (Fir.AArch64.Word.ofBytes? pc).isSome = true) →
+        (List.map
+              (fun pc =>
+                (Option.map (fun x => Fir.AArch64.Word.bytes pc.length x)
+                      (Fir.AArch64.Word.ofBytes? pc)).getD
+                  [])
+              (Fir.AArch64.pieces (Fir.AArch64.passKind sp t) bs)).flatten =
+          bs
+```
+
+- axioms: propext, Quot.sound
+- hypotheses: 3; `Fir` definitions depended on: 233
+
+## `Fir.AArch64.pieces_flatten` (AArch64 C ABI)
+
+The register pieces of a composite passed in registers (8-byte words, or an HFA's members), joined, are its bytes.
+
+```lean
+∀ {sp : Fir.SpaceCfg} {t : Fir.Ty} {bs : List Fir.Byte},
+  bs.length = Fir.Ty.size sp t →
+    ((∃ n e, Fir.AArch64.passKind sp t = Fir.AArch64.PassKind.words n e) ∨
+        ∃ f n, Fir.AArch64.passKind sp t = Fir.AArch64.PassKind.hfa f n) →
+      (Fir.AArch64.pieces (Fir.AArch64.passKind sp t) bs).flatten = bs
+```
+
+- axioms: propext, Quot.sound
+- hypotheses: 2; `Fir` definitions depended on: 162
 
