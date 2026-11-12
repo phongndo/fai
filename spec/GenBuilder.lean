@@ -160,7 +160,7 @@ def fieldParam (f : Field) : Param :=
   | .align | .index => { name := n, rust := "u32", c := [(n, "u32")], cArg := n }
   | .flag => { name := n, rust := "bool", c := [(n, "bool")], cArg := n }
   | .symbol =>
-    { name := n, rust := "&str", c := [(n, "*const c_char")], cArg := s!"cstr({n})?",
+    { name := n, rust := "&str", c := [(n, "*const c_char")], cArg := s!"crate::cstr({n})?",
       rustConv := [s!"let {n}_id = self.str_imm({n})?;"], kindVal := some s!"{n}_id" }
   | .func =>
     { name := n, rust := "FuncRef", c := [(n, "FirFunc")], cArg := s!"FuncRef::from_raw({n})",
@@ -170,16 +170,16 @@ def fieldParam (f : Field) : Param :=
       cArg := s!"GlobalRef::from_raw({n})",
       rustConv := [s!"let {n}_id = self.global_imm({n})?;"], kindVal := some s!"{n}_id" }
   | .ty =>
-    { name := n, rust := "Ty", c := [(n, "FirType")], cArg := s!"ty({n})?",
+    { name := n, rust := "Ty", c := [(n, "FirType")], cArg := s!"crate::ty({n})?",
       rustConv := [s!"let {n}_id = self.ty_imm({n})?;"], kindVal := some s!"{n}_id" }
   | .succ =>
     { name := n, rust := "Target<'_>", c := [(n, "FirTarget")],
-      cConv := [s!"let {n}_args = values({n}.args, {n}.nargs);"],
-      cArg := s!"target({n}, {n}_args)",
+      cConv := [s!"let {n}_args = crate::values({n}.args, {n}.nargs);"],
+      cArg := s!"crate::target({n}, {n}_args)",
       rustConv := [s!"let {n}_id = self.succ({n})?;"], kindVal := some s!"{n}_id" }
   | .cases =>
     { name := n, rust := "&[SwitchCase<'_>]", c := [(n, "*const FirCase"), (s!"n{n}", "usize")],
-      cConv := [s!"let {n}_v = switch_cases({n}, n{n});"], cArg := s!"&{n}_v",
+      cConv := [s!"let {n}_v = crate::switch_cases({n}, n{n});"], cArg := s!"&{n}_v",
       rustConv := [s!"let {n}_id = self.cases({n})?;"], kindVal := some s!"{n}_id" }
 
 def operandParam (n : String) : Param :=
@@ -188,15 +188,15 @@ def operandParam (n : String) : Param :=
 
 def listParam (n : String) : Param :=
   { name := n, rust := "&[Operand]", c := [(n, "*const FirValue"), (s!"n{n}", "usize")],
-    cArg := s!"values({n}, n{n})", rustConv := [s!"self.operand_list({n});"] }
+    cArg := s!"crate::values({n}, n{n})", rustConv := [s!"self.operand_list({n});"] }
 
 def resultsParam : ResMode → List Param
   | .given 1 =>
-    [{ name := "result", rust := "Ty", c := [("result", "FirType")], cArg := "ty(result)?" }]
+    [{ name := "result", rust := "Ty", c := [("result", "FirType")], cArg := "crate::ty(result)?" }]
   | .given _ | .regions =>
     [{ name := "results", rust := "&[Ty]",
        c := [("results", "*const FirType"), ("nresults", "usize")],
-       cConv := ["let results = tys(results, nresults)?;"], cArg := "&results" }]
+       cConv := ["let results = crate::tys(results, nresults)?;"], cArg := "&results" }]
   | _ => []
 
 /-- The parameters, in order: result types, modifiers, then the format's immediates and
@@ -337,11 +337,11 @@ def capiOp (d : OpDecl) (i : Nat) : List String := Id.run do
   out := out ++ ["#[unsafe(no_mangle)]",
     s!"pub unsafe extern \"C\" fn fir_{method}({sig}) -> {cRet} \{",
     "    unsafe {",
-    "        with_builder(fb, FIR_INVALID, |f| {"]
+    "        with_builder(fb, FIR_INVALID, |builder| {"]
   for p in ps do
     for s in p.cConv do out := out ++ [s!"            {s}"]
   let args := ", ".intercalate (ps.map (·.cArg))
-  out := out ++ [s!"            f.{method}({args}).map({conv})", "        })", "    }", "}", ""]
+  out := out ++ [s!"            builder.{method}({args}).map({conv})", "        })", "    }", "}", ""]
   return out
 
 def generateCapi : String := Id.run do
