@@ -245,6 +245,21 @@ Instruction selection, Register allocation, Backend testing, Globals, Floats.
 - **Not yet:** `fai-cc` still rejects floats (track F2); varargs with floats (track V) and HFAs
   by value (track A); macOS's argument packing; a four-register `fmadd`; a proof that isel
   refines its source.
+- **Fixed after review:** the allocator's checker followed only value flow, so it accepted an
+  FP virtual register in `x0`; it now first requires each virtual register's home to be an
+  allocatable register of its class (never scratch, `x16`, `x18`, `x29`, `x30`, `sp`, `xzr`,
+  `d29`…`d31`) or a slot of its own below the slot count (unit tests in `regalloc.rs`). The
+  backend harness excused any numeric difference or arithmetic trap in a module that observed
+  addresses anywhere (`ptr.addr` of null included, and every aggregate global counted as
+  holding pointers), so a wrong float or a stray `convert` trap passed; a taint analysis
+  (`tests/taint`: allocation-site points-to, calls, exceptions, branches taint their function)
+  now excuses only tainted values, events' arguments, and traps at tainted locations, with
+  self-tests for the reported outputs. It flags about 23% of the random programs (the old flag
+  36%). The stricter rule exposed no backend bug; it needed two rules: a run that traps at a
+  tainted location may stop before the other run's (deterministic) trap (`s21-p2636`), and
+  `freeze` of what may be `poison` is the oracle's choice, 0 in the interpreter and the
+  register's value in hardware (`s37-p621`), so the analysis tracks `poison`. Fixtures and
+  `FIR_FUZZ=3000` on seeds 21, 37, and 53: no differences.
 
 ### Track F2a: floats in fai-cc (done)
 
