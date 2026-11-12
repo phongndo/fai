@@ -4,6 +4,8 @@
 //! the path in `FIR_REF`. `FIR_REF=none` skips the comparisons, leaving only the checks that
 //! need no reference.
 
+pub mod evidence;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -49,9 +51,14 @@ pub fn expected_errors(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The Lean reference tool, or `None` with `FIR_REF=none` (which fails when a full run is
+/// required: see [`evidence`]).
 pub fn reference() -> Option<PathBuf> {
     match std::env::var("FIR_REF") {
-        Ok(s) if s == "none" => None,
+        Ok(s) if s == "none" => {
+            evidence::require("FIR_REF=none disables the comparisons with the Lean reference");
+            None
+        }
         Ok(s) => Some(PathBuf::from(s)),
         Err(_) => {
             let p = repo().join("spec/.lake/build/bin/fir-ref");

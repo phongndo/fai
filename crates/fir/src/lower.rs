@@ -18,10 +18,130 @@ use num_bigint::BigInt;
 use crate::body::{
     Body, Case, Int, OpId, Operand, OperandKind, RegionId, Succ, ValueId, ValueSpec,
 };
+use crate::contract::Lowering;
 use crate::decl::{Imm, Layer};
 use crate::ir::*;
 use crate::types::Shape;
 use crate::verify::render_loc;
+
+/// What the lowering does with ops of a kind, and what backs it ([`crate::contract`]): MFIR ops
+/// stay; checked arithmetic, `ptr.field`, and `ptr.index` are expanded (proved:
+/// `Fir.Lower.Proof.Expand.refines`); aggregate, union, and slice ops are scalarized and `cf.try`
+/// is lowered to `cf.blocks` (tested against `fir-ref lower`, not proved); LFIR ops are rejected.
+#[deny(clippy::wildcard_enum_match_arm)]
+pub fn support(k: OpKind) -> Lowering {
+    match k {
+        OpKind::Const(_)
+        | OpKind::Poison
+        | OpKind::Freeze
+        | OpKind::Copy
+        | OpKind::Select
+        | OpKind::Arith(..)
+        | OpKind::Bit(_)
+        | OpKind::Div(..)
+        | OpKind::Shift(..)
+        | OpKind::Cmp(_)
+        | OpKind::Zext
+        | OpKind::Sext
+        | OpKind::Trunc(_)
+        | OpKind::MemStack { .. }
+        | OpKind::MemAlloc { .. }
+        | OpKind::MemFree { .. }
+        | OpKind::Load { .. }
+        | OpKind::Store { .. }
+        | OpKind::PtrOffset { .. }
+        | OpKind::PtrAddr
+        | OpKind::PtrExpose
+        | OpKind::PtrFromExposed
+        | OpKind::PtrWithAddr
+        | OpKind::PtrNull
+        | OpKind::PtrCmp(_)
+        | OpKind::Call { .. }
+        | OpKind::If
+        | OpKind::Loop { .. }
+        | OpKind::Yield
+        | OpKind::Break
+        | OpKind::Continue
+        | OpKind::Ret
+        | OpKind::Blocks { .. }
+        | OpKind::Br { .. }
+        | OpKind::CondBr { .. }
+        | OpKind::Switch { .. }
+        | OpKind::TySize(_)
+        | OpKind::TyAlign(_)
+        | OpKind::TyOffset { .. }
+        | OpKind::MemStackOf { .. }
+        | OpKind::MemCopy { .. }
+        | OpKind::MemGlobal { .. }
+        | OpKind::FuncAddr { .. }
+        | OpKind::CallIndirect(_)
+        | OpKind::Check(_)
+        | OpKind::Throw
+        | OpKind::Invoke { .. }
+        | OpKind::FloatConst { .. }
+        | OpKind::FloatBin(_)
+        | OpKind::FloatUn(_)
+        | OpKind::FloatFma
+        | OpKind::FloatCmp(_)
+        | OpKind::FloatExt
+        | OpKind::FloatTrunc
+        | OpKind::FloatToInt { .. }
+        | OpKind::IntToFloat { .. }
+        | OpKind::FloatFromBits
+        | OpKind::FloatToBits
+        | OpKind::VaStart
+        | OpKind::VaArg
+        | OpKind::VaEnd
+        | OpKind::InvokeIndirect { .. } => Lowering::Keep,
+        OpKind::Overflow { .. } | OpKind::PtrField { .. } | OpKind::PtrIndex { .. } => {
+            Lowering::Expand
+        }
+        OpKind::AggMake
+        | OpKind::AggExtract { .. }
+        | OpKind::AggInsert { .. }
+        | OpKind::UnionMake { .. }
+        | OpKind::UnionTag
+        | OpKind::UnionGet { .. }
+        | OpKind::SliceMake
+        | OpKind::SlicePtr
+        | OpKind::SliceLen
+        | OpKind::SliceGet { .. }
+        | OpKind::SliceSet { .. } => Lowering::Scalarize,
+        OpKind::Try => Lowering::LowerExn,
+        OpKind::A64Code
+        | OpKind::A64Alu { .. }
+        | OpKind::A64AluImm { .. }
+        | OpKind::A64ShiftImm { .. }
+        | OpKind::A64Ext { .. }
+        | OpKind::A64Mov { .. }
+        | OpKind::A64MovWide { .. }
+        | OpKind::A64Csel { .. }
+        | OpKind::A64Ldr { .. }
+        | OpKind::A64Str { .. }
+        | OpKind::A64Adrl { .. }
+        | OpKind::A64AdrlFunc { .. }
+        | OpKind::A64B { .. }
+        | OpKind::A64BCond { .. }
+        | OpKind::A64Ret
+        | OpKind::A64Trap(_)
+        | OpKind::A64Bl { .. }
+        | OpKind::A64Blr { .. }
+        | OpKind::A64BlAlloc { .. }
+        | OpKind::A64ExnSet { .. }
+        | OpKind::A64ExnTake { .. }
+        | OpKind::A64BExn { .. }
+        | OpKind::A64Falu { .. }
+        | OpKind::A64Funary { .. }
+        | OpKind::A64Fmadd { .. }
+        | OpKind::A64FmovImm { .. }
+        | OpKind::A64Fcmp { .. }
+        | OpKind::A64Fcsel { .. }
+        | OpKind::A64Fcvt { .. }
+        | OpKind::A64Cvtf { .. }
+        | OpKind::A64Fcvtz { .. }
+        | OpKind::A64BlFree { .. } => Lowering::No("is an LFIR op"),
+    }
+}
 
 /// Lower an HFIR module to MFIR (Lean's `Lower.lowerModule`). Globals and external functions
 /// stay as they are.

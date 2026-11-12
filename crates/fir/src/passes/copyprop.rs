@@ -30,16 +30,10 @@ use crate::ir::OpKind;
 use super::{Remarks, at};
 
 /// Whether copy propagation stops at the op: it has regions, or calls a function, with or
-/// without a handler (Lean's `Flat` fails: `callee?` is `some`).
+/// without a handler (Lean's `Flat` fails: `callee?` is `some`, which the generated contract
+/// records as `calls`).
 fn stops(body: &Body, op: OpId) -> bool {
-    !body.regions(op).is_empty()
-        || matches!(
-            body.kind(op),
-            OpKind::Call { .. }
-                | OpKind::CallIndirect(_)
-                | OpKind::Invoke { .. }
-                | OpKind::InvokeIndirect { .. }
-        )
+    !body.regions(op).is_empty() || body.kind(op).contract().calls
 }
 
 /// Make the ops after each copy read its operand. Returns how many operands were rewritten.

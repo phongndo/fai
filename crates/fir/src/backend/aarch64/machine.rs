@@ -62,7 +62,7 @@ struct Lfir<'m> {
 
 /// Run function `f` of an LFIR module with `args`, and describe the outcome as `fir-ref run`
 /// does (Lean's `AArch64.run`).
-pub(super) fn run(m: Machine<'_>, f: u32, args: &[Value], fuel: u64) -> String {
+pub(super) fn run(m: Machine<'_>, f: u32, args: &[Value], fuel: u64) -> RunOutput {
     let mut l = Lfir {
         m,
         x: [Word::Bits(0); 31],
@@ -78,7 +78,13 @@ pub(super) fn run(m: Machine<'_>, f: u32, args: &[Value], fuel: u64) -> String {
         exn: None,
     };
     match l.start(f, args) {
-        Err(h) => h.render(),
+        Err(h) => RunOutput {
+            line: h.render(),
+            events: l.m.trace.clone(),
+            absorbing: matches!(h.behavior, Behavior::Ub(_) | Behavior::Stuck(_)),
+            out_of_fuel: false,
+            profile: l.m.profile,
+        },
         Ok(()) => l.drive(fuel),
     }
 }
@@ -726,6 +732,8 @@ impl<'m> Lfir<'m> {
         };
         match (body.kind(op), body.regions(op)) {
             (OpKind::A64Code, &[entry, ..]) => {
+                // The code container is entered once per call, not once per block or step.
+                self.m.profile.record(OpKind::A64Code);
                 let saved = self.saved_words();
                 let (n, nf) = self.vreg_count(f);
                 let vbase = self.vregs.len() as u32;
@@ -744,6 +752,7 @@ impl<'m> Lfir<'m> {
                 Ok(())
             }
             (OpKind::Ret, []) => {
+                self.m.profile.record(OpKind::Ret);
                 let params: Vec<ValueId> = body.params(body.entry()).collect();
                 let tys: Vec<Ty> = params.iter().map(|&v| body.ty(v)).collect();
                 let vs = self.arg_vals(loc, &tys)?;
@@ -982,6 +991,7 @@ impl<'m> Lfir<'m> {
 
     /// Lean's `exec`.
     fn exec(&mut self, op: OpId) -> R<()> {
+        self.m.profile.record(self.body().kind(op));
         let body = self.body();
         let loc = body.loc(op);
         let mut classes = Vec::new();
@@ -1326,16 +1336,28 @@ impl<'m> Lfir<'m> {
 
     /// Lean's `drive`. A step that halts adds no events, as Lean renders the trace from before
     /// the step.
-    fn drive(&mut self, fuel: u64) -> String {
+    fn drive(&mut self, fuel: u64) -> RunOutput {
         let mut steps = 0;
         loop {
             if steps >= fuel {
-                return format!("{}out of fuel after {fuel} steps", self.m.trace);
+                return RunOutput {
+                    line: format!("{}out of fuel after {fuel} steps", self.m.trace),
+                    events: self.m.trace.clone(),
+                    absorbing: false,
+                    out_of_fuel: true,
+                    profile: std::mem::take(&mut self.m.profile),
+                };
             }
             let mark = self.m.trace.len();
             if let Err(h) = self.step() {
                 self.m.trace.truncate(mark);
-                return format!("{}{}", self.m.trace, h.render());
+                return RunOutput {
+                    line: format!("{}{}", self.m.trace, h.render()),
+                    events: self.m.trace.clone(),
+                    absorbing: matches!(h.behavior, Behavior::Ub(_) | Behavior::Stuck(_)),
+                    out_of_fuel: false,
+                    profile: std::mem::take(&mut self.m.profile),
+                };
             }
             steps += 1;
         }

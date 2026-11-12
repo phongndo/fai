@@ -403,6 +403,124 @@ pub fn parse_int(s: &str) -> Option<BigInt> {
     }
 }
 
+/// What the interpreter does with ops of a kind ([`crate::contract`]): it runs every op of every
+/// layer, LFIR's `aarch64.*` ops on the machine model (`backend/aarch64/machine.rs`). The
+/// differential tests against `fir-ref run` are what check that it runs them as Lean does.
+#[deny(clippy::wildcard_enum_match_arm)]
+pub fn support(k: OpKind) -> crate::contract::Support {
+    match k {
+        OpKind::Const(_)
+        | OpKind::Poison
+        | OpKind::Freeze
+        | OpKind::Copy
+        | OpKind::Select
+        | OpKind::Arith(..)
+        | OpKind::Bit(_)
+        | OpKind::Div(..)
+        | OpKind::Shift(..)
+        | OpKind::Cmp(_)
+        | OpKind::Zext
+        | OpKind::Sext
+        | OpKind::Trunc(_)
+        | OpKind::MemStack { .. }
+        | OpKind::MemAlloc { .. }
+        | OpKind::MemFree { .. }
+        | OpKind::Load { .. }
+        | OpKind::Store { .. }
+        | OpKind::PtrOffset { .. }
+        | OpKind::PtrAddr
+        | OpKind::PtrExpose
+        | OpKind::PtrFromExposed
+        | OpKind::PtrWithAddr
+        | OpKind::PtrNull
+        | OpKind::PtrCmp(_)
+        | OpKind::Call { .. }
+        | OpKind::If
+        | OpKind::Loop { .. }
+        | OpKind::Yield
+        | OpKind::Break
+        | OpKind::Continue
+        | OpKind::Ret
+        | OpKind::Blocks { .. }
+        | OpKind::Br { .. }
+        | OpKind::CondBr { .. }
+        | OpKind::Switch { .. }
+        | OpKind::TySize(_)
+        | OpKind::TyAlign(_)
+        | OpKind::TyOffset { .. }
+        | OpKind::PtrField { .. }
+        | OpKind::PtrIndex { .. }
+        | OpKind::MemStackOf { .. }
+        | OpKind::MemCopy { .. }
+        | OpKind::MemGlobal { .. }
+        | OpKind::FuncAddr { .. }
+        | OpKind::CallIndirect(_)
+        | OpKind::AggMake
+        | OpKind::AggExtract { .. }
+        | OpKind::AggInsert { .. }
+        | OpKind::Overflow { .. }
+        | OpKind::UnionMake { .. }
+        | OpKind::UnionTag
+        | OpKind::UnionGet { .. }
+        | OpKind::SliceMake
+        | OpKind::SlicePtr
+        | OpKind::SliceLen
+        | OpKind::SliceGet { .. }
+        | OpKind::SliceSet { .. }
+        | OpKind::Check(_)
+        | OpKind::Try
+        | OpKind::Throw
+        | OpKind::Invoke { .. }
+        | OpKind::InvokeIndirect { .. }
+        | OpKind::A64Code
+        | OpKind::A64Alu { .. }
+        | OpKind::A64AluImm { .. }
+        | OpKind::A64ShiftImm { .. }
+        | OpKind::A64Ext { .. }
+        | OpKind::A64Mov { .. }
+        | OpKind::A64MovWide { .. }
+        | OpKind::A64Csel { .. }
+        | OpKind::A64Ldr { .. }
+        | OpKind::A64Str { .. }
+        | OpKind::A64Adrl { .. }
+        | OpKind::A64AdrlFunc { .. }
+        | OpKind::A64B { .. }
+        | OpKind::A64BCond { .. }
+        | OpKind::A64Ret
+        | OpKind::A64Trap(_)
+        | OpKind::A64Bl { .. }
+        | OpKind::A64Blr { .. }
+        | OpKind::A64BlAlloc { .. }
+        | OpKind::A64ExnSet { .. }
+        | OpKind::A64ExnTake { .. }
+        | OpKind::A64BExn { .. }
+        | OpKind::FloatConst { .. }
+        | OpKind::FloatBin(_)
+        | OpKind::FloatUn(_)
+        | OpKind::FloatFma
+        | OpKind::FloatCmp(_)
+        | OpKind::FloatExt
+        | OpKind::FloatTrunc
+        | OpKind::FloatToInt { .. }
+        | OpKind::IntToFloat { .. }
+        | OpKind::FloatFromBits
+        | OpKind::FloatToBits
+        | OpKind::A64Falu { .. }
+        | OpKind::A64Funary { .. }
+        | OpKind::A64Fmadd { .. }
+        | OpKind::A64FmovImm { .. }
+        | OpKind::A64Fcmp { .. }
+        | OpKind::A64Fcsel { .. }
+        | OpKind::A64Fcvt { .. }
+        | OpKind::A64Cvtf { .. }
+        | OpKind::A64Fcvtz { .. }
+        | OpKind::VaStart
+        | OpKind::VaArg
+        | OpKind::VaEnd
+        | OpKind::A64BlFree { .. } => crate::contract::Support::Yes,
+    }
+}
+
 /// Run `@name` in `m` with arguments written as text (integers, `null`, `poison`) for at most
 /// `fuel` steps, and describe the outcome in one line, exactly as `fir-ref run` does. Errors are
 /// what `fir-ref run` prints on stderr: no such function, a wrong argument count, or a bad
@@ -420,6 +538,38 @@ pub struct RunOutput {
     pub events: String,
     pub absorbing: bool,
     pub out_of_fuel: bool,
+    /// Ops actually dispatched in this run, including an op that halted it. Nothing in an
+    /// unentered function/region, after a halt, or beyond the fuel budget is counted.
+    pub profile: ExecutionProfile,
+}
+
+/// Execution counts by op kind's printed name (modifiers included). Only the interpreter can
+/// add counts; consumers decide whether a run's result was compared successfully before using
+/// its profile as evidence. Implicit yields and synthesized external returns are not source ops.
+///
+/// Counting is always on, so it is an array increment: one counter per kind, indexed by the
+/// kind's generated contract (`OpContract::index`), allocated at the first op.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExecutionProfile {
+    counts: Vec<u64>,
+}
+
+impl ExecutionProfile {
+    /// Kinds actually dispatched, with the number of times each was dispatched.
+    pub fn counts(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        self.counts
+            .iter()
+            .enumerate()
+            .filter(|&(_, &n)| n > 0)
+            .map(|(i, &n)| (crate::contract::CONTRACTS[i].name, n))
+    }
+
+    fn record(&mut self, kind: OpKind) {
+        if self.counts.is_empty() {
+            self.counts = vec![0; crate::contract::CONTRACTS.len()];
+        }
+        self.counts[kind.contract().index as usize] += 1;
+    }
 }
 
 impl RunOutput {
@@ -445,6 +595,33 @@ pub fn run_detail(
     run_detail_with(m, name, args, fuel, lower_rets, NanRule::Canonical)
 }
 
+/// Which address choices a run makes. The Lean semantics leaves addresses to the oracle
+/// (`realize` takes its answer when it fits), and so whether a one-past-the-end pointer equals a
+/// pointer to another allocation; `fir-ref run`, and [`run`], take the oracle that always answers
+/// 0. Another layout is another behavior the same semantics allows, which tests use to tell the
+/// parts of an outcome that depend on addresses from those that don't.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Addresses {
+    /// First fit from `0x1000`; a one-past-the-end pointer never equals another allocation's.
+    #[default]
+    Low,
+    /// First fit from this address (aligned up), falling back to `Low`'s choice where it doesn't
+    /// fit; a one-past-the-end pointer equals a pointer to another allocation's start.
+    From(u64),
+}
+
+/// [`run_detail`] with the address choices `addrs`.
+pub fn run_detail_in(
+    m: &Module,
+    name: &str,
+    args: &[&str],
+    fuel: u64,
+    lower_rets: bool,
+    addrs: Addresses,
+) -> Result<RunOutput, String> {
+    run_full(m, name, args, fuel, lower_rets, NanRule::Canonical, addrs)
+}
+
 /// [`run_detail`] for the oracle whose NaN choice is `nan` (and that answers 0 otherwise):
 /// `NanRule::Arm` gives the NaNs compiled code gives. An LFIR module runs on the AArch64 machine,
 /// whose NaNs are Arm's whatever `nan` says.
@@ -455,6 +632,18 @@ pub fn run_detail_with(
     fuel: u64,
     lower_rets: bool,
     nan: NanRule,
+) -> Result<RunOutput, String> {
+    run_full(m, name, args, fuel, lower_rets, nan, Addresses::Low)
+}
+
+fn run_full(
+    m: &Module,
+    name: &str,
+    args: &[&str],
+    fuel: u64,
+    lower_rets: bool,
+    nan: NanRule,
+    addrs: Addresses,
 ) -> Result<RunOutput, String> {
     if m.space.addr_bits > 64 {
         return Err(format!(
@@ -482,6 +671,7 @@ pub fn run_detail_with(
         ));
     }
     let mut mach = Machine::new(m);
+    mach.addrs = addrs;
     let mut vals = Vec::with_capacity(args.len());
     for (&p, &a) in params.iter().zip(args) {
         vals.push(mach.parse_arg(f.body.ty(p), a)?);
@@ -512,12 +702,7 @@ pub fn run_detail_with(
         vals.push(mach.parse_arg(ty, v)?);
     }
     if let crate::Layer::Lfir(_) = m.layer {
-        return Ok(RunOutput {
-            line: lfir::run(mach, fi as u32, &vals, fuel),
-            events: String::new(),
-            absorbing: false,
-            out_of_fuel: false,
-        });
+        return Ok(lfir::run(mach, fi as u32, &vals, fuel));
     }
     mach.lower_rets = lower_rets;
     mach.nan = nan;
@@ -527,6 +712,7 @@ pub fn run_detail_with(
             events: String::new(),
             absorbing: matches!(h.behavior, Behavior::Ub(_) | Behavior::Stuck(_)),
             out_of_fuel: false,
+            profile: mach.profile,
         },
         Ok(()) => mach.drive(fuel),
     })
@@ -540,6 +726,8 @@ struct Machine<'m> {
     nfuncs: u32,
     /// The events so far, each followed by `; `, as the outcome line shows them.
     trace: String,
+    /// Counts only at dispatch, never while walking the module's syntax.
+    profile: ExecutionProfile,
     space: &'m SpaceCfg,
     /// Pointers (indices into `ptrs`) to the globals, by name.
     globals: FxHashMap<&'m str, u32>,
@@ -577,6 +765,8 @@ struct Machine<'m> {
     base: u32,
     /// Show returned values as the lowering returns them (`run_detail`).
     lower_rets: bool,
+    /// The address choices ([`run_detail_in`]).
+    addrs: Addresses,
     /// How NaN results are picked (`run_detail_with`).
     nan: NanRule,
     /// Reused buffers.
@@ -608,6 +798,7 @@ impl<'m> Machine<'m> {
             funcs,
             nfuncs,
             trace: String::new(),
+            profile: ExecutionProfile::default(),
             space: &module.space,
             globals: FxHashMap::default(),
             fn_ptrs: vec![NONE; module.funcs.len() + module.externs.len()],
@@ -634,6 +825,7 @@ impl<'m> Machine<'m> {
             func: 0,
             base: 0,
             lower_rets: false,
+            addrs: Addresses::Low,
             nan: NanRule::Canonical,
             scratch: Vec::new(),
             bytes_buf: Vec::new(),
@@ -1293,10 +1485,21 @@ impl<'m> Machine<'m> {
                 && b + span <= limit
                 && taken.iter().all(|&(lo, hi)| b + span <= lo || hi <= b)
         };
-        let best = std::iter::once(align_up(0x1000, align))
-            .chain(taken.iter().map(|&(_, hi)| align_up(hi, align)))
-            .filter(|&b| fits(b))
-            .min();
+        let first_fit = |start: u128| {
+            std::iter::once(align_up(start, align))
+                .chain(
+                    taken
+                        .iter()
+                        .map(|&(_, hi)| align_up(hi, align))
+                        .filter(|&b| b >= start),
+                )
+                .filter(|&b| fits(b))
+                .min()
+        };
+        let best = match self.addrs {
+            Addresses::Low => first_fit(0x1000),
+            Addresses::From(base) => first_fit(u128::from(base)).or_else(|| first_fit(0x1000)),
+        };
         let Some(b) = best else {
             return ub(
                 UbKind::AddressSpace,
@@ -1872,8 +2075,15 @@ impl<'m> Machine<'m> {
                     );
                 }
                 // Pointers into different allocations are never equal; with one past the end
-                // the oracle decides, and its `0` says "not equal" too.
-                Ok(pred != Pred::Eq)
+                // the oracle decides, and its `0` says "not equal" too. Another layout's oracle
+                // says "equal".
+                let inside =
+                    |x: u32, off: i128| off >= 0 && off < i128::from(self.allocs.size[x as usize]);
+                let equal = match self.addrs {
+                    Addresses::Low => false,
+                    Addresses::From(_) => !(inside(a, o) && inside(b, o2)),
+                };
+                Ok(equal == (pred == Pred::Eq))
             }
             _ => {
                 if !is_eq {
@@ -3273,6 +3483,7 @@ impl<'m> Machine<'m> {
         let body = self.body();
         let loc = body.loc(op);
         let kind = body.kind(op);
+        self.profile.record(kind);
         let mut vs = std::mem::take(&mut self.scratch);
         match kind {
             OpKind::If => {
@@ -3573,6 +3784,7 @@ impl<'m> Machine<'m> {
                     events: self.trace.clone(),
                     absorbing: false,
                     out_of_fuel: true,
+                    profile: std::mem::take(&mut self.profile),
                 };
             }
             if let Err(h) = self.step() {
@@ -3581,6 +3793,7 @@ impl<'m> Machine<'m> {
                     events: self.trace.clone(),
                     absorbing: matches!(h.behavior, Behavior::Ub(_) | Behavior::Stuck(_)),
                     out_of_fuel: false,
+                    profile: std::mem::take(&mut self.profile),
                 };
             }
             steps += 1;

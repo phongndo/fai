@@ -56,6 +56,7 @@ use rustc_hash::FxHashMap;
 use super::abi::{self, ArgLoc};
 use super::mir::{Frame, Inst, MFunc};
 use crate::body::{Body, OpId, OperandKind, RegionId, ValueId};
+use crate::contract::Support;
 use crate::ir::*;
 use crate::types::align_up;
 
@@ -205,6 +206,130 @@ pub fn check_module(m: &Module) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// What instruction selection does with ops of a kind ([`crate::contract`]): every MFIR op is
+/// selected, and so are `ptr.field` and `ptr.index` (HFIR ops over scalars, so that core-op HFIR
+/// compiles without lowering); the other HFIR building blocks need lowering first, and LFIR is
+/// already selected. Integers wider than 64 bits are a separate, per-type limit
+/// ([`check_module`], `check_ty`).
+#[deny(clippy::wildcard_enum_match_arm)]
+pub fn support(k: OpKind) -> Support {
+    const HFIR: Support = Support::No(
+        "is HFIR only: lower the module to MFIR first (`fir::lower_checked`, or `fir::backend::prepare`)",
+    );
+    const LFIR: Support = Support::No("is an LFIR op: the module is already selected");
+    match k {
+        OpKind::Const(_)
+        | OpKind::Poison
+        | OpKind::Freeze
+        | OpKind::Copy
+        | OpKind::Select
+        | OpKind::Arith(..)
+        | OpKind::Bit(_)
+        | OpKind::Div(..)
+        | OpKind::Shift(..)
+        | OpKind::Cmp(_)
+        | OpKind::Zext
+        | OpKind::Sext
+        | OpKind::Trunc(_)
+        | OpKind::MemStack { .. }
+        | OpKind::MemAlloc { .. }
+        | OpKind::MemFree { .. }
+        | OpKind::Load { .. }
+        | OpKind::Store { .. }
+        | OpKind::PtrOffset { .. }
+        | OpKind::PtrAddr
+        | OpKind::PtrExpose
+        | OpKind::PtrFromExposed
+        | OpKind::PtrWithAddr
+        | OpKind::PtrNull
+        | OpKind::PtrCmp(_)
+        | OpKind::Call { .. }
+        | OpKind::If
+        | OpKind::Loop { .. }
+        | OpKind::Yield
+        | OpKind::Break
+        | OpKind::Continue
+        | OpKind::Ret
+        | OpKind::Blocks { .. }
+        | OpKind::Br { .. }
+        | OpKind::CondBr { .. }
+        | OpKind::Switch { .. }
+        | OpKind::TySize(_)
+        | OpKind::TyAlign(_)
+        | OpKind::TyOffset { .. }
+        | OpKind::PtrField { .. }
+        | OpKind::PtrIndex { .. }
+        | OpKind::MemStackOf { .. }
+        | OpKind::MemCopy { .. }
+        | OpKind::MemGlobal { .. }
+        | OpKind::FuncAddr { .. }
+        | OpKind::CallIndirect(_)
+        | OpKind::Check(_)
+        | OpKind::Throw
+        | OpKind::Invoke { .. }
+        | OpKind::FloatConst { .. }
+        | OpKind::FloatBin(_)
+        | OpKind::FloatUn(_)
+        | OpKind::FloatFma
+        | OpKind::FloatCmp(_)
+        | OpKind::FloatExt
+        | OpKind::FloatTrunc
+        | OpKind::FloatToInt { .. }
+        | OpKind::IntToFloat { .. }
+        | OpKind::FloatFromBits
+        | OpKind::FloatToBits
+        | OpKind::VaStart
+        | OpKind::VaArg
+        | OpKind::VaEnd
+        | OpKind::InvokeIndirect { .. } => Support::Yes,
+        OpKind::AggMake
+        | OpKind::AggExtract { .. }
+        | OpKind::AggInsert { .. }
+        | OpKind::Overflow { .. }
+        | OpKind::UnionMake { .. }
+        | OpKind::UnionTag
+        | OpKind::UnionGet { .. }
+        | OpKind::SliceMake
+        | OpKind::SlicePtr
+        | OpKind::SliceLen
+        | OpKind::SliceGet { .. }
+        | OpKind::SliceSet { .. }
+        | OpKind::Try => HFIR,
+        OpKind::A64Code
+        | OpKind::A64Alu { .. }
+        | OpKind::A64AluImm { .. }
+        | OpKind::A64ShiftImm { .. }
+        | OpKind::A64Ext { .. }
+        | OpKind::A64Mov { .. }
+        | OpKind::A64MovWide { .. }
+        | OpKind::A64Csel { .. }
+        | OpKind::A64Ldr { .. }
+        | OpKind::A64Str { .. }
+        | OpKind::A64Adrl { .. }
+        | OpKind::A64AdrlFunc { .. }
+        | OpKind::A64B { .. }
+        | OpKind::A64BCond { .. }
+        | OpKind::A64Ret
+        | OpKind::A64Trap(_)
+        | OpKind::A64Bl { .. }
+        | OpKind::A64Blr { .. }
+        | OpKind::A64BlAlloc { .. }
+        | OpKind::A64ExnSet { .. }
+        | OpKind::A64ExnTake { .. }
+        | OpKind::A64BExn { .. }
+        | OpKind::A64Falu { .. }
+        | OpKind::A64Funary { .. }
+        | OpKind::A64Fmadd { .. }
+        | OpKind::A64FmovImm { .. }
+        | OpKind::A64Fcmp { .. }
+        | OpKind::A64Fcsel { .. }
+        | OpKind::A64Fcvt { .. }
+        | OpKind::A64Cvtf { .. }
+        | OpKind::A64Fcvtz { .. }
+        | OpKind::A64BlFree { .. } => LFIR,
+    }
 }
 
 /// Whether an op's results, and its operands, may be integers wider than 64 bits. Such an
@@ -1757,20 +1882,16 @@ impl Sel<'_, '_> {
                 });
                 self.trap_if(Cond::Eq, reason);
             }
-            k if k.decl().layers.hfir && !k.decl().layers.mfir => {
-                return Err(format!(
-                    "{}{} is HFIR only: lower the module to MFIR first (`fir::lower_checked`, \
-                     or `fir::backend::prepare`)",
-                    at(self.loc),
-                    k.mnemonic()
-                ));
-            }
             k => {
-                return Err(format!(
-                    "{}{} is not supported by the AArch64 backend",
-                    at(self.loc),
-                    k.mnemonic()
-                ));
+                return Err(match support(k) {
+                    Support::No(why) => format!("{}{} {why}", at(self.loc), k.mnemonic()),
+                    Support::Yes => format!(
+                        "{}internal error: {} is declared supported (`isel::support`) but \
+                         instruction selection has no case for it",
+                        at(self.loc),
+                        k.mnemonic()
+                    ),
+                });
             }
         }
         Ok(())

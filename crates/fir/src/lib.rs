@@ -51,10 +51,14 @@
 pub mod backend;
 mod body;
 pub mod builder;
+pub mod contract;
 #[path = "generated/builder.rs"]
 #[rustfmt::skip]
 mod builder_ops;
 mod decl;
+#[path = "generated/contracts.rs"]
+#[rustfmt::skip]
+mod generated_contracts;
 pub mod float;
 mod globals;
 pub mod interp;
@@ -82,7 +86,7 @@ pub use builder::{
 pub use decl::{Check, Effect, Field, FieldTy, Imm, Item, Layer, Layers, OpDecl, Tier, TyE};
 pub use globals::Run;
 pub use ir::*;
-pub use lower::{lower_checked, lower_module};
+pub use lower::{lower_checked, lower_module, support as lower_support};
 pub use ops::{TARGETS, op_kind};
 pub use parse::parse_module;
 pub use sem::TrapReason;
