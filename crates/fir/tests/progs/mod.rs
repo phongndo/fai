@@ -35,12 +35,26 @@ use std::fmt::Write;
 
 use num_bigint::BigInt;
 
-/// A small deterministic random number generator (SplitMix64).
-pub struct Rng(u64);
+/// A small deterministic random number generator (SplitMix64). A *narrow* one also makes the
+/// generator keep integers to at most 64 bits and the data layout to the default (64-bit
+/// pointers), as the AArch64 backend needs.
+pub struct Rng(u64, bool);
 
 impl Rng {
     pub fn new(seed: u64) -> Rng {
-        Rng(seed)
+        Rng(seed, false)
+    }
+
+    // Only the AArch64 test uses it.
+    #[allow(dead_code)]
+    pub fn narrow(seed: u64) -> Rng {
+        Rng(seed, true)
+    }
+
+    /// An integer width from `ws`, at most 64 for a narrow generator.
+    pub fn width(&mut self, ws: &[u32]) -> u32 {
+        let w = self.pick(ws);
+        if self.1 { w.min(64) } else { w }
     }
 
     pub fn next(&mut self) -> u64 {
@@ -491,7 +505,7 @@ impl Gen<'_> {
     }
 
     fn int_type(&mut self) -> T {
-        T::I(self.rng.pick(WIDTHS))
+        T::I(self.rng.width(WIDTHS))
     }
 
     fn size_of(&self, t: T) -> u64 {
@@ -649,7 +663,7 @@ impl Gen<'_> {
 
     fn mem_type(&mut self) -> T {
         match self.rng.below(10) {
-            0..=4 => T::I(self.rng.pick(&[8, 16, 32, 32, 64, 64, 128])),
+            0..=4 => T::I(self.rng.width(&[8, 16, 32, 32, 64, 64, 128])),
             5..=7 => T::P,
             _ => T::B(self.rng.pick(&[8, 32, 64])),
         }
@@ -671,7 +685,7 @@ impl Gen<'_> {
             115..=116 => self.indirect_call(),
             117 => self.table_dispatch(),
             0..=3 => {
-                let w = self.rng.pick(WIDTHS);
+                let w = self.rng.width(WIDTHS);
                 self.konst(w);
             }
             4..=15 => {
@@ -745,9 +759,13 @@ impl Gen<'_> {
                 self.def(t, &format!("select {c}, {a}, {b}"));
             }
             39..=42 => {
-                let (mut v, mut w) = (self.rng.pick(WIDTHS), self.rng.pick(WIDTHS));
+                let (mut v, mut w) = (self.rng.width(WIDTHS), self.rng.width(WIDTHS));
                 if v == w {
-                    w += 1;
+                    if w < 64 || !self.rng.1 {
+                        w += 1;
+                    } else {
+                        v -= 1;
+                    }
                 }
                 if v > w {
                     std::mem::swap(&mut v, &mut w);
@@ -859,7 +877,7 @@ impl Gen<'_> {
             89..=93 if self.depth < 3 => self.blocks_op(),
             94..=98 if self.func + 1 < self.sigs.len() => self.call_op(),
             _ => {
-                let w = self.rng.pick(WIDTHS);
+                let w = self.rng.width(WIDTHS);
                 self.konst(w);
             }
         }
@@ -994,7 +1012,7 @@ impl Gen<'_> {
         if self.rng.chance(25) {
             T::P
         } else {
-            T::I(self.rng.pick(&[1, 8, 32, 64]))
+            T::I(self.rng.width(&[1, 8, 32, 64]))
         }
     }
 
@@ -1122,7 +1140,7 @@ impl Gen<'_> {
 
     /// `cf.switch` on a random integer: distinct keys modulo `2^w`, written signed or unsigned.
     fn switch(&mut self, from: usize) {
-        let w = self.rng.pick(&[1, 8, 8, 32, 32, 64, 7, 65, 128]);
+        let w = self.rng.width(&[1, 8, 8, 32, 32, 64, 7, 65, 128]);
         let v = self.operand(T::I(w));
         let d = self.target(from);
         let d = self.jump_args(d);
@@ -1263,7 +1281,7 @@ impl Gen<'_> {
             2 => T::I(16),
             3..=4 => T::I(32),
             5 => T::I(64),
-            6 => T::I(self.rng.pick(&[24, 128])),
+            6 => T::I(self.rng.width(&[24, 128])),
             7..=9 => T::P,
             _ => T::B(self.rng.pick(&[8, 32])),
         }
@@ -1939,7 +1957,9 @@ fn arg(rng: &mut Rng, t: T) -> String {
 
 /// A random program.
 pub fn program(rng: &mut Rng) -> Program {
+    let narrow = rng.1;
     let (ptr_size, addr) = match rng.below(20) {
+        _ if narrow => (64, 64),
         0..=11 => (64, 64),
         12 | 13 => (32, 32),
         14 | 15 => (64, 32),
@@ -1956,7 +1976,7 @@ pub fn program(rng: &mut Rng) -> Program {
                 if rng.chance(if i == 0 { 15 } else { 55 }) {
                     T::P
                 } else {
-                    T::I(rng.pick(&[1, 8, 32, 64, 7, 128]))
+                    T::I(rng.width(&[1, 8, 32, 64, 7, 128]))
                 }
             })
             .collect();
@@ -1964,7 +1984,7 @@ pub fn program(rng: &mut Rng) -> Program {
             .map(|_| match rng.below(10) {
                 0..=1 => T::P,
                 2 => T::B(rng.pick(&[8, 32])),
-                _ => T::I(rng.pick(&[1, 8, 32, 64, 65, 128])),
+                _ => T::I(rng.width(&[1, 8, 32, 64, 65, 128])),
             })
             .collect();
         sigs.push(Sig { params, rets });
@@ -1976,7 +1996,7 @@ pub fn program(rng: &mut Rng) -> Program {
                 if rng.chance(55) {
                     T::P
                 } else {
-                    T::I(rng.pick(&[1, 8, 32, 64, 128]))
+                    T::I(rng.width(&[1, 8, 32, 64, 128]))
                 }
             })
             .collect();
@@ -1984,7 +2004,7 @@ pub fn program(rng: &mut Rng) -> Program {
             .map(|_| match rng.below(10) {
                 0..=2 => T::P,
                 3 => T::B(rng.pick(&[8, 32])),
-                _ => T::I(rng.pick(&[1, 8, 32, 64, 65, 128])),
+                _ => T::I(rng.width(&[1, 8, 32, 64, 65, 128])),
             })
             .collect();
         sigs.push(Sig { params, rets });
@@ -1993,11 +2013,13 @@ pub fn program(rng: &mut Rng) -> Program {
     // The data layout: usually the default alignments, sometimes others.
     let natural = 1u64 << (u64::from(ptr_size) / 8).max(1).ilog2();
     let ptr_align = match rng.below(12) {
+        _ if narrow => natural,
         0 => natural * 2,
         1 if natural > 1 => natural / 2,
         _ => natural,
     };
     let ints: Vec<(u32, u64)> = match rng.below(12) {
+        _ if narrow => vec![(8, 1), (16, 2), (32, 4), (64, 8), (128, 16)],
         0 => vec![(8, 1), (16, 2), (32, 4), (64, 4)],
         1 => vec![(8, 1), (16, 1), (32, 2), (64, 2), (128, 8)],
         _ => vec![(8, 1), (16, 2), (32, 4), (64, 8), (128, 16)],

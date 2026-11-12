@@ -806,8 +806,17 @@ impl Sel<'_, '_> {
                 out.locs.push(None);
             }
         }
-        // The prologue's `sub sp, sp, N` is its fifth instruction.
+        // The prologue's `sub sp, sp, N` is its fifth instruction. Before allocation it makes
+        // room for the outgoing arguments and the locals, so the code runs as it is; the frame
+        // lowering replaces it.
         out.frame.alloc_at = 4;
+        out.insts[4] = Inst::AluImm {
+            op: AluImmOp::Sub,
+            sf: Sf::X,
+            d: Reg::SP,
+            n: Reg::SP,
+            imm: i64::from(out.frame.outgoing + out.frame.locals),
+        };
         out
     }
 
@@ -1114,8 +1123,8 @@ impl Sel<'_, '_> {
             OpKind::Call { callee } => {
                 let func = self.cx.funcs[body.str(callee)];
                 let args = self.operands(op)?;
-                let (ps, rs) = self.cx.sig(func);
-                self.call(op, &args, ps.len(), rs.len(), |s| {
+                let (_, rs) = self.cx.sig(func);
+                self.call(op, &args, rs.len(), |s| {
                     s.emit(Inst::Bl { func });
                 });
             }
@@ -1125,11 +1134,11 @@ impl Sel<'_, '_> {
                     return Err(format!("{}not a function type", at(self.loc)));
                 };
                 let (ps, rs) = (ps.to_vec(), rs.to_vec());
-                let (np, nr) = (ps.len(), rs.len());
+                let nr = rs.len();
                 self.sigs.push((ps, rs));
                 let sig = (self.sigs.len() - 1) as u32;
                 let target = args[0];
-                self.call(op, &args[1..], np, nr, |s| {
+                self.call(op, &args[1..], nr, |s| {
                     s.emit(Inst::Blr { n: target, sig });
                 });
             }
@@ -1289,14 +1298,7 @@ impl Sel<'_, '_> {
     }
 
     /// A call: arguments where the convention puts them, the call, then the results.
-    fn call(
-        &mut self,
-        op: OpId,
-        args: &[Reg],
-        _nparams: usize,
-        nrets: usize,
-        emit: impl FnOnce(&mut Self),
-    ) {
+    fn call(&mut self, op: OpId, args: &[Reg], nrets: usize, emit: impl FnOnce(&mut Self)) {
         for (i, &a) in args.iter().enumerate().skip(8) {
             self.str_(MemSize::X, a, Reg::SP, 8 * (i as i64 - 8));
         }
@@ -1673,6 +1675,8 @@ impl Sel<'_, '_> {
                 self.trap_if(Cond::Hs, TrapReason::Shift);
                 amt
             }
+            // An `i1` shifts by 0, the amount modulo 1.
+            ShiftEdge::Mask if w == 1 => self.konst(0),
             ShiftEdge::Mask if w.is_power_of_two() => {
                 let t = self.fresh();
                 self.emit(Inst::AluImm {

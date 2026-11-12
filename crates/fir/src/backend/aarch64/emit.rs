@@ -39,8 +39,11 @@ impl Os {
 #[derive(Clone, Debug)]
 pub struct Options {
     pub os: Os,
-    /// Prepended to the module's own function and global names (not to external functions).
+    /// Prepended to the module's own function and global names.
     pub prefix: String,
+    /// Prepended to external functions' names (not to the runtime's: `malloc`, `free`,
+    /// `aligned_alloc`, `__fir_trap`).
+    pub extern_prefix: String,
 }
 
 impl Default for Options {
@@ -48,6 +51,7 @@ impl Default for Options {
         Options {
             os: Os::host(),
             prefix: String::new(),
+            extern_prefix: String::new(),
         }
     }
 }
@@ -63,7 +67,6 @@ pub fn trap_code(r: TrapReason) -> u32 {
 
 struct Emitter<'a> {
     m: &'a Module,
-    mm: &'a MModule,
     o: &'a Options,
     out: String,
 }
@@ -128,8 +131,8 @@ impl Emitter<'_> {
         self.out.push('\n');
     }
 
-    /// A module symbol: a function or global of the module, with the prefix, or an external
-    /// function as it is; with `_` in front on Darwin.
+    /// A symbol: the module's own (with the prefix), or a runtime one as it is; with `_` in
+    /// front on Darwin.
     fn sym(&self, name: &str, own: bool) -> String {
         let base = if own {
             format!("{}{name}", self.o.prefix)
@@ -147,7 +150,13 @@ impl Emitter<'_> {
         let n = self.m.funcs.len();
         match self.m.funcs.get(f as usize) {
             Some(func) => (self.sym(&func.name, true), false),
-            None => (self.sym(&self.m.externs[f as usize - n].name, false), true),
+            None => {
+                let name = &self.m.externs[f as usize - n].name;
+                (
+                    self.sym(&format!("{}{name}", self.o.extern_prefix), false),
+                    true,
+                )
+            }
         }
     }
 
@@ -418,13 +427,10 @@ impl Emitter<'_> {
             }
             (Init::Sym(r), Ty::Ptr) => {
                 let name = gs.text(r);
-                let s = if gs_has(gs, name) {
+                let s = if gs_has(gs, name) || self.m.funcs.iter().any(|f| f.name == name) {
                     self.sym(name, true)
                 } else {
-                    match self.m.funcs.iter().position(|f| f.name == name) {
-                        Some(_) => self.sym(name, true),
-                        None => self.sym(name, false),
-                    }
+                    self.sym(&format!("{}{name}", self.o.extern_prefix), false)
                 };
                 relocs.push((start, s));
                 out.resize(start + 8, 0);
@@ -529,7 +535,6 @@ fn gs_has(gs: &Globals, name: &str) -> bool {
 pub fn emit(m: &Module, mm: &MModule, o: &Options) -> String {
     let mut e = Emitter {
         m,
-        mm,
         o,
         out: String::new(),
     };
@@ -556,7 +561,6 @@ pub fn emit(m: &Module, mm: &MModule, o: &Options) -> String {
     let _ = writeln!(e.out, "{t}:");
     e.line("brk #1000");
     e.globals();
-    let _ = e.mm;
     if o.os == Os::Linux {
         e.out
             .push_str("\n\t.section .note.GNU-stack,\"\",%progbits\n");

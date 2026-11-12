@@ -276,7 +276,6 @@ pub struct MFunc {
     pub nvregs: u32,
     /// The signatures of calls through pointers: parameter and result types.
     pub sigs: Vec<(Vec<Ty>, Vec<Ty>)>,
-    /// How many parameters and results each callee has (by function index), for `bl`.
     pub frame: Frame,
 }
 
@@ -317,16 +316,6 @@ pub struct MModule {
     pub funcs: Vec<MFunc>,
     /// The allocator families named by `mem.alloc` and `mem.free`.
     pub families: Vec<String>,
-}
-
-/// Which registers a call reads and writes under AAPCS64: it reads the argument registers its
-/// arguments use (and `x8` for more than two results) and writes every caller-saved register.
-pub fn call_uses(nargs: usize, nrets: usize, uses: &mut Vec<Reg>) {
-    uses.clear();
-    uses.extend((0..nargs.min(8) as u32).map(Reg::x));
-    if nrets > 2 {
-        uses.push(Reg::x(8));
-    }
 }
 
 /// The registers a call may change: `x0`…`x18` and `x30`.
