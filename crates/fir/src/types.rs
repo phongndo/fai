@@ -23,6 +23,16 @@ impl TyId {
     pub fn index(self) -> usize {
         self.0 as usize
     }
+
+    /// The id as a 32-bit number, as the C API passes it.
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+
+    /// The id a [`raw`](Self::raw) number stands for. Nothing checks that it exists.
+    pub fn from_raw(n: u32) -> TyId {
+        TyId(n)
+    }
 }
 
 /// How a struct's fields are laid out (Lean's `Policy`).

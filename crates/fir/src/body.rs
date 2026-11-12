@@ -40,6 +40,16 @@ macro_rules! id {
             pub fn index(self) -> usize {
                 self.0 as usize
             }
+
+            /// The id as a 32-bit number, as the C API passes it.
+            pub fn raw(self) -> u32 {
+                self.0
+            }
+
+            /// The id a [`raw`](Self::raw) number stands for. Nothing checks that it exists.
+            pub fn from_raw(n: u32) -> Self {
+                $name(n)
+            }
         }
     };
 }
@@ -168,8 +178,10 @@ fn push_span<T>(pool: &mut Vec<T>, items: impl IntoIterator<Item = T>) -> Span {
     }
 }
 
-/// An operand: a value, or a hole standing for a value not written yet. Packed in 32 bits.
+/// An operand: a value, or a hole standing for a value not written yet. Packed in 32 bits: a
+/// value's id, or a hole's with the top bit set.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct Operand(u32);
 
 /// What an [`Operand`] refers to.
@@ -188,12 +200,27 @@ impl Operand {
         Operand(h.0 | TAG)
     }
 
+    /// The packed 32 bits, as the C API passes them.
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+
+    pub fn from_raw(n: u32) -> Operand {
+        Operand(n)
+    }
+
     pub fn get(self) -> OperandKind {
         if self.0 & TAG == 0 {
             OperandKind::Value(ValueId(self.0))
         } else {
             OperandKind::Hole(HoleId(self.0 & !TAG))
         }
+    }
+}
+
+impl From<ValueId> for Operand {
+    fn from(v: ValueId) -> Operand {
+        Operand::value(v)
     }
 }
 
@@ -1196,6 +1223,27 @@ impl Body {
 
     pub fn def(&self, value: ValueId) -> ValueDef {
         self.value_info[value.index()].def.unpack()
+    }
+
+    /// Rename a value. The old name's text stays in the body, unused, so a builder names each
+    /// value once: values are made with empty names and named afterwards.
+    pub fn set_name(&mut self, value: ValueId, name: &str) {
+        self.value_info[value.index()].name = self.push_text(name);
+    }
+
+    /// Replace a value's facts. Like [`Body::set_name`], the old list stays in the pool.
+    pub fn set_facts(&mut self, value: ValueId, facts: impl IntoIterator<Item = TrustedFact>) {
+        self.value_info[value.index()].facts = push_span(&mut self.facts, facts);
+    }
+
+    /// How many regions the body has; region ids are below this.
+    pub fn num_regions(&self) -> usize {
+        self.regions.len()
+    }
+
+    /// How many holes the body has; hole ids are below this.
+    pub fn num_holes(&self) -> usize {
+        self.holes.len()
     }
 }
 

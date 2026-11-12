@@ -1,6 +1,6 @@
 name = "fir"
 version = "0.1.0"
-defaultTargets = ["Fir", "fir-ref", "gen-rust"]
+defaultTargets = ["Fir", "fir-ref", "gen-rust", "gen-builder"]
 
 [[lean_lib]]
 name = "Fir"
@@ -12,3 +12,7 @@ root = "Main"
 [[lean_exe]]
 name = "gen-rust"
 root = "GenRust"
+
+[[lean_exe]]
+name = "gen-builder"
+root = "GenBuilder"

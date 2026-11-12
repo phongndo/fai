@@ -18,6 +18,10 @@
 //! [`Globals`].
 
 mod body;
+mod builder;
+#[path = "generated/builder.rs"]
+#[rustfmt::skip]
+mod builder_ops;
 mod decl;
 mod globals;
 pub mod interp;
@@ -35,6 +39,10 @@ mod verify;
 pub use body::{
     Body, Case, CasesId, HoleId, Int, IntId, OpId, Operand, OperandKind, Ops, RegionId, StrId,
     Succ, SuccId, UseId, Uses, ValueDef, ValueId, ValueSpec,
+};
+pub use builder::{
+    BuildError, FactArg, FuncBuilder, FuncRef, GlobalRef, InsertPoint, IntImm, ModuleBuilder,
+    Results, SwitchCase, Target, Values,
 };
 pub use decl::{Check, Effect, Field, FieldTy, Imm, Item, Layer, Layers, OpDecl, Tier, TyE};
 pub use globals::Run;

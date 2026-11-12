@@ -101,6 +101,12 @@ impl Globals {
         });
     }
 
+    /// Replace global `g`'s initializer, so that globals can be declared before the
+    /// initializers that take each other's addresses.
+    pub fn set_init(&mut self, g: usize, init: Init) {
+        self.rows[g].init = init;
+    }
+
     pub fn int_init(&mut self, n: BigInt) -> Init {
         self.ints.push(n);
         Init::Int((self.ints.len() - 1) as u32)
