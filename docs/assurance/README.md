@@ -197,6 +197,16 @@ it, `tests/aarch64/address-unrelated.fir` with a miscompiled multiply would pass
 counted: 21 address tokens excused across 13 runs in the last full run, and one fixture
 (`provenance.fir`'s `cmp_end`) that matches another layout exactly.
 
+First fit packs allocations in one order under every base, so bits just above an allocation's
+alignment could agree in every sampled layout by accident: track A's review found `s71-p534`
+(`FIR_FUZZ_SEED=71`), a zero-size 8-aligned slot with bit 3 set in each layout, counted as a
+difference when the native stack aligned it to 16, though the semantics only requires a multiple
+of 8. The comparison now also runs each comparable run under `Addresses::Scatter` (two seeds,
+each in two phases): every allocation is placed on its own, in a pseudo-random region, at an odd
+multiple of its alignment in one phase and an even one in the other, so the lowest bit that moves
+is the allocation's alignment, which the semantics forces, rather than a sample's agreement
+(`review_forced_address_bits_come_from_alignment`).
+
 ### The proof audit (`fir-audit`)
 
 `spec/Audit.lean` (its own executable: it imports `Lean`, which `Fir` avoids so `fir-ref` stays

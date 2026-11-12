@@ -609,6 +609,22 @@ pub enum Addresses {
     /// First fit from this address (aligned up), falling back to `Low`'s choice where it doesn't
     /// fit; a one-past-the-end pointer equals a pointer to another allocation's start.
     From(u64),
+    /// Each allocation on its own: first fit from a pseudo-random region of `seed`'s (a multiple
+    /// of 2^24, below 2^48), plus a pseudo-random multiple of its alignment that is odd if `odd`
+    /// and even otherwise. The two phases of a seed place every allocation whose alignment is at
+    /// most 2^23 alike except for the bit of its alignment, which they flip, and the regions vary
+    /// the bits above independently per allocation, so the only bits all layouts agree on are
+    /// the ones alignment forces. Falls back to `Low`'s choice where it doesn't fit (a smaller
+    /// address space); a one-past-the-end pointer never equals another allocation's.
+    Scatter { seed: u64, odd: bool },
+}
+
+/// SplitMix64's output function: a well-mixed 64-bit value of `x`.
+fn mix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
 }
 
 /// [`run_detail`] with the address choices `addrs`.
@@ -1503,6 +1519,13 @@ impl<'m> Machine<'m> {
         let best = match self.addrs {
             Addresses::Low => first_fit(0x1000),
             Addresses::From(base) => first_fit(u128::from(base)).or_else(|| first_fit(0x1000)),
+            Addresses::Scatter { seed, odd } => {
+                let h = mix64(seed ^ mix64(u64::from(a)));
+                // Regions 1 to 2^24 - 1 of 2^24 bytes: below 2^48, never 0.
+                let region = u128::from(h % ((1 << 24) - 1) + 1) << 24;
+                let k = u128::from((mix64(h) % 256) * 2 + u64::from(odd));
+                first_fit(region + k * align).or_else(|| first_fit(0x1000))
+            }
         };
         let Some(b) = best else {
             return ub(
@@ -2084,7 +2107,7 @@ impl<'m> Machine<'m> {
                 let inside =
                     |x: u32, off: i128| off >= 0 && off < i128::from(self.allocs.size[x as usize]);
                 let equal = match self.addrs {
-                    Addresses::Low => false,
+                    Addresses::Low | Addresses::Scatter { .. } => false,
                     Addresses::From(_) => !(inside(a, o) && inside(b, o2)),
                 };
                 Ok(equal == (pred == Pred::Eq))

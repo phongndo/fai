@@ -28,11 +28,13 @@
 //!   choice too. A run whose output differs only in tainted values, and only in their numbers,
 //!   or where one run ends in an arithmetic or conversion trap at a tainted location and the
 //!   other ends otherwise, is counted, not failed. Each comparable run is also made under other
-//!   address layouts the semantics allows (`fir::interp::Addresses::From`): a result one of them
-//!   gives matches, and a tainted integer that those layouts move may differ only within the span
-//!   of bits they moved (so `addr & 255` can't come out as 256, and an aligned address stays
-//!   aligned); tainted values no layout moves (the oracle's `freeze`) are left to the taint
-//!   analysis.
+//!   address layouts the semantics allows (`fir::interp::Addresses::From`, and
+//!   `Addresses::Scatter`, which places each allocation on its own and, in its two phases, flips
+//!   the bit of each allocation's alignment): a result one of them gives matches, and a tainted
+//!   integer that those layouts move may differ only within the span of bits they moved (so
+//!   `addr & 255` can't come out as 256, and an aligned address stays aligned, but only as
+//!   aligned as the semantics requires); tainted values no layout moves (the oracle's `freeze`)
+//!   are left to the taint analysis.
 //! * Where `fir run` prints `poison` or a byte of a `va_list` cursor, any value matches; a
 //!   non-null pointer prints as `ptr ?`
 //!   (allocation numbers are the interpreter's); leak notes are dropped (counted).
@@ -844,11 +846,30 @@ fn normalize(reference: &str) -> Result<(String, bool), String> {
     Ok((out, leaks))
 }
 
-/// The address layouts besides the reference's that each comparable run is also made under. The
-/// first two start from bitwise complements (`0101…` and `1010…` over 48 bits), so between them
-/// every address bit above an allocation's alignment takes both values. The third is where
-/// qemu-user puts the stack.
+/// The bases of the first-fit address layouts besides the reference's that each comparable run is
+/// also made under. The first two start from bitwise complements (`0101…` and `1010…` over 48
+/// bits), so between them the base's bits take both values. The third is where qemu-user puts
+/// the stack.
 const LAYOUTS: [u64; 3] = [0x5555_5555_5555, 0xaaaa_aaaa_aaaa, 0x7ffd_9a3c_5a40];
+
+/// Every alternative layout: [`LAYOUTS`], and two seeds of `Addresses::Scatter` in both phases.
+/// First fit packs allocations in one order under every base, so an allocation's bits just
+/// above its alignment can agree in all of them by accident (found in review: a zero-size
+/// 8-aligned slot had bit 3 set in each, while the native stack aligns it to 16). Scatter's two
+/// phases flip each allocation's alignment bit, so the bits every layout agrees on are those the
+/// semantics forces (an allocation's alignment, `fir::interp`'s `realize`), not a sample's
+/// accident, and its regions vary the bits above per allocation.
+fn layouts() -> Vec<fir::interp::Addresses> {
+    use fir::interp::Addresses;
+    let scatter = [1u64, 2]
+        .into_iter()
+        .flat_map(|seed| [false, true].map(|odd| Addresses::Scatter { seed, odd }));
+    LAYOUTS
+        .into_iter()
+        .map(Addresses::From)
+        .chain(scatter)
+        .collect()
+}
 
 /// Why a compile failure is a declared limitation of the backend, if it is one (decision: C ABI
 /// for aggregates refuses to pass a composite whose pointer leaf doesn't fill an `x` register's
@@ -876,9 +897,10 @@ fn toks(s: &str) -> Vec<&str> {
 }
 
 /// Whether each integer of `got` that differs from `want` at a position some address layout
-/// (`alts`, the same run under [`LAYOUTS`]) moves stays within the span of bits that moved: from
-/// the lowest bit a layout changed to the highest. Bits below the span are forced (an alignment),
-/// bits above it too (a mask, the address space's size). Positions no layout moves, and results
+/// (`alts`, the same run under [`layouts`]) moves stays within the span of bits that moved: from
+/// the lowest bit a layout changed to the highest. Bits below the span are forced (an alignment,
+/// which `Addresses::Scatter`'s phases make the lowest bit that moves), bits above it too (a
+/// mask, the address space's size). Positions no layout moves, and results
 /// whose shape differs from `want`'s, are left to the taint analysis.
 fn within_moved_bits(want: &str, alts: &[String], got: &str) -> bool {
     let (w, g) = (toks(want), toks(got));
@@ -935,9 +957,7 @@ fn native_profile(
     got: &str,
 ) -> Option<fir::interp::ExecutionProfile> {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
-    for addrs in std::iter::once(fir::interp::Addresses::Low)
-        .chain(LAYOUTS.iter().copied().map(fir::interp::Addresses::From))
-    {
+    for addrs in std::iter::once(fir::interp::Addresses::Low).chain(layouts()) {
         let r =
             fir::interp::run_detail_in(m, f, &a, fuel, m.layer == fir::Layer::Hfir, addrs).unwrap();
         if let Ok((line, _)) = normalize(&r.line)
@@ -1141,18 +1161,11 @@ fn check_module(
                     tally.lock().unwrap().count("(leak notes dropped)");
                 }
                 // The same run under the other address layouts, where it is comparable too.
-                let alts: Vec<String> = LAYOUTS
-                    .iter()
-                    .filter_map(|&base| {
-                        let r = fir::interp::run_detail_in(
-                            src,
-                            f,
-                            &a,
-                            *fuel,
-                            lowered,
-                            fir::interp::Addresses::From(base),
-                        )
-                        .ok()?;
+                let alts: Vec<String> = layouts()
+                    .into_iter()
+                    .filter_map(|addrs| {
+                        let r =
+                            fir::interp::run_detail_in(src, f, &a, *fuel, lowered, addrs).ok()?;
                         normalize(&r.line).ok().map(|x| x.0)
                     })
                     .collect();
@@ -1668,13 +1681,10 @@ fn review_address_exemption_preserves_masked_integer_range() {
         .0
     };
     let want = result(fir::interp::Addresses::Low);
-    let alts: Vec<_> = LAYOUTS
-        .iter()
-        .map(|&base| result(fir::interp::Addresses::From(base)))
-        .collect();
+    let alts: Vec<_> = layouts().into_iter().map(result).collect();
     assert_eq!(want, "returned i64 0");
     assert_eq!(
-        alts,
+        alts[..3],
         ["returned i64 85", "returned i64 170", "returned i64 64"]
     );
     // Another value within the bits that move is a legal address's.
@@ -1707,11 +1717,52 @@ fn layouts_move_only_addresses() {
     };
     let low = run(fir::interp::Addresses::Low);
     assert_eq!(low, "returned i64 4096, i32 9");
-    for base in LAYOUTS {
-        let other = run(fir::interp::Addresses::From(base));
+    for l in layouts() {
+        let other = run(l);
         assert_ne!(other, low);
         assert!(other.ends_with(", i32 9"), "{other}");
     }
+}
+
+/// Found in review (`s71-p534`, `FIR_FUZZ_SEED=71`): the address of a zero-size 8-aligned stack
+/// slot had bit 3 set under every first-fit layout, so the 16-aligned address the native stack
+/// gives it counted as a difference, though the semantics requires only a multiple of 8. The
+/// scatter layouts flip bit 3, so any multiple of 8 within the moved bits is allowed, and a
+/// multiple of 4 that isn't one of 8 still isn't.
+#[test]
+fn review_forced_address_bits_come_from_alignment() {
+    let m = fir::parse_module(
+        "func @f() -> i64 {\n  %p: ptr = mem.stack 0, align 8\n  %q: ptr = mem.stack 8, align 8\n  %b: i64 = ptr.expose %q\n  %a: i64 = ptr.expose %p\n  func.ret %a\n}",
+    )
+    .unwrap();
+    fir::verify_module(&m).unwrap();
+    let result = |addrs| {
+        normalize(
+            &fir::interp::run_detail_in(&m, "f", &[], 100, false, addrs)
+                .unwrap()
+                .line,
+        )
+        .unwrap()
+        .0
+    };
+    let want = result(fir::interp::Addresses::Low);
+    let alts: Vec<_> = layouts().into_iter().map(result).collect();
+    let n: u64 = want.rsplit(' ').next().unwrap().parse().unwrap();
+    assert_eq!(n % 8, 0);
+    // The two first-fit layouts the review's run had (the others weren't comparable there)
+    // agree on bit 3, as the reference does; scatter's phases move it.
+    let bit3 = |alts: &[String]| {
+        alts.iter()
+            .any(|a| (a.rsplit(' ').next().unwrap().parse::<u64>().unwrap() ^ n) & 8 != 0)
+    };
+    assert_eq!(n & 8, 8);
+    assert!(!bit3(&alts[1..3]));
+    assert!(bit3(&alts[3..]));
+    let flipped = format!("returned i64 {}", n ^ 8);
+    let off4 = format!("returned i64 {}", n ^ 4);
+    assert!(!within_moved_bits(&want, &alts[1..3], &flipped));
+    assert!(within_moved_bits(&want, &alts, &flipped));
+    assert!(!within_moved_bits(&want, &alts, &off4));
 }
 
 /// The address-dependence analysis of `text`, on the module the backend compiles.
