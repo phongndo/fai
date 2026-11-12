@@ -16,14 +16,18 @@ blocks end in explicit branches. Before register allocation the code uses virtua
 
 namespace Fir
 
-/-- A register: a general-purpose register `x0`…`x30`, the stack pointer `sp`, the zero register
-`xzr`, or a virtual register `vN`. An op's size modifier (`.w` or `.x`) says how much of it the op
-reads and writes; the name is the same for both. -/
+/-- A register, in one of two classes. General-purpose: `x0`…`x30`, the stack pointer `sp`, the
+zero register `xzr`, or a virtual register `vN`. FP/SIMD: `d0`…`d31`, the scalar view of Arm's
+`V0`…`V31` (`sN` and `dN` in assembly), or a virtual one `fvN`. An op's size modifier (`.w` or `.x`
+for general-purpose registers, `.s` or `.d` for FP ones) says how much of it the op reads and
+writes; the name is the same for both, as `x3` names `w3` too. -/
 inductive Reg where
   | x (n : Nat)
   | sp
   | xzr
   | v (n : Nat)
+  | d (n : Nat)
+  | fv (n : Nat)
   deriving DecidableEq, Repr, Inhabited
 
 def Reg.render : Reg → String
@@ -31,21 +35,32 @@ def Reg.render : Reg → String
   | .sp => "sp"
   | .xzr => "xzr"
   | .v n => s!"v{n}"
+  | .d n => s!"d{n}"
+  | .fv n => s!"fv{n}"
 
 instance : ToString Reg := ⟨Reg.render⟩
 
-/-- A register's name: `x0`…`x30`, `sp`, `xzr`, or `v` and a number. -/
+/-- Whether the register is an FP/SIMD one. -/
+def Reg.isFp : Reg → Bool
+  | .d _ | .fv _ => true
+  | _ => false
+
+/-- A register's name: `x0`…`x30`, `sp`, `xzr`, `v` and a number, `d0`…`d31`, or `fv` and a
+number. -/
 def Reg.ofString? (s : String) : Option Reg :=
   if s == "sp" then some .sp
   else if s == "xzr" then some .xzr
   else
+    let num (ds : List Char) : Option Nat :=
+      if ds.isEmpty || (ds.length > 1 && ds.head? == some '0') then none
+      else (String.ofList ds).toNat?
     match s.toList with
+    | 'f' :: 'v' :: ds => (num ds).map .fv
     | c :: ds =>
-      let n? := if ds.isEmpty || (ds.length > 1 && ds.head? == some '0') then none
-        else (String.ofList ds).toNat?
-      match c, n? with
+      match c, num ds with
       | 'x', some n => if n ≤ 30 then some (.x n) else none
       | 'v', some n => some (.v n)
+      | 'd', some n => if n ≤ 31 then some (.d n) else none
       | _, _ => none
     | [] => none
 
@@ -53,6 +68,10 @@ def Reg.ofString? (s : String) : Option Reg :=
 #guard Reg.ofString? "x31" == none
 #guard Reg.ofString? "v007" == none
 #guard Reg.ofString? "v12" == some (.v 12)
+#guard Reg.ofString? "d31" == some (.d 31)
+#guard Reg.ofString? "d32" == none
+#guard Reg.ofString? "fv3" == some (.fv 3)
+#guard Reg.ofString? "fv03" == none
 
 /-- The operation size (ASL's `sf`): `.w` reads the low 32 bits of its sources and writes a
 zero-extended 32-bit result; `.x` uses all 64. -/
@@ -134,5 +153,47 @@ instance : Spelled MemSize := ⟨[sp "b" .b, sp "h" .h, sp "w" .w, sp "x" .x]⟩
 
 /-- `sbfx` (signed) and `ubfx`: extract the low bits and sign- or zero-extend them. -/
 def extModes : List (Spelling Bool) := [sp "sbfx" true, sp "ubfx" false]
+
+/-! ## FP/SIMD -/
+
+/-- The format of a scalar FP operation (ASL's `ftype`): `s` (`f32`, the low 32 bits of the
+register) or `d` (`f64`, the low 64). A write zeroes the rest of the register. -/
+inductive FSize where
+  | s | d
+  deriving DecidableEq, Repr
+
+def FSize.bits : FSize → Nat
+  | .s => 32
+  | .d => 64
+
+/-- The float type of the format. -/
+def FSize.fty : FSize → FloatTy
+  | .s => .f32
+  | .d => .f64
+
+instance : Spelled FSize := ⟨[sp "s" .s, sp "d" .d]⟩
+
+/-- Scalar FP arithmetic on two registers. -/
+inductive FAluOp where
+  | fadd | fsub | fmul | fdiv
+  deriving DecidableEq, Repr
+
+instance : Spelled FAluOp := ⟨[sp "fadd" .fadd, sp "fsub" .fsub, sp "fmul" .fmul,
+  sp "fdiv" .fdiv]⟩
+
+/-- Scalar FP operations on one register. `fmov` copies; between a general-purpose and an FP
+register it moves the bits (Arm's `FMOV (general)`: `fmov d0, x1`, `fmov w1, s0`). -/
+inductive FUnaryOp where
+  | fmov | fabs | fneg | fsqrt
+  deriving DecidableEq, Repr
+
+instance : Spelled FUnaryOp := ⟨[sp "fmov" .fmov, sp "fabs" .fabs, sp "fneg" .fneg,
+  sp "fsqrt" .fsqrt]⟩
+
+/-- `scvtf` (signed) and `ucvtf`: an integer to a float, rounded. -/
+def cvtfModes : List (Spelling Bool) := [sp "scvtf" true, sp "ucvtf" false]
+
+/-- `fcvtzs` (signed) and `fcvtzu`: a float to an integer, toward zero, saturating. -/
+def fcvtzModes : List (Spelling Bool) := [sp "fcvtzs" true, sp "fcvtzu" false]
 
 end Fir

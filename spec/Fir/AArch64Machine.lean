@@ -8,8 +8,10 @@ import Fir.Print
 
 How `fir-ref run` runs an LFIR module for AArch64 (`layer lfir aarch64`). It is a register
 machine over FIR's core: the memory, allocations, events, and oracle of `Fir.Interp` stay as they
-are, and the machine adds the general-purpose registers `x0`…`x30`, `sp`, the flags NZCV, and a
-stack of call frames, each with its own virtual registers. The instructions' bit-level meaning is
+are, and the machine adds the general-purpose registers `x0`…`x30`, `sp`, the FP/SIMD registers
+`d0`…`d31` (the low 64 bits of `V0`…`V31`, all scalar code reads; a write of `s` or `d` zeroes the
+rest), the flags NZCV, and a stack of call frames, each with its own virtual registers of both
+classes. The instructions' bit-level meaning is
 `Fir.AArch64`'s; this file adds what FIR needs on top:
 
 * **Registers hold words**: 64 bits, or a pointer with its provenance. Adding or subtracting an
@@ -23,12 +25,18 @@ stack of call frames, each with its own virtual registers. The instructions' bit
   Lifetimes and bounds are checked; alignment, `noalias`, and `readonly` scopes are not (LFIR has
   no facts).
 * **The stack** is one allocation of `stackSize` bytes; `sp` starts at its end.
-* **Calls** follow AAPCS64 (decision: LFIR for AArch64): arguments in `x0`…`x7` and then in 8-byte
-  stack slots from `sp`; one or two results in `x0` and `x1`, more in 8-byte slots at the address
-  the caller passes in `x8`. A narrow integer travels in the low bits of its register. `bl`
-  enters an LFIR function, which must leave `x19`…`x29` and `sp` as it found them, or calls an
-  external function: one event, its results placed as above, and the caller-saved registers
-  (`x0`…`x18`, `x30`) and flags then hold oracle choices. `ret` returns to the frame below,
+* **Registers have classes**: an instruction that names a register of the wrong class (an FP
+  register in `add`, a general-purpose one in `fadd`) is stuck; `fmov`, `ldr`, and `str` take
+  either for the register they move.
+* **Calls** follow AAPCS64 (decision: Calling convention): integer and pointer arguments in
+  `x0`…`x7` and float arguments in `d0`…`d7`, counted separately, then 8-byte stack slots from
+  `sp` in order (`argLocs`); one or two results in `d0`, `d1` when all are floats of one format,
+  otherwise in `x0`, `x1` (a float as its bits), more in 8-byte slots at the address the caller
+  passes in `x8` (`resRegs`). A narrow integer or an `f32` travels in the low bits of its
+  register. `bl` enters an LFIR function, which must leave `x19`…`x29`, `sp`, and `d8`…`d15` as
+  it found them, or calls an external function: one event, its results placed as above, and the
+  caller-saved registers (`x0`…`x18`, `x30`, `d0`…`d7`, `d16`…`d31`) and flags then hold oracle
+  choices. `ret` returns to the frame below,
   whatever `x30` holds: return addresses aren't modeled.
 * **Runtime calls**: `aarch64.bl.alloc` and `aarch64.bl.free` allocate and free like `mem.alloc`
   and `mem.free`, without an event; `aarch64.trap.R` traps with reason `R`.
@@ -50,13 +58,14 @@ inductive Word where
   | ptr (p : Ptr)
   deriving DecidableEq, Repr, Inhabited
 
-/-- One running function: its blocks, the rest of the current block, its virtual registers, and
-what `x19`…`x29` and `sp` held on entry. -/
+/-- One running function: its blocks, the rest of the current block, its virtual registers (`vN`
+and `fvN`), and what the callee-saved registers held on entry. -/
 structure LFrame where
   func : Func
   blocks : List Region
   ops : List Op
   vregs : Std.HashMap Nat Word := {}
+  fvregs : Std.HashMap Nat (BitVec 64) := {}
   saved : List Word
 
 structure LMachine where
@@ -64,6 +73,8 @@ structure LMachine where
   /-- `x0`…`x30`. -/
   regs : Array Word := Array.replicate 31 (.bits 0)
   sp : Word := .bits 0
+  /-- `d0`…`d31`: the low 64 bits of the FP/SIMD registers. -/
+  fregs : Array (BitVec 64) := Array.replicate 32 0
   nzcv : BitVec 4 := 0
   frames : List LFrame := []
   /-- Where the outermost call's results go when it has more than two. -/
@@ -92,6 +103,7 @@ def frame (loc : Option Loc) : LM LFrame := do
   | f :: _ => pure f
   | [] => stuckL loc "no running function"
 
+/-- A general-purpose register. -/
 def readReg (loc : Option Loc) : Reg → LM Word
   | .xzr => pure (.bits 0)
   | .sp => do pure (← get).sp
@@ -100,7 +112,9 @@ def readReg (loc : Option Loc) : Reg → LM Word
     match (← frame loc).vregs[n]? with
     | some w => pure w
     | none => stuckL loc s!"v{n} is read before it is written"
+  | r => stuckL loc s!"{r} is not a general-purpose register"
 
+/-- Write a general-purpose register (`exec` checks the class first). -/
 def writeReg (r : Reg) (w : Word) : LM Unit :=
   modify fun m => match r with
     | .xzr => m
@@ -109,6 +123,31 @@ def writeReg (r : Reg) (w : Word) : LM Unit :=
     | .v n => { m with frames := match m.frames with
       | f :: fs => { f with vregs := f.vregs.insert n w } :: fs
       | [] => [] }
+    | .d _ | .fv _ => m
+
+/-- An FP register's 64 bits. -/
+def readF (loc : Option Loc) : Reg → LM (BitVec 64)
+  | .d n => do pure ((← get).fregs.getD n 0)
+  | .fv n => do
+    match (← frame loc).fvregs[n]? with
+    | some b => pure b
+    | none => stuckL loc s!"fv{n} is read before it is written"
+  | r => stuckL loc s!"{r} is not an FP register"
+
+def writeF (r : Reg) (b : BitVec 64) : LM Unit :=
+  modify fun m => match r with
+    | .d n => { m with fregs := m.fregs.set! n b }
+    | .fv n => { m with frames := match m.frames with
+      | f :: fs => { f with fvregs := f.fvregs.insert n b } :: fs
+      | [] => [] }
+    | _ => m
+
+/-- An FP register's low bits, as a float of the format. -/
+def readFs (loc : Option Loc) (fs : FSize) (r : Reg) : LM (Float.Bits fs.fty.fmt) := do
+  pure ((← readF loc r).setWidth _)
+
+/-- Write a float of the format, zeroing the register's other bits. -/
+def writeFs (fs : FSize) (r : Reg) (b : Float.Bits fs.fty.fmt) : LM Unit := writeF r (b.setWidth 64)
 
 /-- A word's bits: a pointer's address, given an address if it has none. -/
 def toBits (loc : Option Loc) : Word → LM (BitVec 64)
@@ -116,6 +155,14 @@ def toBits (loc : Option Loc) : Word → LM (BitVec 64)
   | .ptr p => do pure (BitVec.ofNat 64 (← liftCM (ptrAddr loc p)))
 
 def readBits (loc : Option Loc) (r : Reg) : LM (BitVec 64) := do toBits loc (← readReg loc r)
+
+/-- A register of either class, as a word (an FP register's bits). -/
+def readAny (loc : Option Loc) (r : Reg) : LM Word :=
+  if r.isFp then do pure (.bits (← readF loc r)) else readReg loc r
+
+/-- Write a register of either class (an FP register gets the word's bits). -/
+def writeAny (loc : Option Loc) (r : Reg) (w : Word) : LM Unit :=
+  if r.isFp then do writeF r (← toBits loc w) else writeReg r w
 
 /-- A word moved by `k` bytes: a pointer stays one (`ptr.offset.wrap`). -/
 def offsetWord (loc : Option Loc) (w : Word) (k : Int) : LM Word :=
@@ -205,10 +252,11 @@ def valOfWord (loc : Option Loc) (t : Ty) (w : Word) : LM RVal := do
   | .byte n =>
     if n > 64 then stuckL loc s!"{t} is wider than a register"
     else pure (.bytes ((← bytesOfWord loc 8 w).take (n / 8)))
+  | .float f => pure (.float f (.bits ((← toBits loc w).setWidth f.width)))
   | _ => stuckL loc s!"{t} is not a value type"
 
-/-- The word that carries a value: an integer zero-extended, a pointer as it is, bytes as a word
-(`wordOfBytes`), and `poison` as an oracle choice. -/
+/-- The word that carries a value: an integer or a float's bits zero-extended, a pointer as it is,
+bytes as a word (`wordOfBytes`), and `poison` as an oracle choice. -/
 def wordOfVal (loc : Option Loc) : RVal → LM Word
   | .int _ (.bits b) => pure (.bits (b.setWidth 64))
   | .int _ .poison => do pure (.bits (← chooseBits))
@@ -216,48 +264,98 @@ def wordOfVal (loc : Option Loc) : RVal → LM Word
   | .ptr none => do pure (.bits (← chooseBits))
   | .bytes bs => wordOfBytes loc bs
   | .agg _ => stuckL loc "an aggregate is not a register value"
-  | .float .. => stuckL loc "a float is not in a general-purpose register"
+  | .float _ (.bits b) => pure (.bits (b.setWidth 64))
+  | .float _ .poison => do pure (.bits (← chooseBits))
 
-/-- The arguments of a call with parameter types `ps`: `x0`…`x7`, then 8-byte stack slots from
-`sp`. -/
+/-- Where AAPCS64 puts the arguments of a call with parameter types `ps` (decision: Calling
+convention): integers and pointers in `x0`…`x7` and floats in `d0`…`d7`, counted separately and
+in order, and the rest in 8-byte stack slots from `sp` (`.inr` with the slot's offset), in
+order. -/
+def argLocs (ps : List Ty) : List (Reg ⊕ Nat) := go ps 0 0 0
+where
+  go : List Ty → Nat → Nat → Nat → List (Reg ⊕ Nat)
+    | [], _, _, _ => []
+    | .float _ :: ts, g, f, s =>
+      if f < 8 then .inl (.d f) :: go ts g (f + 1) s else .inr (8 * s) :: go ts g f (s + 1)
+    | _ :: ts, g, f, s =>
+      if g < 8 then .inl (.x g) :: go ts (g + 1) f s else .inr (8 * s) :: go ts g f (s + 1)
+
+/-- How many stack slots a call's arguments take. -/
+def stackSlots (ps : List Ty) : Nat := ((argLocs ps).filter (·.isRight)).length
+
+#guard argLocs [.int 32, .float .f64, .ptr] == [.inl (.x 0), .inl (.d 0), .inl (.x 1)]
+#guard (argLocs ((List.replicate 9 (.float .f32)) ++ [.int 8])).getLast? == some (.inl (.x 0))
+#guard stackSlots ((List.replicate 9 (.float .f32)) ++ (List.replicate 10 (.int 8))) == 3
+
+/-- The registers one or two results go in: `d0`, `d1` (`s0`, `s1`) when all are floats of one
+format, otherwise `x0`, `x1`, a float as its bits; `none` for three or more, which go in 8-byte
+slots at the address the caller passes in `x8`. This is how C returns a struct of the results,
+each an 8-byte field (`double`, `float`, or a 64-bit integer): a homogeneous float aggregate in
+FP registers, any other 16 bytes in `x0` and `x1`. -/
+def resRegs (rets : List Ty) : Option (List Reg) :=
+  if rets.length > 2 then none
+  else
+    let fp := match rets with
+      | .float f :: rest => rest.all (· == .float f)
+      | _ => false
+    some ((List.range rets.length).map fun i => if fp = true then .d i else .x i)
+
+#guard resRegs [.float .f32, .float .f32] == some [.d 0, .d 1]
+#guard resRegs [.float .f32, .float .f64] == some [.x 0, .x 1]
+#guard resRegs [.int 8, .float .f64] == some [.x 0, .x 1]
+
+/-- A word in a stack slot `off` bytes above `sp`. -/
+def slotWord (loc : Option Loc) (off : Nat) : LM Word := do
+  loadWord loc 8 (← offsetWord loc (← get).sp off)
+
+/-- The arguments of a call with parameter types `ps`, from where `argLocs` puts them. -/
 def argVals (loc : Option Loc) (ps : List Ty) : LM (List RVal) :=
-  ps.zipIdx.mapM fun (t, i) => do
-    let w ← if i < 8 then readReg loc (.x i)
-      else loadWord loc 8 (← offsetWord loc (← get).sp (8 * (i - 8)))
+  (ps.zip (argLocs ps)).mapM fun (t, l) => do
+    let w ← match l with
+      | .inl r => readAny loc r
+      | .inr off => slotWord loc off
     valOfWord loc t w
 
-/-- Place a call's results: one or two in `x0` and `x1`, more in 8-byte slots at `x8`. -/
+/-- Place a call's results where `resRegs` says: in registers, or in 8-byte slots at `x8`. -/
 def setResults (loc : Option Loc) (rets : List Ty) (vs : List RVal) : LM Unit := do
-  if rets.length ≤ 2 then
-    for (v, i) in vs.zipIdx do writeReg (.x i) (← wordOfVal loc v)
-  else
+  match resRegs rets with
+  | some rs => for (v, r) in vs.zip rs do writeAny loc r (← wordOfVal loc v)
+  | none =>
     let area ← readReg loc (.x 8)
     for (v, i) in vs.zipIdx do
       storeWord loc 8 (← offsetWord loc area (8 * i)) (← wordOfVal loc v)
 
+/-- The FP registers a call may change: `d0`…`d7` and `d16`…`d31` (of `d8`…`d15`, only the high
+64 bits, which the machine doesn't hold). -/
+def fpCallerSaved : List Nat := List.range 8 ++ (List.range 16).map (· + 16)
+
 /-- After a call outside LFIR: the caller-saved registers other than `keep`, and the flags, hold
 oracle choices. -/
-def clobber (keep : Nat) : LM Unit := do
+def clobber (keep : List Reg) : LM Unit := do
   for i in List.range 19 do
-    if i ≥ keep then writeReg (.x i) (.bits (← chooseBits))
+    unless keep.contains (.x i) do writeReg (.x i) (.bits (← chooseBits))
   writeReg (.x 30) (.bits (← chooseBits))
+  for i in fpCallerSaved do
+    unless keep.contains (.d i) do writeF (.d i) (← chooseBits)
   let f ← chooseBits
   modify fun m => { m with nzcv := f.setWidth 4 }
 
 /-! ## Calls and returns -/
 
-/-- What a function must preserve: `x19`…`x29`, then `sp`. -/
-def calleeSaved : List Reg := (List.range 11).map (fun i => .x (19 + i)) ++ [.sp]
+/-- What a function must preserve: `x19`…`x29`, `sp`, then `d8`…`d15` (their low 64 bits). -/
+def calleeSaved : List Reg :=
+  (List.range 11).map (fun i => .x (19 + i)) ++ [.sp] ++ (List.range 8).map (fun i => .d (8 + i))
 
-def savedWords : LM (List Word) := calleeSaved.mapM (readReg none)
+def savedWords : LM (List Word) := calleeSaved.mapM (readAny none)
 
 /-- End the outermost call: its results, by its signature (or the exception it threw), and the
 leaks. -/
 def finish (loc : Option Loc) (f : Func) : LM Unit := do
   if let some w := (← get).exn then
     throw { outcome := .threw (← valOfWord loc .ptr w), loc, leaks := leaks (← get).core }
-  let ws ← if f.rets.length ≤ 2 then (List.range f.rets.length).mapM fun i => readReg loc (.x i)
-    else (List.range f.rets.length).mapM fun i => do
+  let ws ← match resRegs f.rets with
+    | some rs => rs.mapM (readAny loc)
+    | none => (List.range f.rets.length).mapM fun i => do
       loadWord loc 8 (← offsetWord loc (← get).resArea (8 * i : Nat))
   let vs ← (f.rets.zip ws).mapM fun (t, w) => valOfWord loc t w
   throw { outcome := .ret vs, loc, leaks := leaks (← get).core }
@@ -290,7 +388,7 @@ def callExt (loc : Option Loc) (x : Extern) : LM Unit := do
   | none => modify fun m => { m with hung := true }
   | some rs =>
     setResults loc x.rets rs
-    clobber (if x.rets.length ≤ 2 then x.rets.length else 0)
+    clobber ((resRegs x.rets).getD [])
 
 def callNamed (loc : Option Loc) (name : String) : LM Unit := do
   let c := (← get).core
@@ -374,8 +472,38 @@ def ptrOfWord (w : Word) : LM Ptr := do
     | some (a, al) => pure (.rel a 0 (n - al.base.getD 0))
     | none => pure (.abs n [])
 
+/-- The registers an instruction names that must be of one class: general-purpose (`false`) or
+FP (`true`). `fmov`, `ldr`, and `str` take either class for the register they move. -/
+def regClasses : OpKind → List (Reg × Bool)
+  | .a64Alu _ _ d n m | .a64Csel _ _ _ d n m => [(d, false), (n, false), (m, false)]
+  | .a64AluImm _ _ d n _ | .a64ShiftImm _ _ d n _ | .a64Ext _ _ d n _ | .a64Mov _ d n =>
+    [(d, false), (n, false)]
+  | .a64MovWide _ _ d _ _ | .a64Adrl d _ | .a64AdrlFunc d _ | .a64ExnTake d => [(d, false)]
+  | .a64Ldr _ _ base _ | .a64Str _ _ base _ | .a64Blr _ base | .a64ExnSet base => [(base, false)]
+  | .a64Falu _ _ d n m | .a64Fmadd _ d n m | .a64Fcsel _ _ d n m => [(d, true), (n, true), (m, true)]
+  | .a64Funary op _ d n => if op = .fmov then [] else [(d, true), (n, true)]
+  | .a64FmovImm _ d _ => [(d, true)]
+  | .a64Fcmp _ n m => [(n, true), (m, true)]
+  | .a64Fcvt _ _ d n => [(d, true), (n, true)]
+  | .a64Cvtf _ _ _ d n => [(d, true), (n, false)]
+  | .a64Fcvtz _ _ _ d n => [(d, false), (n, true)]
+  | _ => []
+
+/-- `fmov` between registers of any classes but two general-purpose ones: the low bits of the
+format, zero-extended. -/
+def fmov (loc : Option Loc) (fs : FSize) (d n : Reg) : LM Unit := do
+  let low (b : BitVec 64) : BitVec 64 := (b.setWidth fs.bits).setWidth 64
+  match d.isFp, n.isFp with
+  | true, true => writeF d (low (← readF loc n))
+  | true, false => writeF d (low (← readBits loc n))
+  | false, true => writeReg d (.bits (low (← readF loc n)))
+  | false, false => stuckL loc "fmov needs an FP register"
+
 def exec (op : Op) : LM Unit := do
   let loc := op.loc
+  for (r, fp) in regClasses op.kind do
+    unless r.isFp == fp do
+      stuckL loc s!"{r} is not {if fp then "an FP" else "a general-purpose"} register"
   match op.kind with
   | .a64Alu o sf d n m =>
     let (a, b) := (← readReg loc n, ← readReg loc m)
@@ -428,10 +556,35 @@ def exec (op : Op) : LM Unit := do
       | _, _ => writeReg d (.bits (cselElse o sf (← readBits loc m)))
   | .a64Ldr size d base off =>
     let addr ← offsetWord loc (← readReg loc base) off
-    writeReg d (← loadWord loc size.bytes addr)
+    writeAny loc d (← loadWord loc size.bytes addr)
   | .a64Str size s base off =>
     let addr ← offsetWord loc (← readReg loc base) off
-    storeWord loc size.bytes addr (← readReg loc s)
+    storeWord loc size.bytes addr (← readAny loc s)
+  | .a64Falu o fs d n m => writeFs fs d (fpAlu o (← readFs loc fs n) (← readFs loc fs m))
+  | .a64Funary o fs d n =>
+    match o with
+    | .fmov => fmov loc fs d n
+    | .fabs => writeFs fs d (Float.abs (← readFs loc fs n))
+    | .fneg => writeFs fs d (Float.neg (← readFs loc fs n))
+    | .fsqrt => writeFs fs d (fpSqrt (← readFs loc fs n))
+  | .a64Fmadd fs d n m =>
+    writeFs fs d (fpMulAdd (← readFs loc fs d) (← readFs loc fs n) (← readFs loc fs m))
+  | .a64FmovImm fs d imm =>
+    unless imm < 256 do stuckL loc s!"{imm} is not an 8-bit immediate"
+    writeFs fs d (vfpExpandImm _ imm)
+  | .a64Fcmp fs n m =>
+    let f := fpCompare (← readFs loc fs n) (← readFs loc fs m)
+    modify fun st => { st with nzcv := f }
+  | .a64Fcsel c fs d n m =>
+    let r := if conditionHolds c (← get).nzcv then n else m
+    writeFs fs d (← readFs loc fs r)
+  | .a64Fcvt dst src d n =>
+    if dst = src then stuckL loc "fcvt converts between s and d"
+    else writeFs dst d (fpConvert _ (← readFs loc src n))
+  | .a64Cvtf signed fs sf d n =>
+    writeFs fs d (intToFp _ signed ((← readBits loc n).setWidth sf.bits))
+  | .a64Fcvtz signed sf fs d n =>
+    writeReg d (.bits ((fpToInt signed sf.bits (← readFs loc fs n)).setWidth 64))
   | .a64Adrl d g =>
     match (← get).core.addrs[g]? with
     | some p => writeReg d (.ptr p)
@@ -457,11 +610,11 @@ def exec (op : Op) : LM Unit := do
     let size ← readBits loc (.x 0)
     if (← liftCM choose) != 0 then writeReg (.x 0) (.bits 0)
     else writeReg (.x 0) (.ptr (← liftCM (newAlloc loc size.toNat align (.heap family))))
-    clobber 1
+    clobber [.x 0]
   | .a64BlFree family =>
     let p ← ptrOfWord (← readReg loc (.x 0))
     liftCM (freePtr loc family (some p))
-    clobber 0
+    clobber []
   | k => stuckL loc s!"{k.name} can't run in LFIR"
 
 /-- One step: the next instruction of the running function. -/
@@ -490,11 +643,15 @@ def start (f : Func) (args : List RVal) : LM Unit := do
     down (8 * f.rets.length)
     modify fun m => { m with resArea := m.sp }
     writeReg (.x 8) (← get).sp
-  if args.length > 8 then
-    down (8 * (args.length - 8))
-    for (v, i) in (args.drop 8).zipIdx do
-      storeWord none 8 (← offsetWord none (← get).sp (8 * i)) (← wordOfVal none v)
-  for (v, i) in (args.take 8).zipIdx do writeReg (.x i) (← wordOfVal none v)
+  let locs := argLocs (f.params.map (·.ty))
+  let slots := stackSlots (f.params.map (·.ty))
+  if slots > 0 then
+    down (8 * slots)
+    for (v, l) in args.zip locs do
+      if let .inr off := l then
+        storeWord none 8 (← offsetWord none (← get).sp off) (← wordOfVal none v)
+  for (v, l) in args.zip locs do
+    if let .inl r := l then writeAny none r (← wordOfVal none v)
   enter none f
   if (← get).frames.isEmpty then finish none f
 

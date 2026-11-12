@@ -118,14 +118,15 @@ def ident : P String := do
   | .ident s => discard next; pure s
   | t => fail s!"expected a name but found {t.describe}"
 
-/-- A target register: `x0`…`x30`, `sp`, `xzr`, or `v` and a number. -/
+/-- A target register: `x0`…`x30`, `sp`, `xzr`, `v` and a number, `d0`…`d31`, or `fv` and a
+number. -/
 def reg : P Reg := do
   match ← peek with
   | .ident s =>
     match Reg.ofString? s with
     | some r => discard next; pure r
-    | none => fail s!"expected a register like x0 or v1 but found '{s}'"
-  | t => fail s!"expected a register like x0 or v1 but found {t.describe}"
+    | none => fail s!"expected a register like x0, v1, d2, or fv3 but found '{s}'"
+  | t => fail s!"expected a register like x0, v1, d2, or fv3 but found {t.describe}"
 
 def labelName : P String := do
   match ← peek with

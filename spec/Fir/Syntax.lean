@@ -1170,7 +1170,8 @@ fir_ops
     rule
       operands []
       noResults
-  /-- `aarch64.ldr.w x0, x1, 8`: load 1, 2, 4, or 8 bytes from `x1 + 8`, zero-extended. -/
+  /-- `aarch64.ldr.w x0, x1, 8`: load 1, 2, 4, or 8 bytes from `x1 + 8`, zero-extended. Into an
+  FP register (`aarch64.ldr.w d0, x1, 8`) it is Arm's `ldr s0, [x1, #8]`. -/
   op a64Ldr (size : MemSize) (d base : Reg) (off : Int)
     name "aarch64.ldr.{size}"
     format "{d}, {base}, {off}"
@@ -1179,11 +1180,94 @@ fir_ops
     rule
       operands []
       noResults
-  /-- `aarch64.str.w x0, x1, 8`: store the low 1, 2, 4, or 8 bytes of `x0` at `x1 + 8`. -/
+  /-- `aarch64.str.w x0, x1, 8`: store the low 1, 2, 4, or 8 bytes of `x0` at `x1 + 8`, an FP
+  register's too (`aarch64.str.x d0, x1, 8` is `str d0, [x1, #8]`). -/
   op a64Str (size : MemSize) (s base : Reg) (off : Int)
     name "aarch64.str.{size}"
     format "{s}, {base}, {off}"
     effects write
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.fadd.d d0, d1, d2` and friends: scalar FP arithmetic in the format; see
+  `FAluOp`. A NaN result is Arm's (`AArch64.fpProcessNaNs`, default-NaN mode off). -/
+  op a64Falu (op : FAluOp) (fs : FSize) (d n m : Reg)
+    name "aarch64.{op}.{fs}"
+    format "{d}, {n}, {m}"
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.fsqrt.d d0, d1` and friends: scalar FP operations on one register; see
+  `FUnaryOp`. `fmov` also moves bits between a general-purpose register and an FP one
+  (`aarch64.fmov.d d0, x1`, `aarch64.fmov.s x1, d0`). -/
+  op a64Funary (op : FUnaryOp) (fs : FSize) (d n : Reg)
+    name "aarch64.{op}.{fs}"
+    format "{d}, {n}"
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.fmadd.d d0, d1, d2`: `d0 := d1 * d2 + d0`, rounded once: Arm's `fmadd d0, d1, d2,
+  d0`, with the destination as the addend (four registers don't fit an op's immediates). -/
+  op a64Fmadd (fs : FSize) (d n m : Reg)
+    name "aarch64.fmadd.{fs}"
+    format "{d}, {n}, {m}"
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.fmov.imm.d d0, 112`: the float Arm's 8-bit immediate encodes (`VFPExpandImm`:
+  112 is 1.0, `fmov d0, #1.0`). -/
+  op a64FmovImm (fs : FSize) (d : Reg) (imm : Index)
+    name "aarch64.fmov.imm.{fs}"
+    format "{d}, {imm}"
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.fcmp.d d0, d1`: compare, setting the flags (`0011` when unordered, `0110` when
+  equal, `1000` when less, `0010` when greater). -/
+  op a64Fcmp (fs : FSize) (n m : Reg)
+    name "aarch64.fcmp.{fs}"
+    format "{n}, {m}"
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.fcsel.eq.d d0, d1, d2`: `d1` if the condition holds, else `d2`. -/
+  op a64Fcsel (c : Cond) (fs : FSize) (d n m : Reg)
+    name "aarch64.fcsel.{c}.{fs}"
+    format "{d}, {n}, {m}"
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.fcvt.d.s d0, d1`: convert between the formats (to `d` from `s` here; exact one
+  way, rounded the other). -/
+  op a64Fcvt (dst src : FSize) (d n : Reg)
+    name "aarch64.fcvt.{dst}.{src}"
+    format "{d}, {n}"
+    layers lfir
+    rule
+      deny ["aarch64.fcvt.s.s", "aarch64.fcvt.d.d"] "fcvt converts between s and d"
+      operands []
+      noResults
+  /-- `aarch64.scvtf.d.x d0, x1`: an integer of the size, signed (`scvtf`) or unsigned
+  (`ucvtf`), to the format, rounded. -/
+  op a64Cvtf (signed : Bool) (fs : FSize) (sf : Sf) (d n : Reg)
+    name "aarch64.{signed : cvtfModes}.{fs}.{sf}"
+    format "{d}, {n}"
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.fcvtzs.x.d x0, d1`: a float to an integer of the size, signed (`fcvtzs`) or
+  unsigned (`fcvtzu`), toward zero, saturating at the bounds, NaN giving 0. -/
+  op a64Fcvtz (signed : Bool) (sf : Sf) (fs : FSize) (d n : Reg)
+    name "aarch64.{signed : fcvtzModes}.{sf}.{fs}"
+    format "{d}, {n}"
     layers lfir
     rule
       operands []
