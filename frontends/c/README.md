@@ -56,8 +56,9 @@ builds `fai-cc` with CMake (against the static library of the current sources), 
   requires the same output and exit code;
 - runs each program's HFIR in FIR's interpreter under Arm's NaN choice (`NanRule::Arm`, the NaNs
   the hardware gives): the calls of the output helpers (events) must spell the same output and
-  `main` must return the same code. Programs that call other external functions (libc, libm) can't
-  be compared there and are listed;
+  `main` must return the same code. Programs that call other external functions (libc's `printf`,
+  libm) can't be compared there, since the interpreter's world answers them with zeros: they are
+  listed with the first such function they call;
 - checks that each program in `tests/errors/` gets exactly the diagnostics its `// expect: LINE:COL:
   TEXT` lines name, and exit code 1.
 
@@ -66,14 +67,17 @@ It runs by default on Linux; on macOS (whose binaries aren't Linux ones) only wi
 turns it off. Missing tools are a failure that names them, not a skip. `FAI_CC_ONLY=name` runs only
 the programs whose names contain `name`.
 
-The corpus prints through `tests/runtime/fai_test.h` (`fai_put_long`, `fai_put_char`, and helpers
-written in C on top of them: `show_d` and `show_f` print a float's exact bits in hexadecimal and a
-rounded decimal), since `printf` needs varargs (track V). Its programs must not have undefined
-behavior: UB allows the three builds to differ. Nor may their output depend on what C leaves
-unspecified: which NaN's payload an operation on two different NaNs keeps (the reference compiler
-commutes `+` and `*`), or whether a signaling NaN is quieted by an operation the reference compiler
-folds away (`x * 1.0`). Float inputs live in non-constant globals, so the reference compiler can't
-fold libm calls with its own correctly rounded arithmetic.
+Most of the corpus prints through `tests/runtime/fai_test.h` (`fai_put_long`, `fai_put_char`, and
+helpers written in C on top of them: `show_d` and `show_f` print a float's exact bits in hexadecimal
+and a rounded decimal), so the interpreter's run is compared too; the `printf_*` programs and a few
+others print with `printf`, and run only natively. Variadic functions defined in C that print
+through the helpers (`varargs.c`) are compared in the interpreter as well. A program never prints an
+address (`%p` goes into a buffer that is checked). Its programs must not have undefined behavior: UB
+allows the three builds to differ. Nor may their output depend on what C leaves unspecified: which
+NaN's payload an operation on two different NaNs keeps (the reference compiler commutes `+` and
+`*`), or whether a signaling NaN is quieted by an operation the reference compiler folds away
+(`x * 1.0`). Float inputs live in non-constant globals, so the reference compiler can't fold libm
+calls with its own correctly rounded arithmetic.
 
 ## What is supported
 
@@ -98,6 +102,12 @@ extensions Clang accepts, such as case ranges and `__extension__`):
 - **Functions:** definitions, prototypes, recursion, function pointers; calls to functions defined
   elsewhere (libc, libm) as FIR external functions that may do anything; `malloc` and `free` as
   FIR's `c.malloc` heap allocations; `main` returns 0 when it falls off its end.
+- **Varargs:** variadic functions defined here (`int sum(int n, ...)`, and C23's `f(...)`) and
+  elsewhere (`printf`, `snprintf`, `sprintf`, `fprintf`, `vprintf`, `vsnprintf`, `vfprintf`, …),
+  called directly or through pointers, with C's default argument promotions (`float` to `double`,
+  narrower integers to `int`, as Clang inserts them); `<stdarg.h>`: `va_start`, `va_arg` of every
+  scalar type, `va_end`, `va_copy`; a `va_list` as a local, a global, a struct field, an array
+  element, a parameter (passed by value), or through a pointer.
 - **Float builtins** with a FIR op: the constants (`__builtin_inf`, `__builtin_huge_val`,
   `__builtin_nan("…")`, `__builtin_nans`, and their `f` forms, which `<math.h>`'s `INFINITY`,
   `HUGE_VAL`, and `NAN` expand to), `__builtin_fabs`, `__builtin_sqrt`, `__builtin_copysign`,
@@ -126,6 +136,18 @@ same rounded constant at compile time), `float` to `double` with `float.ext`, an
 `float.trunc`. Literals and global initializers are Clang's exact bits (`float.const`,
 `fir_init_f32`/`fir_init_f64`). `float` stays `float` (`FLT_EVAL_METHOD` is 0 on AArch64), and
 parameters and results follow AAPCS64 through FIR's calling convention.
+
+A function with `...` is a variadic FIR function (`func @sum(%n: i32, ...)`), one defined elsewhere
+a variadic external function, and a pointer to one has a variadic signature
+(`func.call.indirect func<(ptr, ...) -> i32>`); a call passes the variadic arguments as Clang
+promoted them (`i32`, `i64`, `ptr`, `f64`). `va_list` is, on AArch64 Linux, the struct `__va_list`
+(AAPCS64's five fields; not an array, as on x86-64), and FIR's `va_list` memory type, whose layout
+is checked against Clang's: so `va_list` objects are `mem.stack.of va_list`, `va_start` is
+`va.start`, `va_arg(ap, T)` `va.arg` of T's FIR type, `va_end` `va.end`, and `va_copy` (and
+assigning a `va_list`) `mem.copy va_list`. A `va_list` parameter is a `ptr`: AAPCS64 passes a
+composite larger than 16 bytes as the address of a copy the caller makes and the callee owns, so a
+call copies the argument into a `mem.stack.of va_list` of its own and passes that, and the callee
+uses the pointer as its parameter's object; this is the ABI libc's `vprintf` expects.
 
 Every local and parameter is a `mem.stack.of` slot made at the function's entry (mem2reg comes
 later), so values never cross blocks. Statements are structured where C's are (`cf.if`, `cf.loop`;
@@ -156,8 +178,9 @@ exactly, but has no conversion to integers for C to compute with).
 Each is diagnosed where it appears:
 
 - `long double` (binary128 on AArch64, which FIR doesn't have), `_Complex`, and the other float
-  formats (`_Float16`, `__fp16`, `__bf16`, `_Float128`); variadic functions, defined or called, so
-  `printf` (track V); structs and unions passed or returned by value (track A).
+  formats (`_Float16`, `__fp16`, `__bf16`, `_Float128`), so also `printf("%Lf", …)`; structs and
+  unions passed or returned by value, as variadic arguments, or read by `va_arg` (track A), and a
+  `va_list` returned by value.
 - `<math.h>`'s `isgreater` family, which glibc defines with statement expressions under Clang (the
   `__builtin_isgreater` forms work); float builtins without a FIR op (`__builtin_fmin`, …);
   `#pragma STDC FENV_ACCESS`: FIR's floats round to nearest and have no exception flags, so a
@@ -167,8 +190,9 @@ Each is diagnosed where it appears:
   packed structs, alignments above 16, thread-local variables, inline assembly, statement
   expressions, labels as values, `++`/`--` on `_Bool`, wide string literals, calls with arguments
   through declarations without prototypes, old-style (K&R) definitions.
-- Variables defined in another file (`extern int x;`, libc's `stdout` and `errno`): FIR has no
-  external globals.
+- Variables defined in another file (`extern int x;`, libc's `stdout`, `stderr`, and `errno`): FIR
+  has no external globals, so `fprintf` and `vfprintf` work on streams the program opens
+  (`fopen`, `fmemopen`, `fdopen`) but not on `stdout` and `stderr`.
 - Global initializers that point inside an object (`&table[2]`, `"abc" + 1`), or that store an
   address as an integer: FIR's initializers name only the start of a global.
 

@@ -74,8 +74,8 @@ M and F run in parallel; then N; then V and A one after the other (both change t
   (decision: Pointer bytes as integers; as built, `char` is `i8`: see Progress); `goto` and `switch` use `cf.blocks`; C unions are
   memory (a struct of the largest member's size and alignment), accessed through pointers.
 - **Tests:** a corpus of C programs under `frontends/c/tests/`, each compiled by `fai-cc` and by
-  clang, run, and compared; until varargs land, output goes through a small extern print helper
-  instead of `printf`.
+  clang, run, and compared; most print through a small extern print helper, whose calls the
+  interpreter's run can be compared on, and some through `printf` (track F2b).
 
 ## Varargs and aggregates by value (tracks V and A)
 
@@ -368,6 +368,57 @@ Lowering proofs, Backend testing, C external functions.
   cursor's, as it refines `poison` (`Byte.Refines`).
 - **Not yet:** `fai-cc`'s varargs (track F2); macOS's variant (open item 4); aggregates as
   variadic arguments (track A); integers wider than 64 bits as variadic arguments.
+
+### Track F2b: varargs and printf in fai-cc (done)
+
+Decisions: C frontend (varargs mapping), C external functions, C frontend testing; Varargs and
+va_list (track V) unchanged.
+
+- **Mapping:** a C function with `...` is a variadic FIR function (`fir_func_declare_va`), an
+  undefined one a variadic external function with every effect (`fir_extern_declare_va`), and a
+  pointer to one has a variadic signature (`fir_type_func_va`), so calls are the same
+  `fir_func_call` and `fir_func_call_indirect` with the variadic arguments after the fixed ones.
+  The variadic arguments are what Clang's AST already holds: C's default argument promotions are
+  implicit casts (`float` to `double` is `float.ext`, `char` and `short` to `int` an extension),
+  so every one is an `i32`, `i64`, `ptr`, or `f64`. `va_list` is, on AArch64 Linux, the struct
+  `__va_list`, not an array (x86-64's): it maps to FIR's `va_list` memory type wherever it is an
+  object (locals, globals, struct fields, arrays), checked against Clang's size and alignment.
+  `__builtin_va_start` (and C23's `__builtin_c23_va_start`), `VAArgExpr`, `__builtin_va_end`, and
+  `__builtin_va_copy` are `va.start`, `va.arg` of the type's FIR type, `va.end`, and
+  `mem.copy va_list`. A `va_list` parameter is a `ptr`, as AAPCS64 passes a composite larger than
+  16 bytes: the caller copies the argument into a `mem.stack.of va_list` of the call's region and
+  passes its address, and the callee uses the pointer as its parameter's object. So C-defined
+  functions taking a `va_list` and libc's `vprintf`, `vsnprintf`, `vfprintf` are called alike,
+  directly or through pointers, and a callee's `va_arg`s leave the caller's cursor where it was
+  (in C it is indeterminate). Structs and unions as variadic arguments or `va_arg` types (track
+  A), `long double` arguments (`%Lf`), and returning a `va_list` are diagnosed.
+- **Tests:** five new corpus programs (60 in all): `varargs` (variadic definitions printing
+  through the helpers: sums, mixed classes, promoted `char`/`short`/`float`/`_Bool`/enum
+  arguments, twelve longs and twelve doubles so both classes spill to the stack, `va_copy`, a
+  `va_list` passed by value and by pointer and kept in a struct, restarts, pointers through the
+  arguments, the limits of each type, nested variadic calls, calls through pointers to variadic
+  functions), `varargs_printf` (a printf written over `va_arg`, checked against `vsnprintf` on
+  `va_copy`'s copy of the same arguments, and forwarding from `...` through two functions taking
+  a `va_list`), `printf_ints` (every length modifier, conversion, and flag at each type's limits,
+  `*` widths and precisions, printf's result; `%p` into a buffer checked by `sscanf`),
+  `printf_floats` (`%f %e %g %a` and upper-case forms with widths, precisions, and flags on signed
+  zeros, subnormals, the limits, infinities, NaNs, ties, and promoted floats), and
+  `printf_strings` (`%s` and `%c`, `puts`, `sprintf`, `snprintf` truncation and sizing,
+  `vsnprintf` and `vprintf` wrappers, `fprintf` and `vfprintf` into `fmemopen`'s stream).
+  `crc32`, `game_of_life`, `knapsack`, `libc_calls`, and `float_libm` now print with `printf`
+  (the last two already called other externals). All 60 match the reference natively without and
+  with `-O`; 51 match in `fir run` (`varargs` among them), and the 9 that call other external
+  functions are listed with the first one (`printf`, `vsnprintf`, `strlen`) instead of being
+  compared; 13 error tests (`errors/varargs.c` now holds what is still missing).
+- **API friction:** none in building variadic signatures, calls, or the `va.*` ops: the C API's
+  split of the call by the callee's signature meant no new call functions. Two gaps: FIR has no
+  external globals, so `stdout` and `stderr` (and `fprintf` to them) stay out until it does; and
+  passing a `va_list` by value is the frontend's job, in AAPCS64-Linux's form (the address of a
+  copy). That form fits x86-64 too (an array, which decays to its address), but not macOS's or
+  Windows's `char *` `va_list`, which is passed as its value: a load of the cursor's bytes, which
+  FIR's semantics reads as `poison`. Open item 4 will need a way to pass a `va_list` by value.
+- **Not yet:** external globals (`stdout`, `stderr`, `errno`); structs and unions by value,
+  variadic ones included (track A); `long double`.
 
 ## Not in this round
 
