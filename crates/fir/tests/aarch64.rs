@@ -19,9 +19,15 @@
 //!   it returns, and `main` prints it as `threw ptr …`.
 //! * Runs that end in UB, get stuck, reach a hole, are ambiguous, or run out of fuel are not
 //!   comparable (UB allows anything) and are only counted.
-//! * Where a module observes addresses (the interpreter's and the hardware's differ), a run
-//!   that differs only in integers or floats, or in ending with an arithmetic or conversion
-//!   trap where the other doesn't, is counted, not failed.
+//! * Addresses are the interpreter's and the hardware's own choices, so a taint analysis
+//!   (`taint`) finds what may depend on them: `ptr.addr` and `ptr.expose` of possibly non-null
+//!   pointers, pointer comparisons, `ptr.from_exposed`, `ptr.with_addr`, and numeric loads from
+//!   objects that stores (or address initializers) may have put pointer bytes in, followed
+//!   through values, memory (allocation-site points-to sets), calls, exceptions, and branches
+//!   (which taint their whole function); `freeze` of what may be `poison` is the oracle's
+//!   choice too. A run whose output differs only in tainted values, and only in their numbers,
+//!   or where one run ends in an arithmetic or conversion trap at a tainted location and the
+//!   other ends otherwise, is counted, not failed.
 //! * Where `fir run` prints `poison`, any value matches; a non-null pointer prints as `ptr ?`
 //!   (allocation numbers are the interpreter's); leak notes are dropped (counted).
 //!
@@ -41,7 +47,7 @@
 //! reference tool runs the LFIR text too, and must print exactly what `fir run` prints.
 //!
 //! `FIR_FUZZ=N` sets the number of random programs (default 100), `FIR_FUZZ_SEED` the seed;
-//! `FIR_SHOW_ADDRESS_DIFFS=1` prints the runs that differ only where addresses are observed.
+//! `FIR_SHOW_ADDRESS_DIFFS=1` prints the runs that differ only in address-dependent outcomes.
 //! Without a toolchain (`$FIR_CC`, `cc` on AArch64, else `aarch64-unknown-linux-gnu-cc`) or a
 //! way to run the binaries, the native half is skipped with a note; the LFIR half always runs.
 
@@ -49,6 +55,7 @@
 mod common;
 #[allow(dead_code)]
 mod progs;
+mod taint;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -60,6 +67,7 @@ use std::time::{Duration, Instant};
 use fir::backend::aarch64 as a64;
 use fir::interp::NanRule;
 use fir::{Module, Ty};
+use taint::{Taint, matches};
 
 struct Toolchain {
     cc: String,
@@ -548,100 +556,6 @@ fn normalize(reference: &str) -> Result<(String, bool), String> {
     Ok((out, leaks))
 }
 
-/// Whether a module's runs can depend on where allocations are: it observes addresses
-/// (`ptr.addr`, `ptr.expose`), turns them into pointers, compares pointers (which across
-/// allocations is a nondeterministic choice), or reads memory that may hold pointers as integers.
-fn observes_addresses(m: &Module) -> bool {
-    use fir::OpKind as K;
-    let mut int_loads = false;
-    // A global initialized with addresses, or (below) a pointer store or copy, puts pointer
-    // bytes in memory.
-    let mut ptr_bytes = (0..m.globals.len())
-        .any(|g| matches!(m.globals.init(g), fir::Init::Sym(_) | fir::Init::List(_)));
-    for f in &m.funcs {
-        let b = &f.body;
-        let mut stack = vec![b.entry()];
-        while let Some(r) = stack.pop() {
-            for op in b.ops(r) {
-                match b.kind(op) {
-                    K::PtrAddr
-                    | K::PtrExpose
-                    | K::PtrFromExposed
-                    | K::PtrWithAddr
-                    | K::PtrCmp(_) => {
-                        return true;
-                    }
-                    K::Load { .. } => {
-                        int_loads |= b.results(op).any(|v| b.ty(v) != Ty::Ptr);
-                    }
-                    K::Store { ty: Ty::Ptr, .. } | K::MemCopy { .. } => ptr_bytes = true,
-                    _ => {}
-                }
-                stack.extend_from_slice(b.regions(op));
-            }
-        }
-    }
-    int_loads && ptr_bytes
-}
-
-/// Whether `got` differs from `want` only where runs that observe addresses may: in integer or
-/// float values, or in ending with a trap that arithmetic raises (`overflow`, `div0`, `shift`,
-/// `convert`) where the other run doesn't, since the numbers may come from addresses
-/// (`ptr.addr` of a stack slot squared overflows at qemu's addresses, not at the
-/// interpreter's, and converts to a float that doesn't fit an `i32`).
-fn differs_in_integers(want: &str, got: &str) -> bool {
-    let toks = |s: &str| -> Vec<String> {
-        s.split([' ', ',', ';', '(', ')'])
-            .filter(|t| !t.is_empty())
-            .map(str::to_owned)
-            .collect()
-    };
-    let num = |t: &str| {
-        t.parse::<i128>().is_ok()
-            || t.parse::<f64>().is_ok()
-            || t.starts_with("0x")
-            || t.starts_with("nan")
-            || t.starts_with("-nan")
-            || t == "?"
-            || t == "null"
-    };
-    let ints = |want: &str, got: &str| {
-        let (w, g) = (toks(want), toks(got));
-        w.len() == g.len()
-            && w.iter()
-                .zip(&g)
-                .all(|(a, b)| a == b || a == "poison" || (num(a) && num(b)))
-    };
-    if ints(want, got) {
-        return true;
-    }
-    let (wp, we) = want.rsplit_once("; ").unwrap_or(("", want));
-    let (gp, ge) = got.rsplit_once("; ").unwrap_or(("", got));
-    let arith = |e: &str| {
-        ["trap overflow", "trap div0", "trap shift", "trap convert"]
-            .iter()
-            .any(|t| e.starts_with(t))
-    };
-    ints(wp, gp) && (arith(we) || arith(ge))
-}
-
-/// Whether `got` matches the normalized reference, where `poison` matches anything.
-fn matches(want: &str, got: &str) -> bool {
-    let toks = |s: &str| -> Vec<String> {
-        s.split([' ', ',', ';', '(', ')'])
-            .filter(|t| !t.is_empty())
-            .map(str::to_owned)
-            .collect()
-    };
-    let (w, g) = (toks(want), toks(got));
-    // `?` is a non-null pointer, or a byte of one (any value).
-    w.len() == g.len()
-        && w.iter()
-            .zip(&g)
-            .all(|(a, b)| a == b || a == "poison" || (a == "?" && b.starts_with("0x")))
-}
-
-/// What the LFIR of a module gives for a run, before and after register allocation.
 /// The LFIR of a module, before and after register allocation, verified.
 fn lfir_modules(m: &Module) -> Result<[Module; 2], String> {
     let mut mm = a64::select(m)?;
@@ -776,14 +690,20 @@ fn check_module(
         return true;
     }
     let mut ok = true;
-    let addresses = observes_addresses(m);
-    // A difference only in integers, where addresses are observed, isn't a failure.
-    let differs = |want: &str, got: &str, what: &str| -> bool {
-        if addresses && differs_in_integers(want, got) {
+    let taint = Taint::of(m);
+    if taint.any() {
+        tally
+            .lock()
+            .unwrap()
+            .count("(modules with address-dependent outcomes)");
+    }
+    // A difference only in what may depend on addresses isn't a failure.
+    let differs = |f: &str, want: &str, got: &str, what: &str| -> bool {
+        if taint.exempt(f, want, got) {
             tally
                 .lock()
                 .unwrap()
-                .count(format!("{what} differs where addresses are observed"));
+                .count(format!("{what} differs in address-dependent outcomes"));
             if std::env::var_os("FIR_SHOW_ADDRESS_DIFFS").is_some() {
                 eprintln!("{name}: {what}\n  want {want}\n  got  {got}");
             }
@@ -856,7 +776,7 @@ fn check_module(
                             .lock()
                             .unwrap()
                             .count(format!("LFIR ({stage}) matches"));
-                    } else if differs(want, &g, &format!("LFIR ({stage})")) {
+                    } else if differs(f, want, &g, &format!("LFIR ({stage})")) {
                         ok = false;
                         tally.lock().unwrap().fails.push(format!(
                             "{name} @{f}({}): LFIR ({stage})\n  want {want}\n  got  {g}",
@@ -935,7 +855,7 @@ fn check_module(
                 if want.contains("threw ") {
                     t.count(format!("{what} matches (threw)"));
                 }
-            } else if differs(want, &got, what) {
+            } else if differs(f, want, &got, what) {
                 ok = false;
                 tally.lock().unwrap().fails.push(format!(
                     "{name} @{f}({}): {what}\n  want {want}\n  got  {got}",
@@ -1137,4 +1057,128 @@ fn random_programs_run_natively() {
         &format!("{count} random programs (seed {seed})"),
         tally.into_inner().unwrap(),
     );
+}
+
+/// The address-dependence analysis of `text`, on the module the backend compiles.
+fn taint_of(text: &str) -> Taint {
+    let m = fir::parse_module(text).unwrap();
+    fir::verify_module(&m).unwrap();
+    Taint::of(&fir::backend::prepare(&m, false).unwrap())
+}
+
+#[test]
+fn address_exemptions_need_tainted_outcomes() {
+    // An address observed (of null, which is no observation) doesn't excuse an unrelated
+    // float or trap.
+    let t = taint_of(
+        "func @f() -> f64 {
+           %p: ptr = ptr.null
+           %a: i64 = ptr.addr %p
+           %r: f64 = float.const 1.0
+           func.ret %r
+         }",
+    );
+    assert!(!t.exempt("f", "returned f64 1.0", "returned f64 2.0"));
+    assert!(!t.exempt("f", "returned f64 1.0", "trap convert @1:1"));
+    // Nor does a real address that doesn't reach the outcome.
+    let t = taint_of(
+        "func @f(%x: f64) -> (i64, f64) {
+           %p: ptr = mem.stack 8, align 8
+           %a: i64 = ptr.addr %p
+           %y: f64 = float.add %x, %x
+           %i: i32 = float.to_int.s.trap %y @2:1
+           func.ret %a, %y
+         }",
+    );
+    assert!(t.exempt(
+        "f",
+        "returned i64 4096, f64 1.0",
+        "returned i64 77, f64 1.0"
+    ));
+    assert!(!t.exempt(
+        "f",
+        "returned i64 4096, f64 1.0",
+        "returned i64 4096, f64 2.0"
+    ));
+    assert!(!t.exempt("f", "returned i64 4096, f64 1.0", "trap convert @2:1"));
+    // An address that does reach the trap, or the float, excuses them.
+    let t = taint_of(
+        "func @f() -> f64 {
+           %p: ptr = mem.stack 8, align 8
+           %a: i64 = ptr.addr %p
+           %y: f64 = int.to_float.s %a
+           %i: i32 = float.to_int.s.trap %y @2:1
+           func.ret %y
+         }",
+    );
+    assert!(t.exempt("f", "returned f64 4096.0", "returned f64 1e15"));
+    assert!(t.exempt("f", "trap convert @2:1", "returned f64 1e15"));
+    // The run that traps at the tainted location may stop before a trap the other reaches.
+    assert!(t.exempt("f", "trap overflow @9:9", "trap convert @2:1"));
+    assert!(!t.exempt("f", "trap overflow @9:9", "trap convert @8:8"));
+    // So does a branch on one, for what it controls.
+    let t = taint_of(
+        "func @f() -> i32 {
+           %p: ptr = mem.stack 8, align 8
+           %a: i64 = ptr.addr %p
+           %z: i64 = int.const 0
+           %c: i1 = int.cmp.eq %a, %z
+           %r: i32 = cf.if %c {
+             %one: i32 = int.const 1
+             cf.yield %one
+           } else {
+             %two: i32 = int.const 2
+             cf.yield %two
+           }
+           func.ret %r
+         }",
+    );
+    assert!(t.exempt("f", "returned i32 2", "returned i32 1"));
+    // `freeze` of what may be `poison` is the oracle's choice too; of a number, it isn't.
+    let text = |modifier: &str| {
+        format!(
+            "func @f() -> i8 {{
+               %x: i8 = int.const -1
+               %y: i8 = int.add.{modifier} %x, %x
+               %z: i8 = freeze %y
+               func.ret %z
+             }}"
+        )
+    };
+    assert!(taint_of(&text("nuw")).exempt("f", "returned i8 0", "returned i8 -2"));
+    assert!(!taint_of(&text("wrap")).exempt("f", "returned i8 0", "returned i8 -2"));
+}
+
+#[test]
+fn pointer_bytes_taint_only_where_pointers_go() {
+    // A pointer stored in one slot makes integer loads from it tainted, not from another.
+    let text = |from: &str| {
+        format!(
+            "func @f() -> i64 {{
+               %a: ptr = mem.stack 8, align 8
+               %b: ptr = mem.stack 8, align 8
+               %z: i64 = int.const 0
+               mem.store i64 %z, %b, align 8
+               mem.store ptr %a, %a, align 8
+               %v: i64 = mem.load %{from}, align 8
+               func.ret %v
+             }}"
+        )
+    };
+    assert!(taint_of(&text("a")).exempt("f", "returned i64 4096", "returned i64 7"));
+    assert!(!taint_of(&text("b")).exempt("f", "returned i64 0", "returned i64 7"));
+    // An aggregate global without addresses holds no pointer bytes; one with an address does.
+    let text = |init: &str| {
+        format!(
+            "global @x: i64 = 0
+             global @g: struct<C>{{ptr, i64}} = {init}
+             func @f() -> i64 {{
+               %g: ptr = mem.global @g
+               %v: i64 = mem.load %g, align 8
+               func.ret %v
+             }}"
+        )
+    };
+    assert!(!taint_of(&text("{null, 5}")).exempt("f", "returned i64 0", "returned i64 7"));
+    assert!(taint_of(&text("{@x, 5}")).exempt("f", "returned i64 4096", "returned i64 7"));
 }
