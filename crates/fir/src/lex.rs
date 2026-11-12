@@ -1,27 +1,87 @@
 //! Splits FIR text into tokens, mirroring `spec/Fir/Lex.lean`. Comments start with `//` and run
 //! to the end of the line. Columns count characters, as in Lean.
+//!
+//! Tokens are produced on demand and borrow their text from the input, so lexing allocates
+//! nothing. Lean lexes the whole file before parsing; the parser keeps that behavior by checking
+//! the rest of the input for a lexing error before it reports one of its own (see
+//! [`Lexer::first_error`]).
 
 use num_bigint::BigInt;
 
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Tok {
+/// A punctuation token.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Sym {
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    LBracket,
+    RBracket,
+    Comma,
+    Colon,
+    Eq,
+    Arrow,
+}
+
+impl Sym {
+    pub fn text(self) -> &'static str {
+        match self {
+            Sym::LParen => "(",
+            Sym::RParen => ")",
+            Sym::LBrace => "{",
+            Sym::RBrace => "}",
+            Sym::LBracket => "[",
+            Sym::RBracket => "]",
+            Sym::Comma => ",",
+            Sym::Colon => ":",
+            Sym::Eq => "=",
+            Sym::Arrow => "->",
+        }
+    }
+
+    fn of_byte(b: u8) -> Option<Sym> {
+        Some(match b {
+            b'(' => Sym::LParen,
+            b')' => Sym::RParen,
+            b'{' => Sym::LBrace,
+            b'}' => Sym::RBrace,
+            b'[' => Sym::LBracket,
+            b']' => Sym::RBracket,
+            b',' => Sym::Comma,
+            b':' => Sym::Colon,
+            b'=' => Sym::Eq,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tok<'a> {
     /// `%name`
-    Value(String),
+    Value(&'a str),
     /// `@name`
-    Global(String),
+    Global(&'a str),
     /// `@line:col`
     Loc(u32, u32),
     /// `?name`
-    Hole(String),
-    Ident(String),
-    Int(BigInt),
-    Str(String),
-    /// One of `( ) { } [ ] , : = ->`
-    Sym(&'static str),
+    Hole(&'a str),
+    Ident(&'a str),
+    /// An integer literal: an optional `-` and decimal digits.
+    Int(&'a str),
+    Str(&'a str),
+    Sym(Sym),
     Eof,
 }
 
-impl Tok {
+/// The value of an integer literal. Small ones skip the general decimal conversion.
+pub fn int_value(text: &str) -> BigInt {
+    match text.parse::<i64>() {
+        Ok(n) => BigInt::from(n),
+        Err(_) => text.parse().expect("an integer literal"),
+    }
+}
+
+impl Tok<'_> {
     pub fn describe(&self) -> String {
         match self {
             Tok::Value(s) => format!("%{s}"),
@@ -29,160 +89,186 @@ impl Tok {
             Tok::Loc(l, c) => format!("@{l}:{c}"),
             Tok::Hole(s) => format!("?{s}"),
             Tok::Ident(s) => format!("'{s}'"),
-            Tok::Int(n) => n.to_string(),
+            Tok::Int(s) => int_value(s).to_string(),
             Tok::Str(s) => format!("\"{s}\""),
-            Tok::Sym(s) => format!("'{s}'"),
+            Tok::Sym(s) => format!("'{}'", s.text()),
             Tok::Eof => "end of input".into(),
         }
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Token {
-    pub tok: Tok,
+#[derive(Clone, Copy, Debug)]
+pub struct Token<'a> {
+    pub tok: Tok<'a>,
     pub line: u32,
     pub col: u32,
 }
 
-fn is_name_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_' || c == '.'
+fn is_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'.'
 }
 
-/// Lean's `Char.isWhitespace`.
-fn is_space(c: char) -> bool {
-    matches!(c, ' ' | '\t' | '\r' | '\n')
-}
-
-const SYMS: [&str; 9] = ["(", ")", "{", "}", "[", "]", ",", ":", "="];
-
-struct Lexer<'a> {
-    chars: std::iter::Peekable<std::str::Chars<'a>>,
+#[derive(Clone)]
+pub struct Lexer<'a> {
+    text: &'a str,
+    pos: usize,
     line: u32,
     col: u32,
 }
 
-impl Lexer<'_> {
-    fn peek(&mut self) -> Option<char> {
-        self.chars.peek().copied()
+impl<'a> Lexer<'a> {
+    pub fn new(text: &'a str) -> Lexer<'a> {
+        Lexer {
+            text,
+            pos: 0,
+            line: 1,
+            col: 1,
+        }
     }
 
-    fn peek2(&self) -> Option<char> {
-        let mut it = self.chars.clone();
-        it.next();
-        it.next()
+    fn byte(&self, at: usize) -> Option<u8> {
+        self.text.as_bytes().get(at).copied()
     }
 
-    fn advance(&mut self) {
-        match self.chars.next() {
-            Some('\n') => {
+    /// Skip ASCII bytes matching `p`; they are one column each.
+    fn skip_ascii(&mut self, p: impl Fn(u8) -> bool) -> &'a str {
+        let start = self.pos;
+        let bytes = self.text.as_bytes();
+        while self.pos < bytes.len() && p(bytes[self.pos]) {
+            self.pos += 1;
+        }
+        self.col += (self.pos - start) as u32;
+        &self.text[start..self.pos]
+    }
+
+    /// Skip to `stop` (exclusive), counting characters and line breaks.
+    fn skip_until(&mut self, stop: u8) -> &'a str {
+        let start = self.pos;
+        let bytes = self.text.as_bytes();
+        while self.pos < bytes.len() && bytes[self.pos] != stop {
+            let b = bytes[self.pos];
+            if b == b'\n' {
                 self.line += 1;
                 self.col = 1;
+            } else if b & 0xC0 != 0x80 {
+                self.col += 1;
             }
-            Some(_) => self.col += 1,
-            None => {}
+            self.pos += 1;
         }
+        &self.text[start..self.pos]
     }
 
-    fn take_while(&mut self, p: impl Fn(char) -> bool) -> String {
-        let mut s = String::new();
-        while let Some(c) = self.peek().filter(|&c| p(c)) {
-            s.push(c);
-            self.advance();
+    pub fn next_token(&mut self) -> Result<Token<'a>, String> {
+        loop {
+            match self.byte(self.pos) {
+                Some(b' ' | b'\t' | b'\r') => {
+                    self.pos += 1;
+                    self.col += 1;
+                }
+                Some(b'\n') => {
+                    self.pos += 1;
+                    self.line += 1;
+                    self.col = 1;
+                }
+                Some(b'/') if self.byte(self.pos + 1) == Some(b'/') => {
+                    self.skip_until(b'\n');
+                }
+                _ => break,
+            }
         }
-        s
-    }
-}
-
-pub fn lex(input: &str) -> Result<Vec<Token>, String> {
-    let mut lx = Lexer {
-        chars: input.chars().peekable(),
-        line: 1,
-        col: 1,
-    };
-    let mut toks = Vec::new();
-    loop {
-        let (line, col) = (lx.line, lx.col);
+        let (line, col) = (self.line, self.col);
         let fail = |msg: String| Err(format!("{line}:{col}: {msg}"));
-        let Some(c) = lx.peek() else {
-            toks.push(Token {
+        let Some(c) = self.byte(self.pos) else {
+            return Ok(Token {
                 tok: Tok::Eof,
                 line,
                 col,
             });
-            return Ok(toks);
         };
-        let next = lx.peek2();
-        let tok = if is_space(c) {
-            lx.advance();
-            continue;
-        } else if c == '/' && next == Some('/') {
-            lx.take_while(|c| c != '\n');
-            continue;
-        } else if c == '-' && next == Some('>') {
-            lx.advance();
-            lx.advance();
-            Tok::Sym("->")
-        } else if let Some(sym) = SYMS.iter().find(|s| s.starts_with(c)) {
-            lx.advance();
+        let next = self.byte(self.pos + 1);
+        let tok = if c == b'-' && next == Some(b'>') {
+            self.pos += 2;
+            self.col += 2;
+            Tok::Sym(Sym::Arrow)
+        } else if let Some(sym) = Sym::of_byte(c) {
+            self.pos += 1;
+            self.col += 1;
             Tok::Sym(sym)
-        } else if c == '%' || c == '?' {
-            lx.advance();
-            let name = lx.take_while(is_name_char);
+        } else if c == b'%' || c == b'?' {
+            self.pos += 1;
+            self.col += 1;
+            let name = self.skip_ascii(is_name_byte);
             if name.is_empty() {
-                return fail(format!("expected a name after '{c}'"));
+                return fail(format!("expected a name after '{}'", c as char));
             }
-            if c == '%' {
+            if c == b'%' {
                 Tok::Value(name)
             } else {
                 Tok::Hole(name)
             }
-        } else if c == '@' {
-            lx.advance();
-            if lx.peek().is_some_and(|c| c.is_ascii_digit()) {
-                let l = lx.take_while(|c| c.is_ascii_digit());
-                if lx.peek() != Some(':') {
+        } else if c == b'@' {
+            self.pos += 1;
+            self.col += 1;
+            if next.is_some_and(|b| b.is_ascii_digit()) {
+                let l = self.skip_ascii(|b| b.is_ascii_digit());
+                if self.byte(self.pos) != Some(b':') {
                     return fail("expected ':' in a location".into());
                 }
-                lx.advance();
-                let c = lx.take_while(|c| c.is_ascii_digit());
-                Tok::Loc(number(&l, line, col)?, number(&c, line, col)?)
+                self.pos += 1;
+                self.col += 1;
+                let c = self.skip_ascii(|b| b.is_ascii_digit());
+                if c.is_empty() {
+                    return fail("expected a column number in a location".into());
+                }
+                Tok::Loc(number(l, line, col)?, number(c, line, col)?)
             } else {
-                let name = lx.take_while(is_name_char);
+                let name = self.skip_ascii(is_name_byte);
                 if name.is_empty() {
                     return fail("expected a name after '@'".into());
                 }
                 Tok::Global(name)
             }
-        } else if c.is_ascii_digit() || (c == '-' && next.is_some_and(|c| c.is_ascii_digit())) {
-            let neg = c == '-';
-            if neg {
-                lx.advance();
+        } else if c.is_ascii_digit() || (c == b'-' && next.is_some_and(|b| b.is_ascii_digit())) {
+            let start = self.pos;
+            if c == b'-' {
+                self.pos += 1;
+                self.col += 1;
             }
-            let digits = lx.take_while(|c| c.is_ascii_digit());
-            let text = if neg { format!("-{digits}") } else { digits };
-            Tok::Int(text.parse().expect("decimal digits"))
-        } else if c == '"' {
-            lx.advance();
-            let body = lx.take_while(|c| c != '"');
-            if lx.peek().is_none() {
+            self.skip_ascii(|b| b.is_ascii_digit());
+            Tok::Int(&self.text[start..self.pos])
+        } else if c == b'"' {
+            self.pos += 1;
+            self.col += 1;
+            let body = self.skip_until(b'"');
+            if self.pos >= self.text.len() {
                 return fail("unterminated string".into());
             }
-            lx.advance();
+            self.pos += 1;
+            self.col += 1;
             Tok::Str(body)
-        } else if c.is_ascii_alphabetic() || c == '_' {
-            Tok::Ident(lx.take_while(is_name_char))
+        } else if c.is_ascii_alphabetic() || c == b'_' {
+            Tok::Ident(self.skip_ascii(is_name_byte))
         } else {
-            return fail(format!("unexpected character '{c}'"));
+            let ch = self.text[self.pos..].chars().next().expect("a character");
+            return fail(format!("unexpected character '{ch}'"));
         };
-        toks.push(Token { tok, line, col });
+        Ok(Token { tok, line, col })
+    }
+
+    /// The first lexing error from here to the end of the input, if any.
+    pub fn first_error(mut self) -> Option<String> {
+        loop {
+            match self.next_token() {
+                Err(e) => return Some(e),
+                Ok(Token { tok: Tok::Eof, .. }) => return None,
+                Ok(_) => {}
+            }
+        }
     }
 }
 
-/// A location component. Lean's `toNat!` gives 0 for an empty string.
+/// A location component.
 fn number(s: &str, line: u32, col: u32) -> Result<u32, String> {
-    if s.is_empty() {
-        return Ok(0);
-    }
     s.parse()
         .map_err(|_| format!("{line}:{col}: location {s} is too large"))
 }

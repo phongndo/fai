@@ -7,3 +7,4 @@ license.workspace = true
 
 [dependencies]
 num-bigint = "0.4"
+rustc-hash = "2"

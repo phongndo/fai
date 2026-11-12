@@ -2,11 +2,12 @@
 //!
 //! Everything is an op: an op has a kind, typed results, operands, nested regions, and a source
 //! location. Ops live in a per-function arena ([`crate::Body`]); this module defines the values
-//! stored in it.
+//! stored in it. They are all small `Copy` values: strings and integers are ids into the arena's
+//! side tables ([`StrId`], [`IntId`]), so an op owns no heap memory.
 
 use std::fmt;
 
-use num_bigint::BigInt;
+use crate::body::{IntId, StrId};
 
 /// A source location, `@line:col`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -70,19 +71,19 @@ impl Trust {
 }
 
 /// A claim about a value. Facts constrain defined values only; `poison` passes.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Fact {
     /// Signed range, inclusive.
-    RangeS(BigInt, BigInt),
+    RangeS(IntId, IntId),
     /// Unsigned range, inclusive.
-    RangeU(BigInt, BigInt),
+    RangeU(IntId, IntId),
     NonNull,
     Align(u64),
     NoAlias,
     ReadOnly,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TrustedFact {
     pub fact: Fact,
     pub trust: Trust,
@@ -181,10 +182,10 @@ pub enum AllocFail {
     Trap,
 }
 
-/// What an op does. Mirrors `Fir.OpKind`.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+/// What an op does. Mirrors `Fir.OpKind`. Alignments are 32-bit (Lean's are unbounded).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum OpKind {
-    Const(BigInt),
+    Const(IntId),
     Poison,
     Freeze,
     Copy,
@@ -199,22 +200,22 @@ pub enum OpKind {
     Trunc(TruncMode),
     MemStack {
         size: u64,
-        align: u64,
+        align: u32,
     },
     MemAlloc {
         fail: AllocFail,
-        family: String,
-        align: u64,
+        family: StrId,
+        align: u32,
     },
     MemFree {
-        family: String,
+        family: StrId,
     },
     Load {
-        align: u64,
+        align: u32,
     },
     Store {
         ty: Ty,
-        align: u64,
+        align: u32,
     },
     PtrOffset {
         inbounds: bool,
@@ -226,7 +227,7 @@ pub enum OpKind {
     PtrNull,
     PtrCmp(Pred),
     Call {
-        callee: String,
+        callee: StrId,
     },
     If,
     Loop {

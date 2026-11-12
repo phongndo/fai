@@ -8,69 +8,18 @@
 //! * Where the reference fails to parse a file, this crate must fail with the same message.
 //! * A file with no expected error must also pass the reference's verifier.
 //!
-//! The reference is `spec/.lake/build/bin/fir-ref` (build it with `lake build` in `spec/`), or
-//! the path in `FIR_REF`. `FIR_REF=none` skips the comparison, leaving only the checks that
+//! See `common` for where the reference comes from; `FIR_REF=none` leaves only the checks that
 //! need no reference.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+mod common;
 
-fn repo() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap()
-}
+use std::path::Path;
 
-fn fir_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let mut entries: Vec<_> = std::fs::read_dir(dir)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .collect();
-    entries.sort();
-    for p in entries {
-        if p.is_dir() {
-            fir_files(&p, out);
-        } else if p.extension().is_some_and(|e| e == "fir") {
-            out.push(p);
-        }
-    }
-}
-
-fn reference() -> Option<PathBuf> {
-    match std::env::var("FIR_REF") {
-        Ok(s) if s == "none" => None,
-        Ok(s) => Some(PathBuf::from(s)),
-        Err(_) => {
-            let p = repo().join("spec/.lake/build/bin/fir-ref");
-            assert!(
-                p.exists(),
-                "the Lean reference tool is missing: run `lake build` in spec/, or set FIR_REF=none to skip"
-            );
-            Some(p)
-        }
-    }
-}
+use common::{display_name, expected_errors, fir_files, outcome, reference, run};
 
 /// The reference's output for `fir-ref fmt FILE ARGS...`: its stdout, or the message it fails with.
 fn reference_fmt(tool: &Path, file: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new(tool)
-        .arg("fmt")
-        .arg(file)
-        .args(args)
-        .output()
-        .expect("running fir-ref");
-    if out.status.success() {
-        Ok(String::from_utf8(out.stdout).unwrap())
-    } else {
-        let err = String::from_utf8(out.stderr).unwrap();
-        let prefix = format!("{}: ", file.display());
-        Err(err
-            .trim_end()
-            .strip_prefix(&prefix)
-            .unwrap_or(err.trim_end())
-            .to_owned())
-    }
+    outcome(&run(tool, "fmt", file, args), file)
 }
 
 /// Printing is stable: what this crate prints, it reads back and prints the same.
@@ -87,20 +36,14 @@ fn check_stable(name: &str, m: &fir::Module, fails: &mut Vec<String>) {
 
 #[test]
 fn text_matches_reference() {
-    let mut files = Vec::new();
-    fir_files(&repo().join("tests"), &mut files);
-    assert!(!files.is_empty());
+    let files = fir_files();
     let tool = reference();
     let mut fails = Vec::new();
     let (mut matched, mut rejected_alike, mut name_errors) = (0, 0, 0);
     for file in &files {
-        let name = file.strip_prefix(repo()).unwrap().display().to_string();
+        let name = display_name(file);
         let text = std::fs::read_to_string(file).unwrap();
-        let expected: Vec<&str> = text
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix("// error:"))
-            .map(str::trim)
-            .collect();
+        let expected = expected_errors(&text);
         let expects = |e: &str| expected.iter().any(|t| e.contains(t));
         let parsed = fir::parse_module(&text);
         if let Ok(m) = &parsed {
