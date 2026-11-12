@@ -1,0 +1,990 @@
+//! Random well-typed FIR programs, for differential testing against the Lean reference.
+//!
+//! A program has one to three functions; `@f0` is the entry, and each function calls only the
+//! ones after it, so there is no recursion. Bodies mix integer ops of every width class (1, 8,
+//! 16, 32, 64, odd, and over 128 bits) with every edge-case modifier; `cf.if` (sometimes leaving
+//! an enclosing loop) and counted `cf.loop`s (sometimes `progress`, sometimes with a bound from
+//! an argument); and memory. The generator tracks the allocations in scope, so most loads and
+//! stores go to valid, aligned offsets and runs get far; the rest are out of bounds, misaligned,
+//! through null, dangling, or freed pointers. Memory ops cover stack and heap allocations,
+//! loads and stores of integers, pointers, and bytes (so pointers are read back as integers and
+//! integers as pointers), frees (sometimes twice, or of the wrong family), pointer offsets,
+//! address observation, exposure and `ptr.from_exposed` of nearby addresses, `ptr.with_addr`,
+//! comparisons, facts on results and parameters, and calls passing possibly aliasing pointers to
+//! `noalias` and `readonly` parameters. Each program comes with argument lists and fuel limits.
+
+use std::fmt::Write;
+
+use num_bigint::BigInt;
+
+/// A small deterministic random number generator (SplitMix64).
+pub struct Rng(u64);
+
+impl Rng {
+    pub fn new(seed: u64) -> Rng {
+        Rng(seed)
+    }
+
+    pub fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// A number below `n`.
+    pub fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    /// True with probability `p` percent.
+    pub fn chance(&mut self, p: u64) -> bool {
+        self.below(100) < p
+    }
+
+    pub fn pick<T: Copy>(&mut self, xs: &[T]) -> T {
+        xs[self.below(xs.len() as u64) as usize]
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum T {
+    I(u32),
+    P,
+    B(u32),
+}
+
+impl std::fmt::Display for T {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            T::I(w) => write!(f, "i{w}"),
+            T::P => f.write_str("ptr"),
+            T::B(w) => write!(f, "b{w}"),
+        }
+    }
+}
+
+/// A generated program, with the arguments and fuel to run its entry `@f0` with.
+pub struct Program {
+    pub text: String,
+    pub runs: Vec<(Vec<String>, u64)>,
+}
+
+struct Sig {
+    params: Vec<T>,
+    rets: Vec<T>,
+}
+
+/// A pointer in scope known to point at the start of an allocation (or assumed to, for pointer
+/// parameters).
+#[derive(Clone)]
+struct Mem {
+    name: String,
+    size: u64,
+    align: u64,
+    /// The heap family, for frees.
+    family: Option<&'static str>,
+}
+
+const WIDTHS: &[u32] = &[1, 8, 8, 16, 32, 32, 32, 64, 64, 7, 65, 128, 200];
+
+/// A constant of width `w`, biased toward edge cases. Written signed or unsigned.
+fn interesting(rng: &mut Rng, w: u32) -> BigInt {
+    let one = BigInt::from(1);
+    let max_u = (&one << w) - 1u32;
+    let max_s = (&one << (w - 1)) - 1u32;
+    let min_s = -(&one << (w - 1));
+    match rng.below(10) {
+        0 => BigInt::from(0),
+        1 => BigInt::from(1),
+        2 => BigInt::from(-1).max(min_s),
+        3 => max_s,
+        4 => min_s,
+        5 => max_u,
+        6 | 7 => BigInt::from(rng.below(8)) & max_u,
+        _ => {
+            let mut x = BigInt::from(0);
+            for _ in 0..w.div_ceil(64) {
+                x = (x << 64u32) + BigInt::from(rng.next());
+            }
+            let x = x & &max_u;
+            if rng.chance(50) && x > max_s {
+                x - (&one << w)
+            } else {
+                x
+            }
+        }
+    }
+}
+
+struct Gen<'r> {
+    rng: &'r mut Rng,
+    out: String,
+    line: u32,
+    sigs: Vec<Sig>,
+    func: usize,
+    /// The values visible here, with their types.
+    scope: Vec<(String, T)>,
+    /// The visible pointers to allocations.
+    mems: Vec<Mem>,
+    /// Visible address-size integers that are exposed addresses.
+    exposed: Vec<String>,
+    next: u32,
+    depth: usize,
+    /// The enclosing loops' parameter and result types, innermost last.
+    loops: Vec<(Vec<T>, Vec<T>)>,
+    addr: u32,
+    ptr_size: u32,
+    ops_left: u32,
+}
+
+impl Gen<'_> {
+    fn fresh(&mut self) -> String {
+        self.next += 1;
+        format!("v{}", self.next)
+    }
+
+    fn indent(&mut self) {
+        for _ in 0..self.depth + 1 {
+            self.out.push_str("  ");
+        }
+    }
+
+    fn loc(&mut self) -> String {
+        if self.rng.chance(92) {
+            format!(" @{}:{}", self.line, self.depth * 2 + 3)
+        } else {
+            String::new()
+        }
+    }
+
+    fn newline(&mut self) {
+        self.out.push('\n');
+        self.line += 1;
+    }
+
+    /// What is visible, to restore when a region ends.
+    fn mark(&self) -> (usize, usize, usize) {
+        (self.scope.len(), self.mems.len(), self.exposed.len())
+    }
+
+    fn restore(&mut self, m: (usize, usize, usize)) {
+        self.scope.truncate(m.0);
+        self.mems.truncate(m.1);
+        self.exposed.truncate(m.2);
+    }
+
+    /// Emit `results = body @loc` and define the results.
+    fn op(&mut self, results: &[(String, T, String)], body: &str) {
+        self.indent();
+        let rs: Vec<String> = results
+            .iter()
+            .map(|(n, t, facts)| format!("%{n}: {t}{facts}"))
+            .collect();
+        if !rs.is_empty() {
+            write!(self.out, "{} = ", rs.join(", ")).unwrap();
+        }
+        let loc = self.loc();
+        write!(self.out, "{body}{loc}").unwrap();
+        self.newline();
+        for (n, t, _) in results {
+            self.scope.push((n.clone(), *t));
+        }
+    }
+
+    /// Define one result of type `t`, sometimes with a fact.
+    fn def(&mut self, t: T, body: &str) -> String {
+        let n = self.fresh();
+        let facts = if self.rng.chance(1) {
+            self.fact(t, false)
+        } else {
+            String::new()
+        };
+        self.op(&[(n.clone(), t, facts)], body);
+        n
+    }
+
+    /// A bracketed fact for a value of type `t`, or nothing.
+    fn fact(&mut self, t: T, param: bool) -> String {
+        let trust = self.rng.pick(&["assume", "check", "proved"]);
+        let f = match t {
+            T::I(w) => {
+                let signed = self.rng.chance(50);
+                let m = BigInt::from(1) << w;
+                let norm = |x: BigInt| {
+                    if signed && x >= (&m >> 1u32) {
+                        x - &m
+                    } else if !signed && x < BigInt::from(0) {
+                        x + &m
+                    } else {
+                        x
+                    }
+                };
+                let (a, b) = if self.rng.chance(60) {
+                    // Wide: usually holds.
+                    if signed {
+                        (
+                            -(&m >> 1u32),
+                            (&m >> 1u32) - 1u32 - BigInt::from(self.rng.below(2)),
+                        )
+                    } else {
+                        (BigInt::from(self.rng.below(2)).min(&m - 1u32), &m - 1u32)
+                    }
+                } else {
+                    let a = interesting(self.rng, w);
+                    let b = interesting(self.rng, w);
+                    (norm(a), norm(b))
+                };
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                format!("range.{}({lo}, {hi})", if signed { "s" } else { "u" })
+            }
+            T::P => {
+                let choices: &[&str] = if param {
+                    &[
+                        "noalias", "noalias", "noalias", "readonly", "nonnull", "align",
+                    ]
+                } else {
+                    &["nonnull", "align"]
+                };
+                match self.rng.pick(choices) {
+                    "align" => format!("align({})", self.rng.pick(&[1, 1, 2, 4, 8, 32])),
+                    f => f.to_owned(),
+                }
+            }
+            T::B(_) => return String::new(),
+        };
+        format!(" [{f} {trust}]")
+    }
+
+    fn values(&self, t: T) -> Vec<String> {
+        self.scope
+            .iter()
+            .filter(|(_, u)| *u == t)
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    fn int_type(&mut self) -> T {
+        T::I(self.rng.pick(WIDTHS))
+    }
+
+    fn size_of(&self, t: T) -> u64 {
+        match t {
+            T::I(w) | T::B(w) => u64::from(w / 8),
+            T::P => u64::from(self.ptr_size / 8),
+        }
+    }
+
+    /// An operand of type `t`: usually an existing value, otherwise a new one.
+    fn operand(&mut self, t: T) -> String {
+        if self.rng.below(1500) == 0 {
+            return format!("?h{}: {t}", self.rng.below(3));
+        }
+        let vs = self.values(t);
+        if !vs.is_empty() && self.rng.chance(75) {
+            let i = self.rng.below(vs.len() as u64) as usize;
+            return format!("%{}", vs[i]);
+        }
+        let n = match t {
+            T::I(w) => self.konst(w),
+            T::P => {
+                if !self.mems.is_empty() && self.rng.chance(70) {
+                    let i = self.rng.below(self.mems.len() as u64) as usize;
+                    return format!("%{}", self.mems[i].name);
+                }
+                self.new_ptr()
+            }
+            T::B(w) => {
+                let (p, a) = self.access(u64::from(w / 8));
+                self.def(t, &format!("mem.load {p}, align {a}"))
+            }
+        };
+        format!("%{n}")
+    }
+
+    fn konst(&mut self, w: u32) -> String {
+        let n = interesting(self.rng, w);
+        self.def(T::I(w), &format!("int.const {n}"))
+    }
+
+    /// A constant of width `w` in `lo..=hi`, wrapped to the width.
+    fn small(&mut self, w: u32, lo: i64, hi: i64) -> String {
+        let n = lo + self.rng.below((hi - lo + 1) as u64) as i64;
+        let n = if w < 64 {
+            i128::from(n).rem_euclid(1i128 << w).to_string()
+        } else {
+            n.to_string()
+        };
+        let name = self.fresh();
+        self.op(
+            &[(name.clone(), T::I(w), String::new())],
+            &format!("int.const {n}"),
+        );
+        format!("%{name}")
+    }
+
+    fn align(&mut self) -> u64 {
+        self.rng.pick(&[1, 1, 2, 4, 4, 8, 8, 16])
+    }
+
+    /// A new allocation (or, rarely, null).
+    fn new_ptr(&mut self) -> String {
+        let align = self.align();
+        match self.rng.below(10) {
+            0 => self.def(T::P, "ptr.null"),
+            1..=3 => {
+                let family = self.rng.pick(&["c.malloc", "c.malloc", "cpp.new"]);
+                let fail = self.rng.pick(&["null", "trap"]);
+                let size = self.rng.pick(&[0, 4, 8, 8, 16, 24, 32]);
+                let n = self.small(self.addr, size, size);
+                let name = self.def(
+                    T::P,
+                    &format!("mem.alloc.{fail} {family} {n}, align {align}"),
+                );
+                self.mems.push(Mem {
+                    name: name.clone(),
+                    size: size as u64,
+                    align,
+                    family: Some(family),
+                });
+                name
+            }
+            _ => {
+                let size = self.rng.pick(&[0, 1, 4, 8, 8, 16, 16, 24, 32, 64]);
+                let name = self.def(T::P, &format!("mem.stack {size}, align {align}"));
+                self.mems.push(Mem {
+                    name: name.clone(),
+                    size,
+                    align,
+                    family: None,
+                });
+                name
+            }
+        }
+    }
+
+    /// A pointer to access `size` bytes through, and the alignment to access with: usually a
+    /// valid, aligned offset into an allocation in scope.
+    fn access(&mut self, size: u64) -> (String, u64) {
+        let fits: Vec<Mem> = self
+            .mems
+            .iter()
+            .filter(|m| m.size >= size)
+            .cloned()
+            .collect();
+        if fits.is_empty() || self.rng.chance(12) {
+            if self.rng.chance(40) {
+                // A fresh allocation that fits.
+                let align = self.rng.pick(&[1, 4, 8, 16]);
+                let total = size + self.rng.pick(&[0, 0, 8]);
+                let name = self.def(T::P, &format!("mem.stack {total}, align {align}"));
+                self.mems.push(Mem {
+                    name: name.clone(),
+                    size: total,
+                    align,
+                    family: None,
+                });
+                return (format!("%{name}"), align.min(size.max(1)));
+            }
+            let p = self.operand(T::P);
+            return (p, self.align());
+        }
+        let m = fits[self.rng.below(fits.len() as u64) as usize].clone();
+        // Usually the largest alignment both the allocation and the access allow; sometimes a
+        // smaller one, sometimes one too large.
+        let max = m.align.min(size.max(1));
+        let smaller: Vec<u64> = [1, 2, 4, 8, 16].into_iter().filter(|&a| a <= max).collect();
+        let align = if self.rng.chance(60) {
+            max
+        } else {
+            self.rng.pick(&smaller)
+        };
+        let align = if self.rng.chance(6) { align * 2 } else { align };
+        let slots = (m.size - size) / align;
+        let mut off = self.rng.below(slots + 1) * align;
+        if self.rng.chance(8) {
+            off = m.size - size + self.rng.pick(&[1, align, 8]);
+        }
+        if off == 0 {
+            return (format!("%{}", m.name), align);
+        }
+        let n = self.small(self.addr, off as i64, off as i64);
+        let p = self.def(T::P, &format!("ptr.offset.inbounds %{}, {n}", m.name));
+        (format!("%{p}"), align)
+    }
+
+    fn mem_type(&mut self) -> T {
+        match self.rng.below(10) {
+            0..=4 => T::I(self.rng.pick(&[8, 16, 32, 32, 64, 64, 128])),
+            5..=7 => T::P,
+            _ => T::B(self.rng.pick(&[8, 32, 64])),
+        }
+    }
+
+    /// One random op (possibly with regions).
+    fn stmt(&mut self) {
+        self.ops_left = self.ops_left.saturating_sub(1);
+        match self.rng.below(100) {
+            0..=3 => {
+                let w = self.rng.pick(WIDTHS);
+                self.konst(w);
+            }
+            4..=15 => {
+                let t = self.int_type();
+                let op = self.rng.pick(&["add", "sub", "mul"]);
+                let m = self.rng.pick(&[
+                    "wrap", "wrap", "nsw", "nuw", "nsw.nuw", "s.sat", "u.sat", "s.trap", "u.trap",
+                    "s.ub", "u.ub",
+                ]);
+                let (a, b) = (self.operand(t), self.operand(t));
+                self.def(t, &format!("int.{op}.{m} {a}, {b}"));
+            }
+            16..=19 => {
+                let t = self.int_type();
+                let op = self.rng.pick(&["and", "or", "xor"]);
+                let (a, b) = (self.operand(t), self.operand(t));
+                self.def(t, &format!("int.{op} {a}, {b}"));
+            }
+            20..=25 => {
+                let t = self.int_type();
+                let T::I(w) = t else { unreachable!() };
+                let op = self.rng.pick(&["div.s", "div.u", "rem.s", "rem.u"]);
+                let m = if op.ends_with(".u") {
+                    self.rng.pick(&["ub", "trap", "total"]).to_owned()
+                } else {
+                    let z = self.rng.pick(&["ub", "trap", "total"]);
+                    let o = self.rng.pick(&["ub", "trap", "wrap"]);
+                    match (z, o) {
+                        ("ub", "ub") | ("trap", "trap") | ("total", "wrap") => z.to_owned(),
+                        _ => format!("{z}.{o}"),
+                    }
+                };
+                let a = self.operand(t);
+                let b = if self.rng.chance(30) {
+                    self.small(w, -1, 1)
+                } else {
+                    self.operand(t)
+                };
+                self.def(t, &format!("int.{op}.{m} {a}, {b}"));
+            }
+            26..=31 => {
+                let t = self.int_type();
+                let T::I(w) = t else { unreachable!() };
+                let op = self.rng.pick(&["shl", "shr.u", "shr.s"]);
+                let e = self.rng.pick(&["ub", "trap", "mask", "total"]);
+                let a = self.operand(t);
+                let n = if self.rng.chance(75) {
+                    self.small(w, 0, i64::from(w.min(200)) + 2)
+                } else {
+                    self.operand(t)
+                };
+                self.def(t, &format!("int.{op}.{e} {a}, {n}"));
+            }
+            32..=36 => {
+                let t = self.int_type();
+                let p = self.rng.pick(&[
+                    "eq", "ne", "slt", "sle", "sgt", "sge", "ult", "ule", "ugt", "uge",
+                ]);
+                let (a, b) = (self.operand(t), self.operand(t));
+                self.def(T::I(1), &format!("int.cmp.{p} {a}, {b}"));
+            }
+            37..=38 => {
+                let t = if self.rng.chance(20) {
+                    T::P
+                } else {
+                    self.int_type()
+                };
+                let t = if t == T::P { self.int_type() } else { t };
+                let c = self.operand(T::I(1));
+                let (a, b) = (self.operand(t), self.operand(t));
+                self.def(t, &format!("select {c}, {a}, {b}"));
+            }
+            39..=42 => {
+                let (mut v, mut w) = (self.rng.pick(WIDTHS), self.rng.pick(WIDTHS));
+                if v == w {
+                    w += 1;
+                }
+                if v > w {
+                    std::mem::swap(&mut v, &mut w);
+                }
+                if self.rng.chance(50) {
+                    let op = self.rng.pick(&["zext", "sext"]);
+                    let a = self.operand(T::I(v));
+                    self.def(T::I(w), &format!("int.{op} {a}"));
+                } else {
+                    let m = self.rng.pick(&["wrap", "nsw", "nuw"]);
+                    let a = self.operand(T::I(w));
+                    self.def(T::I(v), &format!("int.trunc.{m} {a}"));
+                }
+            }
+            43..=45 => {
+                let t = self.int_type();
+                match self.rng.below(3) {
+                    0 => {
+                        self.def(t, "poison");
+                    }
+                    1 => {
+                        let a = self.operand(t);
+                        self.def(t, &format!("freeze {a}"));
+                    }
+                    _ => {
+                        let t = if self.rng.chance(30) { T::P } else { t };
+                        let a = self.operand(t);
+                        self.def(t, &format!("copy {a}"));
+                    }
+                }
+            }
+            46..=49 => {
+                self.new_ptr();
+            }
+            50..=58 => {
+                let t = self.mem_type();
+                let (p, a) = self.access(self.size_of(t));
+                self.def(t, &format!("mem.load {p}, align {a}"));
+            }
+            59..=66 => {
+                let t = self.mem_type();
+                let v = self.operand(t);
+                let (p, a) = self.access(self.size_of(t));
+                self.op(&[], &format!("mem.store {t} {v}, {p}, align {a}"));
+            }
+            67..=69 => {
+                let p = self.operand(T::P);
+                let n = if self.rng.chance(80) {
+                    self.small(self.addr, -8, 40)
+                } else {
+                    self.operand(T::I(self.addr))
+                };
+                let m = self.rng.pick(&["inbounds", "inbounds", "wrap"]);
+                self.def(T::P, &format!("ptr.offset.{m} {p}, {n}"));
+            }
+            70..=73 => {
+                // Sometimes the end of an allocation: where the next one may start.
+                let p = match self.mems.len() {
+                    n if n > 0 && self.rng.chance(35) => {
+                        let m = self.mems[self.rng.below(n as u64) as usize].clone();
+                        let size = self.small(self.addr, m.size as i64, m.size as i64);
+                        format!(
+                            "%{}",
+                            self.def(T::P, &format!("ptr.offset.wrap %{}, {size}", m.name))
+                        )
+                    }
+                    _ => self.operand(T::P),
+                };
+                if self.rng.chance(30) {
+                    self.def(T::I(self.addr), &format!("ptr.addr {p}"));
+                } else {
+                    let a = self.def(T::I(self.addr), &format!("ptr.expose {p}"));
+                    self.exposed.push(a);
+                }
+            }
+            74..=78 => self.address_op(),
+            79..=80 => {
+                let p = self
+                    .rng
+                    .pick(&["eq", "ne", "eq", "ne", "ult", "ule", "ugt", "uge"]);
+                let (a, b) = (self.operand(T::P), self.operand(T::P));
+                self.def(T::I(1), &format!("ptr.cmp.{p} {a}, {b}"));
+            }
+            81..=82 => {
+                let heap: Vec<Mem> = self
+                    .mems
+                    .iter()
+                    .filter(|m| m.family.is_some())
+                    .cloned()
+                    .collect();
+                if heap.is_empty() && self.rng.chance(70) {
+                    return;
+                }
+                let (p, family) = if !heap.is_empty() && self.rng.chance(85) {
+                    let m = heap[self.rng.below(heap.len() as u64) as usize].clone();
+                    let family = if self.rng.chance(85) {
+                        m.family.unwrap()
+                    } else {
+                        "cpp.new"
+                    };
+                    (format!("%{}", m.name), family)
+                } else {
+                    (self.operand(T::P), "c.malloc")
+                };
+                self.op(&[], &format!("mem.free {family} {p}"));
+            }
+            83..=88 if self.depth < 3 => self.if_op(),
+            89..=93 if self.depth < 3 => self.loop_op(),
+            94..=98 if self.func + 1 < self.sigs.len() => self.call_op(),
+            _ => {
+                let w = self.rng.pick(WIDTHS);
+                self.konst(w);
+            }
+        }
+    }
+
+    /// Two allocations given addresses one after the other, both exposed, and a pointer from
+    /// the address where the first ends and the second starts: it may belong to either.
+    fn boundary(&mut self) {
+        let size = self.rng.pick(&[0, 4, 8, 16]);
+        let align = self.rng.pick(&[1, 4, 8]);
+        let a = self.def(T::P, &format!("mem.stack {size}, align {align}"));
+        let b = self.def(T::P, &format!("mem.stack 8, align {align}"));
+        let ea = self.def(T::I(self.addr), &format!("ptr.expose %{a}"));
+        let eb = self.def(T::I(self.addr), &format!("ptr.expose %{b}"));
+        self.exposed.extend([ea.clone(), eb]);
+        let d = self.small(self.addr, size, size);
+        let x = self.def(T::I(self.addr), &format!("int.add.wrap %{ea}, {d}"));
+        let p = self.def(T::P, &format!("ptr.from_exposed %{x}"));
+        for (name, size) in [(a, size as u64), (b, 8), (p, 4)] {
+            self.mems.push(Mem {
+                name,
+                size,
+                align,
+                family: None,
+            });
+        }
+    }
+
+    /// `ptr.from_exposed` or `ptr.with_addr` of an address near an observed one.
+    fn address_op(&mut self) {
+        if self.rng.chance(25) {
+            return self.boundary();
+        }
+        let aw = T::I(self.addr);
+        let a = if !self.exposed.is_empty() && self.rng.chance(80) {
+            let i = self.rng.below(self.exposed.len() as u64) as usize;
+            format!("%{}", self.exposed[i])
+        } else {
+            self.operand(aw)
+        };
+        let a = if self.rng.chance(40) {
+            let d = self.small(self.addr, -4, 12);
+            format!("%{}", self.def(aw, &format!("int.add.wrap {a}, {d}")))
+        } else {
+            a
+        };
+        if self.rng.chance(75) {
+            let p = self.def(T::P, &format!("ptr.from_exposed {a}"));
+            // Treat it as a small allocation: accesses through it are often valid.
+            if self.rng.chance(50) {
+                self.mems.push(Mem {
+                    name: p,
+                    size: 4,
+                    align: 1,
+                    family: None,
+                });
+            }
+        } else {
+            let p = self.operand(T::P);
+            self.def(T::P, &format!("ptr.with_addr {p}, {a}"));
+        }
+    }
+
+    /// Ops, then a terminator chosen by `end`, inside a region; the region's values are hidden
+    /// afterwards.
+    fn region(&mut self, n: u32, end: impl FnOnce(&mut Self)) {
+        let mark = self.mark();
+        self.depth += 1;
+        for _ in 0..n {
+            if self.ops_left == 0 {
+                break;
+            }
+            self.stmt();
+        }
+        end(self);
+        self.depth -= 1;
+        self.restore(mark);
+    }
+
+    fn close(&mut self) {
+        self.indent();
+        self.out.push('}');
+    }
+
+    /// `%r..: T.. = ` for an op with regions.
+    fn results_prefix(&mut self, names: &[(String, T)]) {
+        self.indent();
+        if !names.is_empty() {
+            let rs: Vec<String> = names.iter().map(|(n, t)| format!("%{n}: {t}")).collect();
+            write!(self.out, "{} = ", rs.join(", ")).unwrap();
+        }
+    }
+
+    fn if_op(&mut self) {
+        let c = self.operand(T::I(1));
+        let rets: Vec<T> = (0..self.rng.below(3)).map(|_| self.state_type()).collect();
+        let names: Vec<(String, T)> = rets.iter().map(|t| (self.fresh(), *t)).collect();
+        self.results_prefix(&names);
+        let loc = self.loc();
+        write!(self.out, "cf.if {c}{loc} {{").unwrap();
+        self.newline();
+        for branch in 0..2 {
+            let n = self.rng.below(5) as u32;
+            let rets = rets.clone();
+            self.region(n, |g| {
+                // A branch without results may leave the enclosing loop instead.
+                if rets.is_empty() && !g.loops.is_empty() && g.rng.chance(30) {
+                    g.loop_exit();
+                } else if !rets.is_empty() || g.rng.chance(50) {
+                    let vs: Vec<String> = rets.iter().map(|t| g.operand(*t)).collect();
+                    g.op(&[], format!("cf.yield {}", vs.join(", ")).trim_end());
+                }
+            });
+            self.close();
+            if branch == 0 {
+                self.out.push_str(" else {");
+                self.newline();
+            }
+        }
+        self.newline();
+        self.scope.extend(names);
+    }
+
+    fn state_type(&mut self) -> T {
+        if self.rng.chance(25) {
+            T::P
+        } else {
+            T::I(self.rng.pick(&[1, 8, 32, 64]))
+        }
+    }
+
+    /// `cf.break` or `cf.continue` of the innermost loop.
+    fn loop_exit(&mut self) {
+        let (params, results) = self.loops.last().unwrap().clone();
+        let (kw, ts) = if self.rng.chance(60) {
+            ("cf.break", results)
+        } else {
+            ("cf.continue", params)
+        };
+        let vs: Vec<String> = ts.iter().map(|t| self.operand(*t)).collect();
+        self.op(&[], format!("{kw} {}", vs.join(", ")).trim_end());
+    }
+
+    /// A counted loop: `%i` counts up from 0 to a bound; other state is random.
+    fn loop_op(&mut self) {
+        let bound = if self.rng.chance(85) {
+            self.small(32, 0, 5)
+        } else {
+            self.operand(T::I(32))
+        };
+        let zero = self.small(32, 0, 0);
+        let one = self.small(32, 1, 1);
+        let extra: Vec<T> = (0..self.rng.below(3)).map(|_| self.state_type()).collect();
+        let inits: Vec<String> = extra.iter().map(|t| self.operand(*t)).collect();
+        let i = self.fresh();
+        let state: Vec<(String, T)> = std::iter::once((i.clone(), T::I(32)))
+            .chain(extra.iter().map(|t| (self.fresh(), *t)))
+            .collect();
+        let names: Vec<(String, T)> = extra.iter().map(|t| (self.fresh(), *t)).collect();
+        self.results_prefix(&names);
+        let progress = if self.rng.chance(40) { " progress" } else { "" };
+        let iter: Vec<String> = state
+            .iter()
+            .zip(std::iter::once(zero).chain(inits))
+            .map(|((n, t), init)| format!("%{n}: {t} = {init}"))
+            .collect();
+        let loc = self.loc();
+        write!(
+            self.out,
+            "cf.loop{progress} iter({}){loc} {{",
+            iter.join(", ")
+        )
+        .unwrap();
+        self.newline();
+        self.loops
+            .push((state.iter().map(|(_, t)| *t).collect(), extra.clone()));
+        let mark = self.mark();
+        self.scope.extend(state.iter().cloned());
+        self.depth += 1;
+        // Leave when the counter reaches the bound.
+        let done = self.def(T::I(1), &format!("int.cmp.sge %{i}, {bound}"));
+        self.indent();
+        let loc = self.loc();
+        write!(self.out, "cf.if %{done}{loc} {{").unwrap();
+        self.newline();
+        self.depth += 1;
+        let branch = self.mark();
+        let outs: Vec<String> = extra.iter().map(|t| self.operand(*t)).collect();
+        self.op(&[], format!("cf.break {}", outs.join(", ")).trim_end());
+        self.restore(branch);
+        self.depth -= 1;
+        self.close();
+        self.newline();
+        self.depth -= 1;
+        let n = 1 + self.rng.below(6) as u32;
+        self.region(n, |g| {
+            let next = g.def(T::I(32), &format!("int.add.wrap %{i}, {one}"));
+            let mut vs = vec![format!("%{next}")];
+            for t in &extra {
+                vs.push(g.operand(*t));
+            }
+            g.op(&[], &format!("cf.continue {}", vs.join(", ")));
+        });
+        self.loops.pop();
+        self.restore(mark);
+        self.close();
+        self.newline();
+        self.scope.extend(names);
+    }
+
+    fn call_op(&mut self) {
+        let callee =
+            self.func + 1 + self.rng.below((self.sigs.len() - self.func - 1) as u64) as usize;
+        let params = self.sigs[callee].params.clone();
+        let rets = self.sigs[callee].rets.clone();
+        let args: Vec<String> = params.iter().map(|t| self.operand(*t)).collect();
+        let results: Vec<(String, T, String)> = rets
+            .iter()
+            .map(|t| (self.fresh(), *t, String::new()))
+            .collect();
+        self.op(
+            &results,
+            &format!("func.call @f{callee}({})", args.join(", ")),
+        );
+    }
+
+    fn func(&mut self, idx: usize) {
+        self.func = idx;
+        self.scope.clear();
+        self.mems.clear();
+        self.exposed.clear();
+        self.ops_left = 45;
+        let (params, rets) = (self.sigs[idx].params.clone(), self.sigs[idx].rets.clone());
+        let mut ps = Vec::new();
+        for t in &params {
+            let n = self.fresh();
+            let facts = if *t == T::P && idx == 0 {
+                // The entry gets null or poison: only scope facts let it run.
+                if self.rng.chance(30) {
+                    format!(" [{} assume]", self.rng.pick(&["noalias", "readonly"]))
+                } else {
+                    String::new()
+                }
+            } else if (*t == T::P && self.rng.chance(50)) || self.rng.chance(3) {
+                self.fact(*t, true)
+            } else {
+                String::new()
+            };
+            ps.push(format!("%{n}: {t}{facts}"));
+            if *t == T::P && idx > 0 {
+                self.mems.push(Mem {
+                    name: n.clone(),
+                    size: 8,
+                    align: 1,
+                    family: None,
+                });
+            }
+            self.scope.push((n, *t));
+        }
+        let rs = match rets.len() {
+            0 => String::new(),
+            1 => format!(" -> {}", rets[0]),
+            _ => {
+                let ts: Vec<String> = rets.iter().map(T::to_string).collect();
+                format!(" -> ({})", ts.join(", "))
+            }
+        };
+        let file = if self.rng.chance(30) {
+            " loc \"gen.c\""
+        } else {
+            ""
+        };
+        write!(self.out, "func @f{idx}({}){rs}{file} {{", ps.join(", ")).unwrap();
+        self.newline();
+        let n = 4 + self.rng.below(18);
+        for _ in 0..n {
+            if self.ops_left == 0 {
+                break;
+            }
+            self.stmt();
+        }
+        let vs: Vec<String> = rets.iter().map(|t| self.operand(*t)).collect();
+        self.op(&[], format!("func.ret {}", vs.join(", ")).trim_end());
+        self.out.push('}');
+        self.newline();
+        self.newline();
+    }
+}
+
+fn arg(rng: &mut Rng, t: T) -> String {
+    match t {
+        T::I(w) => {
+            if rng.chance(6) {
+                "poison".to_owned()
+            } else if rng.chance(50) {
+                (rng.below(10) as i64 - 3).to_string()
+            } else {
+                interesting(rng, w).to_string()
+            }
+        }
+        T::P => if rng.chance(85) { "null" } else { "poison" }.to_owned(),
+        T::B(_) => unreachable!("byte parameters are not generated"),
+    }
+}
+
+/// A random program.
+pub fn program(rng: &mut Rng) -> Program {
+    let (ptr_size, addr) = match rng.below(20) {
+        0..=11 => (64, 64),
+        12 | 13 => (32, 32),
+        14 | 15 => (64, 32),
+        16 | 17 => (128, 64),
+        18 => (16, 16),
+        _ => (8, 8),
+    };
+    let nfuncs = 1 + rng.below(3) as usize;
+    let mut sigs = Vec::new();
+    for i in 0..nfuncs {
+        let np = rng.below(if i == 0 { 3 } else { 4 });
+        let params: Vec<T> = (0..np)
+            .map(|_| {
+                if rng.chance(if i == 0 { 15 } else { 55 }) {
+                    T::P
+                } else {
+                    T::I(rng.pick(&[1, 8, 32, 64, 7, 128]))
+                }
+            })
+            .collect();
+        let rets: Vec<T> = (0..rng.below(3))
+            .map(|_| match rng.below(10) {
+                0..=1 => T::P,
+                2 => T::B(rng.pick(&[8, 32])),
+                _ => T::I(rng.pick(&[1, 8, 32, 64, 65, 128])),
+            })
+            .collect();
+        sigs.push(Sig { params, rets });
+    }
+    let entry_params = sigs[0].params.clone();
+    let mut g = Gen {
+        rng,
+        out: String::new(),
+        line: 1,
+        sigs,
+        func: 0,
+        scope: Vec::new(),
+        mems: Vec::new(),
+        exposed: Vec::new(),
+        next: 0,
+        depth: 0,
+        loops: Vec::new(),
+        addr,
+        ptr_size,
+        ops_left: 0,
+    };
+    if (ptr_size, addr) != (64, 64) {
+        write!(g.out, "memspace default ptr {ptr_size} addr {addr}").unwrap();
+        g.newline();
+        g.newline();
+    }
+    for i in 0..nfuncs {
+        g.func(i);
+    }
+    let text = g.out;
+    let rng = g.rng;
+    let runs = (0..3)
+        .map(|_| {
+            let args = entry_params.iter().map(|t| arg(rng, *t)).collect();
+            let fuel = rng.pick(&[3000, 3000, 3000, 200, 40]);
+            (args, fuel)
+        })
+        .collect();
+    Program { text, runs }
+}
