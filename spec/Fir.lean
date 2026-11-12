@@ -17,3 +17,4 @@ import Fir.Dse
 import Fir.Space
 import Fir.Fwd
 import Fir.CopyProp
+import Fir.Dce
