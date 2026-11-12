@@ -112,6 +112,9 @@ pub enum FieldTy {
     Cases,
     /// A target register, `x3` or `v12`, [`Imm::Reg`].
     Reg,
+    /// A float constant's bits, [`Imm::Nat`], written as the float of the op's one result type
+    /// (`1.5`, `nan`); the generic form writes the bits as an integer.
+    Float,
 }
 
 /// An immediate's value.
@@ -210,6 +213,14 @@ pub enum Check {
     Union(TyE),
     /// The type is a scalar value type.
     Scalar(TyE),
+    /// The types are floats.
+    Floats(&'static [TyE]),
+    /// The types are integers or floats.
+    Numeric(&'static [TyE]),
+    /// The two types have the same width in bits.
+    SameWidth(TyE, TyE),
+    /// The immediate is the bits of a value of the float type.
+    FloatBits(u8, TyE),
 }
 
 /// Effect categories (decision: Effects); resource tags come later.

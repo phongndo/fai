@@ -1410,6 +1410,40 @@ impl<'m> FuncBuilder<'m> {
                         return err(format!("expected integers but got {}", self.show_list(&ts)));
                     }
                 }
+                Check::Floats(ts) => {
+                    let ts: Vec<Ty> = ts.iter().map(|e| ty(&vars, *e)).collect();
+                    if !ts.iter().all(|t| t.is_float()) {
+                        return err(format!("expected floats but got {}", self.show_list(&ts)));
+                    }
+                }
+                Check::Numeric(ts) => {
+                    let ts: Vec<Ty> = ts.iter().map(|e| ty(&vars, *e)).collect();
+                    if !ts.iter().all(|t| matches!(t, Ty::Int(_) | Ty::Float(_))) {
+                        return err(format!(
+                            "expected integers or floats but got {}",
+                            self.show_list(&ts)
+                        ));
+                    }
+                }
+                Check::SameWidth(a, t) => {
+                    let (a, t) = (ty(&vars, a), ty(&vars, t));
+                    if width(a) != width(t) {
+                        return err(format!(
+                            "{} and {} have different widths",
+                            self.show(a),
+                            self.show(t)
+                        ));
+                    }
+                }
+                Check::FloatBits(i, t) => {
+                    let t = ty(&vars, t);
+                    if let Some(Imm::Nat(n)) = kind.imm(i.into())
+                        && width(t) < 64
+                        && n >> width(t) != 0
+                    {
+                        return err(format!("{n} is not the bits of a {}", self.show(t)));
+                    }
+                }
                 Check::Pow2(i) => {
                     if let Some(Imm::Align(a)) = kind.imm(i.into())
                         && !a.is_power_of_two()
@@ -1472,6 +1506,7 @@ impl<'m> FuncBuilder<'m> {
 fn width(t: Ty) -> u32 {
     match t {
         Ty::Int(w) | Ty::Byte(w) => w,
+        Ty::Float(f) => f.width(),
         _ => 0,
     }
 }

@@ -76,7 +76,26 @@ fn push_ty(out: &mut String, types: &Types, t: Ty) {
             push_u64(out, w.into());
         }
         Ty::Slice => out.push_str("slice"),
+        Ty::Float(f) => out.push_str(f.name()),
         Ty::Agg(_) => types.write(out, t),
+    }
+}
+
+/// Whether the readable form can write the op's float constant, if it has one: as the float of
+/// its one result's type, whose width the bits fit (Lean's `Op.floatShown`).
+fn float_shown(b: &Body, op: OpId) -> Option<FloatTy> {
+    let kind = b.kind(op);
+    let decl = kind.decl();
+    let Some(i) = decl.imms.iter().position(|f| f.ty == FieldTy::Float) else {
+        return Some(FloatTy::F64);
+    };
+    let mut rs = b.results(op);
+    match (rs.next(), rs.next(), kind.imm(i)) {
+        (Some(r), None, Some(Imm::Nat(n))) => match b.ty(r) {
+            Ty::Float(f) if crate::float::fits(f, n) => Some(f),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -179,6 +198,7 @@ impl Printer<'_> {
         if kind
             .decl()
             .fits(b.operands(op).len(), || kind.succ_args(b), regions)
+            && float_shown(b, op).is_some()
         {
             self.readable(depth, op);
         } else {
@@ -304,6 +324,11 @@ impl Printer<'_> {
                                 next = self.succ(case.succ, operands, next);
                             }
                             self.out.push(']');
+                        }
+                        Some(Imm::Nat(n)) if f.ty == FieldTy::Float => {
+                            self.out.push(' ');
+                            let t = float_shown(b, op).unwrap_or(FloatTy::F64);
+                            self.out.push_str(&crate::float::render(t, n));
                         }
                         Some(v) => {
                             self.out.push(' ');

@@ -25,6 +25,7 @@ pub enum TrapReason {
     Oom,
     Bounds,
     Tag,
+    Convert,
 }
 
 impl TrapReason {
@@ -36,6 +37,7 @@ impl TrapReason {
             TrapReason::Oom => "oom",
             TrapReason::Bounds => "bounds",
             TrapReason::Tag => "tag",
+            TrapReason::Convert => "convert",
         }
     }
 }
@@ -64,6 +66,7 @@ pub enum UbKind {
     BadCall,
     Bounds,
     Tag,
+    Convert,
 }
 
 impl UbKind {
@@ -90,6 +93,7 @@ impl UbKind {
             UbKind::BadCall => "bad-call",
             UbKind::Bounds => "bounds",
             UbKind::Tag => "tag",
+            UbKind::Convert => "convert",
         }
     }
 }

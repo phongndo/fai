@@ -311,7 +311,7 @@ fn check_ty(types: &Types, sp: &SpaceCfg, layer: Layer, loc: Option<Loc>, t: Ty)
         Ty::Byte(w) if !(w > 0 && w.is_multiple_of(8)) => {
             verr(loc, format!("b{w} is not a valid type"))
         }
-        Ty::Int(_) | Ty::Ptr | Ty::Byte(_) | Ty::Slice => Ok(()),
+        Ty::Int(_) | Ty::Ptr | Ty::Byte(_) | Ty::Slice | Ty::Float(_) => Ok(()),
         Ty::Agg(id) => {
             let part = |x: Ty| -> VResult<()> {
                 check_ty(types, sp, layer, loc, x)?;
@@ -434,6 +434,7 @@ fn check_sized(types: &Types, sp: &SpaceCfg, layer: Layer, loc: Option<Loc>, t: 
 fn width(t: Ty) -> u32 {
     match t {
         Ty::Int(w) | Ty::Byte(w) => w,
+        Ty::Float(f) => f.width(),
         _ => 0,
     }
 }
@@ -604,7 +605,7 @@ fn is_loadable_scalar(space: &SpaceCfg, t: Ty) -> bool {
     match t {
         Ty::Int(w) => w.is_multiple_of(8),
         Ty::Ptr => space.ptr_bits.is_multiple_of(8),
-        Ty::Byte(_) => true,
+        Ty::Byte(_) | Ty::Float(_) => true,
         Ty::Slice | Ty::Agg(_) => false,
     }
 }
@@ -936,6 +937,46 @@ fn check_simple(
                 let t = ty(&t);
                 if !t.is_value() {
                     return verr(loc, format!("{} is not a scalar type", show(t)));
+                }
+            }
+            Check::Floats(ts) => {
+                if !ts.iter().all(|e| ty(e).is_float()) {
+                    return verr(
+                        loc,
+                        format!("expected floats but got {}", types.show_list(&tys_of(ts))),
+                    );
+                }
+            }
+            Check::Numeric(ts) => {
+                if !ts
+                    .iter()
+                    .all(|e| matches!(ty(e), Ty::Int(_) | Ty::Float(_)))
+                {
+                    return verr(
+                        loc,
+                        format!(
+                            "expected integers or floats but got {}",
+                            types.show_list(&tys_of(ts))
+                        ),
+                    );
+                }
+            }
+            Check::SameWidth(a, t) => {
+                let (a, t) = (ty(&a), ty(&t));
+                if width(a) != width(t) {
+                    return verr(
+                        loc,
+                        format!("{} and {} have different widths", show(a), show(t)),
+                    );
+                }
+            }
+            Check::FloatBits(i, t) => {
+                let Some(Imm::Nat(n)) = field(i) else {
+                    return verr(loc, "malformed op");
+                };
+                let t = ty(&t);
+                if width(t) < 64 && n >> width(t) != 0 {
+                    return verr(loc, format!("{n} is not the bits of a {}", show(t)));
                 }
             }
         }

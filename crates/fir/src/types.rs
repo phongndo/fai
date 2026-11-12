@@ -339,6 +339,7 @@ impl Types {
             Ty::Int(w) => write!(out, "i{w}").unwrap(),
             Ty::Ptr => out.push_str("ptr"),
             Ty::Byte(w) => write!(out, "b{w}").unwrap(),
+            Ty::Float(f) => out.push_str(f.name()),
             Ty::Agg(id) => match self.shape(id) {
                 Shape::Struct(p, fs) => {
                     write!(out, "struct<{}>{{", p.name()).unwrap();
@@ -395,6 +396,10 @@ impl Types {
     pub fn dims(&self, sp: &SpaceCfg, t: Ty) -> (u128, u64) {
         match t {
             Ty::Int(w) | Ty::Byte(w) => (u128::from(w / 8), u64::from(sp.int_align(w))),
+            Ty::Float(f) => (
+                u128::from(f.width() / 8),
+                u64::from(sp.int_align(f.width())),
+            ),
             Ty::Ptr => (u128::from(sp.ptr_bits / 8), u64::from(sp.ptr_align)),
             Ty::Slice => {
                 let (_, size, align) = slice_layout(sp);

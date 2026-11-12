@@ -389,7 +389,7 @@ impl<'m> Lfir<'m> {
                 Ok(Value::Bytes { start, len: n / 8 })
             }
             Ty::Int(_) | Ty::Byte(_) => stuck(loc, format!("{t} is wider than a register")),
-            Ty::Agg(_) | Ty::Slice => stuck(loc, "not a value type"),
+            Ty::Agg(_) | Ty::Slice | Ty::Float(_) => stuck(loc, "not a value type"),
         }
     }
 
@@ -410,6 +410,9 @@ impl<'m> Lfir<'m> {
                 self.word_of_bytes(loc, &bs)?
             }
             Value::Agg { .. } => return stuck(loc, "an aggregate is not a register value"),
+            Value::Float { .. } | Value::FloatPoison(_) => {
+                return stuck(loc, "a float is not in a general-purpose register");
+            }
             Value::Unset => return stuck(loc, "no value"),
         })
     }

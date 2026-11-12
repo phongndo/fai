@@ -32,14 +32,15 @@
 //! values (`FirValue`, which also stands for holes), ops (`FirOp`), and regions (`FirRegion`,
 //! which also stands for blocks of `cf.blocks`) of the function being built. `FIR_INVALID` is
 //! no id. Value types are ids made without a module: `fir_type_int(32)`, `fir_type_byte(8)`,
-//! `FIR_TYPE_PTR`, and HFIR's `FIR_TYPE_SLICE`; struct, array, union, and function types are
-//! made in a module (`fir_type_struct`, …).
+//! `FIR_TYPE_PTR`, `FIR_TYPE_F32`, `FIR_TYPE_F64`, and HFIR's `FIR_TYPE_SLICE`; struct, array,
+//! union, and function types are made in a module (`fir_type_struct`, …).
 //!
 //! **Ops.** One function per op, generated from its declaration (`src/generated/ops.rs`), named
 //! like the Rust builder's methods with `fir_` in front: its arguments are the builder, the
 //! result types the op can't imply, every modifier (a `FIR_OVF_*`, `FIR_EDGE_*`, … constant:
 //! none has a default), then the op's immediates and operands as its text writes them; lists are
-//! a pointer and a length. Ops with regions are made with their regions empty
+//! a pointer and a length. `fir_float_const` takes a float's bits (a `uint64_t`, the low 32 for
+//! `f32`); `fir_float_const_f32` and `fir_float_const_f64` take a C `float` or `double`. Ops with regions are made with their regions empty
 //! (`fir_cf_if_begin`); `fir_op_region` and `fir_position_at_end` fill them, and
 //! `fir_block_new` adds the blocks of `cf.blocks` and `aarch64.code`. A region's parameters (a
 //! loop's state, `cf.try`'s exception, which the builder makes) are `fir_region_param`. Code that
@@ -71,10 +72,11 @@ use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use fir::{
-    AllocFail, AluImmOp, AluOp, ArithOp, BitOp, BuildError, Cond, CselOp, DivOp, Edge, ExtEffect,
-    FactArg, FuncBuilder, FuncRef, GlobalRef, Init, IntImm, MemClass, MemSize, ModuleBuilder,
-    MovOp, OpId, Operand, Ovf, Policy, Pred, RegionId, Sf, ShiftEdge, ShiftImmOp, ShiftOp,
-    SpaceCfg, SwitchCase, Target, TrapReason, TruncMode, Trust, Ty, TyId, ValueDef,
+    AllocFail, AluImmOp, AluOp, ArithOp, BitOp, BuildError, Cond, CselOp, CvtEdge, DivOp, Edge,
+    ExtEffect, FBinOp, FPred, FUnOp, FactArg, FloatTy, FuncBuilder, FuncRef, GlobalRef, Init,
+    IntImm, MemClass, MemSize, ModuleBuilder, MovOp, OpId, Operand, Ovf, Policy, Pred, RegionId,
+    Sf, ShiftEdge, ShiftImmOp, ShiftOp, SpaceCfg, SwitchCase, Target, TrapReason, TruncMode, Trust,
+    Ty, TyId, ValueDef,
 };
 
 #[path = "generated/ops.rs"]
@@ -83,7 +85,7 @@ mod ops;
 pub use ops::*;
 
 /// The API's version: the major version times 65536, plus the minor version.
-pub const FIR_API_VERSION: u32 = (1 << 16) | 1;
+pub const FIR_API_VERSION: u32 = (1 << 16) | 2;
 
 /// No id: what a call returns when it fails.
 pub const FIR_INVALID: u32 = u32::MAX;
@@ -97,8 +99,8 @@ pub type FirValue = u32;
 pub type FirOp = u32;
 /// A region of the function being built; also a block of `cf.blocks`.
 pub type FirRegion = u32;
-/// A type: a value type (`fir_type_int`, `fir_type_byte`, `FIR_TYPE_PTR`, `FIR_TYPE_SLICE`), or a
-/// struct, array, union, or function type of a module.
+/// A type: a value type (`fir_type_int`, `fir_type_byte`, `FIR_TYPE_PTR`, `FIR_TYPE_F32`,
+/// `FIR_TYPE_F64`, `FIR_TYPE_SLICE`), or a struct, array, union, or function type of a module.
 pub type FirType = u32;
 /// A function of a module, defined in it or external.
 pub type FirFunc = u32;
@@ -142,6 +144,10 @@ pub const FIR_LAYER_LFIR: FirLayer = 2;
 pub const FIR_TYPE_PTR: FirType = 0xC000_0000;
 /// `slice` (HFIR): a pointer and an address-sized length.
 pub const FIR_TYPE_SLICE: FirType = 0xC000_0001;
+/// `f32`: IEEE 754 binary32.
+pub const FIR_TYPE_F32: FirType = 0xC000_0002;
+/// `f64`: IEEE 754 binary64.
+pub const FIR_TYPE_F64: FirType = 0xC000_0003;
 const TY_TAG: u32 = 3 << 30;
 const TY_BYTE: u32 = 1 << 30;
 const TY_AGG: u32 = 2 << 30;
@@ -256,6 +262,43 @@ pub type FirShiftOp = u32;
 pub const FIR_SHIFT_OP_SHL: FirShiftOp = 0;
 pub const FIR_SHIFT_OP_SHR_U: FirShiftOp = 1;
 pub const FIR_SHIFT_OP_SHR_S: FirShiftOp = 2;
+
+/// `float.add`, `float.sub`, `float.mul`, `float.div`, `float.copysign` (`FBinOp`).
+pub type FirFBinOp = u32;
+pub const FIR_FBIN_OP_ADD: FirFBinOp = 0;
+pub const FIR_FBIN_OP_SUB: FirFBinOp = 1;
+pub const FIR_FBIN_OP_MUL: FirFBinOp = 2;
+pub const FIR_FBIN_OP_DIV: FirFBinOp = 3;
+pub const FIR_FBIN_OP_COPYSIGN: FirFBinOp = 4;
+
+/// `float.neg`, `float.abs`, `float.sqrt` (`FUnOp`).
+pub type FirFUnOp = u32;
+pub const FIR_FUN_OP_NEG: FirFUnOp = 0;
+pub const FIR_FUN_OP_ABS: FirFUnOp = 1;
+pub const FIR_FUN_OP_SQRT: FirFUnOp = 2;
+
+/// A float comparison (`FPred`): ordered (false on NaN), unordered (true on NaN), `ord`, `uno`.
+pub type FirFPred = u32;
+pub const FIR_FPRED_OEQ: FirFPred = 0;
+pub const FIR_FPRED_ONE: FirFPred = 1;
+pub const FIR_FPRED_OLT: FirFPred = 2;
+pub const FIR_FPRED_OLE: FirFPred = 3;
+pub const FIR_FPRED_OGT: FirFPred = 4;
+pub const FIR_FPRED_OGE: FirFPred = 5;
+pub const FIR_FPRED_ORD: FirFPred = 6;
+pub const FIR_FPRED_UEQ: FirFPred = 7;
+pub const FIR_FPRED_UNE: FirFPred = 8;
+pub const FIR_FPRED_ULT: FirFPred = 9;
+pub const FIR_FPRED_ULE: FirFPred = 10;
+pub const FIR_FPRED_UGT: FirFPred = 11;
+pub const FIR_FPRED_UGE: FirFPred = 12;
+pub const FIR_FPRED_UNO: FirFPred = 13;
+
+/// What `float.to_int` does with NaN and out-of-range inputs (`CvtEdge`).
+pub type FirCvtEdge = u32;
+pub const FIR_CVT_EDGE_UB: FirCvtEdge = 0;
+pub const FIR_CVT_EDGE_SAT: FirCvtEdge = 1;
+pub const FIR_CVT_EDGE_TRAP: FirCvtEdge = 2;
 
 /// What `mem.alloc` does when allocation fails (`AllocFail`).
 pub type FirAllocFail = u32;
@@ -393,6 +436,8 @@ pub const FIR_TRAP_REASON_OOM: FirTrapReason = 3;
 pub const FIR_TRAP_REASON_BOUNDS: FirTrapReason = 4;
 /// A union read as a variant it doesn't hold.
 pub const FIR_TRAP_REASON_TAG: FirTrapReason = 5;
+/// A float converted to an integer is NaN or out of range (`float.to_int.*.trap`).
+pub const FIR_TRAP_REASON_CONVERT: FirTrapReason = 6;
 
 /// A C enum's value as the Rust value it stands for.
 pub(crate) trait CEnum: Sized {
@@ -475,7 +520,22 @@ c_enum!(MemSize, "FirMemSize":
 c_enum!(TrapReason, "FirTrapReason":
     FIR_TRAP_REASON_DIV0 => TrapReason::Div0, FIR_TRAP_REASON_OVERFLOW => TrapReason::Overflow,
     FIR_TRAP_REASON_SHIFT => TrapReason::Shift, FIR_TRAP_REASON_OOM => TrapReason::Oom,
-    FIR_TRAP_REASON_BOUNDS => TrapReason::Bounds, FIR_TRAP_REASON_TAG => TrapReason::Tag);
+    FIR_TRAP_REASON_BOUNDS => TrapReason::Bounds, FIR_TRAP_REASON_TAG => TrapReason::Tag,
+    FIR_TRAP_REASON_CONVERT => TrapReason::Convert);
+c_enum!(FBinOp, "FirFBinOp":
+    FIR_FBIN_OP_ADD => FBinOp::Add, FIR_FBIN_OP_SUB => FBinOp::Sub, FIR_FBIN_OP_MUL => FBinOp::Mul,
+    FIR_FBIN_OP_DIV => FBinOp::Div, FIR_FBIN_OP_COPYSIGN => FBinOp::Copysign);
+c_enum!(FUnOp, "FirFUnOp":
+    FIR_FUN_OP_NEG => FUnOp::Neg, FIR_FUN_OP_ABS => FUnOp::Abs, FIR_FUN_OP_SQRT => FUnOp::Sqrt);
+c_enum!(FPred, "FirFPred":
+    FIR_FPRED_OEQ => FPred::Oeq, FIR_FPRED_ONE => FPred::One, FIR_FPRED_OLT => FPred::Olt,
+    FIR_FPRED_OLE => FPred::Ole, FIR_FPRED_OGT => FPred::Ogt, FIR_FPRED_OGE => FPred::Oge,
+    FIR_FPRED_ORD => FPred::Ord, FIR_FPRED_UEQ => FPred::Ueq, FIR_FPRED_UNE => FPred::Une,
+    FIR_FPRED_ULT => FPred::Ult, FIR_FPRED_ULE => FPred::Ule, FIR_FPRED_UGT => FPred::Ugt,
+    FIR_FPRED_UGE => FPred::Uge, FIR_FPRED_UNO => FPred::Uno);
+c_enum!(CvtEdge, "FirCvtEdge":
+    FIR_CVT_EDGE_UB => CvtEdge::Ub, FIR_CVT_EDGE_SAT => CvtEdge::Sat,
+    FIR_CVT_EDGE_TRAP => CvtEdge::Trap);
 c_enum!(AllocFail, "FirAllocFail":
     FIR_ALLOC_FAIL_NULL => AllocFail::Null, FIR_ALLOC_FAIL_TRAP => AllocFail::Trap);
 c_enum!(Policy, "FirPolicy":
@@ -647,6 +707,8 @@ pub(crate) fn ty(t: FirType) -> Result<Ty, BuildError> {
         TY_AGG => Ty::Agg(TyId::from_raw(n)),
         _ if t == FIR_TYPE_PTR => Ty::Ptr,
         _ if t == FIR_TYPE_SLICE => Ty::Slice,
+        _ if t == FIR_TYPE_F32 => Ty::Float(FloatTy::F32),
+        _ if t == FIR_TYPE_F64 => Ty::Float(FloatTy::F64),
         _ => return Err(BuildError::new(format!("{t:#x} is not a type"))),
     })
 }
@@ -658,6 +720,8 @@ fn ty_to_c(t: Ty) -> FirType {
         Ty::Agg(id) => TY_AGG | id.raw(),
         Ty::Ptr => FIR_TYPE_PTR,
         Ty::Slice => FIR_TYPE_SLICE,
+        Ty::Float(FloatTy::F32) => FIR_TYPE_F32,
+        Ty::Float(FloatTy::F64) => FIR_TYPE_F64,
     }
 }
 
@@ -686,6 +750,20 @@ pub(crate) unsafe fn switch_cases<'a>(p: *const FirCase, n: usize) -> Vec<Switch
             target: target(c.target, unsafe { values(c.target.args, c.target.nargs) }),
         })
         .collect()
+}
+
+// Float constants from C values.
+
+/// `float.const` of type `f32` with the bits of a C `float` (NaN payloads included).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_float_const_f32(fb: *mut FirBuilder, value: f32) -> FirValue {
+    unsafe { fir_float_const(fb, FIR_TYPE_F32, u64::from(value.to_bits())) }
+}
+
+/// `float.const` of type `f64` with the bits of a C `double` (NaN payloads included).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_float_const_f64(fb: *mut FirBuilder, value: f64) -> FirValue {
+    unsafe { fir_float_const(fb, FIR_TYPE_F64, value.to_bits()) }
 }
 
 // Modules.
@@ -964,7 +1042,7 @@ pub unsafe extern "C" fn fir_module_optimize(
 /// assembly, as `fir compile --emit asm` does: HFIR is lowered to MFIR first, and with
 /// `optimize` the default pass pipeline runs on the MFIR (`fir compile -O`). `*out` gets the
 /// assembly text; free it with `fir_string_free`. `FIR_ERR_COMPILE` if the module uses what the
-/// backend doesn't support yet (integers wider than 64 bits, holes, other data layouts).
+/// backend doesn't support yet (integers wider than 64 bits, floats, holes, other data layouts).
 /// Exceptions use an error-return convention: an exception that escapes a compiled function is
 /// pending in `struct { void *flag; void *value; } __fir_exn` (nonzero `flag`) when it returns;
 /// a C caller checks `flag` after the call, and clears it to catch.

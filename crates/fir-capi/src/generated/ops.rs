@@ -21,8 +21,8 @@ pub unsafe extern "C" fn fir_int_const(fb: *mut FirBuilder, result: FirType, n: 
     }
 }
 
-/// `poison`: a `poison` value of a scalar type (`iN`, `ptr`, or `bN`, whose bytes are all
-/// `poison`).
+/// `poison`: a `poison` value of a scalar type (`iN`, `ptr`, `bN` (whose bytes are all
+/// `poison`), or a float).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_poison(fb: *mut FirBuilder, result: FirType) -> FirValue {
     unsafe {
@@ -32,7 +32,7 @@ pub unsafe extern "C" fn fir_poison(fb: *mut FirBuilder, result: FirType) -> Fir
     }
 }
 
-/// `freeze %x`: `%x`, or an arbitrary value if it is `poison`.
+/// `freeze %x`: `%x`, or an arbitrary value if it is `poison`; an integer or a float.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_freeze(fb: *mut FirBuilder, t: FirValue) -> FirValue {
     unsafe {
@@ -495,6 +495,122 @@ pub unsafe extern "C" fn fir_func_call_indirect(fb: *mut FirBuilder, sig: FirTyp
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.func_call_indirect(crate::ty(sig)?, Operand::from_raw(p), crate::values(args, nargs)).map(|r| r.op.raw())
+        })
+    }
+}
+
+/// `float.const 1.5`: the result type's float with these bits, written as the shortest
+/// decimal that reads back to them, `inf`, `-inf`, `nan`, or `nan(0x…)` (see `Fir.FloatText`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_float_const(fb: *mut FirBuilder, result: FirType, value: u64) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.float_const(crate::ty(result)?, value).map(|v| v.raw())
+        })
+    }
+}
+
+/// `float.add %a, %b`, `float.sub`, `float.mul`, `float.div`: the exact result, rounded to
+/// nearest (ties to even); `float.copysign %a, %b`: `%a`'s magnitude with `%b`'s sign.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_float_bin(fb: *mut FirBuilder, op: FirFBinOp, a: FirValue, b: FirValue) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.float_bin(FBinOp::from_c(op)?, Operand::from_raw(a), Operand::from_raw(b)).map(|v| v.raw())
+        })
+    }
+}
+
+/// `float.neg %a`, `float.abs %a` (the sign bit flipped or cleared), `float.sqrt %a`
+/// (rounded).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_float_un(fb: *mut FirBuilder, op: FirFUnOp, a: FirValue) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.float_un(FUnOp::from_c(op)?, Operand::from_raw(a)).map(|v| v.raw())
+        })
+    }
+}
+
+/// `float.fma %a, %b, %c`: `%a * %b + %c`, rounded once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_float_fma(fb: *mut FirBuilder, a: FirValue, b: FirValue, c: FirValue) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.float_fma(Operand::from_raw(a), Operand::from_raw(b), Operand::from_raw(c)).map(|v| v.raw())
+        })
+    }
+}
+
+/// `float.cmp.olt %a, %b` and friends; see `FPred`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_float_cmp(fb: *mut FirBuilder, p: FirFPred, a: FirValue, b: FirValue) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.float_cmp(FPred::from_c(p)?, Operand::from_raw(a), Operand::from_raw(b)).map(|v| v.raw())
+        })
+    }
+}
+
+/// `float.ext %a`: a float in a wider format, exactly.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_float_ext(fb: *mut FirBuilder, result: FirType, a: FirValue) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.float_ext(crate::ty(result)?, Operand::from_raw(a)).map(|v| v.raw())
+        })
+    }
+}
+
+/// `float.trunc %a`: a float in a narrower format, rounded.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_float_trunc(fb: *mut FirBuilder, result: FirType, a: FirValue) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.float_trunc(crate::ty(result)?, Operand::from_raw(a)).map(|v| v.raw())
+        })
+    }
+}
+
+/// `float.to_int.s.sat %a`: the integer part (toward zero), signed or unsigned, of the result
+/// type; a NaN or an integer part out of range is UB (`.ub`), the nearest bound (`.sat`, NaN
+/// gives 0), or a trap with reason `convert` (`.trap`). A `poison` input is UB for `.ub` and
+/// `.trap`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_float_to_int(fb: *mut FirBuilder, result: FirType, signed: bool, edge: FirCvtEdge, a: FirValue) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.float_to_int(crate::ty(result)?, signed, CvtEdge::from_c(edge)?, Operand::from_raw(a)).map(|v| v.raw())
+        })
+    }
+}
+
+/// `int.to_float.s %a`: the integer, signed or unsigned, as the result type's float, rounded.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_int_to_float(fb: *mut FirBuilder, result: FirType, signed: bool, a: FirValue) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.int_to_float(crate::ty(result)?, signed, Operand::from_raw(a)).map(|v| v.raw())
+        })
+    }
+}
+
+/// `float.from_bits %a`: the float with an integer's bits (the same width).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_float_from_bits(fb: *mut FirBuilder, result: FirType, a: FirValue) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.float_from_bits(crate::ty(result)?, Operand::from_raw(a)).map(|v| v.raw())
+        })
+    }
+}
+
+/// `float.to_bits %a`: a float's bits, as an integer of the same width.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_float_to_bits(fb: *mut FirBuilder, result: FirType, a: FirValue) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.float_to_bits(crate::ty(result)?, Operand::from_raw(a)).map(|v| v.raw())
         })
     }
 }

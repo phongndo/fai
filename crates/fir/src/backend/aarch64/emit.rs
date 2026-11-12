@@ -75,6 +75,7 @@ pub fn trap_code(r: TrapReason) -> u32 {
         TrapReason::Oom => 3,
         TrapReason::Bounds => 4,
         TrapReason::Tag => 5,
+        TrapReason::Convert => 6,
     }
 }
 

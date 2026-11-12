@@ -23,7 +23,8 @@ pub struct Loc {
     pub col: u32,
 }
 
-/// A type. The scalar value types are signless integers `iN`, pointers, and byte types `bN`;
+/// A type. The scalar value types are signless integers `iN`, pointers, byte types `bN`, and
+/// floats (`f32`, `f64`);
 /// `slice` is HFIR's pointer and length; structs, arrays, unions, and function types are ids into
 /// a [`Types`] table (see `types.rs`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -32,6 +33,7 @@ pub enum Ty {
     Ptr,
     Byte(u32),
     Slice,
+    Float(FloatTy),
     Agg(TyId),
 }
 
@@ -39,7 +41,35 @@ impl Ty {
     /// Whether this is a scalar value type, the only types values have outside HFIR (Lean's
     /// `Ty.isValue`).
     pub fn is_value(self) -> bool {
-        matches!(self, Ty::Int(_) | Ty::Ptr | Ty::Byte(_))
+        matches!(self, Ty::Int(_) | Ty::Ptr | Ty::Byte(_) | Ty::Float(_))
+    }
+
+    pub fn is_float(self) -> bool {
+        matches!(self, Ty::Float(_))
+    }
+}
+
+/// The float types (Lean's `FloatTy`): IEEE 754 binary32 and binary64.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum FloatTy {
+    F32,
+    F64,
+}
+
+impl FloatTy {
+    /// The width in bits.
+    pub fn width(self) -> u32 {
+        match self {
+            FloatTy::F32 => 32,
+            FloatTy::F64 => 64,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            FloatTy::F32 => "f32",
+            FloatTy::F64 => "f64",
+        }
     }
 }
 
@@ -52,6 +82,7 @@ impl fmt::Display for Ty {
             Ty::Ptr => f.write_str("ptr"),
             Ty::Byte(w) => write!(f, "b{w}"),
             Ty::Slice => f.write_str("slice"),
+            Ty::Float(t) => f.write_str(t.name()),
             Ty::Agg(id) => write!(f, "type#{}", id.index()),
         }
     }
@@ -223,6 +254,52 @@ pub enum ShiftOp {
     Shl,
     ShrU,
     ShrS,
+}
+
+/// `float.add`, `float.sub`, `float.mul`, `float.div`, `float.copysign`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum FBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Copysign,
+}
+
+/// `float.neg`, `float.abs`, `float.sqrt`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum FUnOp {
+    Neg,
+    Abs,
+    Sqrt,
+}
+
+/// Float comparison predicates (Lean's `FPred`): ordered (`o…`, false on NaN), unordered (`u…`,
+/// true on NaN), `ord`, and `uno`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum FPred {
+    Oeq,
+    One,
+    Olt,
+    Ole,
+    Ogt,
+    Oge,
+    Ord,
+    Ueq,
+    Une,
+    Ult,
+    Ule,
+    Ugt,
+    Uge,
+    Uno,
+}
+
+/// What `float.to_int` does with NaN and out-of-range inputs.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum CvtEdge {
+    Ub,
+    Sat,
+    Trap,
 }
 
 /// What `mem.alloc` does when allocation fails.

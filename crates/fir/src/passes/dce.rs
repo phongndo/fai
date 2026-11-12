@@ -15,9 +15,14 @@
 //! `Pure` asks for no regions, no call, no stack allocation, not a terminator, operands that are
 //! all variables (no holes), and a computation that only reads the core and fails only by UB or
 //! getting stuck (`ReadOnly`) for any operand values. `Dce.copy_pure`, `const_pure`, and
-//! `poison_pure` prove it for copies, constants, and `poison`; for the other ops below it is
-//! read off Lean's `evalSimple` (no `choose`, no allocation, no address taken, no memory or
-//! scope touched, no trap), not proved:
+//! `poison_pure` prove it for copies, constants, and `poison`, and `Dce.float_pure` for the float
+//! ops that can't trap: `float.const`, `float.add`/`sub`/`mul`/`div`/`copysign`,
+//! `float.neg`/`abs`/`sqrt`, `float.fma`, `float.cmp`, `float.ext`, `float.trunc`,
+//! `int.to_float`, `float.from_bits`, `float.to_bits`, and `float.to_int` unless it traps
+//! (`.trap`; `.ub` is UB, which a deletion may remove). A NaN result reads the oracle's next
+//! answer without using it up, so these only read the core. For the other ops below it is read
+//! off Lean's `evalSimple` (no `choose`, no allocation, no address taken, no memory or scope
+//! touched, no trap), not proved:
 //!
 //! * integer ops: `select`, `int.and`/`or`/`xor`, comparisons, `zext`/`sext`/`trunc`, and
 //!   `int.add`/`sub`/`mul`, divisions, and shifts unless a modifier traps (`.trap`, a `.trap`
@@ -37,7 +42,7 @@
 //! and the `.trap` form traps out of bounds), `slice.set.*` (a store), and `cf.check.*` (a trap).
 
 use crate::body::{Body, OpId, OperandKind, ValueDef};
-use crate::ir::{Edge, OpKind, Ovf, ShiftEdge};
+use crate::ir::{CvtEdge, Edge, OpKind, Ovf, ShiftEdge};
 
 use super::{Remarks, at, walk};
 
@@ -71,7 +76,18 @@ pub fn pure_kind(k: OpKind) -> bool {
         | OpKind::UnionTag
         | OpKind::SliceMake
         | OpKind::SlicePtr
-        | OpKind::SliceLen => true,
+        | OpKind::SliceLen
+        | OpKind::FloatConst { .. }
+        | OpKind::FloatBin(_)
+        | OpKind::FloatUn(_)
+        | OpKind::FloatFma
+        | OpKind::FloatCmp(_)
+        | OpKind::FloatExt
+        | OpKind::FloatTrunc
+        | OpKind::IntToFloat { .. }
+        | OpKind::FloatFromBits
+        | OpKind::FloatToBits => true,
+        OpKind::FloatToInt { edge, .. } => edge != CvtEdge::Trap,
         OpKind::UnionGet { trap, .. } => !trap,
         OpKind::Arith(_, ovf) => !matches!(ovf, Ovf::Trap(_)),
         OpKind::Div(_, zero, ovf) => zero != Edge::Trap && ovf != Edge::Trap,

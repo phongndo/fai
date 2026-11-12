@@ -28,7 +28,7 @@ use super::{Remarks, at, walk};
 pub fn exact(t: Ty) -> bool {
     match t {
         Ty::Int(w) => w % 8 == 0 && w > 0,
-        Ty::Ptr | Ty::Byte(_) => true,
+        Ty::Ptr | Ty::Byte(_) | Ty::Float(_) => true,
         Ty::Agg(_) | Ty::Slice => false,
     }
 }

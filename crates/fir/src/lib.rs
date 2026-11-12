@@ -55,6 +55,7 @@ pub mod builder;
 #[rustfmt::skip]
 mod builder_ops;
 mod decl;
+pub mod float;
 mod globals;
 pub mod interp;
 mod ir;

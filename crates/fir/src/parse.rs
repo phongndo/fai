@@ -248,7 +248,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// A type: `i32`, `ptr`, `b8`, `struct<C>{i32, ptr}`, `array<4 x i32>`,
+    /// A type: `i32`, `ptr`, `b8`, `f32`, `f64`, `struct<C>{i32, ptr}`, `array<4 x i32>`,
     /// `func<(i32, ptr) -> i32>`, `union<i32, ptr>`, or `slice`.
     fn ty(&mut self) -> PResult<Ty> {
         let s = self.ident()?;
@@ -290,6 +290,8 @@ impl<'a> Parser<'a> {
                 Ok(self.types().array(n, elem))
             }
             "slice" => Ok(Ty::Slice),
+            "f32" => Ok(Ty::Float(FloatTy::F32)),
+            "f64" => Ok(Ty::Float(FloatTy::F64)),
             "union" => {
                 self.expect_sym(Sym::Lt)?;
                 let variants = self.sep_by(Self::ty, Sym::Gt)?;
@@ -661,7 +663,77 @@ impl<'a> Parser<'a> {
             }
             FieldTy::Cases => Imm::Cases(self.cases(true)?),
             FieldTy::Reg => Imm::Reg(self.reg()?),
+            // A float constant's bits, in the generic form.
+            FieldTy::Float => Imm::Nat(self.nat()?),
         })
+    }
+
+    /// A float literal (Lean's `floatLit`): a decimal, an integer, `inf`, `-inf`, `nan`, `-nan`,
+    /// or `nan(0x…)`.
+    fn float_lit(&mut self) -> PResult<crate::float::Lit> {
+        use crate::float::Lit;
+        let lit = match self.peek() {
+            Tok::Float(s) => {
+                self.bump()?;
+                crate::float::parse_lit(s)
+            }
+            Tok::Int(s) => {
+                self.bump()?;
+                let n = int_value(s);
+                Some(Lit::Dec {
+                    neg: n.sign() == Sign::Minus,
+                    d: n.magnitude().clone(),
+                    e: 0,
+                })
+            }
+            Tok::Ident(s @ ("inf" | "-inf" | "nan" | "-nan")) => {
+                self.bump()?;
+                let neg = s.starts_with('-');
+                if s.ends_with("inf") {
+                    Some(Lit::Inf(neg))
+                } else if self.try_sym(Sym::LParen)? {
+                    let p = self.nat_big()?;
+                    self.expect_sym(Sym::RParen)?;
+                    Some(Lit::Nan(neg, Some(p)))
+                } else {
+                    Some(Lit::Nan(neg, None))
+                }
+            }
+            _ => None,
+        };
+        match lit {
+            Some(l) => Ok(l),
+            None => self.fail(format!(
+                "expected a float like 1.5, inf, or nan but found {}",
+                self.peek().describe()
+            )),
+        }
+    }
+
+    /// A non-negative integer of any size (Lean's `nat`).
+    fn nat_big(&mut self) -> PResult<num_bigint::BigUint> {
+        let text = self.int_text()?;
+        let n = int_value(text);
+        if n.sign() == Sign::Minus {
+            return self.fail("expected a non-negative integer");
+        }
+        Ok(n.magnitude().clone())
+    }
+
+    /// A float constant's bits, read as the float of the op's one result type (Lean's
+    /// `floatBits`).
+    fn float_bits(&mut self) -> PResult<u64> {
+        let lit = self.float_lit()?;
+        match self.results.as_slice() {
+            [r] if r.ty.is_float() => {
+                let Ty::Float(t) = r.ty else { unreachable!() };
+                match lit.to_bits(t) {
+                    Some(b) => Ok(b),
+                    None => self.fail(format!("the NaN payload doesn't fit {}", t.name())),
+                }
+            }
+            _ => self.fail("a float constant needs one float result"),
+        }
     }
 
     /// An op in its readable form, after its name, as its declaration's format says. The
@@ -679,6 +751,7 @@ impl<'a> Parser<'a> {
                             Imm::Succ(self.body.add_succ(s))
                         }
                         FieldTy::Cases => Imm::Cases(self.cases(false)?),
+                        FieldTy::Float => Imm::Nat(self.float_bits()?),
                         _ => self.imm(f)?,
                     };
                     kind.set_imm(i.into(), v);

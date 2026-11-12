@@ -215,6 +215,10 @@ fn check_ty(loc: Option<Loc>, t: Ty) -> Result<()> {
             "{}{t} is wider than 64 bits, which the AArch64 backend doesn't support yet",
             at(loc)
         )),
+        Ty::Float(_) => Err(format!(
+            "{}{t} is a float, which the AArch64 backend doesn't support yet",
+            at(loc)
+        )),
         _ => Ok(()),
     }
 }
@@ -1028,16 +1032,17 @@ impl Sel<'_, '_> {
         let kind = body.kind(op);
         self.loc = body.loc(op);
         let (wide_results, wide_operands) = low_bits_only(kind);
-        if !wide_results {
-            for v in body.results(op) {
+        // Floats are rejected everywhere, wide integers where their high bits matter.
+        for v in body.results(op) {
+            if !wide_results || body.ty(v).is_float() {
                 check_ty(self.loc, body.ty(v))?;
             }
         }
-        if !wide_operands {
-            for o in body.operands(op) {
-                if let OperandKind::Value(v) = o.get() {
-                    check_ty(self.loc, body.ty(v))?;
-                }
+        for o in body.operands(op) {
+            if let OperandKind::Value(v) = o.get()
+                && (!wide_operands || body.ty(v).is_float())
+            {
+                check_ty(self.loc, body.ty(v))?;
             }
         }
         match kind {

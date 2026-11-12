@@ -19,8 +19,8 @@ impl FuncBuilder<'_> {
         Ok(self.result(made, 0))
     }
 
-    /// `poison`: a `poison` value of a scalar type (`iN`, `ptr`, or `bN`, whose bytes are all
-    /// `poison`).
+    /// `poison`: a `poison` value of a scalar type (`iN`, `ptr`, `bN` (whose bytes are all
+    /// `poison`), or a float).
     pub fn poison(&mut self, result: Ty) -> Result<ValueId, BuildError> {
         self.begin_op();
         let kind = OpKind::Poison;
@@ -28,7 +28,7 @@ impl FuncBuilder<'_> {
         Ok(self.result(made, 0))
     }
 
-    /// `freeze %x`: `%x`, or an arbitrary value if it is `poison`.
+    /// `freeze %x`: `%x`, or an arbitrary value if it is `poison`; an integer or a float.
     pub fn freeze(&mut self, t: impl Into<Operand>) -> Result<ValueId, BuildError> {
         self.begin_op();
         self.operand(t.into());
@@ -489,6 +489,114 @@ impl FuncBuilder<'_> {
         let kind = OpKind::CallIndirect(sig_id);
         let made = self.simple(kind, Res::Sig(sig_id))?;
         Ok(self.all_results(made))
+    }
+
+    /// `float.const 1.5`: the result type's float with these bits, written as the shortest
+    /// decimal that reads back to them, `inf`, `-inf`, `nan`, or `nan(0x…)` (see `Fir.FloatText`).
+    pub fn float_const(&mut self, result: Ty, value: u64) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        let kind = OpKind::FloatConst { value };
+        let made = self.simple(kind, Res::Given(&[result]))?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `float.add %a, %b`, `float.sub`, `float.mul`, `float.div`: the exact result, rounded to
+    /// nearest (ties to even); `float.copysign %a, %b`: `%a`'s magnitude with `%b`'s sign.
+    pub fn float_bin(&mut self, op: FBinOp, a: impl Into<Operand>, b: impl Into<Operand>) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(a.into());
+        self.operand(b.into());
+        let kind = OpKind::FloatBin(op);
+        let made = self.simple(kind, Res::Implied)?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `float.neg %a`, `float.abs %a` (the sign bit flipped or cleared), `float.sqrt %a`
+    /// (rounded).
+    pub fn float_un(&mut self, op: FUnOp, a: impl Into<Operand>) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(a.into());
+        let kind = OpKind::FloatUn(op);
+        let made = self.simple(kind, Res::Implied)?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `float.fma %a, %b, %c`: `%a * %b + %c`, rounded once.
+    pub fn float_fma(&mut self, a: impl Into<Operand>, b: impl Into<Operand>, c: impl Into<Operand>) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(a.into());
+        self.operand(b.into());
+        self.operand(c.into());
+        let kind = OpKind::FloatFma;
+        let made = self.simple(kind, Res::Implied)?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `float.cmp.olt %a, %b` and friends; see `FPred`.
+    pub fn float_cmp(&mut self, p: FPred, a: impl Into<Operand>, b: impl Into<Operand>) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(a.into());
+        self.operand(b.into());
+        let kind = OpKind::FloatCmp(p);
+        let made = self.simple(kind, Res::Implied)?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `float.ext %a`: a float in a wider format, exactly.
+    pub fn float_ext(&mut self, result: Ty, a: impl Into<Operand>) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(a.into());
+        let kind = OpKind::FloatExt;
+        let made = self.simple(kind, Res::Given(&[result]))?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `float.trunc %a`: a float in a narrower format, rounded.
+    pub fn float_trunc(&mut self, result: Ty, a: impl Into<Operand>) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(a.into());
+        let kind = OpKind::FloatTrunc;
+        let made = self.simple(kind, Res::Given(&[result]))?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `float.to_int.s.sat %a`: the integer part (toward zero), signed or unsigned, of the result
+    /// type; a NaN or an integer part out of range is UB (`.ub`), the nearest bound (`.sat`, NaN
+    /// gives 0), or a trap with reason `convert` (`.trap`). A `poison` input is UB for `.ub` and
+    /// `.trap`.
+    pub fn float_to_int(&mut self, result: Ty, signed: bool, edge: CvtEdge, a: impl Into<Operand>) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(a.into());
+        let kind = OpKind::FloatToInt { signed, edge };
+        let made = self.simple(kind, Res::Given(&[result]))?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `int.to_float.s %a`: the integer, signed or unsigned, as the result type's float, rounded.
+    pub fn int_to_float(&mut self, result: Ty, signed: bool, a: impl Into<Operand>) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(a.into());
+        let kind = OpKind::IntToFloat { signed };
+        let made = self.simple(kind, Res::Given(&[result]))?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `float.from_bits %a`: the float with an integer's bits (the same width).
+    pub fn float_from_bits(&mut self, result: Ty, a: impl Into<Operand>) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(a.into());
+        let kind = OpKind::FloatFromBits;
+        let made = self.simple(kind, Res::Given(&[result]))?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `float.to_bits %a`: a float's bits, as an integer of the same width.
+    pub fn float_to_bits(&mut self, result: Ty, a: impl Into<Operand>) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(a.into());
+        let kind = OpKind::FloatToBits;
+        let made = self.simple(kind, Res::Given(&[result]))?;
+        Ok(self.result(made, 0))
     }
 
     /// `agg.make %a, %b`: a struct value from its fields, or an array value from its elements;

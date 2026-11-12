@@ -74,8 +74,10 @@ pub enum Tok<'a> {
     /// `^name`, a block label
     Label(&'a str),
     Ident(&'a str),
-    /// An integer literal: an optional `-` and decimal digits.
+    /// An integer literal: an optional `-` and decimal digits, or `0x` and hexadecimal ones.
     Int(&'a str),
+    /// A decimal with a fraction or an exponent, `1.5` or `-2e-3`, as written.
+    Float(&'a str),
     Str(&'a str),
     Sym(Sym),
     Eof,
@@ -83,10 +85,21 @@ pub enum Tok<'a> {
 
 /// The value of an integer literal. Small ones skip the general decimal conversion.
 pub fn int_value(text: &str) -> BigInt {
-    match text.parse::<i64>() {
-        Ok(n) => BigInt::from(n),
-        Err(_) => text.parse().expect("an integer literal"),
+    if let Ok(n) = text.parse::<i64>() {
+        return BigInt::from(n);
     }
+    let (neg, digits) = match text.strip_prefix('-') {
+        Some(t) => (true, t),
+        None => (false, text),
+    };
+    let n = match digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        Some(h) => BigInt::parse_bytes(h.as_bytes(), 16).expect("a hexadecimal literal"),
+        None => digits.parse().expect("an integer literal"),
+    };
+    if neg { -n } else { n }
 }
 
 impl Tok<'_> {
@@ -99,6 +112,7 @@ impl Tok<'_> {
             Tok::Label(s) => format!("^{s}"),
             Tok::Ident(s) => format!("'{s}'"),
             Tok::Int(s) => int_value(s).to_string(),
+            Tok::Float(s) => (*s).to_owned(),
             Tok::Str(s) => format!("\"{s}\""),
             Tok::Sym(s) => format!("'{}'", s.text()),
             Tok::Eof => "end of input".into(),
@@ -238,13 +252,7 @@ impl<'a> Lexer<'a> {
                 Tok::Global(name)
             }
         } else if c.is_ascii_digit() || (c == b'-' && next.is_some_and(|b| b.is_ascii_digit())) {
-            let start = self.pos;
-            if c == b'-' {
-                self.pos += 1;
-                self.col += 1;
-            }
-            self.skip_ascii(|b| b.is_ascii_digit());
-            Tok::Int(&self.text[start..self.pos])
+            return Ok(self.number(line, col));
         } else if c == b'"' {
             self.pos += 1;
             self.col += 1;
@@ -257,6 +265,13 @@ impl<'a> Lexer<'a> {
             Tok::Str(body)
         } else if c.is_ascii_alphabetic() || c == b'_' {
             Tok::Ident(self.skip_ascii(is_name_byte))
+        } else if c == b'-' && next.is_some_and(|b| b.is_ascii_alphabetic()) {
+            // `-inf`, `-nan`: a name with its sign.
+            let start = self.pos;
+            self.pos += 1;
+            self.col += 1;
+            self.skip_ascii(is_name_byte);
+            Tok::Ident(&self.text[start..self.pos])
         } else if c == b'^' {
             // Last, and out of line: labels are rare.
             return self.label(line, col);
@@ -265,6 +280,63 @@ impl<'a> Lexer<'a> {
             return fail(format!("unexpected character '{ch}'"));
         };
         Ok(Token { tok, line, col })
+    }
+
+    /// A number: an optional `-`, then `0x` and hexadecimal digits, or decimal digits with an
+    /// optional fraction (`.` and digits) and exponent (`e` or `E`, an optional sign, digits),
+    /// which make it a float literal.
+    fn number(&mut self, line: u32, col: u32) -> Token<'a> {
+        let start = self.pos;
+        if self.byte(self.pos) == Some(b'-') {
+            self.pos += 1;
+            self.col += 1;
+        }
+        if self.byte(self.pos) == Some(b'0')
+            && matches!(self.byte(self.pos + 1), Some(b'x' | b'X'))
+            && self
+                .byte(self.pos + 2)
+                .is_some_and(|b| b.is_ascii_hexdigit())
+        {
+            self.pos += 2;
+            self.col += 2;
+            self.skip_ascii(|b| b.is_ascii_hexdigit());
+            let tok = Tok::Int(&self.text[start..self.pos]);
+            return Token { tok, line, col };
+        }
+        self.skip_ascii(|b| b.is_ascii_digit());
+        let mut float = false;
+        if self.byte(self.pos) == Some(b'.')
+            && self.byte(self.pos + 1).is_some_and(|b| b.is_ascii_digit())
+        {
+            self.pos += 1;
+            self.col += 1;
+            self.skip_ascii(|b| b.is_ascii_digit());
+            float = true;
+        }
+        if matches!(self.byte(self.pos), Some(b'e' | b'E')) {
+            let d = self.byte(self.pos + 1);
+            let digit_at = |i: usize| self.byte(i).is_some_and(|b| b.is_ascii_digit());
+            let skip = if d.is_some_and(|b| b.is_ascii_digit()) {
+                Some(1)
+            } else if matches!(d, Some(b'-' | b'+')) && digit_at(self.pos + 2) {
+                Some(2)
+            } else {
+                None
+            };
+            if let Some(k) = skip {
+                self.pos += k;
+                self.col += k as u32;
+                self.skip_ascii(|b| b.is_ascii_digit());
+                float = true;
+            }
+        }
+        let text = &self.text[start..self.pos];
+        let tok = if float {
+            Tok::Float(text)
+        } else {
+            Tok::Int(text)
+        };
+        Token { tok, line, col }
     }
 
     /// `^name`, a block label.

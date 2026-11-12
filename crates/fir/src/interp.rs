@@ -81,6 +81,13 @@ enum Value {
     /// A pointer: an index into `ptrs`.
     Ptr(u32),
     PtrPoison,
+    /// A float of type `f`: its bits.
+    Float {
+        f: FloatTy,
+        bits: u64,
+    },
+    /// A float that is `poison`.
+    FloatPoison(FloatTy),
     /// A `bN` value: a run in `byte_vals`.
     Bytes {
         start: u32,
@@ -721,6 +728,26 @@ impl<'m> Machine<'m> {
         }
     }
 
+    /// A float value's bits (`None` for `poison`), Lean's `asFloat`.
+    fn float_of(&self, loc: Option<Loc>, f: FloatTy, v: Value) -> R<Option<u64>> {
+        match v {
+            Value::Float { f: g, bits } if g == f => Ok(Some(bits)),
+            Value::FloatPoison(g) if g == f => Ok(None),
+            Value::Float { f: g, .. } | Value::FloatPoison(g) => stuck(
+                loc,
+                format!("expected an {} but got an {}", f.name(), g.name()),
+            ),
+            _ => stuck(loc, format!("expected an {}", f.name())),
+        }
+    }
+
+    fn float_value(f: FloatTy, v: Option<u64>) -> Value {
+        match v {
+            Some(bits) => Value::Float { f, bits },
+            None => Value::FloatPoison(f),
+        }
+    }
+
     fn new_ptr(&mut self, p: Ptr) -> u32 {
         self.ptrs.push(p);
         (self.ptrs.len() - 1) as u32
@@ -775,6 +802,7 @@ impl<'m> Machine<'m> {
             }
             (Value::Ptr(_) | Value::PtrPoison, Ty::Ptr) => true,
             (Value::Bytes { len, .. }, Ty::Byte(w)) => u64::from(len) * 8 == u64::from(w),
+            (Value::Float { f, .. } | Value::FloatPoison(f), Ty::Float(g)) => f == g,
             (Value::Agg { start, len }, Ty::Slice) => {
                 let ps = &self.agg_vals[Span { start, len }.range()];
                 matches!(
@@ -905,6 +933,10 @@ impl<'m> Machine<'m> {
                 self.render_ptr(p, out);
             }
             Value::PtrPoison => out.push_str("ptr poison"),
+            Value::Float { f, bits } => {
+                write!(out, "{} {}", f.name(), crate::float::render(f, bits)).unwrap()
+            }
+            Value::FloatPoison(f) => write!(out, "{} poison", f.name()).unwrap(),
             Value::Bytes { start, len } => {
                 write!(out, "b{} (", u64::from(len) * 8).unwrap();
                 let span = Span { start, len };
@@ -950,6 +982,13 @@ impl<'m> Machine<'m> {
             },
             (Ty::Ptr, "null") => Ok(Value::Ptr(NULL)),
             (Ty::Ptr, "poison") => Ok(Value::PtrPoison),
+            (Ty::Float(f), "poison") => Ok(Value::FloatPoison(f)),
+            (Ty::Float(f), _) => match crate::float::parse_lit(s).and_then(|l| l.to_bits(f)) {
+                Some(bits) => Ok(Value::Float { f, bits }),
+                None => Err(format!(
+                    "bad argument '{s}': expected a float like 1.5, inf, nan, or poison"
+                )),
+            },
             _ => Err(format!("bad argument '{s}' for {t}")),
         }
     }
@@ -1492,6 +1531,14 @@ impl<'m> Machine<'m> {
                 let v = self.decode_int(w, &bs);
                 self.int_value(w, v)
             }
+            // A float's bits, read as an integer's (decision: Pointer bytes as integers).
+            Ty::Float(f) => {
+                for b in bs.iter_mut() {
+                    *b = self.frag_to_bits(loc, *b)?;
+                }
+                let v = self.decode_int(f.width(), &bs);
+                Self::float_value(f, v.and_then(|b| b.to_u64()))
+            }
             Ty::Ptr => {
                 if bs.contains(&Byte::Poison) {
                     Value::PtrPoison
@@ -1550,6 +1597,7 @@ impl<'m> Machine<'m> {
     fn ty_size(&self, t: Ty) -> u64 {
         match t {
             Ty::Int(w) | Ty::Byte(w) => u64::from(w / 8),
+            Ty::Float(f) => u64::from(f.width() / 8),
             Ty::Ptr => u64::from(self.space.ptr_bits / 8),
             Ty::Agg(_) | Ty::Slice => self.body().types().size(self.space, t) as u64,
         }
@@ -1584,6 +1632,12 @@ impl<'m> Machine<'m> {
                 bs.extend(raw.into_iter().map(Byte::Bits));
             }
             Value::Poison { w } => bs.extend((0..w / 8).map(|_| Byte::Poison)),
+            Value::Float { f, bits } => {
+                let mut raw = Vec::new();
+                sem::to_le_bytes(f.width(), &Bits::Small(bits), &mut raw);
+                bs.extend(raw.into_iter().map(Byte::Bits));
+            }
+            Value::FloatPoison(f) => bs.extend((0..f.width() / 8).map(|_| Byte::Poison)),
             Value::Ptr(p) => bs.extend((0..pb).map(|i| Byte::Frag { ptr: p, i })),
             Value::PtrPoison => bs.extend((0..pb).map(|_| Byte::Poison)),
             Value::Bytes { start, len } => {
@@ -1865,10 +1919,25 @@ impl<'m> Machine<'m> {
                         .extend(std::iter::repeat_n(Byte::Poison, (w / 8) as usize));
                     Value::Bytes { start, len: w / 8 }
                 }
+                Some(Ty::Float(f)) => Value::FloatPoison(f),
                 _ => Value::Poison { w: rw },
             },
             (OpKind::Freeze, &[Value::Poison { w }]) => self.int_value(w, Some(Bits::zero(w))),
+            (OpKind::Freeze, &[Value::FloatPoison(f)]) => Value::Float { f, bits: 0 },
             (OpKind::Freeze | OpKind::Copy, &[v]) => v,
+            (OpKind::Select, &[c, a, b]) if matches!(rty, Some(Ty::Float(_))) => {
+                let Some(Ty::Float(f)) = rty else {
+                    unreachable!()
+                };
+                let c = self.bits(loc, c)?;
+                self.float_of(loc, f, a)?;
+                self.float_of(loc, f, b)?;
+                match c {
+                    None => Value::FloatPoison(f),
+                    Some(c) if !c.is_zero() => a,
+                    Some(_) => b,
+                }
+            }
             (OpKind::Select, &[c, a, b]) => {
                 let c = self.bits(loc, c)?;
                 self.bits(loc, a)?;
@@ -1919,6 +1988,88 @@ impl<'m> Machine<'m> {
                     _ => unreachable!(),
                 });
                 self.int_value(rw, r)
+            }
+            // Floats (Lean's `evalFloat`), for the oracle that answers 0: NaN results are canonical.
+            (OpKind::FloatConst { value }, []) => match rty {
+                Some(Ty::Float(f)) => Value::Float { f, bits: value },
+                _ => return stuck(loc, "float.const of a non-float"),
+            },
+            (OpKind::FloatBin(op), &[a @ (Value::Float { f, .. } | Value::FloatPoison(f)), b]) => {
+                let a = self.float_of(loc, f, a)?;
+                let b = self.float_of(loc, f, b)?;
+                Self::float_value(f, a.zip(b).map(|(a, b)| crate::float::bin(f, op, a, b)))
+            }
+            (OpKind::FloatUn(op), &[a @ (Value::Float { f, .. } | Value::FloatPoison(f))]) => {
+                let a = self.float_of(loc, f, a)?;
+                Self::float_value(f, a.map(|a| crate::float::un(f, op, a)))
+            }
+            (OpKind::FloatFma, &[a @ (Value::Float { f, .. } | Value::FloatPoison(f)), b, c]) => {
+                let a = self.float_of(loc, f, a)?;
+                let b = self.float_of(loc, f, b)?;
+                let c = self.float_of(loc, f, c)?;
+                Self::float_value(
+                    f,
+                    a.zip(b)
+                        .zip(c)
+                        .map(|((a, b), c)| crate::float::fma(f, a, b, c)),
+                )
+            }
+            (OpKind::FloatCmp(p), &[a @ (Value::Float { f, .. } | Value::FloatPoison(f)), b]) => {
+                let a = self.float_of(loc, f, a)?;
+                let b = self.float_of(loc, f, b)?;
+                match a.zip(b) {
+                    Some((a, b)) => Value::Int {
+                        w: 1,
+                        bits: u64::from(crate::float::cmp(f, p, a, b)),
+                    },
+                    None => Value::Poison { w: 1 },
+                }
+            }
+            (
+                OpKind::FloatExt | OpKind::FloatTrunc,
+                &[Value::Float { f, .. } | Value::FloatPoison(f)],
+            ) => {
+                let Some(Ty::Float(g)) = rty else {
+                    return stuck(loc, "expected a float result");
+                };
+                let a = self.float_of(loc, f, vs[0])?;
+                Self::float_value(g, a.map(|a| crate::float::cvt(f, g, a)))
+            }
+            (
+                OpKind::FloatToInt { signed, edge },
+                &[a @ (Value::Float { f, .. } | Value::FloatPoison(f))],
+            ) => {
+                let o = match self.float_of(loc, f, a)? {
+                    Some(a) => crate::float::to_int(f, signed, edge, rw, a),
+                    None if edge == CvtEdge::Sat => Out::Val(None),
+                    None => Out::Ub(UbKind::Poison),
+                };
+                self.int_out(loc, rw, o)?
+            }
+            (OpKind::IntToFloat { signed }, &[a]) => {
+                let Some(Ty::Float(g)) = rty else {
+                    return stuck(loc, "expected a float result");
+                };
+                let w = Self::width(a);
+                let a = self.bits(loc, a)?;
+                Self::float_value(g, a.map(|a| crate::float::from_int(g, signed, w, &a)))
+            }
+            (OpKind::FloatFromBits, &[a]) => {
+                let Some(Ty::Float(g)) = rty else {
+                    return stuck(loc, "expected a float result");
+                };
+                if Self::width(a) != g.width() {
+                    return stuck(
+                        loc,
+                        format!("float.from_bits of an i{} to {}", Self::width(a), g.name()),
+                    );
+                }
+                let a = self.bits(loc, a)?;
+                Self::float_value(g, a.and_then(|a| a.to_u64()))
+            }
+            (OpKind::FloatToBits, &[a @ (Value::Float { f, .. } | Value::FloatPoison(f))]) => {
+                let a = self.float_of(loc, f, a)?;
+                self.int_value(f.width(), a.map(Bits::Small))
             }
             (OpKind::MemAlloc { family, align, .. }, &[n]) => {
                 let Some(size) = self.addr_operand(loc, n)? else {
@@ -2359,6 +2510,7 @@ impl<'m> Machine<'m> {
                 }
             }
             Ty::Ptr => Value::Ptr(NULL),
+            Ty::Float(f) => Value::Float { f, bits: 0 },
             Ty::Byte(w) => {
                 let start = self.byte_vals.len() as u32;
                 let n = w / 8;
@@ -3077,6 +3229,7 @@ impl<'m> Machine<'m> {
     fn poison_of(&mut self, t: Ty) -> Value {
         match t {
             Ty::Ptr => Value::PtrPoison,
+            Ty::Float(f) => Value::FloatPoison(f),
             Ty::Byte(w) => {
                 let start = self.byte_vals.len() as u32;
                 self.byte_vals

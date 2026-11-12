@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 // The API's version: the major version times 65536, plus the minor version.
-#define FIR_API_VERSION ((1 << 16) | 1)
+#define FIR_API_VERSION ((1 << 16) | 2)
 
 // No id: what a call returns when it fails.
 #define FIR_INVALID UINT32_MAX
@@ -25,6 +25,9 @@ typedef struct FirBuilder FirBuilder;
 
 // A module being built, with everything made in it.
 typedef struct FirModule FirModule;
+
+// A value or a hole of the function being built.
+typedef uint32_t FirValue;
 
 // What a call that doesn't return an id reports.
 typedef uint32_t FirStatus;
@@ -43,8 +46,8 @@ typedef uint32_t FirLayer;
 // An object format and its assembler conventions, for `fir_module_compile`.
 typedef uint32_t FirOs;
 
-// A type: a value type (`fir_type_int`, `fir_type_byte`, `FIR_TYPE_PTR`, `FIR_TYPE_SLICE`), or a
-// struct, array, union, or function type of a module.
+// A type: a value type (`fir_type_int`, `fir_type_byte`, `FIR_TYPE_PTR`, `FIR_TYPE_F32`,
+// `FIR_TYPE_F64`, `FIR_TYPE_SLICE`), or a struct, array, union, or function type of a module.
 typedef uint32_t FirType;
 
 // A struct's layout (`Policy`).
@@ -64,9 +67,6 @@ typedef uint32_t FirGlobal;
 
 // A global's initializer, made in a module for `fir_global_declare`.
 typedef uint32_t FirInit;
-
-// A value or a hole of the function being built.
-typedef uint32_t FirValue;
 
 // A region of the function being built; also a block of `cf.blocks`.
 typedef uint32_t FirRegion;
@@ -128,6 +128,18 @@ typedef struct FirCase {
   int64_t key;
   struct FirTarget target;
 } FirCase;
+
+// `float.add`, `float.sub`, `float.mul`, `float.div`, `float.copysign` (`FBinOp`).
+typedef uint32_t FirFBinOp;
+
+// `float.neg`, `float.abs`, `float.sqrt` (`FUnOp`).
+typedef uint32_t FirFUnOp;
+
+// A float comparison (`FPred`): ordered (false on NaN), unordered (true on NaN), `ord`, `uno`.
+typedef uint32_t FirFPred;
+
+// What `float.to_int` does with NaN and out-of-range inputs (`CvtEdge`).
+typedef uint32_t FirCvtEdge;
 
 // Why `cf.check` and `aarch64.trap` trap (`TrapReason`).
 typedef uint32_t FirTrapReason;
@@ -199,6 +211,12 @@ typedef uint32_t FirMemSize;
 
 // `slice` (HFIR): a pointer and an address-sized length.
 #define FIR_TYPE_SLICE 3221225473
+
+// `f32`: IEEE 754 binary32.
+#define FIR_TYPE_F32 3221225474
+
+// `f64`: IEEE 754 binary64.
+#define FIR_TYPE_F64 3221225475
 
 #define FIR_OVF_WRAP 0
 
@@ -287,6 +305,56 @@ typedef uint32_t FirMemSize;
 #define FIR_SHIFT_OP_SHR_U 1
 
 #define FIR_SHIFT_OP_SHR_S 2
+
+#define FIR_FBIN_OP_ADD 0
+
+#define FIR_FBIN_OP_SUB 1
+
+#define FIR_FBIN_OP_MUL 2
+
+#define FIR_FBIN_OP_DIV 3
+
+#define FIR_FBIN_OP_COPYSIGN 4
+
+#define FIR_FUN_OP_NEG 0
+
+#define FIR_FUN_OP_ABS 1
+
+#define FIR_FUN_OP_SQRT 2
+
+#define FIR_FPRED_OEQ 0
+
+#define FIR_FPRED_ONE 1
+
+#define FIR_FPRED_OLT 2
+
+#define FIR_FPRED_OLE 3
+
+#define FIR_FPRED_OGT 4
+
+#define FIR_FPRED_OGE 5
+
+#define FIR_FPRED_ORD 6
+
+#define FIR_FPRED_UEQ 7
+
+#define FIR_FPRED_UNE 8
+
+#define FIR_FPRED_ULT 9
+
+#define FIR_FPRED_ULE 10
+
+#define FIR_FPRED_UGT 11
+
+#define FIR_FPRED_UGE 12
+
+#define FIR_FPRED_UNO 13
+
+#define FIR_CVT_EDGE_UB 0
+
+#define FIR_CVT_EDGE_SAT 1
+
+#define FIR_CVT_EDGE_TRAP 2
 
 #define FIR_ALLOC_FAIL_NULL 0
 
@@ -468,9 +536,18 @@ typedef uint32_t FirMemSize;
 // A union read as a variant it doesn't hold.
 #define FIR_TRAP_REASON_TAG 5
 
+// A float converted to an integer is NaN or out of range (`float.to_int.*.trap`).
+#define FIR_TRAP_REASON_CONVERT 6
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
+
+// `float.const` of type `f32` with the bits of a C `float` (NaN payloads included).
+FirValue fir_float_const_f32(struct FirBuilder *fb, float value);
+
+// `float.const` of type `f64` with the bits of a C `double` (NaN payloads included).
+FirValue fir_float_const_f64(struct FirBuilder *fb, double value);
 
 // The API version the library was built with: `FIR_API_VERSION`.
 uint32_t fir_api_version(void);
@@ -540,7 +617,7 @@ FirStatus fir_module_optimize(struct FirModule *m, struct FirModule **out);
 // assembly, as `fir compile --emit asm` does: HFIR is lowered to MFIR first, and with
 // `optimize` the default pass pipeline runs on the MFIR (`fir compile -O`). `*out` gets the
 // assembly text; free it with `fir_string_free`. `FIR_ERR_COMPILE` if the module uses what the
-// backend doesn't support yet (integers wider than 64 bits, holes, other data layouts).
+// backend doesn't support yet (integers wider than 64 bits, floats, holes, other data layouts).
 // Exceptions use an error-return convention: an exception that escapes a compiled function is
 // pending in `struct { void *flag; void *value; } __fir_exn` (nonzero `flag`) when it returns;
 // a C caller checks `flag` after the call, and clears it to catch.
@@ -713,11 +790,11 @@ FirValue fir_int_const_dec(struct FirBuilder *fb, FirType result, const char *di
 // `int.const n`
 FirValue fir_int_const(struct FirBuilder *fb, FirType result, int64_t n);
 
-// `poison`: a `poison` value of a scalar type (`iN`, `ptr`, or `bN`, whose bytes are all
-// `poison`).
+// `poison`: a `poison` value of a scalar type (`iN`, `ptr`, `bN` (whose bytes are all
+// `poison`), or a float).
 FirValue fir_poison(struct FirBuilder *fb, FirType result);
 
-// `freeze %x`: `%x`, or an arbitrary value if it is `poison`.
+// `freeze %x`: `%x`, or an arbitrary value if it is `poison`; an integer or a float.
 FirValue fir_freeze(struct FirBuilder *fb, FirValue t);
 
 // `copy %x`: the same value, of any type. Rewrites produce it (store-to-load forwarding
@@ -903,6 +980,49 @@ FirOp fir_func_call_indirect(struct FirBuilder *fb,
                              FirValue p,
                              const FirValue *args,
                              size_t nargs);
+
+// `float.const 1.5`: the result type's float with these bits, written as the shortest
+// decimal that reads back to them, `inf`, `-inf`, `nan`, or `nan(0x…)` (see `Fir.FloatText`).
+FirValue fir_float_const(struct FirBuilder *fb, FirType result, uint64_t value);
+
+// `float.add %a, %b`, `float.sub`, `float.mul`, `float.div`: the exact result, rounded to
+// nearest (ties to even); `float.copysign %a, %b`: `%a`'s magnitude with `%b`'s sign.
+FirValue fir_float_bin(struct FirBuilder *fb, FirFBinOp op, FirValue a, FirValue b);
+
+// `float.neg %a`, `float.abs %a` (the sign bit flipped or cleared), `float.sqrt %a`
+// (rounded).
+FirValue fir_float_un(struct FirBuilder *fb, FirFUnOp op, FirValue a);
+
+// `float.fma %a, %b, %c`: `%a * %b + %c`, rounded once.
+FirValue fir_float_fma(struct FirBuilder *fb, FirValue a, FirValue b, FirValue c);
+
+// `float.cmp.olt %a, %b` and friends; see `FPred`.
+FirValue fir_float_cmp(struct FirBuilder *fb, FirFPred p, FirValue a, FirValue b);
+
+// `float.ext %a`: a float in a wider format, exactly.
+FirValue fir_float_ext(struct FirBuilder *fb, FirType result, FirValue a);
+
+// `float.trunc %a`: a float in a narrower format, rounded.
+FirValue fir_float_trunc(struct FirBuilder *fb, FirType result, FirValue a);
+
+// `float.to_int.s.sat %a`: the integer part (toward zero), signed or unsigned, of the result
+// type; a NaN or an integer part out of range is UB (`.ub`), the nearest bound (`.sat`, NaN
+// gives 0), or a trap with reason `convert` (`.trap`). A `poison` input is UB for `.ub` and
+// `.trap`.
+FirValue fir_float_to_int(struct FirBuilder *fb,
+                          FirType result,
+                          bool signed_,
+                          FirCvtEdge edge,
+                          FirValue a);
+
+// `int.to_float.s %a`: the integer, signed or unsigned, as the result type's float, rounded.
+FirValue fir_int_to_float(struct FirBuilder *fb, FirType result, bool signed_, FirValue a);
+
+// `float.from_bits %a`: the float with an integer's bits (the same width).
+FirValue fir_float_from_bits(struct FirBuilder *fb, FirType result, FirValue a);
+
+// `float.to_bits %a`: a float's bits, as an integer of the same width.
+FirValue fir_float_to_bits(struct FirBuilder *fb, FirType result, FirValue a);
 
 // `agg.make %a, %b`: a struct value from its fields, or an array value from its elements;
 // the result type says which.
