@@ -32,6 +32,11 @@ in
     llvm.lld
     llvm.clang-tools
 
+    # The C frontend's build tools (frontends/c, fai-cc); its Clang and LLVM libraries are
+    # CMAKE_PREFIX_PATH below
+    pkgs.cmake
+    pkgs.ninja
+
     # LLVM tools (llc, opt, llvm-mc, FileCheck) for the LLVM bridge and IR tests
     llvm.llvm
     pkgs.lit
@@ -70,6 +75,14 @@ in
 
   # rust-analyzer needs the standard library sources for go-to-definition and completion.
   RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+
+  # Where CMake finds Clang's and LLVM's libraries, headers, and packages for the C frontend
+  # (the same release as the compiler). Not in `packages`: their `bin` would put an unwrapped
+  # clang ahead of the wrapped one on PATH.
+  CMAKE_PREFIX_PATH = lib.makeSearchPath "" [
+    llvm.libclang.dev
+    llvm.llvm.dev
+  ];
 
   # Nix's default _FORTIFY_SOURCE flag warns on every -O0 debug build of C code.
   hardeningDisable = [ "fortify" ];
