@@ -25,11 +25,14 @@
 //!
 //! **The certificate** a checker would validate is the assignment ([`Assignment`]: each
 //! virtual register's physical register or spill slot) with the code before allocation. The
-//! check ([`check`]) is a forward dataflow over the original code tracking which virtual
-//! register each physical register holds (a write takes the register, a call clobbers the
-//! caller-saved ones, a write of a physical register by name takes it from any virtual one),
-//! met by intersection at joins: every read of a virtual register must find its physical
-//! register holding it. Spill slots belong to one virtual register each, so they always do.
+//! check ([`check`]) first requires every virtual register the code names to have a home it may
+//! have: a register of its own class that allocation uses (never a scratch register, `x16`,
+//! `x18`, `x29`, `x30`, `sp`, or `xzr`), or a slot of its own below the slot count. Then a
+//! forward dataflow over the original code tracks which virtual register each physical register
+//! holds (a write takes the register, a call clobbers the caller-saved ones, a write of a
+//! physical register by name takes it from any virtual one), met by intersection at joins:
+//! every read of a virtual register must find its physical register holding it. Spill slots
+//! belong to one virtual register each, so they always do.
 //! It runs on every allocation in debug builds; proving it in Lean is the trust round's.
 //!
 //! **Frame lowering** then fills in the prologue's frame size (the callee-saved registers the
@@ -524,8 +527,76 @@ fn assign(f: &MFunc, sh: &Shapes<'_>) -> Assignment {
     Assignment { homes, slots }
 }
 
+/// Check that every virtual register the code names has a home it may have: a register of its
+/// own class that allocation may use ([`ALLOCATABLE`], [`ALLOCATABLE_FP`]: never a scratch
+/// register, `x16`, `x18`, `x29`, `x30`, `sp`, or `xzr`), or a spill slot below
+/// [`Assignment::slots`] that no other virtual register has.
+fn check_homes(f: &MFunc, a: &Assignment) -> Result<(), String> {
+    // Each virtual register's class (`Some(true)` for FP), from the names the code uses.
+    let mut class: Vec<Option<bool>> = vec![None; a.homes.len()];
+    let mut bad = None;
+    for &i in &f.insts {
+        i.map_regs(|r, _| {
+            if r.is_virtual() && bad.is_none() {
+                match class.get_mut(r.virt_index() as usize) {
+                    None => bad = Some(format!("{r} has no home")),
+                    Some(c @ None) => *c = Some(r.is_fp()),
+                    Some(Some(fp)) if *fp != r.is_fp() => {
+                        bad = Some(format!(
+                            "virtual register {} is named in both classes",
+                            r.virt_index()
+                        ))
+                    }
+                    Some(Some(_)) => {}
+                }
+            }
+            r
+        });
+    }
+    if let Some(e) = bad {
+        return Err(e);
+    }
+    let mut slot_of: Vec<Option<usize>> = vec![None; a.slots as usize];
+    for (v, (&h, c)) in a.homes.iter().zip(&class).enumerate() {
+        let Some(fp) = *c else { continue };
+        let name = if fp {
+            Reg::fvirt(v as u32)
+        } else {
+            Reg::virt(v as u32)
+        };
+        match h {
+            Home::Reg(r) => {
+                let ok = if fp {
+                    r.is_fpr() && ALLOCATABLE_FP.contains(&r.fpr_index())
+                } else {
+                    r.is_gpr() && ALLOCATABLE.contains(&r.0)
+                };
+                if !ok {
+                    return Err(format!("{name} is assigned {r}, which it may not have"));
+                }
+            }
+            Home::Slot(s) => match slot_of.get_mut(s as usize) {
+                None => {
+                    return Err(format!(
+                        "{name} is assigned slot {s}, but there are {} slots",
+                        a.slots
+                    ));
+                }
+                Some(Some(w)) => {
+                    return Err(format!(
+                        "{name} is assigned slot {s}, which virtual register {w} has too"
+                    ));
+                }
+                Some(o) => *o = Some(v),
+            },
+        }
+    }
+    Ok(())
+}
+
 /// Check an assignment against the code before allocation (see the module documentation).
 fn check(f: &MFunc, sh: &Shapes<'_>, a: &Assignment) -> Result<(), String> {
+    check_homes(f, a)?;
     const UNKNOWN: u32 = u32::MAX;
     const PHYS: u32 = u32::MAX - 1;
     let nb = f.blocks.len();
@@ -886,4 +957,155 @@ fn lower_frame(f: &mut MFunc) {
         }
     }
     out.finish(f);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn func(insts: Vec<Inst>, nvregs: u32) -> MFunc {
+        MFunc {
+            locs: vec![None; insts.len()],
+            insts,
+            blocks: vec![0],
+            nvregs,
+            ..MFunc::default()
+        }
+    }
+
+    fn checks(f: &MFunc, rets: Vec<Reg>, homes: Vec<Home>, slots: u32) -> Result<(), String> {
+        let own = CallShape {
+            args: vec![],
+            rets,
+            area: false,
+        };
+        let sh = Shapes {
+            callees: &[],
+            own: &own,
+        };
+        check(f, &sh, &Assignment { homes, slots })
+    }
+
+    /// `fmov.imm.d fv0, 112; fneg.d fv1, fv0; fmov.d d0, fv1; ret`.
+    fn fp_func() -> MFunc {
+        let (v0, v1) = (Reg::fvirt(0), Reg::fvirt(1));
+        func(
+            vec![
+                Inst::FmovImm {
+                    fs: FSize::D,
+                    d: v0,
+                    imm: 112,
+                },
+                Inst::Funary {
+                    op: FUnaryOp::Fneg,
+                    fs: FSize::D,
+                    d: v1,
+                    n: v0,
+                },
+                Inst::Funary {
+                    op: FUnaryOp::Fmov,
+                    fs: FSize::D,
+                    d: Reg::d(0),
+                    n: v1,
+                },
+                Inst::Ret,
+            ],
+            2,
+        )
+    }
+
+    /// `movz v0, 1; add v1, v0, v0; mov x0, v1; ret`.
+    fn int_func() -> MFunc {
+        let (v0, v1) = (Reg::virt(0), Reg::virt(1));
+        func(
+            vec![
+                Inst::MovWide {
+                    op: MovOp::Movz,
+                    sf: Sf::X,
+                    d: v0,
+                    imm: 1,
+                    hw: 0,
+                },
+                Inst::Alu {
+                    op: AluOp::Add,
+                    sf: Sf::X,
+                    d: v1,
+                    n: v0,
+                    m: v0,
+                },
+                Inst::Mov {
+                    sf: Sf::X,
+                    d: Reg::x(0),
+                    n: v1,
+                },
+                Inst::Ret,
+            ],
+            2,
+        )
+    }
+
+    #[test]
+    fn accepts_valid_homes() {
+        let (f, d0) = (fp_func(), vec![Reg::d(0)]);
+        let r = |r| Home::Reg(r);
+        checks(&f, d0.clone(), vec![r(Reg::d(16)), r(Reg::d(8))], 0).unwrap();
+        checks(&f, d0.clone(), vec![Home::Slot(1), Home::Slot(0)], 2).unwrap();
+        let g = int_func();
+        checks(&g, vec![Reg::x(0)], vec![r(Reg::x(19)), Home::Slot(0)], 1).unwrap();
+        // What the allocator itself picks passes.
+        let own = CallShape {
+            args: vec![],
+            rets: d0,
+            area: false,
+        };
+        let sh = Shapes {
+            callees: &[],
+            own: &own,
+        };
+        check(&f, &sh, &assign(&f, &sh)).unwrap();
+    }
+
+    #[test]
+    fn rejects_wrong_class() {
+        // The reported case: the dataflow alone accepted it.
+        let f = fp_func();
+        let homes = vec![Home::Reg(Reg::x(0)), Home::Reg(Reg::x(1))];
+        let e = checks(&f, vec![Reg::d(0)], homes, 0).unwrap_err();
+        assert!(e.contains("fv0 is assigned x0"), "{e}");
+        let g = int_func();
+        let homes = vec![Home::Reg(Reg::d(0)), Home::Reg(Reg::d(1))];
+        assert!(checks(&g, vec![Reg::x(0)], homes, 0).is_err());
+        // A virtual register as a home.
+        let homes = vec![Home::Reg(Reg::virt(0)), Home::Reg(Reg::x(1))];
+        assert!(checks(&g, vec![Reg::x(0)], homes, 0).is_err());
+    }
+
+    #[test]
+    fn rejects_reserved_registers() {
+        let g = int_func();
+        for r in [15, 16, 17, 18, 29, 30, 31, 32] {
+            let homes = vec![Home::Reg(Reg(r)), Home::Reg(Reg::x(1))];
+            assert!(checks(&g, vec![Reg::x(0)], homes, 0).is_err(), "x{r}");
+        }
+        let f = fp_func();
+        for r in [29, 30, 31] {
+            let homes = vec![Home::Reg(Reg::d(r)), Home::Reg(Reg::d(1))];
+            assert!(checks(&f, vec![Reg::d(0)], homes, 0).is_err(), "d{r}");
+        }
+    }
+
+    #[test]
+    fn rejects_bad_slots() {
+        let f = fp_func();
+        let d0 = vec![Reg::d(0)];
+        // Past the slot count.
+        let e = checks(&f, d0.clone(), vec![Home::Slot(0), Home::Slot(1)], 1).unwrap_err();
+        assert!(e.contains("slot 1"), "{e}");
+        assert!(checks(&f, d0.clone(), vec![Home::Slot(u32::MAX), Home::Slot(0)], 1).is_err());
+        // Shared.
+        let e = checks(&f, d0.clone(), vec![Home::Slot(0), Home::Slot(0)], 2).unwrap_err();
+        assert!(e.contains("has too"), "{e}");
+        // Missing.
+        assert!(checks(&f, d0, vec![Home::Slot(0)], 1).is_err());
+    }
 }
