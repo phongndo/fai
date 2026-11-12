@@ -28,6 +28,11 @@
 // * Calls to functions without a body here are `extern func`s that may do anything
 //   (`effects[read(args), read(exposed), read(globals), write(…), alloc, free, trap, diverge]`);
 //   `malloc` and `free` are FIR's `mem.alloc.null c.malloc` and `mem.free c.malloc`.
+// * Variadic functions, defined, external, and called through pointers, are FIR's variadic
+//   functions; their variadic arguments are passed as Clang promoted them. `va_list` (on
+//   AArch64 Linux the struct `__va_list`) is FIR's `va_list` memory type, passed to functions as
+//   the address of a copy (AAPCS64's by-reference composite); `va_start`, `va_arg`, and `va_end`
+//   are `va.start`, `va.arg`, and `va.end`, and `va_copy` is `mem.copy va_list`.
 //
 // What isn't supported yet is reported with its source location and nothing is emitted.
 
@@ -146,6 +151,7 @@ private:
   std::vector<const CompoundLiteralExpr *> pendingLits;
   std::set<std::string> usedNames;
   unsigned counter = 0;
+  bool vaListChecked = false;
 
   // Function state.
   FirBuilder *b = nullptr;
@@ -288,10 +294,36 @@ private:
     unsupported(loc, "values of type '" + t.getAsString() + "' here");
   }
 
+  // C's `va_list`: on AArch64 Linux the struct `__va_list` (AAPCS64's five fields), not an
+  // array as on x86-64, so it is copied by assignment and passed to functions by value.
+  bool isVaList(QualType t) {
+    return ctx.hasSameType(t.getUnqualifiedType(), ctx.getBuiltinVaListType());
+  }
+
+  // FIR's `va_list`, checked against Clang's layout of `__va_list`.
+  FirType vaListTy(SourceLocation loc) {
+    if (!vaListChecked) {
+      QualType t = ctx.getBuiltinVaListType();
+      if (!t->isRecordType())
+        unsupported(loc, "this target's 'va_list' ('" + t.getAsString() + "')");
+      uint64_t size;
+      uint32_t align;
+      layoutOf(FIR_TYPE_VA_LIST, size, align);
+      if (size != (uint64_t)ctx.getTypeSizeInChars(t).getQuantity() || align != alignOf(t)) {
+        report(loc, "internal error: FIR's va_list layout differs from Clang's");
+        throw Abort{};
+      }
+      vaListChecked = true;
+    }
+    return FIR_TYPE_VA_LIST;
+  }
+
   FirType memTy(QualType t, SourceLocation loc) {
     QualType c = t.getCanonicalType();
     if (c.isVolatileQualified())
       unsupported(loc, "'volatile'");
+    if (isVaList(c))
+      return vaListTy(loc);
     if (isScalar(c) || c->isAnyComplexType())
       return scalarTy(c, loc);
     if (const auto *a = ctx.getAsConstantArrayType(c))
@@ -411,10 +443,13 @@ private:
 
   struct Sig {
     std::vector<FirType> params, rets;
+    bool variadic = false;
   };
 
   // A function type's FIR signature. One without a prototype (`int f();`) takes no
-  // parameters: calls with arguments to it are rejected (C23's meaning).
+  // parameters: calls with arguments to it are rejected (C23's meaning). A `va_list`
+  // parameter is a `ptr`: AAPCS64 passes a composite larger than 16 bytes as the address of
+  // the caller's copy, which the callee owns.
   Sig sigOf(const FunctionType *ft, SourceLocation loc) {
     Sig s;
     QualType ret = ft->getReturnType();
@@ -423,9 +458,13 @@ private:
     if (!ret->isVoidType())
       s.rets.push_back(scalarTy(ret, loc));
     if (const auto *p = dyn_cast<FunctionProtoType>(ft)) {
-      if (p->isVariadic())
-        unsupported(loc, "variadic functions (track V)");
+      s.variadic = p->isVariadic();
       for (QualType pt : p->param_types()) {
+        if (isVaList(pt)) {
+          vaListTy(loc);
+          s.params.push_back(FIR_TYPE_PTR);
+          continue;
+        }
         if (pt->isRecordType())
           unsupported(loc, "structs and unions passed by value (track A)");
         s.params.push_back(scalarTy(pt, loc));
@@ -436,8 +475,9 @@ private:
 
   FirType funcTy(const FunctionType *ft, SourceLocation loc) {
     Sig s = sigOf(ft, loc);
-    return ck(fir_type_func(m, s.params.data(), s.params.size(), s.rets.data(), s.rets.size()),
-              "fir_type_func");
+    return ck(fir_type_func_va(m, s.params.data(), s.params.size(), s.rets.data(), s.rets.size(),
+                               s.variadic),
+              "fir_type_func_va");
   }
 
   const FunctionType *fnType(QualType t) { return t->castAs<FunctionType>(); }
@@ -457,14 +497,14 @@ private:
     Sig s = sigOf(fnType(typed->getType()), loc);
     FirFunc f;
     if (def) {
-      f = ck(fir_func_declare(m, name.c_str(), s.params.data(), s.params.size(), s.rets.data(),
-                              s.rets.size()),
-             "fir_func_declare");
+      f = ck(fir_func_declare_va(m, name.c_str(), s.params.data(), s.params.size(), s.rets.data(),
+                                 s.rets.size(), s.variadic),
+             "fir_func_declare_va");
     } else {
-      f = ck(fir_extern_declare(m, name.c_str(), s.params.data(), s.params.size(), s.rets.data(),
-                                s.rets.size(), kAllEffects, std::size(kAllEffects),
-                                FIR_TRUST_ASSUME),
-             "fir_extern_declare");
+      f = ck(fir_extern_declare_va(m, name.c_str(), s.params.data(), s.params.size(), s.rets.data(),
+                                   s.rets.size(), s.variadic, kAllEffects, std::size(kAllEffects),
+                                   FIR_TRUST_ASSUME),
+             "fir_extern_declare_va");
     }
     usedNames.insert(name);
     funcs[fd] = f;
@@ -1056,8 +1096,8 @@ private:
       unsupported(e->getExprLoc(), "labels as values (computed 'goto')");
     if (isa<BinaryConditionalOperator>(e))
       unsupported(e->getExprLoc(), "'?:' without a middle operand");
-    if (isa<VAArgExpr>(e))
-      unsupported(e->getExprLoc(), "'va_arg' (track V)");
+    if (const auto *va = dyn_cast<VAArgExpr>(e))
+      return vaArg(va);
     if (const auto *fl = dyn_cast<FloatingLiteral>(e)) {
       scalarTy(e->getType(), e->getExprLoc()); // diagnose `long double`
       return fconst(e->getType(), fl->getValue());
@@ -1628,6 +1668,60 @@ private:
     }
   }
 
+  // `<stdarg.h>`'s builtins: `va_start` (C17's and C23's), `va_end`, and `va_copy` as
+  // `va.start`, `va.end`, and `mem.copy va_list`; false for other builtins.
+  bool vaBuiltin(const CallExpr *ce, unsigned id) {
+    LocScope ls(*this, ce->getExprLoc());
+    switch (id) {
+    case Builtin::BI__builtin_va_start:
+    case Builtin::BI__builtin_c23_va_start:
+    case Builtin::BIva_start: {
+      FirValue ap = lvalue(ce->getArg(0));
+      for (unsigned i = 1; i < ce->getNumArgs(); i++)
+        discard(ce->getArg(i));
+      ck(fir_va_start(b, ap), "va.start");
+      return true;
+    }
+    case Builtin::BI__builtin_va_end:
+    case Builtin::BIva_end:
+      ck(fir_va_end(b, lvalue(ce->getArg(0))), "va.end");
+      return true;
+    case Builtin::BI__builtin_va_copy:
+    case Builtin::BIva_copy: {
+      FirValue dst = lvalue(ce->getArg(0));
+      FirValue src = lvalue(ce->getArg(1));
+      copy(ce->getArg(0)->getType(), dst, src, ce->getExprLoc());
+      return true;
+    }
+    default:
+      return false;
+    }
+  }
+
+  // `va_arg(ap, T)`: `va.arg` of T's FIR type (`va_arg` of a promoted type, such as `char` or
+  // `float`, is UB in C; FIR reads the argument's low bytes, as AArch64 does).
+  FirValue vaArg(const VAArgExpr *va) {
+    SourceLocation loc = va->getExprLoc();
+    QualType t = va->getType();
+    if (t->isRecordType())
+      unsupported(loc, "'va_arg' of structs and unions (track A)");
+    FirType ty = scalarTy(t, loc);
+    FirValue ap = lvalue(va->getSubExpr());
+    LocScope ls(*this, loc);
+    return ck(fir_va_arg(b, ty, ap), "va.arg");
+  }
+
+  // A `va_list` argument: the address of a copy the callee owns (AAPCS64's composite larger
+  // than 16 bytes), made in the current region.
+  FirValue vaListArg(const Expr *a) {
+    SourceLocation loc = a->getExprLoc();
+    FirValue src = aggAddr(a);
+    LocScope ls(*this, loc);
+    FirValue tmp = ck(fir_mem_stack_of(b, vaListTy(loc), alignOf(a->getType())), "mem.stack.of");
+    copy(a->getType(), tmp, src, loc);
+    return tmp;
+  }
+
   FirValue callExpr(const CallExpr *ce) {
     SourceLocation loc = ce->getExprLoc();
     QualType rt = ce->getType();
@@ -1653,6 +1747,8 @@ private:
         }
         if (FirValue v = floatBuiltin(ce, id); v != FIR_INVALID)
           return v;
+        if (vaBuiltin(ce, id))
+          return FIR_INVALID;
         if (!ctx.BuiltinInfo.isPredefinedLibFunction(id))
           unsupported(loc, "the builtin '" + fd->getName().str() + "'");
       }
@@ -1666,10 +1762,20 @@ private:
     // C's default argument promotions don't match a definition's parameter types in general.
     if (isa<FunctionNoProtoType>(ft) && ce->getNumArgs() > 0)
       unsupported(loc, "calls with arguments to a function declared without a prototype");
+    // Variadic arguments come after the prototype's parameters, already promoted by Clang
+    // (C's default argument promotions: `float` to `double`, narrower integers to `int`).
+    unsigned nfixed = ce->getNumArgs();
     if (const auto *p = dyn_cast<FunctionProtoType>(ft); p && p->isVariadic())
-      unsupported(loc, "calls to variadic functions (track V)");
+      nfixed = p->getNumParams();
     std::vector<FirValue> args;
-    for (const Expr *a : ce->arguments()) {
+    for (unsigned i = 0; i < ce->getNumArgs(); i++) {
+      const Expr *a = ce->getArg(i);
+      if (i >= nfixed && a->getType()->isRecordType())
+        unsupported(a->getExprLoc(), "structs and unions as variadic arguments (track A)");
+      if (isVaList(a->getType())) {
+        args.push_back(vaListArg(a));
+        continue;
+      }
       if (a->getType()->isRecordType())
         unsupported(a->getExprLoc(), "structs and unions passed by value (track A)");
       args.push_back(rvalue(a));
@@ -1802,6 +1908,8 @@ private:
     }
     if (isa<CallExpr>(e))
       unsupported(loc, "structs and unions returned by value (track A)");
+    if (isa<VAArgExpr>(e))
+      unsupported(loc, "'va_arg' of structs and unions (track A)");
     if (isa<StmtExpr>(e))
       unsupported(loc, "statement expressions");
     if (isa<DeclRefExpr, MemberExpr, ArraySubscriptExpr, UnaryOperator, StringLiteral,
@@ -2464,6 +2572,10 @@ private:
         LocScope pl(*this, pd->getLocation());
         FirValue v = ck(fir_builder_param(b, i), "param");
         nameValue(v, pd->getName());
+        if (isVaList(pd->getType())) {
+          slots[pd] = v; // the address of the caller's copy, which is this call's
+          continue;
+        }
         FirValue slot = ck(fir_mem_stack_of(b, memTy(pd->getType(), pd->getLocation()),
                                             (uint32_t)ctx.getDeclAlign(pd).getQuantity()),
                            "mem.stack.of");
