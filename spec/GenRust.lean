@@ -46,7 +46,7 @@ where
 
 def _root_.Fir.FieldTy.rust : FieldTy → String
   | .int => "IntId"
-  | .nat => "u64"
+  | .nat | .float => "u64"
   | .align | .index => "u32"
   | .symbol | .func | .global => "StrId"
   | .ty => "Ty"
@@ -59,7 +59,7 @@ def _root_.Fir.FieldTy.rust : FieldTy → String
 /-- What the name table's kinds hold in an immediate. -/
 def _root_.Fir.FieldTy.placeholder : FieldTy → String
   | .int => "IntId::PLACEHOLDER"
-  | .nat | .index => "0"
+  | .nat | .index | .float => "0"
   | .align => "1"
   | .symbol | .func | .global => "StrId::PLACEHOLDER"
   | .ty => "Ty::Ptr"
@@ -70,7 +70,7 @@ def _root_.Fir.FieldTy.placeholder : FieldTy → String
 
 def _root_.Fir.FieldTy.immVariant : FieldTy → String
   | .int => "Int"
-  | .nat => "Nat"
+  | .nat | .float => "Nat"
   | .align => "Align"
   | .index => "Index"
   | .symbol | .func | .global => "Str"
@@ -92,6 +92,7 @@ def _root_.Fir.FieldTy.rustDecl : FieldTy → String
   | .succ => "Succ"
   | .cases => "Cases"
   | .reg => "Reg"
+  | .float => "Float"
   | _ => "Flag"
 
 /-- A variant names its fields when one is a `bool`, a number, a string, a branch target, or a
@@ -99,7 +100,7 @@ register. -/
 def _root_.Fir.OpDecl.isStruct (d : OpDecl) : Bool :=
   d.fields.any fun f => match f.ty with
     | .nat | .align | .index | .symbol | .func | .global | .flag | .mod "Bool" | .succ | .cases
-    | .reg => true
+    | .reg | .float => true
     | _ => false
 
 /-- `Variant(a, b)` or `Variant { x: a, y: b }` from each field's text; `rest` ends a struct
@@ -191,6 +192,10 @@ def rustRule (d : OpDecl) (checks : List Check) : Except String (List String) :=
       | .variant u i x => pure s!"Check::Variant({t u}, {immIndex d i}, {t x})"
       | .isUnion u => pure s!"Check::Union({t u})"
       | .scalar x => pure s!"Check::Scalar({t x})"
+      | .floats xs => pure s!"Check::Floats({ts xs})"
+      | .numeric xs => pure s!"Check::Numeric({ts xs})"
+      | .sameWidth a x => pure s!"Check::SameWidth({t a}, {t x})"
+      | .floatBits f x => pure s!"Check::FloatBits({immIndex d f}, {t x})"
     out := out ++ [s]
   if env.length > 4 then throw s!"{d.ctor}: a rule names at most 4 types"
   pure out

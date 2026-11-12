@@ -103,6 +103,8 @@ def RVal.encode (cfg : SpaceCfg) : RVal → List Byte
   | .int w v => encodeInt w v
   | .ptr p => encodePtr cfg p
   | .bytes bs => bs
+  -- A float is its bits, as an integer of its width.
+  | .float f v => encodeInt f.width v
   -- Aggregates are stored leaf by leaf (`Fir.Interp`), never encoded whole.
   | .agg _ => []
 

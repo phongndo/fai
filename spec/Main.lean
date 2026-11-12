@@ -11,7 +11,8 @@ fir-ref test PATH...                           run the test files (.fir) under P
 fir-ref lower FILE [--no-locs]                 lower an HFIR module to MFIR and print it
 ```
 
-Arguments are integers, `null` (for pointers), or `poison`. Every free choice takes the oracle's
+Arguments are integers, floats (`1.5`, `-inf`, `nan(0x1)`; see `Fir.FloatText`), `null` (for
+pointers), or `poison`. Every free choice takes the oracle's
 answer `0`: `freeze` gives `0`, allocations succeed, and addresses are assigned first-fit. Every
 external call returns zeros (`0`, `null`) and changes nothing (`World.zero`). The outcome line
 lists the run's events first, each followed by `; `.
@@ -43,6 +44,10 @@ def parseArg (t : Ty) (s : String) : Except String RVal :=
     | none => .error s!"bad argument '{s}': expected an integer or poison"
   | .ptr, "null" => .ok (.ptr (some .null))
   | .ptr, "poison" => .ok (.ptr none)
+  | .float f, "poison" => .ok (.float f .poison)
+  | .float f, _ => match (Float.parseLit s).bind (·.toBits f.fmt) with
+    | some b => .ok (.float f (.bits b))
+    | none => .error s!"bad argument '{s}': expected a float like 1.5, inf, nan, or poison"
   | _, _ => .error s!"bad argument '{s}' for {t}"
 
 /-- How a run went: its events, how it ended, and whether that ending lets a refinement do
@@ -113,11 +118,12 @@ def load (text : String) : Except String (Module × Array Hole) := do
   let holes ← verifyModule m
   pure (m, holes)
 
-/-- `@f(1, 2)` → `("f", ["1", "2"])` -/
+/-- `@f(1, 2)` → `("f", ["1", "2"])`. An argument may hold parentheses (`nan(0x1)`). -/
 def parseCall (s : String) : Option (String × List String) := do
   let s := s.trimAscii.toString
   guard (s.startsWith "@")
-  let [name, rest] := (s.drop 1).toString.splitOn "(" | none
+  let name :: rest@(_ :: _) := (s.drop 1).toString.splitOn "(" | none
+  let rest := "(".intercalate rest
   let inner := (rest.dropEnd 1).toString
   guard (rest.endsWith ")")
   let args := if inner.trimAscii.isEmpty then [] else

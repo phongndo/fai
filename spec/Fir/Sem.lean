@@ -188,6 +188,90 @@ def trunc (mode : TruncMode) (v : Nat) : Val w → Val v
     | .nsw => if r.signExtend w = a then .bits r else .poison
     | .nuw => if r.setWidth w = a then .bits r else .poison
 
+/-! ## Floats
+
+Each op on bits is `Fir.Float`'s; `poison` in, `poison` out, except that `float.to_int` with
+`.ub` or `.trap` needs a defined input (decision: Poison inputs). `o` is the oracle's answer that
+picks a NaN result (`Float.nanResult`). -/
+
+def floatBin (F : FloatFmt) (op : FBinOp) (o : Int) : Val F.width → Val F.width → Val F.width
+  | .bits a, .bits b =>
+    .bits (match op with
+      | .add => Float.add o a b
+      | .sub => Float.sub o a b
+      | .mul => Float.mul o a b
+      | .div => Float.div o a b
+      | .copysign => Float.copysign a b)
+  | _, _ => .poison
+
+def floatUn (F : FloatFmt) (op : FUnOp) (o : Int) : Val F.width → Val F.width
+  | .bits a =>
+    .bits (match op with
+      | .neg => Float.neg a
+      | .abs => Float.abs a
+      | .sqrt => Float.sqrt o a)
+  | .poison => .poison
+
+def floatFma (F : FloatFmt) (o : Int) : Val F.width → Val F.width → Val F.width → Val F.width
+  | .bits a, .bits b, .bits c => .bits (Float.fma o a b c)
+  | _, _, _ => .poison
+
+/-- The result of a comparison when either operand is NaN. -/
+def _root_.Fir.FPred.unordered : FPred → Bool
+  | .ueq | .une | .ult | .ule | .ugt | .uge | .uno => true
+  | .oeq | .one | .olt | .ole | .ogt | .oge | .ord => false
+
+/-- The comparison of two non-NaN values, by their places in the order. -/
+def _root_.Fir.FPred.test : FPred → Int → Int → Bool
+  | .oeq, a, b | .ueq, a, b => a == b
+  | .one, a, b | .une, a, b => a != b
+  | .olt, a, b | .ult, a, b => decide (a < b)
+  | .ole, a, b | .ule, a, b => decide (a ≤ b)
+  | .ogt, a, b | .ugt, a, b => decide (b < a)
+  | .oge, a, b | .uge, a, b => decide (b ≤ a)
+  | .ord, _, _ => true
+  | .uno, _, _ => false
+
+def floatCmp (F : FloatFmt) (p : FPred) : Val F.width → Val F.width → Val 1
+  | .bits a, .bits b => .bits (BitVec.ofBool (Float.cmp p.unordered p.test a b))
+  | _, _ => .poison
+
+/-- `float.ext` and `float.trunc`. -/
+def floatCvt (F G : FloatFmt) (o : Int) : Val F.width → Val G.width
+  | .bits a => .bits (Float.cvt G o a)
+  | .poison => .poison
+
+/-- The nearest integer of `w` bits to a non-NaN float's integer part, for `.sat`. -/
+def satInt {F : FloatFmt} (signed : Bool) (w : Nat) (x : BitVec F.width) : Int :=
+  let lo : Int := if signed then -(2 ^ (w - 1)) else 0
+  let hi : Int := if signed then 2 ^ (w - 1) - 1 else 2 ^ w - 1
+  match Float.decode x with
+  | .nan => 0
+  | .inf neg => if neg then lo else hi
+  | .fin .. => max lo (min hi ((Float.truncInt x).getD 0))
+
+def floatToInt (F : FloatFmt) (signed : Bool) (edge : CvtEdge) (w : Nat) :
+    Val F.width → OpOut w
+  | .poison => if edge = .sat then .ok .poison else .ub .poison
+  | .bits x =>
+    let lo : Int := if signed then -(2 ^ (w - 1)) else 0
+    let hi : Int := if signed then 2 ^ (w - 1) - 1 else 2 ^ w - 1
+    match Float.truncInt x with
+    | some v =>
+      if lo ≤ v ∧ v ≤ hi then .ok (.bits (BitVec.ofInt w v))
+      else match edge with
+        | .ub => .ub .convert
+        | .trap => .trap .convert
+        | .sat => .ok (.bits (BitVec.ofInt w (satInt signed w x)))
+    | none => match edge with
+      | .ub => .ub .convert
+      | .trap => .trap .convert
+      | .sat => .ok (.bits (BitVec.ofInt w (satInt signed w x)))
+
+def intToFloat (F : FloatFmt) (signed : Bool) : Val w → Val F.width
+  | .bits a => .bits (Float.ofInt F (if signed then a.toInt else a.toNat))
+  | .poison => .poison
+
 /-! ## Facts -/
 
 /-- Whether an integer satisfies a fact. `poison` satisfies every fact; pointer facts are

@@ -1,5 +1,6 @@
 import Fir.Syntax
 import Fir.Lex
+import Fir.FloatText
 
 /-!
 # Parser
@@ -159,7 +160,7 @@ def nat : P Nat := do
   let n ← int
   if n < 0 then fail "expected a non-negative integer" else pure n.toNat
 
-/-- A type: `i32`, `ptr`, `b8`, `struct<C>{i32, ptr}`, `array<4 x i32>`,
+/-- A type: `i32`, `ptr`, `b8`, `f32`, `f64`, `struct<C>{i32, ptr}`, `array<4 x i32>`,
 `func<(i32, ptr) -> i32>`, `union<i32, ptr>`, or `slice`. -/
 partial def ty : P Ty := do
   let s ← ident
@@ -183,6 +184,8 @@ partial def ty : P Ty := do
     expectSym ">"
     pure (.array n t)
   | "slice" => pure .slice
+  | "f32" => pure (.float .f32)
+  | "f64" => pure (.float .f64)
   | "union" =>
     expectSym "<"
     pure (.union (← sepBy ty ">"))
@@ -309,7 +312,42 @@ def imm (f : Field) : P Imm :=
   | .succ => (.succ ·.1) <$> genericSucc
   | .cases => (.cases ·.1) <$> cases genericSucc
   | .reg => .reg <$> reg
+  -- A float constant's bits, in the generic form.
+  | .float => .nat <$> nat
   | .flag | .mod _ => .flag <$> tryIdent f.name
+
+/-- A float literal (`Fir.FloatText`): a decimal, an integer, `inf`, `-inf`, `nan`, `-nan`, or
+`nan(0x…)`. -/
+def floatLit : P Float.Lit := do
+  let lit? : Option Float.Lit ← match ← peek with
+    | .float s => discard next; pure (Float.parseLit s)
+    | .int n => discard next; pure (some (.dec (decide (n < 0)) n.natAbs 0))
+    | .ident s =>
+      match s with
+      | "inf" | "-inf" | "nan" | "-nan" =>
+        discard next
+        let neg := s.startsWith "-"
+        if s.endsWith "inf" then pure (some (.inf neg))
+        else if ← trySym "(" then
+          let p ← nat
+          expectSym ")"
+          pure (some (.nan neg (some p)))
+        else pure (some (.nan neg none))
+      | _ => pure none
+    | _ => pure none
+  match lit? with
+  | some l => pure l
+  | none => fail s!"expected a float like 1.5, inf, or nan but found {(← peek).describe}"
+
+/-- A float constant's bits, read as the float of the op's one result type. -/
+def floatBits (results : List Result) : P Nat := do
+  let lit ← floatLit
+  match results with
+  | [{ ty := .float t, .. }] =>
+    match lit.toBits t.fmt with
+    | some b => pure b.toNat
+    | none => fail s!"the NaN payload doesn't fit {t.name}"
+  | _ => fail "a float constant needs one float result"
 
 /-- `%name: type = %init` -/
 def iterArg : P (Result × Operand) := do
@@ -319,7 +357,8 @@ def iterArg : P (Result × Operand) := do
 
 /-- The readable form after the op name, up to its location: the kind with its immediates, the
 operands, and the parameters `%iter` gives the first region. -/
-def head (kind : OpKind) (d : OpDecl) : P (OpKind × List Operand × List Result) := do
+def head (kind : OpKind) (d : OpDecl) (results : List Result) :
+    P (OpKind × List Operand × List Result) := do
   let mut kind := kind
   let mut args := []
   let mut params := []
@@ -336,6 +375,7 @@ def head (kind : OpKind) (d : OpDecl) : P (OpKind × List Operand × List Result
         let (cs, ops) ← cases succ
         kind := kind.setImm f (.cases cs)
         args := args ++ ops
+      | .float => kind := kind.setImm f (.nat (← floatBits results))
       | _ => kind := kind.setImm f (← imm field)
     | .operand => args := args ++ [← operand]
     | .comma => expectSym ","
@@ -447,7 +487,7 @@ mutual
       let name ← ident
       let some kind := opKind name | fail s!"unknown op '{name}'"
       let d := kind.decl
-      let (kind, args, params) ← head kind d
+      let (kind, args, params) ← head kind d results
       let loc ← optLoc
       let mut regions := #[]
       for kw in d.regions do

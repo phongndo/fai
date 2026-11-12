@@ -275,6 +275,11 @@ theorem keeps_asInt (loc : Option Loc) (w : Nat) (v : RVal) : KeepsFixed sp (asI
   unfold asInt; keeps
 macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_asInt)
 
+theorem keeps_asFloat (loc : Option Loc) (f : FloatTy) (v : RVal) :
+    KeepsFixed sp (asFloat loc f v) := by
+  unfold asFloat; keeps
+macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_asFloat)
+
 theorem keeps_asPtr (loc : Option Loc) (v : RVal) : KeepsFixed sp (asPtr loc v) := by
   unfold asPtr; keeps
 macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_asPtr)
@@ -329,6 +334,11 @@ theorem keeps_sliceElem (loc : Option Loc) (trap : Bool) (T : Ty) (s i : RVal) :
     KeepsFixed sp (sliceElem loc trap T s i) := by
   unfold sliceElem; keeps
 macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_sliceElem)
+
+theorem keeps_evalFloat (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVal) :
+    KeepsFixed sp (evalFloat loc k rs vs) := by
+  unfold evalFloat; keeps
+macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_evalFloat)
 
 theorem keeps_evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVal) :
     KeepsFixed sp (evalSimple loc k rs vs) := by

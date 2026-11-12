@@ -11,6 +11,7 @@ interpreter.
 
 * Types: `iN` has `N ≥ 1`; `bN` has `N` a positive multiple of 8. Values (results, parameters,
   function results, holes) have the layer's value types (`Layer.valueTy`): `iN`, `ptr`, `bN`,
+  `f32`, `f64`,
   and in HFIR also structs, arrays, unions, and slices. Struct fields and array elements have a
   layout (no function types, unions, or integers whose size isn't whole bytes); a union has at
   least one variant, each a value type; function types take value types; a struct's or array's
@@ -96,7 +97,7 @@ value types, and sizes that fit the address space. -/
 partial def checkTy (loc : Option Loc) : Ty → VM Unit
   | .int 0 => verr loc "i0 is not a valid type"
   | .byte w => unless w > 0 && w % 8 == 0 do verr loc s!"b{w} is not a valid type"
-  | .int _ | .ptr => pure ()
+  | .int _ | .ptr | .float _ => pure ()
   | t@(.struct _ fs) => do
     for f in fs do
       checkTy loc f
@@ -178,7 +179,7 @@ def expectTys (loc : Option Loc) (what : String) (got want : List Ty) : VM Unit 
 def isLoadableScalar (space : SpaceCfg) : Ty → Bool
   | .int w => w % 8 == 0
   | .ptr => space.ptrBits % 8 == 0
-  | .byte _ => true
+  | .byte _ | .float _ => true
   | _ => false
 
 /-- A scalar in whole bytes, or an aggregate with a layout whose leaves are. -/
@@ -295,6 +296,20 @@ def checkSimple (loc : Option Loc) (k : OpKind) (ins outs : List Ty) : VM Unit :
     | .scalar t =>
       let t := ty t
       unless t.isValue do verr loc s!"{t} is not a scalar type"
+    | .floats ts =>
+      let ts := ts.map ty
+      unless ts.all Ty.isFloat do verr loc s!"expected floats but got {tys ts}"
+    | .numeric ts =>
+      let ts := ts.map ty
+      unless ts.all (fun t => t.isInt || t.isFloat) do
+        verr loc s!"expected integers or floats but got {tys ts}"
+    | .sameWidth a t =>
+      let (a, t) := (ty a, ty t)
+      unless a.width == t.width do verr loc s!"{a} and {t} have different widths"
+    | .floatBits f t =>
+      let some (.nat n) := k.imm f | verr loc "malformed op"
+      let t := ty t
+      unless n < 2 ^ t.width do verr loc s!"{n} is not the bits of a {t}"
 
 def nearestLoop : List RegionCtx → Option (List Ty × List Ty)
   | [] => none

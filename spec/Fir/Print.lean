@@ -1,6 +1,7 @@
 import Fir.Basic
 import Fir.Syntax
 import Fir.Interp
+import Fir.FloatText
 
 /-!
 # Printer
@@ -80,6 +81,15 @@ def OpDecl.fits (d : OpDecl) (k : OpKind) (args : List Operand) (regions : List 
    else if iter then some args.length == regions.head?.map (·.params.length)
    else args.length == (d.items.filter (· == .operand)).length + k.succArgs)
 
+/-- Whether the readable form can write the op's float constant, if it has one: as the float of its
+one result's type, whose width the bits fit. -/
+def Op.floatShown (op : Op) : Bool :=
+  op.kind.decl.imms.all fun f =>
+    f.ty != .float ||
+      match op.results, op.kind.imm f.name with
+      | [{ ty := .float t, .. }], some (.nat n) => n < 2 ^ t.width
+      | _, _ => false
+
 mutual
   partial def renderRegion (showLocs : Bool) (indent : String) (r : Region) : String :=
     let body := r.ops.map (renderOp showLocs (indent ++ "  "))
@@ -120,6 +130,10 @@ mutual
             items := items.push s!"{k}: {text}"
             args := rest
           out := out ++ " [" ++ commas items.toList ++ "]"
+        | { ty := .float, .. }, some (.nat n) =>
+          match op.results with
+          | [{ ty := .float t, .. }] => out := out ++ " " ++ Float.render (F := t.fmt) (BitVec.ofNat _ n)
+          | _ => out := out ++ " " ++ toString n
         | field, some v => out := out ++ " " ++ v.render field
         | _, none => pure ()
       | .operand =>
@@ -178,7 +192,7 @@ mutual
   partial def renderOp (showLocs : Bool) (indent : String) (op : Op) : String :=
     let results := if op.results.isEmpty then "" else
       commas (op.results.map Result.render) ++ " = "
-    let line := if op.kind.decl.fits op.kind op.args op.regions
+    let line := if op.kind.decl.fits op.kind op.args op.regions && op.floatShown
       then renderReadable showLocs indent op
       else renderGeneric showLocs indent op
     indent ++ results ++ line ++ "\n"
@@ -245,8 +259,9 @@ def Byte.render : Byte → String
 
 mutual
   /-- Integers print signed, except `i1`, which prints as `0` or `1`. Pointers print as their
-  allocation and offset (`#2+8`), or as an address. An aggregate prints its parts in braces: a
-  union its tag, then its payload. -/
+  allocation and offset (`#2+8`), or as an address. Floats print as `float.const` writes them
+  (`f64 1.5`, `f32 nan`). An aggregate prints its parts in braces: a union its tag, then its
+  payload. -/
   def RVal.render : RVal → String
     | .int w .poison => s!"i{w} poison"
     | .int w (.bits b) => if w = 1 then s!"i1 {b.toNat}" else s!"i{w} {b.toInt}"
@@ -254,6 +269,8 @@ mutual
     | .ptr (some p) => s!"ptr {p.render}"
     | .bytes bs => s!"b{bs.length * 8} ({commas (bs.map Byte.render)})"
     | .agg vs => "{" ++ commas (RVal.renderList vs) ++ "}"
+    | .float f .poison => s!"{f.name} poison"
+    | .float f (.bits b) => s!"{f.name} {Float.render (F := f.fmt) b}"
   def RVal.renderList : List RVal → List String
     | [] => []
     | v :: vs => RVal.render v :: RVal.renderList vs

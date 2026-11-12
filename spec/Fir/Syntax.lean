@@ -1,4 +1,5 @@
 import Fir.Basic
+import Fir.Float
 import Fir.OpDSL
 import Fir.AArch64Syntax
 
@@ -10,8 +11,8 @@ kind, typed results, operands, nested regions, and a source location. A region h
 parameters (block arguments) and a list of ops.
 
 FIR-1 covers integers, structured control flow, memory, and calls between FIR functions, with
-structs and arrays in memory, globals, and calls through function pointers. Floats, external
-calls, and threads come later.
+structs and arrays in memory, globals, and calls through function pointers; external functions
+and floats (`f32`, `f64`) came after. Threads come later.
 -/
 
 namespace Fir
@@ -37,8 +38,8 @@ def Policy.name : Policy → String
   | .packed => "packed"
   | .auto => "auto"
 
-/-- A type. Values have the *value types*: signless integers `iN`, pointers, and byte types
-`bN` (raw memory, copied exactly). Structs and arrays describe memory, and function types
+/-- A type. Values have the *value types*: signless integers `iN`, pointers, byte types `bN`
+(raw memory, copied exactly), and floats. Structs and arrays describe memory, and function types
 describe calls; neither is a value type (decision: Aggregates). -/
 inductive Ty where
   | int (w : Nat)
@@ -56,6 +57,8 @@ inductive Ty where
   /-- `slice`: an HFIR pointer and a length (an address-sized integer, counting elements), laid
   out as `struct<C>{ptr, iA}`. Like `ptr`, it doesn't name its element type; the ops do. -/
   | slice
+  /-- `f32` or `f64`: an IEEE 754 float (decision: Floats). -/
+  | float (f : FloatTy)
   deriving Repr, Inhabited
 
 mutual
@@ -88,19 +91,25 @@ mutual
       | isTrue h => isTrue (by rw [h])
       | isFalse h => isFalse (by intro e; cases e; exact h rfl)
     | .slice, .slice => isTrue rfl
+    | .float f, .float f' =>
+      if h : f = f' then isTrue (h ▸ rfl) else isFalse (by intro e; cases e; exact h rfl)
     | .int _, .ptr | .int _, .byte _ | .int _, .struct .. | .int _, .array .. | .int _, .func ..
-    | .int _, .union _ | .int _, .slice | .ptr, .int _ | .ptr, .byte _ | .ptr, .struct ..
-    | .ptr, .array .. | .ptr, .func .. | .ptr, .union _ | .ptr, .slice | .byte _, .int _
-    | .byte _, .ptr | .byte _, .struct .. | .byte _, .array .. | .byte _, .func ..
-    | .byte _, .union _ | .byte _, .slice | .struct .., .int _ | .struct .., .ptr
-    | .struct .., .byte _ | .struct .., .array .. | .struct .., .func .. | .struct .., .union _
-    | .struct .., .slice | .array .., .int _ | .array .., .ptr | .array .., .byte _
-    | .array .., .struct .. | .array .., .func .. | .array .., .union _ | .array .., .slice
+    | .int _, .union _ | .int _, .slice | .int _, .float _ | .ptr, .int _ | .ptr, .byte _
+    | .ptr, .struct .. | .ptr, .array .. | .ptr, .func .. | .ptr, .union _ | .ptr, .slice
+    | .ptr, .float _ | .byte _, .int _ | .byte _, .ptr | .byte _, .struct .. | .byte _, .array ..
+    | .byte _, .func .. | .byte _, .union _ | .byte _, .slice | .byte _, .float _
+    | .struct .., .int _ | .struct .., .ptr | .struct .., .byte _ | .struct .., .array ..
+    | .struct .., .func .. | .struct .., .union _ | .struct .., .slice | .struct .., .float _
+    | .array .., .int _ | .array .., .ptr | .array .., .byte _ | .array .., .struct ..
+    | .array .., .func .. | .array .., .union _ | .array .., .slice | .array .., .float _
     | .func .., .int _ | .func .., .ptr | .func .., .byte _ | .func .., .struct ..
-    | .func .., .array .. | .func .., .union _ | .func .., .slice | .union _, .int _
-    | .union _, .ptr | .union _, .byte _ | .union _, .struct .. | .union _, .array ..
-    | .union _, .func .. | .union _, .slice | .slice, .int _ | .slice, .ptr | .slice, .byte _
-    | .slice, .struct .. | .slice, .array .. | .slice, .func .. | .slice, .union _ =>
+    | .func .., .array .. | .func .., .union _ | .func .., .slice | .func .., .float _
+    | .union _, .int _ | .union _, .ptr | .union _, .byte _ | .union _, .struct ..
+    | .union _, .array .. | .union _, .func .. | .union _, .slice | .union _, .float _
+    | .slice, .int _ | .slice, .ptr | .slice, .byte _ | .slice, .struct .. | .slice, .array ..
+    | .slice, .func .. | .slice, .union _ | .slice, .float _ | .float _, .int _ | .float _, .ptr
+    | .float _, .byte _ | .float _, .struct .. | .float _, .array .. | .float _, .func ..
+    | .float _, .union _ | .float _, .slice =>
       isFalse (by intro e; cases e)
   def Ty.decEqList : (a b : List Ty) → Decidable (a = b)
     | [], [] => isTrue rfl
@@ -117,15 +126,20 @@ instance : DecidableEq Ty := Ty.decEq
 /-- The bit width of an integer or byte type. -/
 def Ty.width : Ty → Nat
   | .int w | .byte w => w
+  | .float f => f.width
   | _ => 0
 
 def Ty.isInt : Ty → Bool
   | .int _ => true
   | _ => false
 
+def Ty.isFloat : Ty → Bool
+  | .float _ => true
+  | _ => false
+
 /-- The scalar value types, the only types SSA values can have outside HFIR. -/
 def Ty.isValue : Ty → Bool
-  | .int _ | .ptr | .byte _ => true
+  | .int _ | .ptr | .byte _ | .float _ => true
   | _ => false
 
 /-- The types HFIR values can have: everything but function types (decision: Aggregate values).
@@ -151,6 +165,7 @@ mutual
     | .func ps rs => s!"func<({", ".intercalate (Ty.renderList ps)}){retsText (Ty.renderList rs)}>"
     | .union vs => s!"union<{", ".intercalate (Ty.renderList vs)}>"
     | .slice => "slice"
+    | .float f => f.name
   def Ty.renderList : List Ty → List String
     | [] => []
     | t :: ts => t.render :: Ty.renderList ts
@@ -292,6 +307,30 @@ inductive ShiftOp where
   | shl | shrU | shrS
   deriving DecidableEq, Repr
 
+/-- `float.add`, `float.sub`, `float.mul`, `float.div`, and `float.copysign` (the first operand's
+magnitude with the second's sign). -/
+inductive FBinOp where
+  | add | sub | mul | div | copysign
+  deriving DecidableEq, Repr
+
+/-- `float.neg`, `float.abs`, `float.sqrt` -/
+inductive FUnOp where
+  | neg | abs | sqrt
+  deriving DecidableEq, Repr
+
+/-- Float comparisons: the ordered ones (`o…`) are false when either operand is NaN, the unordered
+ones (`u…`) true; `ord` says neither is NaN, `uno` that one is. -/
+inductive FPred where
+  | oeq | one | olt | ole | ogt | oge | ord | ueq | une | ult | ule | ugt | uge | uno
+  deriving DecidableEq, Repr
+
+/-- What `float.to_int` does with a NaN or an integer part out of the result's range (decision:
+Edge-case vocabulary): immediate UB, the nearest bound (NaN gives 0, as AArch64's `fcvtz` and
+Rust's `as` do), or a trap with reason `convert`. -/
+inductive CvtEdge where
+  | ub | sat | trap
+  deriving DecidableEq, Repr
+
 /-- What `mem.alloc` does when allocation fails. -/
 inductive AllocFail where
   /-- Return null, like C `malloc`. -/
@@ -324,6 +363,17 @@ instance : Spelled TruncMode := ⟨[sp "wrap" .wrap, sp "nsw" .nsw, sp "nuw" .nu
 
 instance : Spelled AllocFail := ⟨[sp "null" .null, sp "trap" .trap]⟩
 
+instance : Spelled FBinOp := ⟨[sp "add" .add, sp "sub" .sub, sp "mul" .mul, sp "div" .div,
+  sp "copysign" .copysign]⟩
+
+instance : Spelled FUnOp := ⟨[sp "neg" .neg, sp "abs" .abs, sp "sqrt" .sqrt]⟩
+
+instance : Spelled FPred := ⟨[sp "oeq" .oeq, sp "one" .one, sp "olt" .olt, sp "ole" .ole,
+  sp "ogt" .ogt, sp "oge" .oge, sp "ord" .ord, sp "ueq" .ueq, sp "une" .une, sp "ult" .ult,
+  sp "ule" .ule, sp "ugt" .ugt, sp "uge" .uge, sp "uno" .uno]⟩
+
+instance : Spelled CvtEdge := ⟨[sp "ub" .ub, sp "sat" .sat, sp "trap" .trap]⟩
+
 /-- `int.add.overflow.s` and `int.add.overflow.u` -/
 def signs : List (Spelling Bool) := [sp "s" true, sp "u" false]
 
@@ -333,7 +383,7 @@ def edgeModes : List (Spelling Bool) := [sp "ub" false, sp "trap" true]
 
 instance : Spelled TrapReason := ⟨[sp "div0" TrapReason.div0, sp "overflow" TrapReason.overflow,
   sp "shift" TrapReason.shift, sp "oom" TrapReason.oom, sp "bounds" TrapReason.bounds,
-  sp "tag" TrapReason.tag]⟩
+  sp "tag" TrapReason.tag, sp "convert" TrapReason.convert]⟩
 
 /-- `ptr.offset.inbounds` and `ptr.offset.wrap` -/
 def offsetModes : List (Spelling Bool) := [sp "inbounds" true, sp "wrap" false]
@@ -397,8 +447,8 @@ fir_ops
       results t "int.const has one result"
       ints t
       fits n t
-  /-- `poison`: a `poison` value of a scalar type (`iN`, `ptr`, or `bN`, whose bytes are all
-  `poison`). -/
+  /-- `poison`: a `poison` value of a scalar type (`iN`, `ptr`, `bN` (whose bytes are all
+  `poison`), or a float). -/
   op poison
     name "poison"
     dialect value
@@ -407,14 +457,14 @@ fir_ops
       operands []
       results t "poison has one result"
       scalar t
-  /-- `freeze %x`: `%x`, or an arbitrary value if it is `poison`. -/
+  /-- `freeze %x`: `%x`, or an arbitrary value if it is `poison`; an integer or a float. -/
   op freeze
     name "freeze"
     dialect value
     format "%"
     rule
       operands t "freeze takes one operand"
-      ints t
+      numeric t
       results [t]
   /-- `copy %x`: the same value, of any type. Rewrites produce it (store-to-load forwarding
   turns a load into a copy of the stored value), and copy propagation removes it. -/
@@ -433,7 +483,7 @@ fir_ops
     rule
       operands c a b "select takes three operands"
       same "select" [c, b] [i1, a]
-      ints a
+      numeric a
       results [a]
   /-- `int.add.nsw %a, %b` and friends: `int.add`, `int.sub`, `int.mul` with an overflow
   modifier. -/
@@ -768,6 +818,114 @@ fir_ops
     effects read write alloc free trap diverge unwind
     rule
       sig sig
+  -- Floats (decisions: Floats, Float ops). Semantics: `Fir.Float`, through `Fir.Sem`.
+  /-- `float.const 1.5`: the result type's float with these bits, written as the shortest
+  decimal that reads back to them, `inf`, `-inf`, `nan`, or `nan(0x…)` (see `Fir.FloatText`). -/
+  op floatConst (value : FloatBits)
+    name "float.const"
+    format "{value}"
+    rule
+      operands []
+      results t "float.const has one result"
+      floats t
+      floatBits value t
+  /-- `float.add %a, %b`, `float.sub`, `float.mul`, `float.div`: the exact result, rounded to
+  nearest (ties to even); `float.copysign %a, %b`: `%a`'s magnitude with `%b`'s sign. -/
+  op floatBin (op : FBinOp)
+    name "float.{op}"
+    format "%, %"
+    rule
+      operands a b "this op takes two operands"
+      same "operands" [b] [a]
+      floats a
+      results [a]
+  /-- `float.neg %a`, `float.abs %a` (the sign bit flipped or cleared), `float.sqrt %a`
+  (rounded). -/
+  op floatUn (op : FUnOp)
+    name "float.{op}"
+    format "%"
+    rule
+      operands a "this op takes one operand"
+      floats a
+      results [a]
+  /-- `float.fma %a, %b, %c`: `%a * %b + %c`, rounded once. -/
+  op floatFma
+    name "float.fma"
+    format "%, %, %"
+    rule
+      operands a b c "float.fma takes three operands"
+      same "operands" [b, c] [a, a]
+      floats a
+      results [a]
+  /-- `float.cmp.olt %a, %b` and friends; see `FPred`. -/
+  op floatCmp (p : FPred)
+    name "float.cmp.{p}"
+    format "%, %"
+    rule
+      operands a b "float.cmp takes two operands"
+      same "operands" [b] [a]
+      floats a
+      results [i1]
+  /-- `float.ext %a`: a float in a wider format, exactly. -/
+  op floatExt
+    name "float.ext"
+    format "%"
+    rule
+      operands a "this op takes one operand"
+      results t "this op has one result"
+      floats a t
+      widens a t
+  /-- `float.trunc %a`: a float in a narrower format, rounded. -/
+  op floatTrunc
+    name "float.trunc"
+    format "%"
+    rule
+      operands a "float.trunc takes one operand"
+      results t "float.trunc has one result"
+      floats a t
+      narrows a t
+  /-- `float.to_int.s.sat %a`: the integer part (toward zero), signed or unsigned, of the result
+  type; a NaN or an integer part out of range is UB (`.ub`), the nearest bound (`.sat`, NaN
+  gives 0), or a trap with reason `convert` (`.trap`). A `poison` input is UB for `.ub` and
+  `.trap`. -/
+  op floatToInt (signed : Bool) (edge : CvtEdge)
+    name "float.to_int.{signed : signs}.{edge}"
+    format "%"
+    effects trap
+    rule
+      operands a "float.to_int takes one operand"
+      results t "float.to_int has one result"
+      floats a
+      ints t
+  /-- `int.to_float.s %a`: the integer, signed or unsigned, as the result type's float, rounded. -/
+  op intToFloat (signed : Bool)
+    name "int.to_float.{signed : signs}"
+    format "%"
+    rule
+      operands a "int.to_float takes one operand"
+      results t "int.to_float has one result"
+      ints a
+      floats t
+  /-- `float.from_bits %a`: the float with an integer's bits (the same width). -/
+  op floatFromBits
+    name "float.from_bits"
+    format "%"
+    rule
+      operands a "this op takes one operand"
+      results t "this op has one result"
+      ints a
+      floats t
+      sameWidth a t
+  /-- `float.to_bits %a`: a float's bits, as an integer of the same width. -/
+  op floatToBits
+    name "float.to_bits"
+    format "%"
+    rule
+      operands a "this op takes one operand"
+      results t "this op has one result"
+      floats a
+      ints t
+      sameWidth a t
   -- HFIR building blocks, lowered by `Fir.Lower`.
   /-- `agg.make %a, %b`: a struct value from its fields, or an array value from its elements;
   the result type says which. -/

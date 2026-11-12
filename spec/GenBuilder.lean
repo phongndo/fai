@@ -42,7 +42,7 @@ register (as in `GenRust`). -/
 def isStruct (d : OpDecl) : Bool :=
   d.fields.any fun f => match f.ty with
     | .nat | .align | .index | .symbol | .func | .global | .flag | .mod "Bool" | .succ | .cases
-    | .reg => true
+    | .reg | .float => true
     | _ => false
 
 /-- `OpKind::Variant(a, b)` or `OpKind::Variant { x: a, y: b }`, each field from its text. -/
@@ -169,6 +169,8 @@ def fieldParam (f : Field) : Param :=
     { name := n, rust := "impl Into<IntImm>", c := [(n, "i64")], cArg := n,
       rustConv := [s!"let {n}_id = self.int_imm({n}.into());"], kindVal := some s!"{n}_id" }
   | .nat => { name := n, rust := "u64", c := [(n, "u64")], cArg := n }
+  -- A float constant's bits (`fir_float_const_f32`/`_f64` in C take a `float`/`double`).
+  | .float => { name := n, rust := "u64", c := [(n, "u64")], cArg := n }
   | .align | .index => { name := n, rust := "u32", c := [(n, "u32")], cArg := n }
   | .flag => { name := n, rust := "bool", c := [(n, "bool")], cArg := n }
   | .symbol =>

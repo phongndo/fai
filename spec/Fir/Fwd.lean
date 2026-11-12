@@ -134,10 +134,11 @@ theorem markAll_read {tags : Std.ExtTreeMap Nat (Option Nat)} {loc : Option Loc}
 /-! ## Decoding what was encoded -/
 
 /-- Scalar types whose values come back unchanged from memory. Integer widths must be whole
-bytes. (Aggregates are HFIR only; the rewrite is for MFIR's scalar loads and stores.) -/
+bytes; floats come back bit for bit, NaN payloads included. (Aggregates are HFIR only; the
+rewrite is for MFIR's scalar loads and stores.) -/
 def Exact : Ty → Prop
   | .int w => w % 8 = 0 ∧ 0 < w
-  | .ptr | .byte _ => True
+  | .ptr | .byte _ | .float _ => True
   | _ => False
 
 theorem Exact.isValue {T : Ty} (h : Exact T) : T.isValue = true := by
@@ -199,6 +200,17 @@ theorem decodeAs_encode {loc : Option Loc} {v : RVal} {T : Ty} {c : Core} {cfg :
   | bytes bs =>
     cases T with
     | byte w => rfl
+    | _ => simp [RVal.hasTy] at hv
+  | float f x =>
+    cases T with
+    | float f' =>
+      simp only [RVal.hasTy, beq_iff_eq] at hv
+      subst hv
+      have hw : f.width % 8 = 0 ∧ 0 < f.width := by cases f <;> decide
+      simp only [decodeAs, RVal.encode, bind, StateT.bind, get, getThe, MonadStateOf.get,
+        StateT.get, pure, StateT.pure, Except.bind, Except.pure,
+        mapM_fragToBits loc _ (encodeInt_noFrags f.width x),
+        MemRules.decode_encodeInt f.width hw.1 hw.2, Option.getD_some]
     | _ => simp [RVal.hasTy] at hv
 
 

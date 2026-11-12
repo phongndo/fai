@@ -1,7 +1,10 @@
 /-!
 # Lexer
 
-Splits FIR text into tokens. Comments start with `//` and run to the end of the line.
+Splits FIR text into tokens. Comments start with `//` and run to the end of the line. Integers
+are decimal or hexadecimal (`0x1f`), with an optional `-`; a decimal with a fraction (`.` and
+digits) or an exponent (`e` or `E`, an optional sign, and digits) is a float literal. A `-`
+followed by a letter starts a name, so that `-inf` and `-nan` are names.
 -/
 
 namespace Fir
@@ -19,6 +22,8 @@ inductive Tok where
   | label (s : String)
   | ident (s : String)
   | int (n : Int)
+  /-- A decimal with a fraction or an exponent, `1.5` or `-2e-3`, as written. -/
+  | float (s : String)
   | str (s : String)
   /-- One of `( ) { } [ ] < > , : = ->` -/
   | sym (s : String)
@@ -33,6 +38,7 @@ def Tok.describe : Tok → String
   | .label s => s!"^{s}"
   | .ident s => s!"'{s}'"
   | .int n => s!"{n}"
+  | .float s => s
   | .str s => s!"\"{s}\""
   | .sym s => s!"'{s}'"
   | .eof => "end of input"
@@ -44,6 +50,11 @@ structure Token where
   deriving Inhabited
 
 private def isNameChar (c : Char) : Bool := c.isAlphanum || c == '_' || c == '.'
+
+private def hexDigit (c : Char) : Nat :=
+  if c.isDigit then c.toNat - '0'.toNat
+  else if 'a' ≤ c && c ≤ 'f' then c.toNat - 'a'.toNat + 10
+  else c.toNat - 'A'.toNat + 10
 
 private structure LexState where
   chars : List Char
@@ -96,9 +107,14 @@ where
       else if c.isDigit || (c == '-' && cs.head?.any Char.isDigit) then
         let neg := c == '-'
         let s1 := if neg then s.advance else s
-        let (digits, s') := s1.takeWhile Char.isDigit
-        let n : Int := digits.toNat!
-        emit (.int (if neg then -n else n)) s'
+        match s1.chars with
+        | '0' :: x :: h :: _ =>
+          if (x == 'x' || x == 'X') && h.isHexDigit then
+            let (hs, s') := s1.advance.advance.takeWhile Char.isHexDigit
+            let n : Int := hs.toList.foldl (fun n c => n * 16 + hexDigit c) 0
+            emit (.int (if neg then -n else n)) s'
+          else number s acc neg s1
+        | _ => number s acc neg s1
       else if c == '"' then
         let (body, s') := s.advance.takeWhile (· != '"')
         if s'.chars.isEmpty then fail "unterminated string"
@@ -106,6 +122,38 @@ where
       else if c.isAlpha || c == '_' then
         let (name, s') := s.takeWhile isNameChar
         emit (.ident name) s'
+      else if c == '-' && cs.head?.any Char.isAlpha then
+        let (name, s') := s.advance.takeWhile isNameChar
+        emit (.ident ("-" ++ name)) s'
       else fail s!"unexpected character '{c}'"
+  /-- A decimal number after its sign: an integer, or a float literal with a fraction or an
+  exponent. -/
+  number (s : LexState) (acc : Array Token) (neg : Bool) (s1 : LexState) :
+      Except String (Array Token) :=
+    let (digits, s2) := s1.takeWhile Char.isDigit
+    let (frac, s3) := match s2.chars with
+      | '.' :: d :: _ => if d.isDigit then
+          let (f, s3) := s2.advance.takeWhile Char.isDigit
+          ("." ++ f, s3)
+        else ("", s2)
+      | _ => ("", s2)
+    let (exp, s4) := match s3.chars with
+      | e :: d :: rest =>
+        if e == 'e' || e == 'E' then
+          if d.isDigit then
+            let (x, s4) := s3.advance.takeWhile Char.isDigit
+            ("e" ++ x, s4)
+          else if (d == '-' || d == '+') && rest.head?.any Char.isDigit then
+            let (x, s4) := s3.advance.advance.takeWhile Char.isDigit
+            ("e" ++ d.toString ++ x, s4)
+          else ("", s3)
+        else ("", s3)
+      | _ => ("", s3)
+    let sign := if neg then "-" else ""
+    let t : Tok := if frac.isEmpty && exp.isEmpty then
+        let n : Int := digits.toNat!
+        .int (if neg then -n else n)
+      else .float (sign ++ digits ++ frac ++ exp)
+    go s4 (acc.push { tok := t, line := s.line, col := s.col })
 
 end Fir

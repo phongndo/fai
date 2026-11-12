@@ -27,7 +27,9 @@ same tables, and the Rust `OpKind`, to `crates/fir/src/generated/ops.rs`.
 *immediates*, written in the op's format: `Int`, `Nat` (Rust `u64`), `Align` (a `Nat`; Rust
 `u32`), `Index` (a field index, a `Nat`; Rust `u32`), `Symbol` (a dotted name such as
 `c.malloc`; a `String`), `Func` (a function, `@f`; a `String`), `Global` (a global, `@g`; a
-`String`), `Ty`, `Flag` (a `Bool` written as a keyword named after the field), `Succ` (a branch
+`String`), `Ty`, `FloatBits` (a float constant's bits, a `Nat`; Rust `u64`; written as the
+float the op's one result type reads them as, decision: Float ops), `Flag` (a `Bool` written as a
+keyword named after the field), `Succ` (a branch
 target `^b(%x, …)`, whose operands are the op's; Rust: an id into a side table), `Cases`
 (`cf.switch`'s `[k: ^b(…), …]`), and `Reg` (a target register such as `x3` or `v12`; Rust: a
 `u32`). Fields of any other type (`Bool` or an enum) are *modifiers*,
@@ -100,6 +102,8 @@ inductive FieldTy where
   | cases
   /-- A target register, `x3` or `v12` (`Fir.Reg`). -/
   | reg
+  /-- A float's bits, written as the float the op's result type reads them as (`1.5`, `nan`). -/
+  | float
   /-- A modifier: `Bool` or an enum, named here. -/
   | mod (type : String)
   deriving DecidableEq, Repr, Inhabited
@@ -216,8 +220,16 @@ inductive Check where
   | variant (u : TyE) (index : String) (t : TyE)
   /-- `union u`: `u` is a union. -/
   | isUnion (u : TyE)
-  /-- `scalar t`: `t` is a scalar value type (`iN`, `ptr`, `bN`). -/
+  /-- `scalar t`: `t` is a scalar value type (`iN`, `ptr`, `bN`, `fN`). -/
   | scalar (t : TyE)
+  /-- `floats a t`: these are floats. -/
+  | floats (ts : List TyE)
+  /-- `numeric a`: these are integers or floats. -/
+  | numeric (ts : List TyE)
+  /-- `sameWidth a t`: `a` and `t` have the same width in bits. -/
+  | sameWidth (a t : TyE)
+  /-- `floatBits v t`: the bits field fits the float `t`. -/
+  | floatBits (field : String) (t : TyE)
   deriving Repr, Inhabited
 
 /-- Effect categories (decision: Effects); resource tags come later. -/
@@ -349,11 +361,12 @@ def fieldTy : String → FieldTy
   | "Succ" => .succ
   | "Cases" => .cases
   | "Reg" => .reg
+  | "FloatBits" => .float
   | t => .mod t
 
 /-- The Lean type of a field type. -/
 def leanTy : String → Name
-  | "Align" | "Index" => `Nat
+  | "Align" | "Index" | "FloatBits" => `Nat
   | "Symbol" | "Func" | "Global" => `String
   | "Flag" => `Bool
   | t => .mkSimple t
@@ -477,6 +490,10 @@ def checkTerm (stx : TSyntax `firCheck) : MacroM Term := do
   | "variant", [u, i, t] => `(Check.variant $(← tyE u) $(quote (← argIdent i)) $(← tyE t))
   | "union", [u] => `(Check.isUnion $(← tyE u))
   | "scalar", [t] => `(Check.scalar $(← tyE t))
+  | "floats", ts => `(Check.floats [$(← ts.toArray.mapM tyE),*])
+  | "numeric", ts => `(Check.numeric [$(← ts.toArray.mapM tyE),*])
+  | "sameWidth", [a, t] => `(Check.sameWidth $(← tyE a) $(← tyE t))
+  | "floatBits", [f, t] => `(Check.floatBits $(quote (← argIdent f)) $(← tyE t))
   | _, _ => Macro.throwErrorAt stx "unknown check"
 
 partial def flatArg : TSyntax `firArg → List String
@@ -515,6 +532,7 @@ def fieldTyTerm : FieldTy → MacroM Term
   | .succ => `(FieldTy.succ)
   | .cases => `(FieldTy.cases)
   | .reg => `(FieldTy.reg)
+  | .float => `(FieldTy.float)
   | .mod t => `(FieldTy.mod $(quote t))
 
 /-- The value a field of the name table's kinds holds when the name doesn't set it. -/
@@ -529,12 +547,13 @@ def defaultTerm : FieldTy → MacroM Term
   | .succ => `(({ label := "", nargs := 0 } : Succ))
   | .cases => `(([] : Cases))
   | .reg => `(Reg.xzr)
+  | .float => `((0 : Nat))
   | .mod _ => Macro.throwError "a modifier field must be set by the name"
 
 /-- The `Imm` constructor for an immediate field. -/
 def immCtor : FieldTy → Name
   | .int => `Imm.int
-  | .nat | .align | .index => `Imm.nat
+  | .nat | .align | .index | .float => `Imm.nat
   | .symbol | .func | .global => `Imm.str
   | .ty => `Imm.ty
   | .succ => `Imm.succ

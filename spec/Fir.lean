@@ -1,4 +1,6 @@
 import Fir.Basic
+import Fir.Float
+import Fir.FloatText
 import Fir.OpDSL
 import Fir.Refinement
 import Fir.Syntax

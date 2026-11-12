@@ -131,6 +131,7 @@ mutual
     | .ptr (some p), .ptr (some p') => p = p'
     | .bytes bs, .bytes bs' => Forall2 Byte.Refines bs bs'
     | .agg ts, .agg ss => RVal.RefinesParts ts ss
+    | .float f v, .float f' v' => ∃ h : f = f', Val.Refines (h ▸ v) v'
     | _, _ => False
   /-- `Forall2 RVal.Refines`, spelled out for the nested recursion (`RVal.refinesParts_eq`). -/
   def RVal.RefinesParts : List RVal → List RVal → Prop
@@ -146,6 +147,7 @@ mutual
     | .ptr (some p), .ptr (some p') => p == p'
     | .bytes bs, .bytes bs' => all2 Byte.refines bs bs'
     | .agg ts, .agg ss => RVal.refinesParts ts ss
+    | .float f v, .float f' v' => if h : f = f' then Val.refines (h ▸ v) v' else false
     | _, _ => false
   def RVal.refinesParts : List RVal → List RVal → Bool
     | [], [] => true
@@ -173,9 +175,18 @@ mutual
       simp [RVal.refines, RVal.Refines, all2_iff (fun _ _ => Byte.refines_iff)]
     | .agg ts, .agg ss => by
       simp only [RVal.refines, RVal.Refines]; exact RVal.refinesParts_iff
-    | .int .., .ptr _ | .int .., .bytes _ | .int .., .agg _ | .ptr _, .int .. | .ptr _, .bytes _
-    | .ptr _, .agg _ | .bytes _, .int .. | .bytes _, .ptr _ | .bytes _, .agg _ | .agg _, .int ..
-    | .agg _, .ptr _ | .agg _, .bytes _ => by simp [RVal.refines, RVal.Refines]
+    | .float f v, .float f' v' => by
+      simp only [RVal.refines, RVal.Refines]
+      split
+      · rename_i h
+        exact ⟨fun hr => ⟨h, Val.refines_iff.mp hr⟩, fun ⟨_, hr⟩ => Val.refines_iff.mpr hr⟩
+      · rename_i h
+        simp [h]
+    | .int .., .ptr _ | .int .., .bytes _ | .int .., .agg _ | .int .., .float .. | .ptr _, .int ..
+    | .ptr _, .bytes _ | .ptr _, .agg _ | .ptr _, .float .. | .bytes _, .int .. | .bytes _, .ptr _
+    | .bytes _, .agg _ | .bytes _, .float .. | .agg _, .int .. | .agg _, .ptr _ | .agg _, .bytes _
+    | .agg _, .float .. | .float .., .int .. | .float .., .ptr _ | .float .., .bytes _
+    | .float .., .agg _ => by simp [RVal.refines, RVal.Refines]
   theorem RVal.refinesParts_iff : ∀ {ts ss : List RVal},
       RVal.refinesParts ts ss = true ↔ RVal.RefinesParts ts ss
     | [], [] => by simp [RVal.refinesParts, RVal.RefinesParts]
@@ -191,6 +202,7 @@ mutual
     | .ptr p => by cases p <;> simp [RVal.Refines]
     | .bytes bs => Forall2.refl Byte.Refines.refl bs
     | .agg vs => by simp only [RVal.Refines]; exact RVal.RefinesParts.refl vs
+    | .float f v => ⟨rfl, Val.Refines.refl v⟩
   theorem RVal.RefinesParts.refl : ∀ (vs : List RVal), RVal.RefinesParts vs vs
     | [] => trivial
     | v :: vs => ⟨RVal.Refines.refl v, RVal.RefinesParts.refl vs⟩
@@ -211,18 +223,32 @@ mutual
       exact Forall2.trans (r := Byte.Refines) (fun _ _ _ => Byte.Refines.trans) h₁ h₂
     | .ptr p, .ptr q, .ptr r, h₁, h₂ => by
       cases p <;> cases q <;> cases r <;> simp_all [RVal.Refines]
+    | .float .., .float .., .float .., h₁, h₂ => by
+      simp only [RVal.Refines] at h₁ h₂ ⊢
+      obtain ⟨hab, h₁⟩ := h₁
+      obtain ⟨hbc, h₂⟩ := h₂
+      subst hab hbc
+      exact ⟨rfl, Val.Refines.trans h₁ h₂⟩
     | .int .., .ptr _, _, h₁, _ | .int .., .bytes _, _, h₁, _ | .int .., .agg _, _, h₁, _
-    | .ptr _, .int .., _, h₁, _ | .ptr _, .bytes _, _, h₁, _ | .ptr _, .agg _, _, h₁, _
-    | .bytes _, .int .., _, h₁, _ | .bytes _, .ptr _, _, h₁, _ | .bytes _, .agg _, _, h₁, _
-    | .agg _, .int .., _, h₁, _ | .agg _, .ptr _, _, h₁, _ | .agg _, .bytes _, _, h₁, _ => by
+    | .int .., .float .., _, h₁, _ | .ptr _, .int .., _, h₁, _ | .ptr _, .bytes _, _, h₁, _
+    | .ptr _, .agg _, _, h₁, _ | .ptr _, .float .., _, h₁, _ | .bytes _, .int .., _, h₁, _
+    | .bytes _, .ptr _, _, h₁, _ | .bytes _, .agg _, _, h₁, _ | .bytes _, .float .., _, h₁, _
+    | .agg _, .int .., _, h₁, _ | .agg _, .ptr _, _, h₁, _ | .agg _, .bytes _, _, h₁, _
+    | .agg _, .float .., _, h₁, _ | .float .., .int .., _, h₁, _ | .float .., .ptr _, _, h₁, _
+    | .float .., .bytes _, _, h₁, _ | .float .., .agg _, _, h₁, _ => by
       cases h₁
     | .int .., .int .., .ptr _, _, h₂ | .int .., .int .., .bytes _, _, h₂
-    | .int .., .int .., .agg _, _, h₂ | .ptr _, .ptr _, .int .., _, h₂
-    | .ptr _, .ptr (some _), .bytes _, _, h₂ | .ptr _, .ptr (some _), .agg _, _, h₂
-    | .ptr _, .ptr none, .bytes _, _, h₂ | .ptr _, .ptr none, .agg _, _, h₂
-    | .bytes _, .bytes _, .int .., _, h₂ | .bytes _, .bytes _, .ptr _, _, h₂
-    | .bytes _, .bytes _, .agg _, _, h₂ | .agg _, .agg _, .int .., _, h₂
-    | .agg _, .agg _, .ptr _, _, h₂ | .agg _, .agg _, .bytes _, _, h₂ => by
+    | .int .., .int .., .agg _, _, h₂ | .int .., .int .., .float .., _, h₂
+    | .ptr _, .ptr _, .int .., _, h₂ | .ptr _, .ptr (some _), .bytes _, _, h₂
+    | .ptr _, .ptr none, .bytes _, _, h₂ | .ptr _, .ptr (some _), .agg _, _, h₂
+    | .ptr _, .ptr none, .agg _, _, h₂ | .ptr _, .ptr (some _), .float .., _, h₂
+    | .ptr _, .ptr none, .float .., _, h₂ | .bytes _, .bytes _, .int .., _, h₂
+    | .bytes _, .bytes _, .ptr _, _, h₂ | .bytes _, .bytes _, .agg _, _, h₂
+    | .bytes _, .bytes _, .float .., _, h₂ | .agg _, .agg _, .int .., _, h₂
+    | .agg _, .agg _, .ptr _, _, h₂ | .agg _, .agg _, .bytes _, _, h₂
+    | .agg _, .agg _, .float .., _, h₂ | .float .., .float .., .int .., _, h₂
+    | .float .., .float .., .ptr _, _, h₂ | .float .., .float .., .bytes _, _, h₂
+    | .float .., .float .., .agg _, _, h₂ => by
       simp [RVal.Refines] at h₂
   theorem RVal.RefinesParts.trans : ∀ {as bs cs : List RVal},
       RVal.RefinesParts as bs → RVal.RefinesParts bs cs → RVal.RefinesParts as cs

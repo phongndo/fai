@@ -103,6 +103,7 @@ def explodeResult (aw : Nat) (r : Result) : List Result :=
 def poisonOf : Ty → RVal
   | .ptr => .ptr none
   | .byte w => .bytes (List.replicate (w / 8) .poison)
+  | .float f => .float f .poison
   | t => .int t.width .poison
 
 mutual

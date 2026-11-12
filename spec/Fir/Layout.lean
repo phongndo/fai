@@ -7,7 +7,8 @@ Where each part of a struct or array goes in memory, from the memory space's dat
 (decisions: Layout, Data layout). Sizes and alignments are in bytes.
 
 * `iN` and `bN` take `N / 8` bytes and the alignment the space lists for their width; a pointer
-  takes the space's pointer size and alignment.
+  takes the space's pointer size and alignment. A float takes its bits and aligns like the
+  integer of its width (decision: Floats).
 * A field or element takes its *stride*: its size rounded up to its alignment.
 * `struct<C>` places each field at the next multiple of its alignment, in order. The struct's
   alignment is its largest field's (1 if it has none), and its size is where the last field ends,
@@ -64,6 +65,7 @@ mutual
   /-- A type's size and alignment. -/
   def Ty.dims (sp : SpaceCfg) : Ty → Nat × Nat
     | .int w | .byte w => (w / 8, sp.intAlign w)
+    | .float f => (f.width / 8, sp.intAlign f.width)
     | .ptr => (sp.ptrBits / 8, sp.ptrAlign)
     | .struct p fs => let (_, size, align) := placeFields p (Ty.strides sp fs); (size, align)
     | .array n t => let (s, a) := t.dims sp; (n * alignUp s a, a)
@@ -78,6 +80,7 @@ end
 /-- How many bytes a value of type `t` takes in memory. -/
 def Ty.size (sp : SpaceCfg) : Ty → Nat
   | .int w | .byte w => w / 8
+  | .float f => f.width / 8
   | .ptr => sp.ptrBits / 8
   | t => (t.dims sp).1
 

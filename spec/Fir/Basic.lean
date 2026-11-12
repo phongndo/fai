@@ -16,6 +16,35 @@ def Val.isPoison : Val w → Bool
   | .poison => true
   | .bits _ => false
 
+/-- A binary floating-point format (IEEE 754): the widths of the exponent field (`e`) and of the
+trailing significand field (`m`). A value takes `1 + e + m` bits: the sign, then the exponent,
+then the significand. -/
+structure FloatFmt where
+  e : Nat
+  m : Nat
+  deriving DecidableEq, Repr
+
+/-- How many bits a value of the format takes. -/
+def FloatFmt.width (F : FloatFmt) : Nat := F.e + F.m + 1
+
+/-- The float types FIR builds (decision: Floats): IEEE 754 binary32 (`f32`) and binary64
+(`f64`). `f16` and `bf16` are decided but not built. -/
+inductive FloatTy where
+  | f32
+  | f64
+  deriving DecidableEq, Repr
+
+def FloatTy.fmt : FloatTy → FloatFmt
+  | .f32 => ⟨8, 23⟩
+  | .f64 => ⟨11, 52⟩
+
+/-- The bit width: 32 or 64. -/
+def FloatTy.width (f : FloatTy) : Nat := f.fmt.width
+
+def FloatTy.name : FloatTy → String
+  | .f32 => "f32"
+  | .f64 => "f64"
+
 /-- A pointer. Its provenance says which allocation it may access.
 
 Allocations get a numeric address lazily, the first time one is observed, so a pointer derived
@@ -52,6 +81,8 @@ inductive RVal where
   pointer and length, or a union's tag (an `i32`) and its variant's payload. There is no
   aggregate `poison`: `poison` stays in the scalars. -/
   | agg (vs : List RVal)
+  /-- A float: its bits (decision: Floats), or `poison`. NaN payloads are bits like any other. -/
+  | float (f : FloatTy) (v : Val f.width)
   deriving Repr
 
 mutual
@@ -70,9 +101,16 @@ mutual
       match RVal.decEqList vs vs' with
       | isTrue h => isTrue (h ▸ rfl)
       | isFalse h => isFalse (by intro e; cases e; exact h rfl)
+    | .float f v, .float f' v' =>
+      if h : f = f' then
+        if hv : h ▸ v = v' then isTrue (by subst h; subst hv; rfl)
+        else isFalse (by intro e; cases e; exact hv rfl)
+      else isFalse (by intro e; cases e; exact h rfl)
     | .int .., .ptr _ | .int .., .bytes _ | .int .., .agg _ | .ptr _, .int .. | .ptr _, .bytes _
     | .ptr _, .agg _ | .bytes _, .int .. | .bytes _, .ptr _ | .bytes _, .agg _ | .agg _, .int ..
-    | .agg _, .ptr _ | .agg _, .bytes _ => isFalse (by intro e; cases e)
+    | .agg _, .ptr _ | .agg _, .bytes _ | .float .., .int .. | .float .., .ptr _
+    | .float .., .bytes _ | .float .., .agg _ | .int .., .float .. | .ptr _, .float ..
+    | .bytes _, .float .. | .agg _, .float .. => isFalse (by intro e; cases e)
   def RVal.decEqList : (a b : List RVal) → Decidable (a = b)
     | [], [] => isTrue rfl
     | v :: vs, v' :: vs' =>
@@ -96,6 +134,8 @@ inductive TrapReason where
   | bounds
   /-- A union read as a variant it doesn't hold (`union.get.trap`). -/
   | tag
+  /-- A float converted to an integer is NaN or out of range (`float.to_int.*.trap`). -/
+  | convert
   deriving DecidableEq, Repr
 
 /-- Which rule a program broke when its behavior is undefined. Refinement ignores the kind;
@@ -137,6 +177,8 @@ inductive UBKind where
   | bounds
   /-- A union read as a variant it doesn't hold (`union.get.ub`). -/
   | tag
+  /-- A float converted to an integer is NaN or out of range (`float.to_int.*.ub`). -/
+  | convert
   deriving DecidableEq, Repr
 
 /-- The outcome of evaluating one op with result width `w`. -/
@@ -195,6 +237,7 @@ def TrapReason.name : TrapReason → String
   | .oom => "oom"
   | .bounds => "bounds"
   | .tag => "tag"
+  | .convert => "convert"
 
 def UBKind.name : UBKind → String
   | .div0 => "div0"
@@ -218,5 +261,6 @@ def UBKind.name : UBKind → String
   | .badCall => "bad-call"
   | .bounds => "bounds"
   | .tag => "tag"
+  | .convert => "convert"
 
 end Fir

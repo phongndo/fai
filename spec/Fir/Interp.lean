@@ -131,6 +131,7 @@ def Ty.zero : Ty → RVal
   | .int w => .int w (.bits 0)
   | .ptr => .ptr (some .null)
   | .byte w => .bytes (List.replicate (w / 8) (.bits 0))
+  | .float f => .float f (.bits 0)
   | _ => .bytes []
 
 /-- The environment `fir-ref run` uses: every external call returns zeros and changes nothing. -/
@@ -247,6 +248,7 @@ mutual
     | .int w _, .int w' => w == w'
     | .ptr _, .ptr => true
     | .bytes bs, .byte w => bs.length * 8 == w
+    | .float f _, .float f' => f == f'
     | .agg vs, .struct _ fs => RVal.hasTys vs fs
     | .agg vs, .array n e => vs.length == n && RVal.allHaveTy vs e
     | .agg [.ptr _, .int _ _], .slice => true
@@ -502,6 +504,10 @@ def decodeAs (loc : Option Loc) (ty : Ty) (bs : List Byte) : CM RVal := do
   | .int w =>
     let bs ← bs.mapM (fragToBits loc)
     pure (.int w ((decodeInt? w bs).getD .poison))
+  -- A float's bits, read as an integer's (decision: Pointer bytes as integers).
+  | .float f =>
+    let bs ← bs.mapM (fragToBits loc)
+    pure (.float f ((decodeInt? f.width bs).getD .poison))
   | .ptr =>
     if bs.contains .poison then return .ptr none
     match ptrOfFrags? bs.length bs with
@@ -631,6 +637,11 @@ def asInt (loc : Option Loc) (w : Nat) : RVal → CM (Val w)
       halt (.stuck s!"expected an i{w} but got an i{w'}") loc
   | _ => halt (.stuck s!"expected an i{w}") loc
 
+def asFloat (loc : Option Loc) (f : FloatTy) : RVal → CM (Val f.width)
+  | .float f' v => if h : f' = f then pure (h ▸ v) else
+      halt (.stuck s!"expected an {f.name} but got an {f'.name}") loc
+  | _ => halt (.stuck s!"expected an {f.name}") loc
+
 def asPtr (loc : Option Loc) : RVal → CM (Option Ptr)
   | .ptr p => pure p
   | _ => halt (.stuck "expected a ptr") loc
@@ -730,6 +741,41 @@ def sliceElem (loc : Option Loc) (trap : Bool) (ty : Ty) (s i : RVal) : CM (Opti
     | some p => offsetBy loc true p (x * BitVec.ofInt aw (ty.stride c.space)).toInt
   | _, _ => ub .poison loc "slice index or length is poison"
 
+/-- Evaluate a float op (decisions: Floats, Float ops). A NaN result is the choice of the
+oracle's next answer, read without using it up, so these ops only read the core (decision: NaN
+determinism). -/
+def evalFloat (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVal) :
+    CM (List RVal) := do
+  let c ← get
+  match k, rs, vs with
+  | .floatConst bits, [r], [] =>
+    match r.ty with
+    | .float f => pure [.float f (.bits (BitVec.ofNat _ bits))]
+    | t => halt (.stuck s!"float.const of {t}") loc
+  | .floatBin op, [_], [.float f a, b] =>
+    pure [.float f (Sem.floatBin f.fmt op (c.oracle c.choices) a (← asFloat loc f b))]
+  | .floatUn op, [_], [.float f a] => pure [.float f (Sem.floatUn f.fmt op (c.oracle c.choices) a)]
+  | .floatFma, [_], [.float f a, b, d] =>
+    pure [.float f (Sem.floatFma f.fmt (c.oracle c.choices) a (← asFloat loc f b) (← asFloat loc f d))]
+  | .floatCmp p, [_], [.float f a, b] => pure [.int 1 (Sem.floatCmp f.fmt p a (← asFloat loc f b))]
+  | .floatExt, [r], [.float f a] | .floatTrunc, [r], [.float f a] =>
+    match r.ty with
+    | .float g => pure [.float g (Sem.floatCvt f.fmt g.fmt (c.oracle c.choices) a)]
+    | t => halt (.stuck s!"expected a float result but got {t}") loc
+  | .floatToInt signed edge, [r], [.float f a] =>
+    pure [.int _ (← fromOut loc (Sem.floatToInt f.fmt signed edge r.ty.width a))]
+  | .intToFloat signed, [r], [.int _ a] =>
+    match r.ty with
+    | .float g => pure [.float g (Sem.intToFloat g.fmt signed a)]
+    | t => halt (.stuck s!"expected a float result but got {t}") loc
+  | .floatFromBits, [r], [.int w a] =>
+    match r.ty with
+    | .float g => if h : w = g.width then pure [.float g (h ▸ a)] else
+        halt (.stuck s!"float.from_bits of an i{w} to {g.name}") loc
+    | t => halt (.stuck s!"expected a float result but got {t}") loc
+  | .floatToBits, [_], [.float f a] => pure [.int f.width a]
+  | _, _, _ => halt (.stuck "malformed op") loc
+
 /-- Evaluate an op without regions that doesn't touch the stack. -/
 def evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVal) :
     CM (List RVal) := do
@@ -741,12 +787,18 @@ def evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVa
     match r.ty with
     | .ptr => pure [.ptr none]
     | .byte w => pure [.bytes (List.replicate (w / 8) .poison)]
+    | .float f => pure [.float f .poison]
     | t => pure [.int t.width .poison]
   | .freeze, [_], [.int w .poison] => pure [.int w (.bits (BitVec.ofInt w (← choose)))]
+  | .freeze, [_], [.float f .poison] => pure [.float f (.bits (BitVec.ofInt _ (← choose)))]
   | .freeze, [_], [v] => pure [v]
   | .copy, [_], [v] => pure [v]
   | .select, [r], [c, a, b] =>
-    pure [.int _ (Sem.select (← asInt loc 1 c) (← asInt loc r.ty.width a) (← asInt loc r.ty.width b))]
+    match r.ty with
+    | .float f =>
+      pure [.float f (Sem.select (← asInt loc 1 c) (← asFloat loc f a) (← asFloat loc f b))]
+    | _ =>
+      pure [.int _ (Sem.select (← asInt loc 1 c) (← asInt loc r.ty.width a) (← asInt loc r.ty.width b))]
   | .arith op ovf, [r], [a, b] =>
     pure [.int _ (← fromOut loc (Sem.arith op ovf (← asInt loc r.ty.width a) (← asInt loc r.ty.width b)))]
   | .bit op, [r], [a, b] =>
@@ -860,7 +912,7 @@ def evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVa
     match ← asInt loc 1 x with
     | .poison => ub .poison loc "check of poison"
     | .bits b => if b = 1 then pure [] else halt (.trap reason) loc
-  | _, _, _ => halt (.stuck "malformed op") loc
+  | _, _, _ => evalFloat loc k rs vs
 
 /-- Compute an op without regions that doesn't touch the stack, from its operands' values, and
 check its results. -/

@@ -76,6 +76,13 @@ theorem encode_length {v : RVal} {T : Ty} (h : v.hasTy T = true) (hT : T.isValue
       simp [RVal.encode, Ty.size]
       omega
     | _ => simp [RVal.hasTy] at h
+  | float f x =>
+    cases T with
+    | float f' =>
+      simp only [RVal.hasTy, beq_iff_eq] at h
+      subst h
+      cases x <;> simp [RVal.encode, encodeInt, Ty.size, length_digits]
+    | _ => simp [RVal.hasTy] at h
 
 /-! ## Marks -/
 
