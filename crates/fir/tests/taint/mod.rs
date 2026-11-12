@@ -25,7 +25,10 @@
 //! `cf.continue`, `cf.br`, `cf.cond_br`, `cf.switch`) and the loop's initial state, through calls
 //! (arguments to parameters, returns to results; an indirect call reaches every function and
 //! external function whose address is taken), and through exceptions (one abstract exception
-//! for the module).
+//! for the module). Every variadic argument passed to a FIR function flows to every `va.arg`
+//! (one abstract list for the module, which may be `poison`: a run may pass it), and `va.start`
+//! writes pointer bytes (the target's `va_list` holds addresses) that `va.end` replaces with
+//! `poison`.
 //!
 //! **Control.** A branch on a tainted value (`cf.if`, `cf.cond_br`, `cf.switch`, a call through
 //! a tainted pointer) taints the whole function: every value, store, trap, and event in it,
@@ -104,6 +107,8 @@ struct Analysis<'m> {
     sites: HashMap<(usize, OpId), u32>,
     /// What may be thrown.
     exn: Abs,
+    /// The variadic arguments passed to any FIR function, which `va.arg` may read.
+    va: Abs,
     throws: bool,
     /// Functions and external functions whose address is taken.
     taken: Vec<usize>,
@@ -204,6 +209,10 @@ impl<'m> Analysis<'m> {
             objs,
             sites: HashMap::new(),
             exn: Abs::default(),
+            va: Abs {
+                poison: true,
+                ..Abs::default()
+            },
             throws,
             taken: Vec::new(),
             taken_ext: Vec::new(),
@@ -305,6 +314,9 @@ impl<'m> Analysis<'m> {
             let a = a.clone().tainted(c);
             self.set(g, *p, &a);
         }
+        for a in args.iter().skip(params.len()) {
+            self.changed |= self.va.join(&a.clone().tainted(c));
+        }
         if c {
             self.set_ctl(g);
         }
@@ -316,6 +328,10 @@ impl<'m> Analysis<'m> {
 
     fn call_ext(&mut self, x: usize, args: &[Abs], c: bool) {
         for (k, a) in args.iter().enumerate() {
+            // A variadic external function's event has an argument per variadic one too.
+            if self.events[x].len() <= k {
+                self.events[x].resize(k + 1, false);
+            }
             if let Some(e) = self.events[x].get_mut(k)
                 && !*e
                 && (a.taint || c)
@@ -339,14 +355,18 @@ impl<'m> Analysis<'m> {
                     .iter()
                     .copied()
                     .filter(|&g| {
-                        let b = &self.m.funcs[g].body;
-                        b.params(b.entry()).len() == args.len()
+                        let f = &self.m.funcs[g];
+                        let n = f.body.params(f.body.entry()).len();
+                        n == args.len() || (f.variadic && n < args.len())
                     })
                     .collect(),
                 self.taken_ext
                     .iter()
                     .copied()
-                    .filter(|&x| self.m.externs[x].params.len() == args.len())
+                    .filter(|&x| {
+                        let x = &self.m.externs[x];
+                        x.params.len() == args.len() || (x.variadic && x.params.len() < args.len())
+                    })
                     .collect(),
             ),
         };
@@ -488,6 +508,35 @@ impl<'m> Analysis<'m> {
             K::MemCopy { .. } => {
                 let v = self.read(&args[1].reach()).tainted(c || any(&args));
                 self.write(&args[0].reach(), &v);
+            }
+            // A `va_list` holds addresses on the target (a cursor, `poison` to loads, in FIR).
+            K::VaStart => {
+                let v = Abs {
+                    poison: true,
+                    ptr: true,
+                    pts: [WILD].into(),
+                    ..Abs::default()
+                };
+                self.write(&first.reach(), &v.tainted(c || first.taint));
+            }
+            K::VaArg => {
+                let cursor = self.read(&first.reach());
+                let v = self.va.clone().tainted(c || first.taint || cursor.taint);
+                res.push(Abs { poison: true, ..v });
+                let w = Abs {
+                    poison: true,
+                    ptr: true,
+                    pts: [WILD].into(),
+                    ..Abs::default()
+                };
+                self.write(&first.reach(), &w.tainted(c || first.taint));
+            }
+            K::VaEnd => {
+                let v = Abs {
+                    poison: true,
+                    ..Abs::default()
+                };
+                self.write(&first.reach(), &v.tainted(c || first.taint));
             }
             K::Call { callee } => {
                 res = self.call(fi, Some(b.str(callee)), &args, c);
