@@ -24,7 +24,7 @@
 //! // func @sum(%n: i32) -> i32: 0 + 1 + … + (n - 1)
 //! let mut f = mb.func("sum", &[i32], &[i32])?;
 //! let n = f.param(0);
-//! f.name(n, "n");
+//! f.name(n, "n")?;
 //! let zero = f.int_const(i32, 0)?;
 //! let r = f.cf_loop(&[i32], false, &[zero.into(), zero.into()], |f, st| {
 //!     let (i, acc) = (st.get(0), st.get(1));

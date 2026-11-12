@@ -84,3 +84,13 @@ by construction (certificates or generated matchers) comes after this round.
 2. HFIR building blocks with their lowerings, and the MFIR pass manager; the AArch64 LFIR dialect,
    isel, regalloc, and assembly (in parallel).
 3. Exceptions through all three layers; end-to-end tests through the C API.
+
+## Progress
+
+- **Builder API (Rust, C):** done. `lake exe gen-builder` generates the op methods and C functions;
+  `ModuleBuilder` covers memory spaces, types, functions, external functions, and globals;
+  `crates/fir-capi` exports it with a cbindgen header. Every verified test file and 300 fuzzer
+  programs rebuild through the builder byte for byte, and `tests/capi/modules.c` builds,
+  verifies, prints, and runs modules through the C API in `cargo test` (clean under ASan and
+  valgrind). Building is about 2.4 times as fast as parsing (`examples/build_bench.rs`). Left
+  until they exist: the module's layer, and lowering, optimizing, and compiling from the API.

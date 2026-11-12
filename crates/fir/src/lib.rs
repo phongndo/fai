@@ -16,9 +16,37 @@
 //! values referring to each other by 32-bit index. Struct, array, and function types are ids into
 //! an interned table ([`Types`]) owned by the body that names them, or by the module's
 //! [`Globals`].
+//!
+//! Modules can also be built in code, through the builder API ([`ModuleBuilder`],
+//! [`FuncBuilder`]): one method per op, generated from its declaration into
+//! `src/generated/builder.rs`, taking every modifier as a required argument, so no UB choice is
+//! left out. The `fir-capi` crate exports the same builder as a stable C API. See [`builder`]
+//! for the rules.
+//!
+//! ```
+//! use fir::{ArithOp, ModuleBuilder, Ovf, Ty};
+//!
+//! let mut mb = ModuleBuilder::new();
+//! let i32 = Ty::Int(32);
+//! let mut f = mb.func("inc", &[i32], &[i32])?;
+//! let x = f.param(0);
+//! f.name(x, "x")?;
+//! let one = f.int_const(i32, 1)?;
+//! let y = f.int_arith(ArithOp::Add, Ovf::Nsw, x, one)?;
+//! f.func_ret(&[y.into()])?;
+//! f.finish()?;
+//! let m = mb.finish();
+//! fir::verify_module(&m).unwrap();
+//! assert_eq!(
+//!     m.render(true),
+//!     "func @inc(%x: i32) -> i32 {\n  %1: i32 = int.const 1\n  %2: i32 = int.add.nsw %x, %1\n  func.ret %2\n}\n"
+//! );
+//! assert_eq!(fir::interp::run(&m, "inc", &["41"], 100).unwrap(), "returned i32 42");
+//! # Ok::<(), fir::BuildError>(())
+//! ```
 
 mod body;
-mod builder;
+pub mod builder;
 #[path = "generated/builder.rs"]
 #[rustfmt::skip]
 mod builder_ops;
