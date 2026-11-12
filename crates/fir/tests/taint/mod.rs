@@ -916,8 +916,8 @@ fn split_top<'a>(s: &'a str, sep: &str) -> Vec<&'a str> {
     let bytes = s.as_bytes();
     while i < bytes.len() {
         match bytes[i] {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
+            b'(' | b'{' => depth += 1,
+            b')' | b'}' => depth -= 1,
             _ if depth == 0 && s[i..].starts_with(sep) => {
                 out.push(&s[start..i]);
                 i += sep.len();
@@ -934,10 +934,26 @@ fn split_top<'a>(s: &'a str, sep: &str) -> Vec<&'a str> {
     out
 }
 
+/// The words of an outcome: separated by spaces and punctuation, with an aggregate's braces as
+/// words of their own.
 fn toks(s: &str) -> Vec<&str> {
-    s.split([' ', ',', ';', '(', ')'])
-        .filter(|t| !t.is_empty())
-        .collect()
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        if matches!(c, ' ' | ',' | ';' | '(' | ')' | '{' | '}') {
+            if start < i {
+                out.push(&s[start..i]);
+            }
+            if matches!(c, '{' | '}') {
+                out.push(&s[i..i + 1]);
+            }
+            start = i + 1;
+        }
+    }
+    if start < s.len() {
+        out.push(&s[start..]);
+    }
+    out
 }
 
 /// Whether `got` matches the normalized reference `want`, where `poison` matches anything and

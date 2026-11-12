@@ -41,10 +41,19 @@
 //! building blocks: aggregate, union, and slice values, checked arithmetic, `cf.check`) compile
 //! as `fir compile` compiles them: lowered to MFIR first (`fir::backend::prepare`). Their
 //! reference is `fir run` of the HFIR program, with returned aggregates, unions, and slices
-//! shown as the scalars the lowering returns (`run_detail` with `lower_rets`, as the lowering's
-//! own tests compare them), so the native output, which prints the lowered function's results,
-//! is compared with the HFIR semantics directly. Where the default `-O` pipeline changes the
-//! MFIR, the optimized program is built and run natively too.
+//! shown as the lowering returns them (`run_detail` with `lower_rets`, as the lowering's own
+//! tests compare them: as their scalars, except one struct or array result, which calls pass
+//! whole), so the native output, which prints the lowered function's results, is compared with
+//! the HFIR semantics directly. Where the default `-O` pipeline changes the MFIR, the optimized
+//! program is built and run natively too.
+//!
+//! Structs and arrays cross the C boundary by value (decision: C ABI for aggregates): the
+//! generated `main` declares a C struct with each composite's layout and AAPCS64 class (a
+//! `struct<packed>` packed, a `struct<auto>` with its fields in layout order, an array as a
+//! struct holding a C array), receives a composite result as one, and prints it as `fir run`
+//! renders it; external functions' stubs take and print composite arguments, variadic ones
+//! included, and return zeroed ones. `tests/abi.rs` checks the ABI against the C compiler with
+//! random signatures.
 //!
 //! The comparison also runs each program's LFIR in the interpreter, before and after register
 //! allocation, and expects what the source run gives (with the same normalization): this checks
@@ -187,6 +196,104 @@ fn toolchain(dir: &Path) -> Result<Toolchain, String> {
     })
 }
 
+/// The C types of a module's composites (decision: C ABI for aggregates): a struct with the
+/// FIR type's layout and AAPCS64 class for each, named by its text. A `struct<C>`'s fields are
+/// its parts in order, a `struct<packed>` is packed, a `struct<auto>`'s fields are in its layout's
+/// order, and an array is a struct holding a C array; integers and bytes of 8 to 64 bits are
+/// `uintN_t` (others `unsigned _BitInt(N)`, which C lays out as FIR does), pointers `void *`.
+#[derive(Default)]
+struct CTypes {
+    defs: String,
+    names: Vec<String>,
+}
+
+impl CTypes {
+    /// The C type of a value of type `t` of table `types` (scalars as they travel).
+    fn ty(&mut self, types: &fir::Types, sp: &fir::SpaceCfg, t: Ty) -> String {
+        if !types.is_composite(t) {
+            return c_ty(t).to_owned();
+        }
+        let key = types.show(t);
+        if let Some(i) = self.names.iter().position(|n| *n == key) {
+            return format!("struct c{i}");
+        }
+        let fields: Vec<(String, String)> = match types.shape_of(t) {
+            Some(fir::Shape::Struct(p, fs)) => {
+                let fs = fs.to_vec();
+                let mut order: Vec<usize> = (0..fs.len()).collect();
+                if p == fir::Policy::Auto {
+                    order.sort_by_key(|&i| std::cmp::Reverse(types.align(sp, fs[i])));
+                }
+                order
+                    .into_iter()
+                    .map(|i| (self.field_ty(types, sp, fs[i]), format!("f{i}")))
+                    .collect()
+            }
+            Some(fir::Shape::Array(n, e)) => {
+                vec![(self.field_ty(types, sp, e), format!("e[{n}]"))]
+            }
+            _ => Vec::new(),
+        };
+        let packed = matches!(
+            types.shape_of(t),
+            Some(fir::Shape::Struct(fir::Policy::Packed, _))
+        );
+        let i = self.names.len();
+        self.names.push(key);
+        let body: String = fields
+            .iter()
+            .map(|(ty, name)| format!(" {ty} {name};"))
+            .collect();
+        let attr = if packed {
+            " __attribute__((packed))"
+        } else {
+            ""
+        };
+        writeln!(self.defs, "struct{attr} c{i} {{{body} }};").unwrap();
+        format!("struct c{i}")
+    }
+
+    /// The C type of a part of a composite.
+    fn field_ty(&mut self, types: &fir::Types, sp: &fir::SpaceCfg, t: Ty) -> String {
+        match t {
+            Ty::Int(w) | Ty::Byte(w) if [8, 16, 32, 64].contains(&w) => format!("uint{w}_t"),
+            Ty::Int(w) | Ty::Byte(w) => format!("unsigned _BitInt({w})"),
+            Ty::Ptr => "void *".to_owned(),
+            _ => self.ty(types, sp, t),
+        }
+    }
+
+    /// Code printing the C expression `e` of FIR type `t` as `fir run` renders the value.
+    fn print(&mut self, types: &fir::Types, t: Ty, e: &str) -> String {
+        let parts: Vec<(Ty, String)> = match types.shape_of(t) {
+            Some(fir::Shape::Struct(_, fs)) => fs
+                .iter()
+                .enumerate()
+                .map(|(i, &f)| (f, format!("{e}.f{i}")))
+                .collect(),
+            Some(fir::Shape::Array(n, el)) => (0..n).map(|j| (el, format!("{e}.e[{j}]"))).collect(),
+            _ => {
+                let e = match t {
+                    Ty::Ptr => format!("(uint64_t)(uintptr_t)({e})"),
+                    Ty::Float(_) => e.to_owned(),
+                    _ => format!("(uint64_t)({e})"),
+                };
+                return c_print(t, &e);
+            }
+        };
+        let mut out = String::from("printf(\"{\"); ");
+        for (k, (pt, pe)) in parts.into_iter().enumerate() {
+            if k > 0 {
+                out.push_str("printf(\", \"); ");
+            }
+            out.push_str(&self.print(types, pt, &pe));
+            out.push(' ');
+        }
+        out.push_str("printf(\"}\");");
+        out
+    }
+}
+
 /// A value type's kind and width for `fir_print`.
 fn kind(t: Ty) -> (char, u32) {
     match t {
@@ -305,9 +412,11 @@ fn typed_arg(s: &str) -> (Ty, &str) {
 /// The argument types of each call of each variadic external function, by name: the call
 /// sites' operand types (a call through a variadic signature may reach any variadic external
 /// function of that signature whose address is taken).
-fn vararg_sites(m: &Module) -> std::collections::BTreeMap<String, Vec<Vec<Ty>>> {
+fn vararg_sites(m: &Module) -> (fir::Types, std::collections::BTreeMap<String, Vec<Vec<Ty>>>) {
     use fir::OpKind as K;
     let mut out: std::collections::BTreeMap<String, Vec<Vec<Ty>>> = Default::default();
+    // The sites' types, composites in one table.
+    let mut st = fir::Types::new();
     let mut taken = Vec::new();
     for g in 0..m.globals.len() {
         m.globals.syms(m.globals.init(g), &mut taken);
@@ -330,13 +439,14 @@ fn vararg_sites(m: &Module) -> std::collections::BTreeMap<String, Vec<Vec<Ty>>> 
         let mut stack = vec![b.entry()];
         while let Some(r) = stack.pop() {
             for op in b.ops(r) {
-                let tys = |skip: usize| -> Vec<Ty> {
+                let mut tys = |skip: usize| -> Vec<Ty> {
                     b.operands(op)[skip..]
                         .iter()
                         .map(|o| match o.get() {
                             fir::OperandKind::Value(v) => b.ty(v),
                             fir::OperandKind::Hole(h) => b.hole_ty(h),
                         })
+                        .map(|t| st.import(b.types(), t))
                         .collect()
                 };
                 let mut add = |name: &str, site: Vec<Ty>| {
@@ -349,18 +459,27 @@ fn vararg_sites(m: &Module) -> std::collections::BTreeMap<String, Vec<Vec<Ty>>> 
                     K::Call { callee } | K::Invoke { callee, .. } => {
                         let name = b.str(callee);
                         if m.externs.iter().any(|x| x.name == name && x.variadic) {
-                            add(name, tys(0));
+                            let site = tys(0);
+                            add(name, site);
                         }
                     }
                     K::CallIndirect(sig) | K::InvokeIndirect { sig, .. } => {
                         if let Some(fir::Shape::Func(ps, rs, true)) = b.types().shape_of(sig) {
+                            // The signature's types are this function's, the external
+                            // function's the module's: compared by structure.
+                            let gt = &m.globals.types;
+                            let same = |xs: &[Ty], ys: &[Ty]| {
+                                xs.len() == ys.len()
+                                    && xs.iter().zip(ys).all(|(&x, &y)| gt.same(x, b.types(), y))
+                            };
                             for x in m.externs.iter().filter(|x| {
                                 x.variadic
                                     && taken.contains(&x.name)
-                                    && x.params.as_slice() == ps
-                                    && x.rets.as_slice() == rs
+                                    && same(&x.params, ps)
+                                    && same(&x.rets, rs)
                             }) {
-                                add(&x.name, tys(1));
+                                let site = tys(1);
+                                add(&x.name, site);
                             }
                         }
                     }
@@ -370,7 +489,7 @@ fn vararg_sites(m: &Module) -> std::collections::BTreeMap<String, Vec<Vec<Ty>>> 
             }
         }
     }
-    out
+    (st, out)
 }
 
 /// The C side of a program: stubs for the external functions, and a `main` that performs run
@@ -389,25 +508,34 @@ fn harness(m: &Module, runs: &[(String, Vec<String>)], darwin: bool) -> String {
     );
     let mut defs = String::new();
     let mut body = String::new();
-    let params = |ps: &[Ty]| -> String {
+    let mut ct = CTypes::default();
+    let sp = &m.space;
+    let params = |ct: &mut CTypes, types: &fir::Types, ps: &[Ty]| -> String {
         if ps.is_empty() {
             "void".to_owned()
         } else {
             ps.iter()
                 .enumerate()
-                .map(|(k, &t)| format!("{} a{k}", c_ty(t)))
+                .map(|(k, &t)| format!("{} a{k}", ct.ty(types, sp, t)))
                 .collect::<Vec<_>>()
                 .join(", ")
         }
     };
-    let sites = vararg_sites(m);
+    // One composite result travels as the C struct; scalars by the backend's convention.
+    let ret_ty = |ct: &mut CTypes, types: &fir::Types, rets: &[Ty], defs: &mut String| match rets {
+        [t] if types.is_composite(*t) => ct.ty(types, sp, *t),
+        _ => c_ret(rets, defs),
+    };
+    let (stypes, sites) = vararg_sites(m);
+    let gtypes = &m.globals.types;
     for (i, x) in m.externs.iter().enumerate() {
-        let site = match sites.get(&x.name).map(Vec::as_slice) {
-            Some([site]) if x.variadic => site.clone(),
-            _ => x.params.clone(),
+        // A variadic stub takes its calls' one argument list, of the sites' table.
+        let (site, ptypes) = match sites.get(&x.name).map(Vec::as_slice) {
+            Some([site]) if x.variadic => (site.clone(), &stypes),
+            _ => (x.params.clone(), gtypes),
         };
-        let ps = params(&site);
-        let ret = c_ret(&x.rets, &mut defs);
+        let ps = params(&mut ct, ptypes, &site);
+        let ret = ret_ty(&mut ct, gtypes, &x.rets, &mut defs);
         writeln!(
             body,
             "{ret} ext{i}({ps}) __asm__(\"{us}fir_ext_{}\");",
@@ -420,28 +548,38 @@ fn harness(m: &Module, runs: &[(String, Vec<String>)], darwin: bool) -> String {
             if k > 0 {
                 body.push_str("  printf(\", \");\n");
             }
-            writeln!(body, "  {}", c_print(t, &format!("a{k}"))).unwrap();
+            writeln!(body, "  {}", ct.print(gtypes, t, &format!("a{k}"))).unwrap();
         }
         for (k, &t) in site.iter().enumerate().skip(x.params.len()) {
             if k > 0 {
                 body.push_str("  printf(\", \");\n");
             }
-            writeln!(body, "  {}", c_print(t, &format!("a{k}"))).unwrap();
+            writeln!(body, "  {}", ct.print(ptypes, t, &format!("a{k}"))).unwrap();
         }
         body.push_str("  printf(\") -> \");\n");
         if x.rets.is_empty() {
             body.push_str("  printf(\"()\");\n");
         }
-        for (k, &t) in x.rets.iter().enumerate() {
-            if k > 0 {
-                body.push_str("  printf(\", \");\n");
+        let whole = matches!(x.rets[..], [t] if gtypes.is_composite(t));
+        if whole {
+            writeln!(
+                body,
+                "  {{ {ret} z; memset(&z, 0, sizeof z); {} }}",
+                ct.print(gtypes, x.rets[0], "z")
+            )
+            .unwrap();
+        } else {
+            for (k, &t) in x.rets.iter().enumerate() {
+                if k > 0 {
+                    body.push_str("  printf(\", \");\n");
+                }
+                writeln!(body, "  {}", c_print(t, "0")).unwrap();
             }
-            writeln!(body, "  {}", c_print(t, "0")).unwrap();
         }
         body.push_str("  printf(\"; \");\n");
         match x.rets.len() {
             0 => {}
-            1 => body.push_str("  return 0;\n"),
+            1 if !whole => body.push_str("  return 0;\n"),
             _ => writeln!(body, "  {ret} r; memset(&r, 0, sizeof r); return r;").unwrap(),
         }
         body.push_str("}\n");
@@ -449,8 +587,8 @@ fn harness(m: &Module, runs: &[(String, Vec<String>)], darwin: bool) -> String {
     for (i, f) in m.funcs.iter().enumerate() {
         let b = &f.body;
         let ps: Vec<Ty> = b.params(b.entry()).map(|v| b.ty(v)).collect();
-        let ret = c_ret(&f.rets, &mut defs);
-        let mut ps = params(&ps);
+        let ret = ret_ty(&mut ct, b.types(), &f.rets, &mut defs);
+        let mut ps = params(&mut ct, b.types(), &ps);
         if f.variadic {
             ps = if ps == "void" {
                 "...".to_owned()
@@ -472,7 +610,7 @@ fn harness(m: &Module, runs: &[(String, Vec<String>)], darwin: bool) -> String {
             cargs.push(c_arg(t, v));
             tys.push(t);
         }
-        let ret = c_ret(&f.rets, &mut defs);
+        let ret = ret_ty(&mut ct, b.types(), &f.rets, &mut defs);
         let call = if f.variadic {
             let ps: Vec<&str> = tys.iter().map(|&t| c_ty(t)).collect();
             let ps = if ps.is_empty() {
@@ -493,7 +631,7 @@ fn harness(m: &Module, runs: &[(String, Vec<String>)], darwin: bool) -> String {
                 writeln!(
                     body,
                     "    {ret} r = {call};\n    {threw}{{\n      printf(\"returned \");\n      {}\n    }}",
-                    c_print(f.rets[0], "r")
+                    ct.print(b.types(), f.rets[0], "r")
                 )
                 .unwrap();
             }
@@ -516,6 +654,7 @@ fn harness(m: &Module, runs: &[(String, Vec<String>)], darwin: bool) -> String {
     }
     body.push_str("  }\n  return 0;\n}\n");
     c.push_str("#include <string.h>\n");
+    c.push_str(&ct.defs);
     c.push_str(&defs);
     c.push_str(&body);
     c
@@ -531,7 +670,7 @@ fn render_floats(line: &str) -> String {
             out.push(' ');
         }
         // The type is its own word, or follows `(` in an event's arguments.
-        let ty = prev.rsplit('(').next().unwrap_or(prev);
+        let ty = prev.rsplit(['(', '{']).next().unwrap_or(prev);
         let f = match ty {
             "f32" => Some(fir::FloatTy::F32),
             "f64" => Some(fir::FloatTy::F64),
@@ -678,6 +817,10 @@ fn normalize(reference: &str) -> Result<(String, bool), String> {
         }
         // `#3`, `#3+8`, `(#3[0],` (a fragment), `0x1000` after `ptr`: an allocation's pointer.
         // A fragment of null is a zero byte.
+        // An aggregate's opening braces stay as they are.
+        let braces = tok.len() - tok.trim_start_matches('{').len();
+        out.push_str(&tok[..braces]);
+        let tok = &tok[braces..];
         let open = tok.strip_prefix('(');
         let body = open.unwrap_or(tok);
         let frag = body.contains('[');
@@ -690,7 +833,10 @@ fn normalize(reference: &str) -> Result<(String, bool), String> {
             } else {
                 "?"
             });
-            out.extend(body.chars().skip_while(|c| !matches!(c, ',' | ';' | ')')));
+            out.extend(
+                body.chars()
+                    .skip_while(|c| !matches!(c, ',' | ';' | ')' | '}')),
+            );
         } else {
             out.push_str(tok);
         }
@@ -856,6 +1002,63 @@ fn blocks_used(m: &Module) -> Vec<&'static str> {
     out
 }
 
+/// How the compiled module passes composites (decision: C ABI for aggregates), for the
+/// statistics: to and from external functions, and as variadic arguments.
+fn composites_used(m: &Module) -> Vec<&'static str> {
+    use fir::OpKind as K;
+    let mut out = Vec::new();
+    let gt = &m.globals.types;
+    if m.externs
+        .iter()
+        .any(|x| x.params.iter().chain(&x.rets).any(|&t| gt.is_composite(t)))
+    {
+        out.push("structs or arrays to or from external functions");
+    }
+    for f in &m.funcs {
+        let b = &f.body;
+        let mut stack = vec![b.entry()];
+        while let Some(r) = stack.pop() {
+            for op in b.ops(r) {
+                stack.extend_from_slice(b.regions(op));
+                let n = match b.kind(op) {
+                    K::Call { callee } | K::Invoke { callee, .. } => {
+                        let name = b.str(callee);
+                        match m.funcs.iter().find(|g| g.name == name) {
+                            Some(g) if g.variadic => g.body.params(g.body.entry()).len(),
+                            Some(_) => continue,
+                            None => match m.externs.iter().find(|x| x.name == name) {
+                                Some(x) if x.variadic => x.params.len(),
+                                _ => continue,
+                            },
+                        }
+                    }
+                    K::CallIndirect(sig) | K::InvokeIndirect { sig, .. } => {
+                        match b.types().shape_of(sig) {
+                            Some(fir::Shape::Func(ps, _, true)) => ps.len() + 1,
+                            _ => continue,
+                        }
+                    }
+                    K::VaArg => {
+                        if b.results(op).any(|v| b.types().is_composite(b.ty(v))) {
+                            out.push("va.arg of structs or arrays");
+                        }
+                        continue;
+                    }
+                    _ => continue,
+                };
+                if b.operands(op)[n.min(b.operands(op).len())..].iter().any(|o| {
+                    matches!(o.get(), fir::OperandKind::Value(v) if b.types().is_composite(b.ty(v)))
+                }) {
+                    out.push("structs or arrays as variadic arguments");
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// Check one module's runs: `(function, args, fuel)`. An HFIR module is lowered first, as
 /// `fir compile` does. `out` takes the statistics and the evidence (native, LFIR).
 fn check_module(
@@ -892,6 +1095,16 @@ fn check_module(
     let text = src.render(false);
     let floats = text.contains("float.") || text.contains(": f32") || text.contains(": f64");
     let varargs = text.contains("...");
+    // Composites in the compiled module's signatures (calls pass them by value).
+    let by_value_uses = composites_used(m);
+    let by_value = !by_value_uses.is_empty()
+        || m.funcs.iter().any(|f| {
+            let b = &f.body;
+            b.params(b.entry())
+                .map(|v| b.ty(v))
+                .chain(f.rets.iter().copied())
+                .any(|t| b.types().is_composite(t))
+        });
     {
         let mut t = tally.lock().unwrap();
         if lowered {
@@ -905,6 +1118,9 @@ fn check_module(
         }
         for b in &blocks {
             t.count(format!("(modules using {b})"));
+        }
+        for c in &by_value_uses {
+            t.count(format!("(modules passing {c})"));
         }
     }
     let mut comparable = Vec::new();
@@ -1069,7 +1285,7 @@ fn check_module(
     }
     let Some(tc) = tc else { return ok };
     // A variadic external function's stub takes one argument list (see `harness`).
-    if vararg_sites(m).values().any(|sites| sites.len() > 1) {
+    if vararg_sites(m).1.values().any(|sites| sites.len() > 1) {
         tally
             .lock()
             .unwrap()
@@ -1126,6 +1342,9 @@ fn check_module(
                 }
                 if varargs {
                     t.count(format!("{what} matches (varargs)"));
+                }
+                if by_value {
+                    t.count(format!("{what} matches (structs by value)"));
                 }
                 if want.contains("nan") {
                     t.count(format!("{what} matches (NaN results)"));
