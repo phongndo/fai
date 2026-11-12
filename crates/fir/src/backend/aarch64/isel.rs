@@ -1166,6 +1166,18 @@ impl Sel<'_, '_> {
         self.zx(g, (8 * size) as u32)
     }
 
+    /// The registers a composite passed in registers travels in: an HFA's members in memory
+    /// order, or else its words (`pack`).
+    fn pieces(&mut self, t: Ty, leaves: &[Reg]) -> Vec<Reg> {
+        match abi::pass_kind(self.body.types(), self.sp, t) {
+            abi::PassKind::Hfa(..) => abi::hfa_order(self.body.types(), self.sp, t)
+                .into_iter()
+                .map(|j| leaves[j])
+                .collect(),
+            _ => self.pack(t, leaves),
+        }
+    }
+
     /// The `x` registers a composite of up to 16 bytes travels in: its leaves' bytes, 8 per
     /// register, as `ldr` would load them (padding as zeros). A pointer that fills a word is
     /// that word, so it keeps its provenance.
@@ -1235,7 +1247,13 @@ impl Sel<'_, '_> {
     /// members as they are, or each leaf's bytes taken out of its words.
     fn unpack(&mut self, t: Ty, regs: &[Reg]) -> Result<Vec<Reg>> {
         if let abi::PassKind::Hfa(..) = abi::pass_kind(self.body.types(), self.sp, t) {
-            return Ok(regs.to_vec());
+            // Member `i` is the leaf at the `i`th offset, not the `i`th declared.
+            let order = abi::hfa_order(self.body.types(), self.sp, t);
+            let mut out = regs.to_vec();
+            for (i, &j) in order.iter().enumerate() {
+                out[j] = regs[i];
+            }
+            return Ok(out);
         }
         let mut out = Vec::new();
         for (o, l) in self.leaves_of(t) {
@@ -2162,10 +2180,7 @@ impl Sel<'_, '_> {
                     None => {
                         let dsts =
                             abi::res_regs(body.types(), self.sp, self.rets).unwrap_or_default();
-                        let srcs = match abi::pass_kind(body.types(), self.sp, t) {
-                            abi::PassKind::Hfa(..) => leaves,
-                            _ => self.pack(t, &leaves),
-                        };
+                        let srcs = self.pieces(t, &leaves);
                         self.moves(&dsts, &srcs);
                     }
                     Some(area) => self.store_leaves(t, &leaves, area, 0),
@@ -2522,10 +2537,7 @@ impl Sel<'_, '_> {
                     srcs.push(a[0]);
                 }
                 ArgLoc::Regs(..) => {
-                    let pieces = match abi::pass_kind(types, self.sp, t) {
-                        abi::PassKind::Hfa(..) => a.clone(),
-                        _ => self.pack(t, a),
-                    };
+                    let pieces = self.pieces(t, a);
                     dsts.extend(l.regs());
                     srcs.extend(pieces);
                 }
@@ -2771,11 +2783,13 @@ impl Sel<'_, '_> {
         self.ldr(MemSize::X, top, ap, top_at);
         let at = self.alu_new(AluOp::Add, top, offs);
         let got = if fp {
-            // One member per 16-byte slot.
+            // One member per 16-byte slot, in memory order: the leaf at offset `o` is member
+            // `o / size`.
             let mut got = Vec::new();
-            for (i, (_, l)) in self.leaves_of(t).into_iter().enumerate() {
+            for (o, l) in self.leaves_of(t) {
                 let r = self.fresh_fp();
                 let size = self.type_size(l);
+                let i = o / size;
                 self.ldr(MemSize::of_bytes(size).unwrap(), r, at, 16 * i as i64);
                 got.push(r);
             }

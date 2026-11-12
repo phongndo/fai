@@ -15,8 +15,9 @@ which register or stack slot.
 float, in a `d` or `s` register). A composite (`Ty.isComposite`: a struct or an array) is
 * nothing if its size is 0 (GCC and Clang ignore empty structs in C);
 * a *homogeneous floating-point aggregate* (HFA, `hfaOf?`) if its leaves are one to four floats
-  of one format at consecutive offsets with no padding, and it has no zero-length array (GCC's
-  rule; empty structs don't count): its members travel in consecutive FP registers, one each;
+  of one format that tile it in memory (in any declared order: memory order is what counts), and
+  it has no zero-length array (GCC's rule; empty structs don't count): its members travel in
+  consecutive FP registers, one each, in memory order;
 * otherwise, up to 16 bytes: its bytes travel in one or two `x` registers, 8 per register, as
   `ldr`s from a double-word-aligned copy would load them (`words`), the first register even if
   the composite is 16-byte aligned (C.10);
@@ -81,14 +82,16 @@ mutual
     | t :: ts => t.hasEmptyArray || Ty.hasEmptyArrayList ts
 end
 
-/-- The format and member count of an HFA: one to four leaves, floats of one format, each right
-after the last, filling the type, which has no zero-length array. -/
+/-- The format and member count of an HFA: one to four leaves, floats of one format, that tile
+the type in memory (one at each multiple of their size), which has no zero-length array. Memory
+order, not the fields' declared order: AAPCS64 classifies the laid-out type, and a
+`struct<auto>` or a nested packed struct can put a later field first. -/
 def hfaOf? (sp : SpaceCfg) (t : Ty) : Option (FloatTy × Nat) :=
   match t.leaves sp with
   | ls@((_, .float f) :: _) =>
     let n := ls.length
     if n ≤ 4 && !t.hasEmptyArray && t.size sp == n * f.bytes &&
-        ls.zipIdx.all (fun ((o, l), i) => l == .float f && o == i * f.bytes) then
+        ls.all (·.2 == .float f) && (List.range n).all (fun i => ls.any (·.1 == i * f.bytes)) then
       some (f, n)
     else none
   | _ => none
@@ -193,6 +196,11 @@ private def sp0 : SpaceCfg := {}
 -- A zero-length array keeps a struct of floats from being an HFA; an empty struct doesn't.
 #guard passKind sp0 (.struct .c [.array 0 (.float .f32), .float .f32]) == .words 1 false
 #guard passKind sp0 (.struct .c [.float .f32, .struct .c [], .float .f32]) == .hfa .f32 2
+-- Memory order: `auto` puts the `f32` (align 4) before the packed struct (align 1), so the
+-- leaves in declared order are at offsets 4 and 0. It is an HFA, as C's `{float; P}` is.
+#guard (Ty.struct .auto [.struct .packed [.float .f32], .float .f32]).leaves sp0 ==
+  [(4, .float .f32), (0, .float .f32)]
+#guard passKind sp0 (.struct .auto [.struct .packed [.float .f32], .float .f32]) == .hfa .f32 2
 #guard argLocs sp0 [.int 32, .float .f64, .ptr] == [.reg (.x 0), .reg (.d 0), .reg (.x 1)]
 #guard (argLocs sp0 ((List.replicate 9 (.float .f32)) ++ [.int 8])).getLast? == some (.reg (.x 0))
 #guard argStack sp0 ((List.replicate 9 (.float .f32)) ++ (List.replicate 10 (.int 8))) == 24
@@ -267,7 +275,7 @@ theorem pieces_flatten {sp : SpaceCfg} {t : Ty} {bs : List Byte} (hl : bs.length
       · rename_i hc
         cases heq
         simp only [Bool.and_eq_true, beq_iff_eq] at hc
-        rw [hc.1.2, Nat.mul_comm]
+        rw [hc.1.1.2, Nat.mul_comm]
         exact Nat.le_refl _
       · cases heq
     · cases heq

@@ -80,7 +80,10 @@ fn has_empty_array(types: &Types, t: Ty) -> bool {
     }
 }
 
-/// The format and member count of an HFA (Lean's `hfaOf?`).
+/// The format and member count of an HFA (Lean's `hfaOf?`): one to four leaves, floats of one
+/// format, that tile the type in memory, whatever order its fields are declared in (a
+/// `struct<auto>` or a nested packed struct can put a later field first; AAPCS64 classifies the
+/// laid-out type).
 pub fn hfa_of(types: &Types, sp: &SpaceCfg, t: Ty) -> Option<(FloatTy, u32)> {
     if has_empty_array(types, t) {
         return None;
@@ -94,11 +97,20 @@ pub fn hfa_of(types: &Types, sp: &SpaceCfg, t: Ty) -> Option<(FloatTy, u32)> {
     let b = u128::from(f.width() / 8);
     let ok = n <= 4
         && types.size(sp, t) == n * b
-        && leaves
-            .iter()
-            .enumerate()
-            .all(|(i, &(o, l))| l == Ty::Float(f) && o == i as u128 * b);
+        && leaves.iter().all(|&(_, l)| l == Ty::Float(f))
+        && (0..n).all(|i| leaves.iter().any(|&(o, _)| o == i * b));
     ok.then_some((f, n as u32))
+}
+
+/// Which leaf of an HFA each of its registers holds: member `i`, the one at offset `i` times
+/// the member size, is leaf `hfa_order(..)[i]` in declared order (memory order, which can differ
+/// from it).
+pub fn hfa_order(types: &Types, sp: &SpaceCfg, t: Ty) -> Vec<usize> {
+    let mut leaves = Vec::new();
+    types.leaves(sp, t, 0, &mut leaves);
+    let mut order: Vec<usize> = (0..leaves.len()).collect();
+    order.sort_by_key(|&j| leaves[j].0);
+    order
 }
 
 /// How AAPCS64 passes a value of type `t` (Lean's `passKind`).
@@ -327,6 +339,10 @@ mod tests {
         let packed = types.structure(Policy::Packed, &[f32_, f32_]);
         let empty = types.structure(Policy::C, &[]);
         let pair = types.structure(Policy::C, &[Ty::Int(64), Ty::Int(64)]);
+        // Memory order: `auto` puts the `f32` before the packed struct, so the leaves in
+        // declared order are at 4 and 0; still an HFA, its members in memory order.
+        let p1 = types.structure(Policy::Packed, &[f32_]);
+        let reordered = types.structure(Policy::Auto, &[p1, f32_]);
         let k = |t| pass_kind(&types, &sp, t);
         assert_eq!(k(s2), PassKind::Words(1, false));
         assert_eq!(k(hfa3), PassKind::Hfa(FloatTy::F32, 3));
@@ -335,6 +351,8 @@ mod tests {
         assert_eq!(k(big), PassKind::Ref);
         assert_eq!(k(al16), PassKind::Words(2, true));
         assert_eq!(k(empty), PassKind::Nothing);
+        assert_eq!(k(reordered), PassKind::Hfa(FloatTy::F32, 2));
+        assert_eq!(hfa_order(&types, &sp, reordered), [1, 0]);
         let locs = |ps: &[Ty]| arg_locs(&types, &sp, ps).0;
         let mut ps = vec![Ty::Ptr; 7];
         ps.extend([pair, Ty::Int(8)]);
