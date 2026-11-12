@@ -4,12 +4,21 @@
 //! fir run FILE [@FUNC] [ARG...] [--fuel N]   run a function (default @main)
 //! fir check FILE                             verify; list holes
 //! fir fmt FILE [--no-locs] [--unverified]     print canonical text (--unverified: parse only)
+//! fir opt FILE [-O | --passes P,...] [--remarks] [--stats] [--verify-each] [--no-locs]
+//!                                            optimize, print canonical text
 //! ```
 //!
 //! `check` prints what `fir-ref check` prints: `ok`, or one `hole ?NAME: TYPE @LOC` line per
 //! hole; on failure, `FILE: MESSAGE` on stderr and exit code 1. `run` prints the one-line
 //! outcome `fir-ref run` prints, for the same oracle (every choice answers `0`); arguments are
 //! integers, `null`, or `poison`, parsed as Lean parses them.
+//!
+//! `opt` runs a pipeline of passes (`fir::passes`): the default `-O` one to a fixed point, or the
+//! passes named by `--passes`, once each, in order. It prints the optimized module; `--remarks`
+//! prints what each pass changed on stderr (`dse: deleted store @3:5 (overwritten by @4:5)`),
+//! and `--stats` how often each pass fired and how long it took. Debug builds, or
+//! `--verify-each`, verify after every pass and name the pass that broke the module; the output
+//! is always verified.
 
 use std::process::ExitCode;
 
@@ -72,13 +81,58 @@ fn run(args: &[&str]) -> Result<(), ExitCode> {
             print!("{}", m.render(!opts.contains(&"--no-locs")));
             Ok(())
         }
+        ["opt", file, opts @ ..] => opt(file, opts),
         _ => {
             eprintln!(
-                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]"
+                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--remarks] [--stats] [--verify-each] [--no-locs]"
             );
             Err(ExitCode::from(2))
         }
     }
+}
+
+fn opt(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
+    use fir::passes::{Pipeline, Remarks};
+    let fail = |e: String| {
+        eprintln!("{file}: {e}");
+        ExitCode::FAILURE
+    };
+    let mut pipeline = Pipeline::default_opt();
+    let (mut remarks, mut stats, mut locs) = (false, false, true);
+    let mut it = opts.iter();
+    while let Some(&o) = it.next() {
+        match o {
+            "-O" => pipeline = Pipeline::default_opt(),
+            "--passes" => {
+                let spec = it
+                    .next()
+                    .ok_or_else(|| fail("--passes needs a list".into()))?;
+                pipeline = Pipeline::parse(spec).map_err(fail)?;
+            }
+            "--remarks" => remarks = true,
+            "--stats" => stats = true,
+            "--verify-each" => {}
+            "--no-locs" => locs = false,
+            _ => return Err(fail(format!("unknown option {o}"))),
+        }
+    }
+    pipeline.verify_each = cfg!(debug_assertions) || opts.contains(&"--verify-each");
+    let mut m = fir::parse_module(&read(file)?).map_err(fail)?;
+    fir::verify_module(&m).map_err(fail)?;
+    let mut log = Remarks::new(remarks);
+    let report = pipeline
+        .run(&mut m, &mut log)
+        .map_err(|e| fail(e.to_string()))?;
+    fir::verify_module(&m)
+        .map_err(|e| fail(format!("the optimized module doesn't verify: {e}")))?;
+    for r in log.list() {
+        eprintln!("{r}");
+    }
+    if stats {
+        eprint!("{report}");
+    }
+    print!("{}", m.render(locs));
+    Ok(())
 }
 
 fn main() -> ExitCode {

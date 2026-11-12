@@ -6,7 +6,8 @@
 //! (`fir-ref fmt`), [`verify_module`] accepts and rejects what `fir-ref check` does, with the
 //! same messages, and [`interp::run`] runs a function and prints the same outcome as `fir-ref
 //! run`. The tests check all of them on every file under `tests/`, and the interpreter also on
-//! random programs.
+//! random programs. [`passes`] holds the pass manager and, as passes, the rewrites proved in
+//! Lean; the tests check that optimized programs refine the originals in the interpreter.
 //!
 //! Each op is declared once, in `spec/Fir/Syntax.lean`; [`OpKind`] and the tables the parser,
 //! printer, and verifier read ([`OpDecl`]) are generated from the declarations into
@@ -59,6 +60,7 @@ mod lex;
 #[rustfmt::skip]
 mod ops;
 mod parse;
+pub mod passes;
 mod print;
 mod sem;
 mod types;
