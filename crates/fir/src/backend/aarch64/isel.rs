@@ -385,6 +385,22 @@ fn check_ty(types: &Types, loc: Option<Loc>, t: Ty) -> Result<()> {
     }
 }
 
+/// Check a type a call passes whole (a parameter, argument, result, or `va.arg` result): as
+/// [`check_ty`], and a composite the convention passes as `x` register words may not have a
+/// pointer that doesn't fill one (`abi::splits_ptr`; decision: C ABI for aggregates), since
+/// registers could carry it only as address bits, dropping its provenance.
+fn check_pass(types: &Types, sp: &SpaceCfg, loc: Option<Loc>, t: Ty) -> Result<()> {
+    check_ty(types, loc, t)?;
+    if abi::splits_ptr(types, sp, t) {
+        return Err(format!(
+            "{}{} has a pointer at an offset that isn't a multiple of 8, which can't be passed by value in registers on AArch64",
+            at(loc),
+            types.show(t)
+        ));
+    }
+    Ok(())
+}
+
 fn at(loc: Option<Loc>) -> String {
     match loc {
         Some(l) => format!("@{}:{}: ", l.line, l.col),
@@ -1415,7 +1431,7 @@ impl Sel<'_, '_> {
         // apart, so nothing is read from an argument register after other code.
         let mut later = Vec::new();
         for ((&p, &t), &l) in params.iter().zip(&ps).zip(&locs) {
-            check_ty(body.types(), None, t)?;
+            check_pass(body.types(), self.sp, None, t)?;
             match l {
                 ArgLoc::Reg(a) => {
                     let r = self.val(p);
@@ -1454,6 +1470,9 @@ impl Sel<'_, '_> {
                 _ => Vec::new(),
             };
             self.agg.insert(p.index() as u32, leaves);
+        }
+        for &t in self.rets {
+            check_pass(body.types(), self.sp, None, t)?;
         }
         if abi::res_regs(body.types(), self.sp, self.rets).is_none() {
             let r = self.fresh();
@@ -2175,6 +2194,7 @@ impl Sel<'_, '_> {
             }
             OpKind::Ret if self.rets.len() == 1 && self.is_composite(self.rets[0]) => {
                 let t = self.rets[0];
+                check_pass(body.types(), self.sp, self.loc, t)?;
                 let leaves = self.operand_regs(op, 0)?;
                 match self.res_ptr {
                     None => {
@@ -2527,6 +2547,9 @@ impl Sel<'_, '_> {
         emit: impl FnOnce(&mut Self),
     ) -> Result<()> {
         let types = self.body.types();
+        for &t in ps.iter().chain(rets) {
+            check_pass(types, self.sp, self.loc, t)?;
+        }
         let (locs, _) = abi::arg_locs(types, self.sp, ps);
         let (mut dsts, mut srcs) = (Vec::new(), Vec::new());
         for ((a, &t), &l) in args.iter().zip(ps).zip(&locs) {
@@ -2731,6 +2754,7 @@ impl Sel<'_, '_> {
     /// as a general-purpose argument, to a copy. Once a class's offset turns positive it stays,
     /// and the arguments after go on the stack too, as the caller placed them.
     fn va_arg_composite(&mut self, ap: Reg, t: Ty) -> Result<Vec<Reg>> {
+        check_pass(self.body.types(), self.sp, self.loc, t)?;
         let kind = abi::pass_kind(self.body.types(), self.sp, t);
         let size = self.type_size(t);
         if kind == abi::PassKind::Ref {

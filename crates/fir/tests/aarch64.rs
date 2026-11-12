@@ -850,13 +850,19 @@ fn normalize(reference: &str) -> Result<(String, bool), String> {
 /// qemu-user puts the stack.
 const LAYOUTS: [u64; 3] = [0x5555_5555_5555, 0xaaaa_aaaa_aaaa, 0x7ffd_9a3c_5a40];
 
-/// Why a compile failure is a declared limitation of the backend, if it is one.
+/// Why a compile failure is a declared limitation of the backend, if it is one (decision: C ABI
+/// for aggregates refuses to pass a composite whose pointer leaf doesn't fill an `x` register's
+/// word, which could travel only as address bits).
 fn known_limit(e: &str) -> Option<&'static str> {
     [
         ("can't be compiled", "holes"),
         ("wider than 64 bits", "integers wider than 64 bits"),
         ("needs 64-bit pointers", "a data layout other than 64-bit"),
         ("cannot lower:", "an offset the lowering can't represent"),
+        (
+            "can't be passed by value in registers",
+            "a composite whose pointer doesn't fill a register word",
+        ),
     ]
     .into_iter()
     .find(|(k, _)| e.contains(k))
@@ -1977,4 +1983,62 @@ fn aggregate_values_need_lowering() {
     );
     let lowered = fir::backend::prepare(&m, false).unwrap();
     a64::compile(&lowered, &a64::Options::default()).unwrap();
+}
+
+/// Found in review: a `struct<packed>{i8, ptr}` passed by value had its pointer shifted across
+/// two `x` registers, which leaves its address bits only, so a `read(args)` callee no longer
+/// reached the allocation in the LFIR machine (and natively) as it does in the semantics: the
+/// LFIR wasn't a refinement. Passing such a composite by value is refused now, as a parameter,
+/// an argument (to FIR or C), or a result (variadic composites are `struct<C>` and arrays, whose
+/// pointers fill words); a pointer that fills a word, or a packed composite passed by reference
+/// (over 16 bytes), is passed as before.
+#[test]
+fn review_split_pointers_are_refused() {
+    let refused = |text: &str| {
+        let m = fir::parse_module(text).unwrap();
+        fir::verify_module(&m).unwrap();
+        let lowered = fir::backend::prepare(&m, false).unwrap();
+        let e = a64::compile(&lowered, &a64::Options::default()).unwrap_err();
+        assert!(
+            e.contains("can't be passed by value in registers") && known_limit(&e).is_some(),
+            "{e}"
+        );
+    };
+    refused(
+        "extern func @see(struct<packed>{i8, ptr}) -> i64 effects[read(args)] assume
+func @f() -> i64 {
+  %p: ptr = mem.stack.of i64, align 8
+  %v: i64 = int.const 42
+  mem.store i64 %v, %p, align 8
+  %one: i8 = int.const 1
+  %s: struct<packed>{i8, ptr} = agg.make %one, %p
+  %r: i64 = func.call @see(%s)
+  func.ret %r
+}
+",
+    );
+    refused(
+        "func @g(%s: struct<packed>{i8, ptr}) -> i8 {
+  %a: i8 = agg.extract %s, 0
+  func.ret %a
+}
+",
+    );
+    refused(
+        "func @h(%p: ptr) -> struct<packed>{i16, ptr} {
+  %a: i16 = int.const 1
+  %s: struct<packed>{i16, ptr} = agg.make %a, %p
+  func.ret %s
+}
+",
+    );
+    for ok in [
+        "func @g(%s: struct<packed>{i64, ptr}) -> i64 {\n  %a: i64 = agg.extract %s, 0\n  func.ret %a\n}\n",
+        "func @g(%s: struct<packed>{i8, ptr, i64, i64}) -> i8 {\n  %a: i8 = agg.extract %s, 0\n  func.ret %a\n}\n",
+    ] {
+        let m = fir::parse_module(ok).unwrap();
+        fir::verify_module(&m).unwrap();
+        let lowered = fir::backend::prepare(&m, false).unwrap();
+        a64::compile(&lowered, &a64::Options::default()).unwrap();
+    }
 }

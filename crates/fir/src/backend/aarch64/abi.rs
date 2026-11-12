@@ -113,6 +113,19 @@ pub fn hfa_order(types: &Types, sp: &SpaceCfg, t: Ty) -> Vec<usize> {
     order
 }
 
+/// Whether a composite AAPCS64 passes as words (up to 16 bytes, not an HFA) has a pointer leaf
+/// that doesn't fill one of them (Lean's `Ty.splitsPtr`): a pointer at an offset that isn't a
+/// multiple of 8, which `x` registers could carry only as shifted address bits, dropping its
+/// provenance. Such composites aren't passed by value (decision: C ABI for aggregates).
+pub fn splits_ptr(types: &Types, sp: &SpaceCfg, t: Ty) -> bool {
+    if !matches!(pass_kind(types, sp, t), PassKind::Words(..)) {
+        return false;
+    }
+    let mut leaves = Vec::new();
+    types.leaves(sp, t, 0, &mut leaves);
+    leaves.iter().any(|&(o, l)| l == Ty::Ptr && o % 8 != 0)
+}
+
 /// How AAPCS64 passes a value of type `t` (Lean's `passKind`).
 pub fn pass_kind(types: &Types, sp: &SpaceCfg, t: Ty) -> PassKind {
     if types.is_composite(t) {
@@ -343,6 +356,14 @@ mod tests {
         // declared order are at 4 and 0; still an HFA, its members in memory order.
         let p1 = types.structure(Policy::Packed, &[f32_]);
         let reordered = types.structure(Policy::Auto, &[p1, f32_]);
+        // A packed pointer straddling two words can't be passed by value; one filling a word,
+        // or one in a composite passed by reference, can.
+        let split = types.structure(Policy::Packed, &[Ty::Int(8), Ty::Ptr]);
+        let whole = types.structure(Policy::C, &[Ty::Int(8), Ty::Ptr]);
+        let by_ref = types.structure(
+            Policy::Packed,
+            &[Ty::Int(8), Ty::Ptr, Ty::Int(64), Ty::Int(64)],
+        );
         let k = |t| pass_kind(&types, &sp, t);
         assert_eq!(k(s2), PassKind::Words(1, false));
         assert_eq!(k(hfa3), PassKind::Hfa(FloatTy::F32, 3));
@@ -353,6 +374,9 @@ mod tests {
         assert_eq!(k(empty), PassKind::Nothing);
         assert_eq!(k(reordered), PassKind::Hfa(FloatTy::F32, 2));
         assert_eq!(hfa_order(&types, &sp, reordered), [1, 0]);
+        assert!(splits_ptr(&types, &sp, split));
+        assert!(!splits_ptr(&types, &sp, whole));
+        assert!(!splits_ptr(&types, &sp, by_ref));
         let locs = |ps: &[Ty]| arg_locs(&types, &sp, ps).0;
         let mut ps = vec![Ty::Ptr; 7];
         ps.extend([pair, Ty::Int(8)]);

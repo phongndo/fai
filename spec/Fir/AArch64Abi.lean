@@ -105,6 +105,13 @@ def passKind (sp : SpaceCfg) (t : Ty) : PassKind :=
       | none => if t.size sp ≤ 16 then .words ((t.size sp + 7) / 8) (t.align sp ≥ 16) else .ref
   else if t.isFloat then .fp else .gp
 
+/-- Whether a composite passed as `x` register words has a pointer leaf that doesn't fill one (at
+an offset that isn't a multiple of 8). Registers could carry it only as shifted address bits,
+which drops its provenance, so such a composite isn't passed by value (decision: C ABI for
+aggregates; instruction selection refuses it, twin `abi::splits_ptr`). -/
+def _root_.Fir.Ty.splitsPtr (sp : SpaceCfg) (t : Ty) : Bool :=
+  (passKind sp t matches .words ..) && (t.leaves sp).any fun (o, l) => l == .ptr && o % 8 != 0
+
 /-- Where an argument travels. -/
 inductive ArgLoc where
   /-- A scalar in a register. -/
@@ -201,6 +208,11 @@ private def sp0 : SpaceCfg := {}
 #guard (Ty.struct .auto [.struct .packed [.float .f32], .float .f32]).leaves sp0 ==
   [(4, .float .f32), (0, .float .f32)]
 #guard passKind sp0 (.struct .auto [.struct .packed [.float .f32], .float .f32]) == .hfa .f32 2
+-- A packed pointer that straddles two words can't be passed by value; one at a word, or in a
+-- composite passed by reference, can.
+#guard (Ty.struct .packed [.int 8, .ptr]).splitsPtr sp0
+#guard !(Ty.struct .c [.int 8, .ptr]).splitsPtr sp0
+#guard !(Ty.struct .packed [.int 8, .ptr, .int 64, .int 64]).splitsPtr sp0
 #guard argLocs sp0 [.int 32, .float .f64, .ptr] == [.reg (.x 0), .reg (.d 0), .reg (.x 1)]
 #guard (argLocs sp0 ((List.replicate 9 (.float .f32)) ++ [.int 8])).getLast? == some (.reg (.x 0))
 #guard argStack sp0 ((List.replicate 9 (.float .f32)) ++ (List.replicate 10 (.int 8))) == 24
