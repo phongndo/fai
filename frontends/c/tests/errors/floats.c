@@ -1,12 +1,23 @@
-/* Floating point comes with track F2: every use is diagnosed where it is. */
-double scale = 2.5;
+/* `long double` (AAPCS64's is IEEE binary128, which FIR doesn't have) and `_Complex` are
+ * diagnosed where they are used; `float` and `double` are fine around them. */
+long double scale = 2.5L;
+double _Complex z;
 
-int half(int x) {
-  float f = x;
-  return (int)(f / 2);
+long double third(long double x) { return x / 3; }
+
+int literal(double d) { return (int)(d + 1.0L); }
+
+int local(void) {
+  long double x = 0;
+  return 0;
 }
 
-int main(void) { return half(4); }
+double fine(float f) { return f * 2.0; }
 
-// expect: 2:8: floating-point types ('double', track F2)
-// expect: 5:9: floating-point types ('float', track F2)
+int main(void) { return (int)fine(1.5f); }
+
+// expect: 3:13: 'long double' (binary128 on AArch64)
+// expect: 4:17: '_Complex'
+// expect: 6:13: 'long double' (binary128 on AArch64)
+// expect: 8:38: 'long double' (binary128 on AArch64)
+// expect: 11:15: 'long double' (binary128 on AArch64)

@@ -51,11 +51,13 @@ cargo test --release -p fir-capi --test fai_cc -- --nocapture
 builds `fai-cc` with CMake (against the static library of the current sources), then:
 
 - compiles every program in `tests/*.c` with the reference compiler (`aarch64-unknown-linux-gnu-cc
-  -O1`, or `$FIR_CC`), with `fai-cc`, and with `fai-cc -O`, links each with `tests/runtime/fai_runtime.c`,
-  runs them (under `qemu-aarch64` off AArch64), and requires the same output and exit code;
-- runs each program's HFIR in FIR's interpreter: the calls of the output helpers (events) must spell
-  the same output and `main` must return the same code. Programs that call other external functions
-  (libc) can't be compared there and are listed;
+  -O1 -ffp-contract=off`, or `$FIR_CC`), with `fai-cc`, and with `fai-cc -O`, links each with
+  `tests/runtime/fai_runtime.c` and libm (`-lm`), runs them (under `qemu-aarch64` off AArch64), and
+  requires the same output and exit code;
+- runs each program's HFIR in FIR's interpreter under Arm's NaN choice (`NanRule::Arm`, the NaNs
+  the hardware gives): the calls of the output helpers (events) must spell the same output and
+  `main` must return the same code. Programs that call other external functions (libc, libm) can't
+  be compared there and are listed;
 - checks that each program in `tests/errors/` gets exactly the diagnostics its `// expect: LINE:COL:
   TEXT` lines name, and exit code 1.
 
@@ -65,29 +67,44 @@ turns it off. Missing tools are a failure that names them, not a skip. `FAI_CC_O
 the programs whose names contain `name`.
 
 The corpus prints through `tests/runtime/fai_test.h` (`fai_put_long`, `fai_put_char`, and helpers
-written in C on top of them), since `printf` needs varargs (track V). Its programs must not have
-undefined behavior: UB allows the three builds to differ.
+written in C on top of them: `show_d` and `show_f` print a float's exact bits in hexadecimal and a
+rounded decimal), since `printf` needs varargs (track V). Its programs must not have undefined
+behavior: UB allows the three builds to differ. Nor may their output depend on what C leaves
+unspecified: which NaN's payload an operation on two different NaNs keeps (the reference compiler
+commutes `+` and `*`), or whether a signaling NaN is quieted by an operation the reference compiler
+folds away (`x * 1.0`). Float inputs live in non-constant globals, so the reference compiler can't
+fold libm calls with its own correctly rounded arithmetic.
 
 ## What is supported
 
-The integer, pointer, aggregate-in-memory, and control-flow subset of C11 (with common GNU
+The integer, float, pointer, aggregate-in-memory, and control-flow subset of C11 (with common GNU
 extensions Clang accepts, such as case ranges and `__extension__`):
 
 - **Types:** `_Bool` (`i8` holding 0 or 1: FIR's `i1` takes no bytes in memory), `char` (unsigned),
-  `short`, `int`, `long`, `long long`, their signed and unsigned forms, enums, pointers, arrays
+  `short`, `int`, `long`, `long long`, their signed and unsigned forms, enums, `float` and `double`
+  (`f32` and `f64`), pointers, arrays
   (multidimensional, flexible array members), structs, unions, bitfields, typedefs, `const`.
 - **Expressions:** all arithmetic, bitwise, shift, comparison, and logical operators; compound
   assignment; increment and decrement; `&&`, `||`, `?:` (short-circuiting, as `cf.if`); casts;
   pointer arithmetic, differences, and comparisons; `&`, `*`, `.`, `->`, `[]`; `sizeof` and
   `_Alignof` (Clang evaluates them); string literals; compound literals and brace and designated
   initializers, local and global; struct and union assignment; the comma operator; direct and
-  indirect calls.
+  indirect calls. On floats: literals (their exact bits), `+ - * /`, unary minus, comparisons,
+  `!` and conditions, compound assignment, `++`/`--`, the usual arithmetic conversions, and casts
+  to and from every integer type and between `float` and `double`.
 - **Statements:** all of them, including `goto`, labels, `switch` with fall-through (and Duff's
-  device), `static` locals, and file-scope globals whose initializers hold integers, strings, and
-  the addresses of globals and functions.
+  device), `static` locals, and file-scope globals whose initializers hold integers, floats,
+  strings, and the addresses of globals and functions.
 - **Functions:** definitions, prototypes, recursion, function pointers; calls to functions defined
-  elsewhere (libc) as FIR external functions that may do anything; `malloc` and `free` as FIR's
-  `c.malloc` heap allocations; `main` returns 0 when it falls off its end.
+  elsewhere (libc, libm) as FIR external functions that may do anything; `malloc` and `free` as
+  FIR's `c.malloc` heap allocations; `main` returns 0 when it falls off its end.
+- **Float builtins** with a FIR op: the constants (`__builtin_inf`, `__builtin_huge_val`,
+  `__builtin_nan("…")`, `__builtin_nans`, and their `f` forms, which `<math.h>`'s `INFINITY`,
+  `HUGE_VAL`, and `NAN` expand to), `__builtin_fabs`, `__builtin_sqrt`, `__builtin_copysign`,
+  `__builtin_fma` (and `f` forms), the classifications `<math.h>`'s macros use (`isnan`, `isinf`,
+  `isfinite`, `isnormal`, `signbit`, `fpclassify`, `__builtin_isinf_sign`), and the quiet
+  comparisons (`__builtin_isgreater` and friends). The library functions (`sqrt`, `fabs`, …) stay
+  calls of libm, which may set `errno`.
 
 ## How C maps to FIR
 
@@ -97,6 +114,18 @@ for unsigned); shifts are `.ub` (by at least the width, or negative); conversion
 `.wrap` and extend by the source's signedness; integer↔pointer casts are `ptr.expose` and
 `ptr.from_exposed`; pointer arithmetic is `ptr.index.inbounds`, and a pointer difference is a
 difference of `ptr.addr`s divided exactly.
+
+Floats are strict IEEE 754, one FIR op per C operator: `+ - * /` are `float.add` and friends, never
+contracted (`a * b + c` is a `float.mul` and a `float.add`, as `-ffp-contract=off`; only `fma` and
+`__builtin_fma` fuse), unary minus is `float.neg`; `<`, `<=`, `>`, `>=`, `==` are the ordered
+`float.cmp.olt` … `oeq` (false on NaN) and `!=` is `une` (true on NaN); a float's truth (`!x`,
+conditions, `&&`, conversion to `_Bool`) is `float.cmp.une` against 0.0. A float converts to an
+integer with `float.to_int.s.ub`/`.u.ub` (C's NaN or out-of-range conversion is UB), an integer to
+a float with `int.to_float` (rounded to nearest, ties to even; a constant integer converts to the
+same rounded constant at compile time), `float` to `double` with `float.ext`, and back with
+`float.trunc`. Literals and global initializers are Clang's exact bits (`float.const`,
+`fir_init_f32`/`fir_init_f64`). `float` stays `float` (`FLT_EVAL_METHOD` is 0 on AArch64), and
+parameters and results follow AAPCS64 through FIR's calling convention.
 
 Every local and parameter is a `mem.stack.of` slot made at the function's entry (mem2reg comes
 later), so values never cross blocks. Statements are structured where C's are (`cf.if`, `cf.loop`;
@@ -126,8 +155,14 @@ exactly, but has no conversion to integers for C to compute with).
 
 Each is diagnosed where it appears:
 
-- `float`, `double`, `long double`, `_Complex` (tracks M and F2); variadic functions, defined or
-  called, so `printf` (track V); structs and unions passed or returned by value (track A).
+- `long double` (binary128 on AArch64, which FIR doesn't have), `_Complex`, and the other float
+  formats (`_Float16`, `__fp16`, `__bf16`, `_Float128`); variadic functions, defined or called, so
+  `printf` (track V); structs and unions passed or returned by value (track A).
+- `<math.h>`'s `isgreater` family, which glibc defines with statement expressions under Clang (the
+  `__builtin_isgreater` forms work); float builtins without a FIR op (`__builtin_fmin`, …);
+  `#pragma STDC FENV_ACCESS`: FIR's floats round to nearest and have no exception flags, so a
+  program that changes the rounding mode (`fesetround`) or tests the flags isn't modeled (the
+  pragma isn't diagnosed).
 - Integers over 64 bits (`__int128`, `_BitInt`), `volatile`, `_Atomic`, variable-length arrays,
   packed structs, alignments above 16, thread-local variables, inline assembly, statement
   expressions, labels as values, `++`/`--` on `_Bool`, wide string literals, calls with arguments

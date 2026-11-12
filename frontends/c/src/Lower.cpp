@@ -12,6 +12,11 @@
 //   by a negative amount is UB in C; signed left shifts that overflow wrap, which refines C's
 //   UB); integer conversions truncate with `.wrap` (C's implementation-defined conversion is
 //   modular on every target Clang supports).
+// * `float` and `double` are `f32` and `f64`, and each operator one `float.*` op: no
+//   contraction (`a * b + c` is a `float.mul` and a `float.add`, as `-ffp-contract=off`), `<`
+//   `<=` `>` `>=` `==` are the ordered predicates and `!=` `une`, a float's truth is
+//   `float.cmp.une` against 0.0, float-to-integer conversions are `float.to_int.*.ub` (C's
+//   out-of-range conversion is UB), and integer-to-float ones round (`int.to_float`).
 // * Objects live in memory: every local and parameter is a `mem.stack.of` slot made at the
 //   function's entry, and every access a load or store (mem2reg comes later). Globals, static
 //   locals, string literals, and file-scope compound literals are FIR globals; aggregate copies
@@ -38,9 +43,11 @@
 #include "clang/Basic/Builtins.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/SourceManager.h"
+#include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 
+#include <cstring>
 #include <functional>
 #include <iterator>
 #include <map>
@@ -237,7 +244,13 @@ private:
 
   bool isScalar(QualType t) {
     t = t.getCanonicalType();
-    return t->isIntegerType() || t->isPointerType() || t->isBooleanType();
+    return t->isIntegerType() || t->isPointerType() || t->isBooleanType() ||
+           t->isRealFloatingType();
+  }
+  // `float` or `double` (and the formats `scalarTy` rejects).
+  static bool isFloat(QualType t) { return t.getCanonicalType()->isRealFloatingType(); }
+  FirType floatTy(QualType t) {
+    return bits(t) == 32 ? (FirType)FIR_TYPE_F32 : (FirType)FIR_TYPE_F64;
   }
 
   FirType scalarTy(QualType t, SourceLocation loc) {
@@ -256,8 +269,16 @@ private:
         unsupported(loc, "128-bit integers ('" + t.getAsString() + "')");
       return fir_type_int(n);
     }
+    if (const auto *bt = c->getAs<BuiltinType>()) {
+      if (bt->getKind() == BuiltinType::Float)
+        return FIR_TYPE_F32;
+      if (bt->getKind() == BuiltinType::Double)
+        return FIR_TYPE_F64;
+      if (bt->getKind() == BuiltinType::LongDouble)
+        unsupported(loc, "'long double' (binary128 on AArch64)");
+    }
     if (c->isRealFloatingType())
-      unsupported(loc, "floating-point types ('" + t.getAsString() + "', track F2)");
+      unsupported(loc, "the floating-point type '" + t.getAsString() + "'");
     if (c->isAnyComplexType())
       unsupported(loc, "'_Complex'");
     if (c->isAtomicType())
@@ -271,7 +292,7 @@ private:
     QualType c = t.getCanonicalType();
     if (c.isVolatileQualified())
       unsupported(loc, "'volatile'");
-    if (isScalar(c) || c->isRealFloatingType() || c->isAnyComplexType())
+    if (isScalar(c) || c->isAnyComplexType())
       return scalarTy(c, loc);
     if (const auto *a = ctx.getAsConstantArrayType(c))
       return ck(fir_type_array(m, a->getSize().getZExtValue(), memTy(a->getElementType(), loc)),
@@ -542,6 +563,19 @@ private:
 
   FirInit izero() { return ck(fir_init_zero(m), "fir_init_zero"); }
   FirInit iint(int64_t v) { return ck(fir_init_int(m, v), "fir_init_int"); }
+  // A float's exact bits as a `float` or `double` initializer.
+  FirInit ifloat(const llvm::APFloat &f, QualType t) {
+    uint64_t x = f.bitcastToAPInt().getZExtValue();
+    if (bits(t) == 32) {
+      uint32_t w = (uint32_t)x;
+      float v;
+      memcpy(&v, &w, 4);
+      return ck(fir_init_f32(m, v), "fir_init_f32");
+    }
+    double v;
+    memcpy(&v, &x, 8);
+    return ck(fir_init_f64(m, v), "fir_init_f64");
+  }
 
   bool isZero(const APValue &v) {
     switch (v.getKind()) {
@@ -550,6 +584,8 @@ private:
       return true;
     case APValue::Int:
       return v.getInt().isZero();
+    case APValue::Float:
+      return v.getFloat().bitcastToAPInt().isZero();
     case APValue::LValue:
       return v.isNullPointer();
     case APValue::Array:
@@ -578,6 +614,12 @@ private:
         unsupported(loc, "addresses used as integers in a global's initializer");
       const llvm::APSInt &n = v.getInt();
       return iint(pattern(n.isSigned() ? (uint64_t)n.getExtValue() : n.getZExtValue(), bits(c)));
+    }
+    if (isFloat(c)) {
+      scalarTy(c, loc); // diagnose `long double`
+      if (!v.isFloat())
+        unsupported(loc, "this floating-point initializer");
+      return ifloat(v.getFloat(), c);
     }
     if (c->isPointerType()) {
       if (!v.isLValue() || !v.getLValueBase())
@@ -694,6 +736,15 @@ private:
         image[off + i] = (uint8_t)(x >> (8 * i));
       return;
     }
+    if (isFloat(c)) {
+      scalarTy(c, loc); // diagnose `long double`
+      if (!v.isFloat())
+        unsupported(loc, "this floating-point initializer");
+      uint64_t x = v.getFloat().bitcastToAPInt().getZExtValue();
+      for (unsigned i = 0; i < bits(c) / 8; i++)
+        image[off + i] = (uint8_t)(x >> (8 * i));
+      return;
+    }
     if (const auto *at = ctx.getAsConstantArrayType(c)) {
       uint64_t stride = ctx.getTypeSizeInChars(at->getElementType()).getQuantity();
       for (uint64_t i = 0; i < at->getSize().getZExtValue(); i++) {
@@ -775,10 +826,41 @@ private:
 
   FirValue boolToInt(FirValue c, QualType to) { return resize(c, 1, bits(to), false); }
 
-  // An integer or pointer value converted to another C scalar type, as C converts it.
+  // A float constant of type `t` with the bits of `f` (converted to `t`'s format first).
+  FirValue fconst(QualType t, llvm::APFloat f) {
+    bool lost;
+    f.convert(bits(t) == 32 ? llvm::APFloat::IEEEsingle() : llvm::APFloat::IEEEdouble(),
+              llvm::APFloat::rmNearestTiesToEven, &lost);
+    return ck(fir_float_const(b, floatTy(t), f.bitcastToAPInt().getZExtValue()), "float.const");
+  }
+  FirValue fzero(QualType t) { return ck(fir_float_const(b, floatTy(t), 0), "float.const"); }
+
+  // A scalar value converted to another C scalar type, as C converts it.
   FirValue convert(FirValue v, QualType from, QualType to, SourceLocation loc) {
     from = from.getCanonicalType();
     to = to.getCanonicalType();
+    if (isFloat(from) || isFloat(to)) {
+      if (isFloat(from))
+        scalarTy(from, loc); // diagnose `long double`
+      if (isFloat(to))
+        scalarTy(to, loc);
+      if (to->isBooleanType())
+        return boolToInt(truth(v, from), to);
+      if (isFloat(from) && isFloat(to)) {
+        if (bits(from) == bits(to))
+          return v;
+        if (bits(from) < bits(to))
+          return ck(fir_float_ext(b, floatTy(to), v), "float.ext");
+        return ck(fir_float_trunc(b, floatTy(to), v), "float.trunc");
+      }
+      if (isFloat(to) && (from->isIntegerType() || from->isBooleanType()))
+        return ck(fir_int_to_float(b, floatTy(to), isSigned(from), v), "int.to_float");
+      if (isFloat(from) && to->isIntegerType())
+        return ck(fir_float_to_int(b, fir_type_int(bits(to)), isSigned(to), FIR_CVT_EDGE_UB, v),
+                  "float.to_int");
+      unsupported(loc,
+                  "conversions from '" + from.getAsString() + "' to '" + to.getAsString() + "'");
+    }
     if (to->isBooleanType()) {
       if (from->isBooleanType())
         return v;
@@ -803,6 +885,8 @@ private:
 
   // Whether a scalar is nonzero, as an `i1`.
   FirValue truth(FirValue v, QualType t) {
+    if (isFloat(t))
+      return ck(fir_float_cmp(b, FIR_FPRED_UNE, v, fzero(t)), "float.cmp");
     if (t->isPointerType())
       return ck(fir_ptr_cmp(b, FIR_PRED_NE, v, ck(fir_ptr_null(b), "ptr.null")), "ptr.cmp");
     return ck(fir_int_cmp(b, FIR_PRED_NE, v, cbits(bits(t), 0)), "int.cmp");
@@ -974,8 +1058,10 @@ private:
       unsupported(e->getExprLoc(), "'?:' without a middle operand");
     if (isa<VAArgExpr>(e))
       unsupported(e->getExprLoc(), "'va_arg' (track V)");
-    if (isa<FloatingLiteral>(e))
-      unsupported(e->getExprLoc(), "floating-point constants (track F2)");
+    if (const auto *fl = dyn_cast<FloatingLiteral>(e)) {
+      scalarTy(e->getType(), e->getExprLoc()); // diagnose `long double`
+      return fconst(e->getType(), fl->getValue());
+    }
     if (const auto *dre = dyn_cast<DeclRefExpr>(e)) {
       if (isa<FunctionDecl>(dre->getDecl()))
         return lvalue(e);
@@ -986,6 +1072,10 @@ private:
   FirValue zeroOf(QualType t, SourceLocation loc) {
     if (t->isPointerType())
       return ck(fir_ptr_null(b), "ptr.null");
+    if (isFloat(t)) {
+      scalarTy(t, loc);
+      return fzero(t);
+    }
     return cint(scalarTy(t, loc), 0);
   }
 
@@ -1040,11 +1130,25 @@ private:
     case CK_ToVoid:
       discard(sub);
       return FIR_INVALID;
+    case CK_IntegralToFloating: {
+      // A constant integer converts to a constant, rounded as `int.to_float` rounds.
+      uint64_t k;
+      if (isFloat(to) && foldInt(sub, k)) {
+        scalarTy(to, loc);
+        llvm::APFloat f(bits(to) == 32 ? llvm::APFloat::IEEEsingle() : llvm::APFloat::IEEEdouble());
+        bool sgn = isSigned(from);
+        llvm::APSInt n(llvm::APInt(64, k), !sgn);
+        if (from->isBooleanType())
+          n = llvm::APSInt(llvm::APInt(64, k != 0), true);
+        f.convertFromAPInt(n, sgn && !from->isBooleanType(), llvm::APFloat::rmNearestTiesToEven);
+        return fconst(to, f);
+      }
+      return convert(rvalue(sub), from, to, loc);
+    }
     case CK_FloatingToIntegral:
-    case CK_IntegralToFloating:
     case CK_FloatingCast:
     case CK_FloatingToBoolean:
-      unsupported(loc, "floating-point conversions (track F2)");
+      return convert(rvalue(sub), from, to, loc);
     default:
       break;
     }
@@ -1061,6 +1165,8 @@ private:
       return rvalue(sub);
     case UO_Minus: {
       FirValue x = rvalue(sub);
+      if (isFloat(t))
+        return ck(fir_float_un(b, FIR_FUN_OP_NEG, x), "float.neg");
       return ck(fir_int_arith(b, FIR_ARITH_OP_SUB, isSigned(t) ? FIR_OVF_NSW : FIR_OVF_WRAP,
                               cbits(bits(t), 0), x),
                 "int.sub");
@@ -1086,6 +1192,10 @@ private:
       FirValue nv;
       if (st->isPointerType()) {
         nv = ptrIndex(old, st->getPointeeType(), cbits(64, inc ? 1 : ~uint64_t(0)), loc);
+      } else if (isFloat(st)) {
+        llvm::APFloat one(1.0);
+        nv = ck(fir_float_bin(b, inc ? FIR_FBIN_OP_ADD : FIR_FBIN_OP_SUB, old, fconst(st, one)),
+                "float.add");
       } else {
         // A type narrower than int is promoted, so the step can't overflow; it wraps when
         // converted back.
@@ -1180,6 +1290,30 @@ private:
   // the AST); `rt` is the right operand's type (shifts don't convert it).
   FirValue arith(BinaryOperatorKind op, FirValue a, FirValue c, QualType t, QualType rt,
                  SourceLocation loc) {
+    if (isFloat(t)) {
+      FirFBinOp fo;
+      switch (op) {
+      case BO_Add:
+      case BO_AddAssign:
+        fo = FIR_FBIN_OP_ADD;
+        break;
+      case BO_Sub:
+      case BO_SubAssign:
+        fo = FIR_FBIN_OP_SUB;
+        break;
+      case BO_Mul:
+      case BO_MulAssign:
+        fo = FIR_FBIN_OP_MUL;
+        break;
+      case BO_Div:
+      case BO_DivAssign:
+        fo = FIR_FBIN_OP_DIV;
+        break;
+      default:
+        unsupported(loc, "this operator on '" + t.getAsString() + "'");
+      }
+      return ck(fir_float_bin(b, fo, a, c), "float.bin");
+    }
     if (!t->isIntegerType())
       unsupported(loc, "arithmetic on '" + t.getAsString() + "'");
     bool sgn = isSigned(t);
@@ -1312,6 +1446,16 @@ private:
       if (isComparison(op)) {
         QualType lt = bo->getLHS()->getType();
         FirValue a = rvalue(bo->getLHS()), c = rvalue(bo->getRHS());
+        if (isFloat(lt)) {
+          // C's relational operators and `==` are false on NaN (ordered), `!=` true.
+          FirFPred fp = op == BO_EQ   ? FIR_FPRED_OEQ
+                        : op == BO_NE ? FIR_FPRED_UNE
+                        : op == BO_LT ? FIR_FPRED_OLT
+                        : op == BO_LE ? FIR_FPRED_OLE
+                        : op == BO_GT ? FIR_FPRED_OGT
+                                      : FIR_FPRED_OGE;
+          return ck(fir_float_cmp(b, fp, a, c), "float.cmp");
+        }
         bool sgn = !lt->isPointerType() && isSigned(lt);
         FirPred p;
         switch (op) {
@@ -1345,6 +1489,145 @@ private:
     return truth(rvalue(e), t);
   }
 
+  // The float builtins with a FIR op (`FIR_INVALID` for others): the constants (`__builtin_inf`,
+  // `__builtin_nan("")`, ...), `__builtin_fabs`, `__builtin_sqrt`, `__builtin_copysign`,
+  // `__builtin_fma`, the classifications `<math.h>` uses, and the quiet comparisons. The library
+  // functions themselves (`fabs`, `sqrt`) stay calls of libm.
+  FirValue floatBuiltin(const CallExpr *ce, unsigned id) {
+    QualType rt = ce->getType();
+    SourceLocation loc = ce->getExprLoc();
+    auto arg = [&](unsigned i) { return rvalue(ce->getArg(i)); };
+    auto un = [&](FirFUnOp op) {
+      scalarTy(rt, loc);
+      return ck(fir_float_un(b, op, arg(0)), "float.un");
+    };
+    auto bin = [&](FirFBinOp op) {
+      scalarTy(rt, loc);
+      FirValue x = arg(0);
+      return ck(fir_float_bin(b, op, x, arg(1)), "float.bin");
+    };
+    // A comparison of the first two arguments, as C's `int`.
+    auto cmp = [&](FirFPred p) {
+      scalarTy(ce->getArg(0)->getType(), loc);
+      FirValue x = arg(0);
+      return boolToInt(ck(fir_float_cmp(b, p, x, arg(1)), "float.cmp"), rt);
+    };
+    // `|x|` compared with the infinity or the smallest normal of x's format.
+    auto absCmp = [&](FirValue x, QualType t, FirFPred p, bool inf) {
+      const llvm::fltSemantics &sem =
+          bits(t) == 32 ? llvm::APFloat::IEEEsingle() : llvm::APFloat::IEEEdouble();
+      FirValue a = ck(fir_float_un(b, FIR_FUN_OP_ABS, x), "float.abs");
+      return ck(fir_float_cmp(b, p, a,
+                              fconst(t, inf ? llvm::APFloat::getInf(sem)
+                                            : llvm::APFloat::getSmallestNormalized(sem))),
+                "float.cmp");
+    };
+    switch (id) {
+    case Builtin::BI__builtin_huge_val:
+    case Builtin::BI__builtin_huge_valf:
+    case Builtin::BI__builtin_inf:
+    case Builtin::BI__builtin_inff:
+    case Builtin::BI__builtin_nan:
+    case Builtin::BI__builtin_nanf:
+    case Builtin::BI__builtin_nans:
+    case Builtin::BI__builtin_nansf: {
+      scalarTy(rt, loc);
+      llvm::APFloat f(0.0);
+      if (!ce->EvaluateAsFloat(f, ctx, Expr::SE_NoSideEffects))
+        unsupported(loc, "this builtin's argument (not a constant string)");
+      return fconst(rt, f);
+    }
+    case Builtin::BI__builtin_fabs:
+    case Builtin::BI__builtin_fabsf:
+      return un(FIR_FUN_OP_ABS);
+    case Builtin::BI__builtin_sqrt:
+    case Builtin::BI__builtin_sqrtf:
+      return un(FIR_FUN_OP_SQRT);
+    case Builtin::BI__builtin_copysign:
+    case Builtin::BI__builtin_copysignf:
+      return bin(FIR_FBIN_OP_COPYSIGN);
+    case Builtin::BI__builtin_fma:
+    case Builtin::BI__builtin_fmaf: {
+      scalarTy(rt, loc);
+      FirValue x = arg(0), y = arg(1);
+      return ck(fir_float_fma(b, x, y, arg(2)), "float.fma");
+    }
+    case Builtin::BI__builtin_isgreater:
+      return cmp(FIR_FPRED_OGT);
+    case Builtin::BI__builtin_isgreaterequal:
+      return cmp(FIR_FPRED_OGE);
+    case Builtin::BI__builtin_isless:
+      return cmp(FIR_FPRED_OLT);
+    case Builtin::BI__builtin_islessequal:
+      return cmp(FIR_FPRED_OLE);
+    case Builtin::BI__builtin_islessgreater:
+      return cmp(FIR_FPRED_ONE);
+    case Builtin::BI__builtin_isunordered:
+      return cmp(FIR_FPRED_UNO);
+    case Builtin::BI__builtin_fpclassify: {
+      // (nan, infinite, normal, subnormal, zero, x): the value naming x's class.
+      QualType t = ce->getArg(5)->getType();
+      if (!isFloat(t))
+        return FIR_INVALID;
+      scalarTy(t, loc);
+      FirValue cls[5];
+      for (unsigned i = 0; i < 5; i++)
+        cls[i] = arg(i);
+      FirValue x = arg(5);
+      FirValue isZero = ck(fir_float_cmp(b, FIR_FPRED_OEQ, x, fzero(t)), "float.cmp");
+      FirValue v = ck(fir_select(b, isZero, cls[4], cls[3]), "select");
+      v = ck(fir_select(b, absCmp(x, t, FIR_FPRED_OGE, false), cls[2], v), "select");
+      v = ck(fir_select(b, absCmp(x, t, FIR_FPRED_OEQ, true), cls[1], v), "select");
+      FirValue nan = ck(fir_float_cmp(b, FIR_FPRED_UNO, x, x), "float.cmp");
+      return ck(fir_select(b, nan, cls[0], v), "select");
+    }
+    case Builtin::BI__builtin_isinf_sign: {
+      // -1 for -inf, 1 for +inf, else 0.
+      QualType t = ce->getArg(0)->getType();
+      if (!isFloat(t))
+        return FIR_INVALID;
+      scalarTy(t, loc);
+      FirValue x = arg(0);
+      FirValue inf = absCmp(x, t, FIR_FPRED_OEQ, true);
+      FirValue neg = ck(fir_float_cmp(b, FIR_FPRED_OLT, x, fzero(t)), "float.cmp");
+      unsigned n = bits(rt);
+      FirValue sgn = ck(fir_select(b, neg, cbits(n, ~uint64_t(0)), cbits(n, 1)), "select");
+      return ck(fir_select(b, inf, sgn, cbits(n, 0)), "select");
+    }
+    case Builtin::BI__builtin_isnan:
+    case Builtin::BI__builtin_isinf:
+    case Builtin::BI__builtin_isfinite:
+    case Builtin::BI__builtin_isnormal:
+    case Builtin::BI__builtin_signbit:
+    case Builtin::BI__builtin_signbitf: {
+      QualType t = ce->getArg(0)->getType();
+      if (!isFloat(t))
+        return FIR_INVALID;
+      scalarTy(t, loc);
+      FirValue x = arg(0), c;
+      if (id == Builtin::BI__builtin_isnan) {
+        c = ck(fir_float_cmp(b, FIR_FPRED_UNO, x, x), "float.cmp");
+      } else if (id == Builtin::BI__builtin_isinf) {
+        c = absCmp(x, t, FIR_FPRED_OEQ, true);
+      } else if (id == Builtin::BI__builtin_isfinite) {
+        c = absCmp(x, t, FIR_FPRED_OLT, true);
+      } else if (id == Builtin::BI__builtin_isnormal) {
+        FirValue lo = absCmp(x, t, FIR_FPRED_OGE, false);
+        c = ck(fir_int_bit(b, FIR_BIT_OP_AND, lo, absCmp(x, t, FIR_FPRED_OLT, true)), "and");
+      } else {
+        unsigned n = bits(t);
+        FirValue raw = ck(fir_float_to_bits(b, fir_type_int(n), x), "float.to_bits");
+        FirValue top = ck(
+            fir_int_shift(b, FIR_SHIFT_OP_SHR_U, FIR_SHIFT_EDGE_UB, raw, cbits(n, n - 1)), "shr");
+        return resize(top, n, bits(rt), false);
+      }
+      return boolToInt(c, rt);
+    }
+    default:
+      return FIR_INVALID;
+    }
+  }
+
   FirValue callExpr(const CallExpr *ce) {
     SourceLocation loc = ce->getExprLoc();
     QualType rt = ce->getType();
@@ -1368,6 +1651,8 @@ private:
           ck(fir_mem_free(b, "c.malloc", rvalue(ce->getArg(0))), "mem.free");
           return FIR_INVALID;
         }
+        if (FirValue v = floatBuiltin(ce, id); v != FIR_INVALID)
+          return v;
         if (!ctx.BuiltinInfo.isPredefinedLibFunction(id))
           unsupported(loc, "the builtin '" + fd->getName().str() + "'");
       }
