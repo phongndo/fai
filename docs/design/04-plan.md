@@ -111,11 +111,11 @@ integers (`char` is `i8`, not `b8`).
   structs, thread-locals, inline assembly, statement expressions, computed `goto`, `++` on `_Bool`,
   wide strings, K&R definitions and calls without prototypes, external variables, and global
   initializers pointing inside an object.
-- **Corpus:** 45 programs in `frontends/c/tests/` (each feature area, plus a hash table, four
+- **Corpus:** 46 programs in `frontends/c/tests/` (each feature area, plus a hash table, four
   sorts, a bytecode interpreter, a tokenizer and expression evaluator, string routines, linked
   lists and a search tree on the heap, bignums, CRC-32, number theory, a BFS over a ring buffer,
   dynamic programming, and goto-, switch-, and Duff's-device-heavy programs) and 13 error tests.
-  All 45 match the cross GCC at `-O1` under `qemu-aarch64`, with and without `-O`; 44 also match
+  All 46 match the cross GCC at `-O1` under `qemu-aarch64`, with and without `-O`; 45 also match
   in `fir run` (the one that calls libc's `strlen`, `memcpy`, … can't be compared there). Every
   error test gets exactly its expected diagnostics. `cargo test -p fir-capi --test fai_cc` runs it
   (on Linux by default).
@@ -146,6 +146,11 @@ integers (`char` is `i8`, not `b8`).
     command line.
 - **Deferred:** floats, varargs, by-value structs, and `printf` (track F2); the gaps above;
   macOS binaries (the corpus needs Linux); an `effects` shorthand for "anything".
+- **Fixed after review:** bitfields in bytes FIR's layout leaves implicit (a struct's tail, or the
+  gap before an aligned member) had no padding slot, so global initializers dropped their bits;
+  every gap holding bitfields now gets an explicit `array<k x i8>` slot. A compound literal that
+  was a function's first stack slot (FIR id 0) was rejected as missing (`lookup`'s default);
+  lookups of FIR ids use `find`. `bitfield_padding.c` covers both.
 
 ### Track M: Floats in the IR (done)
 
@@ -167,8 +172,8 @@ Decisions: Floats, Float ops, NaN choice, Float text.
   `truncInt_ofInt` (integers of at most `m + 1` bits; `f32` and `f64` instances).
   `Dce.float_pure` proves the float ops that can't trap pure. The existing proofs were
   extended for the new value (`RVal.float`: refinement, `Dse`, `Fwd.Exact` with floats, `Space`).
-- Rust: `crates/fir/src/float.rs` (host arithmetic with NaN canonicalization, exact rounding
-  for wide integers and decimals, the same shortest-decimal algorithm as Lean), the parser,
+- Rust: `crates/fir/src/float.rs` (software arithmetic with NaN canonicalization, exact
+  rounding for wide integers and decimals, the same shortest-decimal algorithm as Lean), the parser,
   printer, verifier, interpreter, builder (`float_const` and friends, generated), C API
   (`FIR_TYPE_F32`/`F64`, the `FirFBinOp`, `FirFUnOp`, `FirFPred`, `FirCvtEdge` constants,
   `fir_float_const_f32`/`_f64`, `FIR_TRAP_REASON_CONVERT`; version 1.2), lowering
@@ -189,6 +194,14 @@ Decisions: Floats, Float ops, NaN choice, Float text.
   the C API and checks the compile error.
 - Not yet: floats on AArch64 (track N), float initializers for globals (`zero` or `bytes` for
   now), `f16`/`bf16`.
+- Fixed after review: the interpreter computed with the host's float arithmetic, so a C API
+  caller's rounding mode or FTZ/DAZ changed its results (f32 `1 + 2^-24` gave `0x3f800001`
+  rounding upward; two smallest subnormals summed to 0 under DAZ). `float.rs` now uses
+  `rustc_apfloat`, an exact `u128` square root, and integer comparisons (decision: Float ops),
+  checked against Lean's definitions on big integers and the host's default environment; a
+  float-heavy `fir run` loop takes 1.7× as long, integer code is unchanged. `float_env.rs` runs
+  every `tests/float/` run line with rounding toward +∞ and subnormals flushed (MXCSR or FPCR)
+  and requires the expected outcomes (32 of 196 differed before).
 
 ## Not in this round
 
