@@ -1385,6 +1385,34 @@ impl<'m> Machine<'m> {
         Ok(())
     }
 
+    /// `mem.copy` of `n` bytes: Lean loads them as a `bN` and stores that, so this checks and
+    /// marks the source as a load would, then the destination as a store would.
+    fn copy(&mut self, loc: Option<Loc>, n: u64, align: u32, d: Value, s: Value) -> R<()> {
+        let Some(s) = self.ptr_of(loc, s)? else {
+            return ub(UbKind::Poison, loc, "load through a poison pointer");
+        };
+        let (a, off) = self.access(loc, s, n, align, false)?;
+        let mut bs = std::mem::take(&mut self.bytes_buf);
+        bs.clear();
+        let mem = &self.allocs.bytes[a as usize];
+        bs.extend((0..n).map(|i| mem.get(off + i)));
+        let r = self.copy_to(loc, n, align, d, &bs);
+        self.bytes_buf = bs;
+        r
+    }
+
+    fn copy_to(&mut self, loc: Option<Loc>, n: u64, align: u32, d: Value, bs: &[Byte]) -> R<()> {
+        let Some(d) = self.ptr_of(loc, d)? else {
+            return ub(UbKind::Poison, loc, "store through a poison pointer");
+        };
+        let (a, off) = self.access(loc, d, n, align, true)?;
+        let mem = &mut self.allocs.bytes[a as usize];
+        for (i, b) in bs.iter().enumerate() {
+            mem.set(off + i as u64, *b);
+        }
+        Ok(())
+    }
+
     /// Lean's `freePtr`.
     fn free(&mut self, loc: Option<Loc>, family: &'m str, p: Option<u32>) -> R<()> {
         let Some(p) = p else {
@@ -1738,12 +1766,8 @@ impl<'m> Machine<'m> {
                 return self.offset_by(inbounds, p, wrapped);
             }
             (OpKind::MemCopy { ty, align }, &[d, s]) => {
-                let w = body.types().size(self.space, ty) as u64 * 8;
-                let w = u32::try_from(w).unwrap_or(u32::MAX);
-                let s = self.ptr_of(loc, s)?;
-                let v = self.load(loc, Ty::Byte(w), align, s)?;
-                let d = self.ptr_of(loc, d)?;
-                self.store(loc, Ty::Byte(w), align, v, d)?;
+                let n = body.types().size(self.space, ty) as u64;
+                self.copy(loc, n, align, d, s)?;
                 return Ok(None);
             }
             // Globals and functions

@@ -13,7 +13,9 @@
 //! `src/generated/ops.rs`.
 //!
 //! Code is stored data-oriented ([`Body`]): per-function flat arrays, with ops, regions, and
-//! values referring to each other by 32-bit index.
+//! values referring to each other by 32-bit index. Struct, array, and function types are ids into
+//! an interned table ([`Types`]) owned by the body that names them, or by the module's
+//! [`Globals`].
 
 mod body;
 mod decl;
