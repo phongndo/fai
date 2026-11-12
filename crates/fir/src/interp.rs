@@ -6,7 +6,7 @@
 //!
 //! The machine follows the crate's data-oriented rules (see [`crate::Body`]):
 //!
-//! * **Values** are small `Copy` enums ([`Value`]). Integers up to 64 bits are inline; wider ones,
+//! * **Values** are small `Copy` enums (`Value`). Integers up to 64 bits are inline; wider ones,
 //!   pointers, and byte strings are ids into append-only tables (`wides`, `ptrs`, `byte_vals`).
 //!   Pointer candidate lists are runs in one pool.
 //! * **Environments** are one slot stack: a call gets a run of slots, one per value of its
