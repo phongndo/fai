@@ -847,6 +847,184 @@ static void building_blocks(void) {
   fir_module_free(m);
 }
 
+/* Exceptions in each layer. HFIR: @thrower throws a pointer to @err when its argument is 0;
+ * @catch catches it with cf.try and loads what it points to; @uncaught lets it leave (the run's
+ * outcome is `threw`). MFIR: calls name a handler block (func.invoke, func.invoke.indirect).
+ * LFIR: the exception slot's ops. The HFIR module also lowers, optimizes, and compiles. */
+static FirTarget to(FirRegion block, const FirValue *args, size_t nargs);
+
+static void exceptions(void) {
+  FirModule *m = cur = fir_module_new();
+  FirType i1 = fir_type_int(1), i32 = fir_type_int(32), ptr = FIR_TYPE_PTR;
+  FirGlobal err = ID(fir_global_declare(m, "err", i32, false, 4, ID(fir_init_int(m, 7))));
+  FirFunc thrower = ID(fir_func_declare(m, "thrower", &i32, 1, &i32, 1));
+  FirFunc catcher = ID(fir_func_declare(m, "catch", &i32, 1, &i32, 1));
+  FirFunc uncaught = ID(fir_func_declare(m, "uncaught", &i32, 1, &i32, 1));
+
+  FirBuilder *b = fir_func_begin(m, thrower);
+  FirValue k = ID(fir_builder_param(b, 0));
+  OK(fir_value_set_name(b, k, "k"));
+  FirValue zero = ID(fir_int_const(b, i32, 0));
+  FirValue is0 = ID(fir_int_cmp(b, FIR_PRED_EQ, k, zero));
+  FirOp ifop = ID(fir_cf_if_begin(b, NULL, 0, is0));
+  OK(fir_position_at_end(b, ID(fir_op_region(b, ifop, 0))));
+  FirValue e = ID(fir_mem_global(b, err));
+  ID(fir_exn_throw(b, e));
+  OK(fir_position_at_end(b, ID(fir_op_region(b, ifop, 1))));
+  ID(fir_cf_yield(b, NULL, 0));
+  OK(fir_position_at_end(b, fir_builder_entry(b)));
+  /* What is thrown is a pointer. */
+  CHECK(fir_exn_throw(b, k) == FIR_INVALID);
+  ID(fir_func_ret(b, &k, 1));
+  OK(fir_func_end(b));
+
+  b = fir_func_begin(m, catcher);
+  k = ID(fir_builder_param(b, 0));
+  OK(fir_value_set_name(b, k, "k"));
+  FirOp tryop = ID(fir_cf_try_begin(b, &i32, 1));
+  OK(fir_position_at_end(b, ID(fir_op_region(b, tryop, 0))));
+  FirValue v = ID(fir_op_result(b, ID(fir_func_call(b, thrower, &k, 1)), 0));
+  ID(fir_cf_yield(b, &v, 1));
+  FirRegion handler = ID(fir_op_region(b, tryop, 1));
+  FirValue ex = ID(fir_region_param(b, handler, 0));
+  OK(fir_value_set_name(b, ex, "e"));
+  OK(fir_position_at_end(b, handler));
+  FirValue x = ID(fir_mem_load(b, i32, ex, 4));
+  ID(fir_cf_yield(b, &x, 1));
+  OK(fir_position_at_end(b, fir_builder_entry(b)));
+  FirValue r = ID(fir_op_result(b, tryop, 0));
+  ID(fir_func_ret(b, &r, 1));
+  OK(fir_func_end(b));
+
+  b = fir_func_begin(m, uncaught);
+  k = ID(fir_builder_param(b, 0));
+  v = ID(fir_op_result(b, ID(fir_func_call(b, thrower, &k, 1)), 0));
+  ID(fir_func_ret(b, &v, 1));
+  OK(fir_func_end(b));
+  OK(fir_module_verify(m));
+
+  const char *three[] = {"3"}, *zero_arg[] = {"0"};
+  expect_run(m, "catch", three, 1, "returned i32 3");
+  expect_run(m, "catch", zero_arg, 1, "returned i32 7");
+  expect_run(m, "uncaught", zero_arg, 1, "threw ptr #1");
+
+  /* Lowered: cf.try is a cf.blocks whose handler block the call names. */
+  FirModule *l = NULL;
+  OK(fir_module_lower(m, &l));
+  CHECK(l != NULL);
+  if (l != NULL) {
+    char *text = fir_module_print(l, false);
+    CHECK(text != NULL && strstr(text, "func.invoke @thrower(%k) unwind ^.x1") != NULL);
+    fir_string_free(text);
+    expect_run(l, "catch", zero_arg, 1, "returned i32 7");
+    expect_run(l, "uncaught", zero_arg, 1, "threw ptr #1");
+    FirModule *o = NULL;
+    OK(fir_module_optimize(l, &o));
+    CHECK(o != NULL);
+    if (o != NULL) {
+      expect_run(o, "catch", zero_arg, 1, "returned i32 7");
+      expect_run(o, "catch", three, 1, "returned i32 3");
+      fir_module_free(o);
+    }
+    fir_module_free(l);
+  }
+  char *as = NULL;
+  OK(fir_module_compile(m, "aarch64", true, FIR_OS_LINUX, &as));
+  CHECK(as != NULL && strstr(as, "__fir_exn") != NULL);
+  fir_string_free(as);
+  fir_module_free(m);
+
+  /* MFIR: @handle calls @thrower directly or through a pointer, naming block ^h. */
+  m = cur = fir_module_new();
+  OK(fir_module_set_layer(m, FIR_LAYER_MFIR, NULL));
+  err = ID(fir_global_declare(m, "err", i32, false, 4, ID(fir_init_int(m, 7))));
+  thrower = ID(fir_func_declare(m, "thrower", &i32, 1, &i32, 1));
+  FirType params[2] = {i32, i1};
+  FirFunc handle = ID(fir_func_declare(m, "handle", params, 2, &i32, 1));
+  b = fir_func_begin(m, thrower);
+  k = ID(fir_builder_param(b, 0));
+  zero = ID(fir_int_const(b, i32, 0));
+  is0 = ID(fir_int_cmp(b, FIR_PRED_EQ, k, zero));
+  ifop = ID(fir_cf_if_begin(b, NULL, 0, is0));
+  OK(fir_position_at_end(b, ID(fir_op_region(b, ifop, 0))));
+  ID(fir_exn_throw(b, ID(fir_mem_global(b, err))));
+  OK(fir_position_at_end(b, ID(fir_op_region(b, ifop, 1))));
+  ID(fir_cf_yield(b, NULL, 0));
+  OK(fir_position_at_end(b, fir_builder_entry(b)));
+  ID(fir_func_ret(b, &k, 1));
+  OK(fir_func_end(b));
+
+  b = fir_func_begin(m, handle);
+  k = ID(fir_builder_param(b, 0));
+  FirValue indirect = ID(fir_builder_param(b, 1));
+  FirValue fp = ID(fir_func_addr(b, thrower));
+  FirOp blocks = ID(fir_cf_blocks_begin(b, &i32, 1, false));
+  FirRegion entry = ID(fir_block_new(b, blocks, "entry", NULL, 0));
+  FirRegion dir = ID(fir_block_new(b, blocks, "dir", NULL, 0));
+  FirRegion ind = ID(fir_block_new(b, blocks, "ind", NULL, 0));
+  FirRegion h = ID(fir_block_new(b, blocks, "h", &ptr, 1));
+  OK(fir_position_at_end(b, entry));
+  ID(fir_cf_cond_br(b, indirect, to(ind, NULL, 0), to(dir, NULL, 0)));
+  OK(fir_position_at_end(b, dir));
+  v = ID(fir_op_result(b, ID(fir_func_invoke(b, thrower, &k, 1, to(h, NULL, 0))), 0));
+  ID(fir_cf_yield(b, &v, 1));
+  OK(fir_position_at_end(b, ind));
+  FirType sig = ID(fir_type_func(m, &i32, 1, &i32, 1));
+  v = ID(fir_op_result(b, ID(fir_func_invoke_indirect(b, sig, fp, &k, 1, to(h, NULL, 0))), 0));
+  ID(fir_cf_yield(b, &v, 1));
+  OK(fir_position_at_end(b, h));
+  x = ID(fir_mem_load(b, i32, ID(fir_region_param(b, h, 0)), 4));
+  FirValue z = ID(fir_int_const(b, i32, 0));
+  FirValue neg = ID(fir_int_arith(b, FIR_ARITH_OP_SUB, FIR_OVF_WRAP, z, x));
+  ID(fir_cf_yield(b, &neg, 1));
+  OK(fir_blocks_end(b, blocks));
+  OK(fir_position_at_end(b, fir_builder_entry(b)));
+  r = ID(fir_op_result(b, blocks, 0));
+  ID(fir_func_ret(b, &r, 1));
+  OK(fir_func_end(b));
+  OK(fir_module_verify(m));
+  const char *dir0[] = {"0", "0"}, *ind0[] = {"0", "1"}, *ind4[] = {"4", "1"};
+  expect_run(m, "handle", dir0, 2, "returned i32 -7");
+  expect_run(m, "handle", ind0, 2, "returned i32 -7");
+  expect_run(m, "handle", ind4, 2, "returned i32 4");
+  fir_module_free(m);
+
+  /* LFIR: @raise makes @err pending and returns; @take checks after the call and takes it. */
+  m = cur = fir_module_new();
+  OK(fir_module_set_layer(m, FIR_LAYER_LFIR, "aarch64"));
+  err = ID(fir_global_declare(m, "err", i32, false, 4, ID(fir_init_int(m, 7))));
+  FirFunc raise = ID(fir_func_declare(m, "raise", NULL, 0, &i32, 1));
+  FirFunc take = ID(fir_func_declare(m, "take", NULL, 0, &i32, 1));
+  b = fir_func_begin(m, raise);
+  FirOp code = ID(fir_aarch64_code_begin(b));
+  OK(fir_position_at_end(b, ID(fir_block_new(b, code, "entry", NULL, 0))));
+  ID(fir_aarch64_adrl(b, 0, err));
+  ID(fir_aarch64_exn_set(b, 0));
+  ID(fir_aarch64_ret(b));
+  OK(fir_blocks_end(b, code));
+  OK(fir_func_end(b));
+  b = fir_func_begin(m, take);
+  code = ID(fir_aarch64_code_begin(b));
+  entry = ID(fir_block_new(b, code, "entry", NULL, 0));
+  FirRegion land = ID(fir_block_new(b, code, "land", NULL, 0));
+  FirRegion none = ID(fir_block_new(b, code, "none", NULL, 0));
+  OK(fir_position_at_end(b, entry));
+  ID(fir_aarch64_bl(b, raise));
+  ID(fir_aarch64_b_exn(b, to(land, NULL, 0), to(none, NULL, 0)));
+  OK(fir_position_at_end(b, land));
+  ID(fir_aarch64_exn_take(b, 1));
+  ID(fir_aarch64_ldr(b, FIR_MEM_SIZE_W, 0, 1, 0));
+  ID(fir_aarch64_ret(b));
+  OK(fir_position_at_end(b, none));
+  ID(fir_aarch64_ret(b));
+  OK(fir_blocks_end(b, code));
+  OK(fir_func_end(b));
+  OK(fir_module_verify(m));
+  expect_run(m, "raise", NULL, 0, "threw ptr #1");
+  expect_run(m, "take", NULL, 0, "returned i32 7");
+  fir_module_free(m);
+}
+
 int main(void) {
   CHECK(fir_api_version() == FIR_API_VERSION);
   blocks_loop();
@@ -856,6 +1034,7 @@ int main(void) {
   errors();
   lfir();
   building_blocks();
+  exceptions();
   if (failures > 0) {
     fprintf(stderr, "%d checks failed\n", failures);
     return 1;
