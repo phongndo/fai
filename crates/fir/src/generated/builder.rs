@@ -19,7 +19,8 @@ impl FuncBuilder<'_> {
         Ok(self.result(made, 0))
     }
 
-    /// `poison`: an integer `poison` value.
+    /// `poison`: a `poison` value of a scalar type (`iN`, `ptr`, or `bN`, whose bytes are all
+    /// `poison`).
     pub fn poison(&mut self, result: Ty) -> Result<ValueId, BuildError> {
         self.begin_op();
         let kind = OpKind::Poison;
@@ -488,6 +489,137 @@ impl FuncBuilder<'_> {
         let kind = OpKind::CallIndirect(sig_id);
         let made = self.simple(kind, Res::Sig(sig_id))?;
         Ok(self.all_results(made))
+    }
+
+    /// `agg.make %a, %b`: a struct value from its fields, or an array value from its elements;
+    /// the result type says which.
+    pub fn agg_make(&mut self, result: Ty, args: &[Operand]) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand_list(args);
+        let kind = OpKind::AggMake;
+        let made = self.simple(kind, Res::Given(&[result]))?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `agg.extract %s, 1`: field `1` of a struct value, or element `1` of an array value.
+    pub fn agg_extract(&mut self, result: Ty, a: impl Into<Operand>, index: u32) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(a.into());
+        let kind = OpKind::AggExtract { index };
+        let made = self.simple(kind, Res::Given(&[result]))?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `agg.insert %s, %v, 1`: `%s` with field or element `1` replaced by `%v`.
+    pub fn agg_insert(&mut self, a: impl Into<Operand>, v: impl Into<Operand>, index: u32) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(a.into());
+        self.operand(v.into());
+        let kind = OpKind::AggInsert { index };
+        let made = self.simple(kind, Res::Implied)?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `int.add.overflow.s %a, %b`: the wrapped result and whether the operation overflowed
+    /// (signed, or unsigned with `.u`), as `int.add.s.trap` would trap; `int.sub` and `int.mul` too.
+    /// `poison` in, `poison` out (both results).
+    pub fn int_overflow(&mut self, op: ArithOp, signed: bool, a: impl Into<Operand>, b: impl Into<Operand>) -> Result<Results, BuildError> {
+        self.begin_op();
+        self.operand(a.into());
+        self.operand(b.into());
+        let kind = OpKind::Overflow { op, signed };
+        let made = self.simple(kind, Res::Implied)?;
+        Ok(self.all_results(made))
+    }
+
+    /// `union.make %v, 1`: the union (the result type) holding variant `1`, `%v`.
+    pub fn union_make(&mut self, result: Ty, v: impl Into<Operand>, index: u32) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(v.into());
+        let kind = OpKind::UnionMake { index };
+        let made = self.simple(kind, Res::Given(&[result]))?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `union.tag %u`: which variant `%u` holds, as an `i32`.
+    pub fn union_tag(&mut self, u: impl Into<Operand>) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(u.into());
+        let kind = OpKind::UnionTag;
+        let made = self.simple(kind, Res::Implied)?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `union.get.trap %u, 1`: the payload of variant `1`; if `%u` holds another variant, UB
+    /// (`.ub`) or a trap with reason `tag` (`.trap`).
+    pub fn union_get(&mut self, result: Ty, trap: bool, u: impl Into<Operand>, index: u32) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(u.into());
+        let kind = OpKind::UnionGet { trap, index };
+        let made = self.simple(kind, Res::Given(&[result]))?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `slice.make %p, %n`: the slice of `%n` elements at `%p`.
+    pub fn slice_make(&mut self, p: impl Into<Operand>, n: impl Into<Operand>) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(p.into());
+        self.operand(n.into());
+        let kind = OpKind::SliceMake;
+        let made = self.simple(kind, Res::Implied)?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `slice.ptr %s`
+    pub fn slice_ptr(&mut self, s: impl Into<Operand>) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(s.into());
+        let kind = OpKind::SlicePtr;
+        let made = self.simple(kind, Res::Implied)?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `slice.len %s`
+    pub fn slice_len(&mut self, s: impl Into<Operand>) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(s.into());
+        let kind = OpKind::SliceLen;
+        let made = self.simple(kind, Res::Implied)?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `slice.get.trap %s, %i, align 4`: load element `%i` (unsigned) of the slice, of the result
+    /// type. An index not below the length is UB (`.ub`) or traps with reason `bounds` (`.trap`); a
+    /// `poison` index or length is UB. The element is at `ptr.offset.inbounds` by `%i` times the
+    /// stride, wrapped.
+    pub fn slice_get(&mut self, result: Ty, trap: bool, s: impl Into<Operand>, n: impl Into<Operand>, align: u32) -> Result<ValueId, BuildError> {
+        self.begin_op();
+        self.operand(s.into());
+        self.operand(n.into());
+        let kind = OpKind::SliceGet { trap, align };
+        let made = self.simple(kind, Res::Given(&[result]))?;
+        Ok(self.result(made, 0))
+    }
+
+    /// `slice.set.trap i32 %v, %s, %i, align 4`: store element `%i` of the slice, checked like
+    /// `slice.get`.
+    pub fn slice_set(&mut self, trap: bool, ty: Ty, value: impl Into<Operand>, s: impl Into<Operand>, n: impl Into<Operand>, align: u32) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let ty_id = self.ty_imm(ty)?;
+        self.operand(value.into());
+        self.operand(s.into());
+        self.operand(n.into());
+        let kind = OpKind::SliceSet { trap, ty: ty_id, align };
+        self.simple(kind, Res::None)
+    }
+
+    /// `cf.check.bounds %ok`: nothing if `%ok` is 1; a trap with that reason if it is 0; UB if it
+    /// is `poison`. The lowered form of HFIR's checks.
+    pub fn cf_check(&mut self, reason: TrapReason, x: impl Into<Operand>) -> Result<OpId, BuildError> {
+        self.begin_op();
+        self.operand(x.into());
+        let kind = OpKind::Check(reason);
+        self.simple(kind, Res::None)
     }
 
     /// `aarch64.code { ^entry: … ^b1: … }`: a function's machine code, as labeled blocks entered

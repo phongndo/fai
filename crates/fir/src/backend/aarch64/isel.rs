@@ -9,14 +9,23 @@
 //! **Integers.** An `iN` (N ≤ 64) lives in the low N bits of a register; the bits above are
 //! unspecified. Ops whose result depends only on the low bits (add, sub, mul, logic, `shl`) use
 //! them as they are; the others (comparisons, division, right shifts, extensions, overflow
-//! checks) sign- or zero-extend their operands first. Wider integers are rejected.
+//! checks) sign- or zero-extend their operands first. Wider integers are held as their low 64 bits
+//! where only those bits matter (`low_bits_only`), and rejected elsewhere.
 //!
 //! **Edge cases** follow the op's modifiers: `.wrap`, `.nsw`, `.nuw`, and `.ub` compute the
 //! wrapped result (poison and UB allow any value); `.trap` branches to a trap block on overflow;
 //! `.sat` selects the bound. Division by zero traps when asked to and otherwise relies on
 //! `sdiv`/`udiv` giving 0 (and `msub` giving `x rem 0 = x`), which is what `.total` means; signed
 //! `MIN / -1` wraps in hardware. Shifts by at least the width trap, mask the amount, or select
-//! the all-shifted-out value.
+//! the all-shifted-out value. `poison` of any scalar type (`iN`, `ptr`, `bN`) is 0, one of the
+//! values it allows. `cf.check.R %ok` tests bit 0 of `%ok` and branches to a trap block with
+//! reason `R` (`bounds`, `tag`, …) when it is clear.
+//!
+//! **HFIR.** The building blocks (aggregate, union, and slice values, `int.*.overflow.*`) are
+//! rejected with a message to lower first: drivers compile HFIR through `fir::backend::prepare`,
+//! which lowers it to MFIR (`fir lower`). The lowering checks overflow at one more bit (twice
+//! the bits for `mul`), so overflow ops on integers wider than 63 bits (32 for `mul`) need the
+//! integers above 64 bits that the backend doesn't support yet.
 //!
 //! **Memory**: `mem.stack` slots are fixed frame slots (a loop iteration's slot is the previous
 //! iteration's, which is dead by then); heap allocation calls the family's allocator; loads and
@@ -111,6 +120,30 @@ pub fn check_module(m: &Module) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether an op's results, and its operands, may be integers wider than 64 bits. Such an
+/// integer is held as its low 64 bits (the bits above are unspecified, as for narrower ones), so
+/// only ops whose results' low 64 bits depend on nothing but their operands' low 64 bits may
+/// touch it: constants, `copy`, `freeze`, `select`, bitwise ops, `int.add`/`sub`/`mul` that
+/// don't trap or saturate, extensions *to* a wide type (their operands are narrow), and
+/// truncations *from* one (`.nsw`/`.nuw` give `poison` where the value doesn't fit, so the low
+/// bits will do). That is what HFIR's lowering emits for `ptr.index.inbounds`: the exact product
+/// at twice the address size, truncated with `.nsw`. Anything else (comparisons, division,
+/// shifts, memory, calls, parameters and results, region arguments) is rejected.
+fn low_bits_only(k: OpKind) -> (bool, bool) {
+    match k {
+        OpKind::Const(_) | OpKind::Copy | OpKind::Freeze | OpKind::Select | OpKind::Bit(_) => {
+            (true, true)
+        }
+        OpKind::Arith(_, ovf) => {
+            let ok = !matches!(ovf, Ovf::Trap(_) | Ovf::Sat(_));
+            (ok, ok)
+        }
+        OpKind::Zext | OpKind::Sext => (true, false),
+        OpKind::Trunc(_) => (true, true),
+        _ => (false, false),
+    }
 }
 
 fn check_ty(loc: Option<Loc>, t: Ty) -> Result<()> {
@@ -921,8 +954,18 @@ impl Sel<'_, '_> {
         let body = self.body;
         let kind = body.kind(op);
         self.loc = body.loc(op);
-        for v in body.results(op) {
-            check_ty(self.loc, body.ty(v))?;
+        let (wide_results, wide_operands) = low_bits_only(kind);
+        if !wide_results {
+            for v in body.results(op) {
+                check_ty(self.loc, body.ty(v))?;
+            }
+        }
+        if !wide_operands {
+            for o in body.operands(op) {
+                if let OperandKind::Value(v) = o.get() {
+                    check_ty(self.loc, body.ty(v))?;
+                }
+            }
         }
         match kind {
             OpKind::Const(n) => {
@@ -1295,6 +1338,26 @@ impl Sel<'_, '_> {
                 }
                 targets.sort_by_key(|t| t.0);
                 self.switch_tree(v, &targets, dblock);
+            }
+            OpKind::Check(reason) => {
+                // Bit 0 holds the `i1`; a `poison` one (UB) may trap or not.
+                let c = self.operand(op, 0)?;
+                self.emit(Inst::AluImm {
+                    op: AluImmOp::Ands,
+                    sf: Sf::X,
+                    d: Reg::XZR,
+                    n: c,
+                    imm: 1,
+                });
+                self.trap_if(Cond::Eq, reason);
+            }
+            k if k.decl().layers.hfir && !k.decl().layers.mfir => {
+                return Err(format!(
+                    "{}{} is HFIR only: lower the module to MFIR first (`fir::lower_checked`, \
+                     or `fir::backend::prepare`)",
+                    at(self.loc),
+                    k.mnemonic()
+                ));
             }
             k => {
                 return Err(format!(

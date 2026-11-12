@@ -40,8 +40,11 @@ typedef struct FirIntAlign {
 // A module's layer, for `fir_module_set_layer`.
 typedef uint32_t FirLayer;
 
-// A type: a value type (`fir_type_int`, `fir_type_byte`, `FIR_TYPE_PTR`), or a struct, array,
-// or function type of a module.
+// An object format and its assembler conventions, for `fir_module_compile`.
+typedef uint32_t FirOs;
+
+// A type: a value type (`fir_type_int`, `fir_type_byte`, `FIR_TYPE_PTR`, `FIR_TYPE_SLICE`), or a
+// struct, array, union, or function type of a module.
 typedef uint32_t FirType;
 
 // A struct's layout (`Policy`).
@@ -126,6 +129,9 @@ typedef struct FirCase {
   struct FirTarget target;
 } FirCase;
 
+// Why `cf.check` and `aarch64.trap` trap (`TrapReason`).
+typedef uint32_t FirTrapReason;
+
 // `aarch64.add`, `aarch64.sub`, … on three registers (`AluOp`).
 typedef uint32_t FirAluOp;
 
@@ -154,9 +160,6 @@ typedef uint32_t FirCond;
 // The access size of `aarch64.ldr` and `aarch64.str`: 1, 2, 4, or 8 bytes (`MemSize`).
 typedef uint32_t FirMemSize;
 
-// Why `aarch64.trap` traps (`TrapReason`).
-typedef uint32_t FirTrapReason;
-
 #define FIR_OK 0
 
 // An argument names nothing, breaks the op's typing rule, or clashes with a declaration.
@@ -174,6 +177,16 @@ typedef uint32_t FirTrapReason;
 // A bug in FIR, caught before it crossed the boundary.
 #define FIR_ERR_INTERNAL 5
 
+// Lowering, optimizing, or compiling a verified module failed (such as code the target doesn't
+// support yet).
+#define FIR_ERR_COMPILE 6
+
+// ELF, for Linux.
+#define FIR_OS_LINUX 0
+
+// Mach-O, for macOS.
+#define FIR_OS_DARWIN 1
+
 #define FIR_LAYER_HFIR 0
 
 #define FIR_LAYER_MFIR 1
@@ -183,6 +196,9 @@ typedef uint32_t FirTrapReason;
 
 // `ptr`
 #define FIR_TYPE_PTR 3221225472
+
+// `slice` (HFIR): a pointer and an address-sized length.
+#define FIR_TYPE_SLICE 3221225473
 
 #define FIR_OVF_WRAP 0
 
@@ -446,6 +462,12 @@ typedef uint32_t FirTrapReason;
 
 #define FIR_TRAP_REASON_OOM 3
 
+// An index outside a slice.
+#define FIR_TRAP_REASON_BOUNDS 4
+
+// A union read as a variant it doesn't hold.
+#define FIR_TRAP_REASON_TAG 5
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -503,6 +525,28 @@ FirStatus fir_module_run(struct FirModule *m,
                          uint64_t fuel,
                          char **out);
 
+// Verify an HFIR module and lower it to MFIR, as `fir lower` does: `*out` gets a new MFIR
+// module (free it with `fir_module_free`), and `m` is unchanged. The building blocks become
+// core ops, and aggregate, union, and slice values their scalars, so the lowered functions take
+// and return those scalars. `FIR_ERR_VERIFY` if `m` doesn't verify, `FIR_ERR_COMPILE` if it
+// can't be lowered (such as a field offset the address size can't hold).
+FirStatus fir_module_lower(struct FirModule *m, struct FirModule **out);
+
+// Verify a module and run the default pass pipeline on a copy, as `fir opt -O` does: `*out`
+// gets the optimized module, verified (free it with `fir_module_free`), and `m` is unchanged.
+FirStatus fir_module_optimize(struct FirModule *m, struct FirModule **out);
+
+// Verify a module and compile it for `target` (`"aarch64"`, the only one so far) to GNU
+// assembly, as `fir compile --emit asm` does: HFIR is lowered to MFIR first, and with
+// `optimize` the default pass pipeline runs on the MFIR (`fir compile -O`). `*out` gets the
+// assembly text; free it with `fir_string_free`. `FIR_ERR_COMPILE` if the module uses what the
+// backend doesn't support yet (integers wider than 64 bits, holes, other data layouts).
+FirStatus fir_module_compile(struct FirModule *m,
+                             const char *target,
+                             bool optimize,
+                             FirOs os,
+                             char **out);
+
 // `iN`, for `1 <= width < 2^30`.
 FirType fir_type_int(uint32_t width);
 
@@ -517,6 +561,9 @@ FirType fir_type_struct(struct FirModule *m,
 
 // `array<n x elem>`
 FirType fir_type_array(struct FirModule *m, uint64_t n, FirType elem);
+
+// `union<variants>` (HFIR): one of the variants, value types, and an `i32` tag naming it.
+FirType fir_type_union(struct FirModule *m, const FirType *variants, size_t nvariants);
 
 // `func<(params) -> rets>`, the signature of `func.call.indirect`.
 FirType fir_type_func(struct FirModule *m,
@@ -655,7 +702,8 @@ FirValue fir_int_const_dec(struct FirBuilder *fb, FirType result, const char *di
 // `int.const n`
 FirValue fir_int_const(struct FirBuilder *fb, FirType result, int64_t n);
 
-// `poison`: an integer `poison` value.
+// `poison`: a `poison` value of a scalar type (`iN`, `ptr`, or `bN`, whose bytes are all
+// `poison`).
 FirValue fir_poison(struct FirBuilder *fb, FirType result);
 
 // `freeze %x`: `%x`, or an arbitrary value if it is `poison`.
@@ -844,6 +892,69 @@ FirOp fir_func_call_indirect(struct FirBuilder *fb,
                              FirValue p,
                              const FirValue *args,
                              size_t nargs);
+
+// `agg.make %a, %b`: a struct value from its fields, or an array value from its elements;
+// the result type says which.
+FirValue fir_agg_make(struct FirBuilder *fb, FirType result, const FirValue *args, size_t nargs);
+
+// `agg.extract %s, 1`: field `1` of a struct value, or element `1` of an array value.
+FirValue fir_agg_extract(struct FirBuilder *fb, FirType result, FirValue a, uint32_t index);
+
+// `agg.insert %s, %v, 1`: `%s` with field or element `1` replaced by `%v`.
+FirValue fir_agg_insert(struct FirBuilder *fb, FirValue a, FirValue v, uint32_t index);
+
+// `int.add.overflow.s %a, %b`: the wrapped result and whether the operation overflowed
+// (signed, or unsigned with `.u`), as `int.add.s.trap` would trap; `int.sub` and `int.mul` too.
+// `poison` in, `poison` out (both results).
+FirOp fir_int_overflow(struct FirBuilder *fb, FirArithOp op, bool signed_, FirValue a, FirValue b);
+
+// `union.make %v, 1`: the union (the result type) holding variant `1`, `%v`.
+FirValue fir_union_make(struct FirBuilder *fb, FirType result, FirValue v, uint32_t index);
+
+// `union.tag %u`: which variant `%u` holds, as an `i32`.
+FirValue fir_union_tag(struct FirBuilder *fb, FirValue u);
+
+// `union.get.trap %u, 1`: the payload of variant `1`; if `%u` holds another variant, UB
+// (`.ub`) or a trap with reason `tag` (`.trap`).
+FirValue fir_union_get(struct FirBuilder *fb,
+                       FirType result,
+                       bool trap,
+                       FirValue u,
+                       uint32_t index);
+
+// `slice.make %p, %n`: the slice of `%n` elements at `%p`.
+FirValue fir_slice_make(struct FirBuilder *fb, FirValue p, FirValue n);
+
+// `slice.ptr %s`
+FirValue fir_slice_ptr(struct FirBuilder *fb, FirValue s);
+
+// `slice.len %s`
+FirValue fir_slice_len(struct FirBuilder *fb, FirValue s);
+
+// `slice.get.trap %s, %i, align 4`: load element `%i` (unsigned) of the slice, of the result
+// type. An index not below the length is UB (`.ub`) or traps with reason `bounds` (`.trap`); a
+// `poison` index or length is UB. The element is at `ptr.offset.inbounds` by `%i` times the
+// stride, wrapped.
+FirValue fir_slice_get(struct FirBuilder *fb,
+                       FirType result,
+                       bool trap,
+                       FirValue s,
+                       FirValue n,
+                       uint32_t align);
+
+// `slice.set.trap i32 %v, %s, %i, align 4`: store element `%i` of the slice, checked like
+// `slice.get`.
+FirOp fir_slice_set(struct FirBuilder *fb,
+                    bool trap,
+                    FirType ty,
+                    FirValue value,
+                    FirValue s,
+                    FirValue n,
+                    uint32_t align);
+
+// `cf.check.bounds %ok`: nothing if `%ok` is 1; a trap with that reason if it is 0; UB if it
+// is `poison`. The lowered form of HFIR's checks.
+FirOp fir_cf_check(struct FirBuilder *fb, FirTrapReason reason, FirValue x);
 
 // `aarch64.code { ^entry: … ^b1: … }`: a function's machine code, as labeled blocks entered
 // at the first. Each block ends with a branch, `aarch64.ret`, or `aarch64.trap`. It is the whole

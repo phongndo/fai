@@ -208,6 +208,7 @@ def wordOfVal (loc : Option Loc) : RVal → LM Word
   | .ptr (some p) => pure (.ptr p)
   | .ptr none => do pure (.bits (← chooseBits))
   | .bytes bs => wordOfBytes loc bs
+  | .agg _ => stuckL loc "an aggregate is not a register value"
 
 /-- The arguments of a call with parameter types `ps`: `x0`…`x7`, then 8-byte stack slots from
 `sp`. -/

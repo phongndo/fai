@@ -708,6 +708,145 @@ static void lfir(void) {
   fir_module_free(m);
 }
 
+/* An HFIR module using every building block: aggregate values (and an aggregate parameter and
+ * result), checked arithmetic, a tagged union, a slice, and a check. It runs, lowers to MFIR,
+ * optimizes, and compiles to AArch64 assembly through the C API. */
+static void building_blocks(void) {
+  FirModule *m = cur = fir_module_new();
+  FirType i1 = fir_type_int(1), i32 = fir_type_int(32), i64 = fir_type_int(64);
+  FirType two[2] = {i32, i32};
+  FirType pair = ID(fir_type_struct(m, FIR_POLICY_C, two, 2));
+  FirType vs[2] = {i32, i64};
+  FirType u = ID(fir_type_union(m, vs, 2));
+  CHECK(fir_type_union(m, NULL, 0) == FIR_INVALID);
+  expect_error("a union needs at least one variant", __LINE__);
+  FirType arr = ID(fir_type_array(m, 4, i32));
+
+  /* @swap(%s: struct<C>{i32, i32}) -> struct<C>{i32, i32} */
+  FirFunc swap = ID(fir_func_declare(m, "swap", &pair, 1, &pair, 1));
+  FirBuilder *b = fir_func_begin(m, swap);
+  FirValue s = ID(fir_builder_param(b, 0));
+  OK(fir_value_set_name(b, s, "s"));
+  FirValue a = ID(fir_agg_extract(b, i32, s, 0));
+  FirValue c = ID(fir_agg_extract(b, i32, s, 1));
+  FirValue t = ID(fir_agg_insert(b, s, a, 1));
+  FirValue w = ID(fir_agg_insert(b, t, c, 0));
+  ID(fir_func_ret(b, &w, 1));
+  OK(fir_func_end(b));
+
+  /* @len(%s: slice) -> i64 */
+  FirType slice = FIR_TYPE_SLICE;
+  FirFunc lenf = ID(fir_func_declare(m, "len", &slice, 1, &i64, 1));
+  b = fir_func_begin(m, lenf);
+  FirValue n = ID(fir_slice_len(b, ID(fir_builder_param(b, 0))));
+  ID(fir_func_ret(b, &n, 1));
+  OK(fir_func_end(b));
+
+  /* @blocks(%x: i32, %i: i64) -> (i32, i1, i32, i32, i64, i32) */
+  FirType params[2] = {i32, i64};
+  FirType rets[6] = {i32, i1, i32, i32, i64, i32};
+  FirFunc f = ID(fir_func_declare(m, "blocks", params, 2, rets, 6));
+  b = fir_func_begin(m, f);
+  FirValue x = ID(fir_builder_param(b, 0));
+  FirValue i = ID(fir_builder_param(b, 1));
+  OK(fir_value_set_name(b, x, "x"));
+  OK(fir_value_set_name(b, i, "i"));
+  FirValue one = ID(fir_int_const(b, i32, 1));
+  FirValue y = ID(fir_int_arith(b, FIR_ARITH_OP_ADD, FIR_OVF_WRAP, x, one));
+  FirValue xy[2] = {x, y};
+  FirValue sv = ID(fir_agg_make(b, pair, xy, 2));
+  FirOp call = ID(fir_func_call(b, swap, &sv, 1));
+  FirValue r = ID(fir_op_result(b, call, 0));
+  FirValue r0 = ID(fir_agg_extract(b, i32, r, 0));
+  FirOp add = ID(fir_int_overflow(b, FIR_ARITH_OP_ADD, true, x, y));
+  FirValue ovf = ID(fir_op_result(b, add, 1));
+  FirValue uv = ID(fir_union_make(b, u, x, 0));
+  FirValue tag = ID(fir_union_tag(b, uv));
+  FirValue ux = ID(fir_union_get(b, i32, true, uv, 0));
+  FirValue p = ID(fir_mem_stack_of(b, arr, 4));
+  FirValue four = ID(fir_int_const(b, i64, 4));
+  FirValue sl = ID(fir_slice_make(b, p, four));
+  CHECK(fir_slice_make(b, x, four) == FIR_INVALID);
+  ID(fir_slice_set(b, true, i32, x, sl, i, 4));
+  FirValue g = ID(fir_slice_get(b, i32, true, sl, i, 4));
+  FirValue len = ID(fir_op_result(b, ID(fir_func_call(b, lenf, &sl, 1)), 0));
+  FirValue sp = ID(fir_slice_ptr(b, sl));
+  FirValue same = ID(fir_ptr_cmp(b, FIR_PRED_EQ, sp, p));
+  ID(fir_cf_check(b, FIR_TRAP_REASON_TAG, same));
+  FirValue t1 = ID(fir_int_const(b, i1, 1));
+  FirValue nov = ID(fir_int_bit(b, FIR_BIT_OP_XOR, ovf, t1));
+  ID(fir_cf_check(b, FIR_TRAP_REASON_OVERFLOW, nov));
+  FirValue out[6] = {r0, ovf, tag, ux, len, g};
+  ID(fir_func_ret(b, out, 6));
+  OK(fir_func_end(b));
+  OK(fir_module_verify(m));
+
+  const char *ok_args[] = {"5", "2"};
+  const char *ovf_args[] = {"1073741824", "0"};
+  const char *oob_args[] = {"5", "4"};
+  const char *ret = "returned i32 6, i1 0, i32 0, i32 5, i64 4, i32 5";
+  expect_run(m, "blocks", ok_args, 2, ret);
+  expect_run(m, "blocks", ovf_args, 2, "trap overflow");
+  expect_run(m, "blocks", oob_args, 2, "trap bounds");
+
+  /* Lowered to MFIR: the same runs, and @swap passes its struct as two i32s. */
+  FirModule *l = NULL;
+  OK(fir_module_lower(m, &l));
+  CHECK(l != NULL);
+  if (l != NULL) {
+    expect_run(l, "blocks", ok_args, 2, ret);
+    expect_run(l, "blocks", ovf_args, 2, "trap overflow");
+    expect_run(l, "blocks", oob_args, 2, "trap bounds");
+    char *text = fir_module_print(l, false);
+    CHECK(text != NULL && strncmp(text, "layer mfir\n", 11) == 0);
+    CHECK(text != NULL && strstr(text, "func @swap(%s.0: i32, %s.1: i32) -> (i32, i32)") != NULL);
+    fir_string_free(text);
+    cur = l;
+    FirModule *again = NULL;
+    CHECK(fir_module_lower(l, &again) == FIR_ERR_INVALID && again == NULL);
+    expect_error("only an HFIR module can be lowered", __LINE__);
+
+    /* Optimized: the same runs again. */
+    FirModule *o = NULL;
+    OK(fir_module_optimize(l, &o));
+    CHECK(o != NULL);
+    if (o != NULL) {
+      expect_run(o, "blocks", ok_args, 2, ret);
+      expect_run(o, "blocks", oob_args, 2, "trap bounds");
+      fir_module_free(o);
+    }
+    fir_module_free(l);
+    cur = m;
+  }
+
+  /* Compiled to AArch64 assembly, from the HFIR, with and without -O. */
+  for (int opt = 0; opt < 2; opt++) {
+    char *as = NULL;
+    OK(fir_module_compile(m, "aarch64", opt == 1, FIR_OS_LINUX, &as));
+    CHECK(as != NULL && strstr(as, "blocks:") != NULL && strstr(as, "__fir_trap") != NULL);
+    fir_string_free(as);
+  }
+  char *as = NULL;
+  CHECK(fir_module_compile(m, "x86", false, FIR_OS_LINUX, &as) == FIR_ERR_INVALID && as == NULL);
+  expect_error("unknown target 'x86'", __LINE__);
+  CHECK(fir_module_compile(m, "aarch64", false, 7, &as) == FIR_ERR_INVALID && as == NULL);
+  expect_error("7 is not a FirOs", __LINE__);
+  fir_module_free(m);
+
+  /* What the backend can't compile yet is FIR_ERR_COMPILE. */
+  m = cur = fir_module_new();
+  FirType i128 = fir_type_int(128);
+  FirFunc wide = ID(fir_func_declare(m, "wide", &i128, 1, &i128, 1));
+  b = fir_func_begin(m, wide);
+  FirValue z = ID(fir_builder_param(b, 0));
+  ID(fir_func_ret(b, &z, 1));
+  OK(fir_func_end(b));
+  CHECK(fir_module_compile(m, "aarch64", false, FIR_OS_DARWIN, &as) == FIR_ERR_COMPILE);
+  expect_error("@wide: i128 is wider than 64 bits, which the AArch64 backend doesn't support yet",
+               __LINE__);
+  fir_module_free(m);
+}
+
 int main(void) {
   CHECK(fir_api_version() == FIR_API_VERSION);
   blocks_loop();
@@ -716,6 +855,7 @@ int main(void) {
   control_and_ints();
   errors();
   lfir();
+  building_blocks();
   if (failures > 0) {
     fprintf(stderr, "%d checks failed\n", failures);
     return 1;

@@ -132,9 +132,6 @@ def MemSize.bytes : MemSize → Nat
 
 instance : Spelled MemSize := ⟨[sp "b" .b, sp "h" .h, sp "w" .w, sp "x" .x]⟩
 
-instance : Spelled TrapReason := ⟨[sp "div0" .div0, sp "overflow" .overflow, sp "shift" .shift,
-  sp "oom" .oom]⟩
-
 /-- `sbfx` (signed) and `ubfx`: extract the low bits and sign- or zero-extend them. -/
 def extModes : List (Spelling Bool) := [sp "sbfx" true, sp "ubfx" false]
 

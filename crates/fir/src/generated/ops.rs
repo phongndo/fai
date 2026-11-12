@@ -115,7 +115,7 @@ pub enum OpKind {
     /// `func.call.indirect func<(i32) -> i32> %p(%a)`: a call through a pointer, which must point
     /// at a function of this signature.
     CallIndirect(Ty),
-    /// `agg.make %a, %b` (HFIR building blocks, lowered by `Fir.Lower`): a struct value from its fields, or an array value from its elements;
+    /// `agg.make %a, %b`: a struct value from its fields, or an array value from its elements;
     /// the result type says which.
     AggMake,
     /// `agg.extract %s, 1`: field `1` of a struct value, or element `1` of an array value.

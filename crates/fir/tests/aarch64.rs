@@ -6,12 +6,24 @@
 //! with the run's arguments and prints the outcome in `fir run`'s format, run (natively on
 //! AArch64, under `qemu-aarch64` elsewhere), and compared with `fir run`:
 //!
+//! * A fixture is compiled with only the functions its runs reach; a run whose functions the
+//!   backend can't compile (holes, integers wider than 64 bits, other data layouts) is skipped
+//!   and counted, and the rest of its file still runs.
 //! * External functions are stubs that print the event and return zeros, as `fir run`'s world
 //!   does. Traps reach the test runtime's `__fir_trap`, which prints the reason and location.
 //! * Runs that end in UB, get stuck, reach a hole, are ambiguous, or run out of fuel are not
 //!   comparable (UB allows anything) and are only counted.
 //! * Where `fir run` prints `poison`, any value matches; a non-null pointer prints as `ptr ?`
 //!   (allocation numbers are the interpreter's); leak notes are dropped (counted).
+//!
+//! HFIR modules (the fixtures under `tests/blocks/` and most random programs, which use the
+//! building blocks: aggregate, union, and slice values, checked arithmetic, `cf.check`) compile
+//! as `fir compile` compiles them: lowered to MFIR first (`fir::backend::prepare`). Their
+//! reference is `fir run` of the HFIR program, with returned aggregates, unions, and slices
+//! shown as the scalars the lowering returns (`run_detail` with `lower_rets`, as the lowering's
+//! own tests compare them), so the native output, which prints the lowered function's results,
+//! is compared with the HFIR semantics directly. Where the default `-O` pipeline changes the
+//! MFIR, the optimized program is built and run natively too.
 //!
 //! The comparison also runs each program's LFIR in the interpreter, before and after register
 //! allocation, and expects what the source run gives (with the same normalization): this checks
@@ -57,10 +69,10 @@ const RUNTIME: &str = r#"
 #include <stdio.h>
 #include <stdlib.h>
 
-static const char *reasons[] = {"div0", "overflow", "shift", "oom"};
+static const char *reasons[] = {"div0", "overflow", "shift", "oom", "bounds", "tag"};
 
 void __fir_trap(uint32_t reason, uint32_t line, uint32_t col) {
-    printf("trap %s", reason < 4 ? reasons[reason] : "?");
+    printf("trap %s", reason < 6 ? reasons[reason] : "?");
     if (line != 0xffffffffu) printf(" @%u:%u", line, col);
     printf("\n");
     fflush(stdout);
@@ -502,20 +514,89 @@ impl Tally {
     }
 }
 
-/// Check one module's runs: `(function, args, fuel)`.
+/// The HFIR building blocks a module uses, by name, for the statistics.
+fn blocks_used(m: &Module) -> Vec<&'static str> {
+    use fir::OpKind as K;
+    let mut out = Vec::new();
+    for f in &m.funcs {
+        let b = &f.body;
+        let sig = b
+            .params(b.entry())
+            .map(|v| b.ty(v))
+            .chain(f.rets.iter().copied());
+        if sig.into_iter().any(|t| !t.is_value()) {
+            out.push("aggregate parameters or results");
+        }
+        let mut stack = vec![b.entry()];
+        while let Some(r) = stack.pop() {
+            for op in b.ops(r) {
+                out.push(match b.kind(op) {
+                    K::AggMake | K::AggExtract { .. } | K::AggInsert { .. } => "agg.*",
+                    K::Overflow { .. } => "int.*.overflow.*",
+                    K::UnionMake { .. } | K::UnionTag | K::UnionGet { .. } => "union.*",
+                    K::SliceMake | K::SlicePtr | K::SliceLen => "slice.make/ptr/len",
+                    K::SliceGet { .. } | K::SliceSet { .. } => "slice.get/set",
+                    K::Check(_) => "cf.check",
+                    K::Load { .. } | K::Store { .. } => {
+                        let t = match b.kind(op) {
+                            K::Store { ty, .. } => ty,
+                            _ => b.ty(b.results(op).next().unwrap()),
+                        };
+                        if t.is_value() {
+                            continue;
+                        }
+                        "aggregate loads and stores"
+                    }
+                    _ => continue,
+                });
+                stack.extend_from_slice(b.regions(op));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Check one module's runs: `(function, args, fuel)`. An HFIR module is lowered first, as
+/// `fir compile` does.
 fn check_module(
     tc: Option<&Toolchain>,
     lean: Option<&Path>,
-    m: &Module,
+    src: &Module,
     runs: &[(String, Vec<String>, u64)],
     dir: &Path,
     name: &str,
     tally: &Mutex<Tally>,
 ) -> bool {
+    let lowered = src.layer == fir::Layer::Hfir;
+    let m = match fir::backend::prepare(src, false) {
+        Ok(m) => m,
+        Err(e) => {
+            tally.lock().unwrap().count(format!(
+                "not lowered: {}",
+                e.rsplit(':').next().unwrap_or(&e).trim()
+            ));
+            return true;
+        }
+    };
+    let m = &m;
+    let blocks = blocks_used(src);
+    {
+        let mut t = tally.lock().unwrap();
+        if lowered {
+            t.count("(HFIR modules, lowered)");
+        }
+        for b in &blocks {
+            t.count(format!("(modules using {b})"));
+        }
+    }
     let mut comparable = Vec::new();
     for (f, args, fuel) in runs {
         let a: Vec<&str> = args.iter().map(String::as_str).collect();
-        let reference = fir::interp::run(m, f, &a, *fuel).unwrap_or_else(|e| format!("error {e}"));
+        let reference = fir::interp::run_detail(src, f, &a, *fuel, lowered)
+            .map(|r| r.line)
+            .unwrap_or_else(|e| format!("error {e}"));
         match normalize(&reference) {
             Ok((want, leaks)) => {
                 if leaks {
@@ -571,7 +652,9 @@ fn check_module(
     };
     for (f, args, fuel, want) in &comparable {
         let a: Vec<&str> = args.iter().map(String::as_str).collect();
-        let run = |lm: &Module| fir::interp::run(lm, f, &a, lfir_fuel(*fuel));
+        // The lowering takes up to 16 times the steps of the HFIR program.
+        let fuel = if lowered { 16 * *fuel } else { *fuel };
+        let run = |lm: &Module| fir::interp::run(lm, f, &a, lfir_fuel(fuel));
         match modules
             .iter()
             .map(run)
@@ -585,7 +668,7 @@ fn check_module(
                             .arg(file)
                             .arg(format!("@{f}"))
                             .args(args)
-                            .args(["--fuel", &lfir_fuel(*fuel).to_string()])
+                            .args(["--fuel", &lfir_fuel(fuel).to_string()])
                             .output()
                             .unwrap();
                         let r = String::from_utf8_lossy(&out.stdout).trim_end().to_owned();
@@ -637,23 +720,48 @@ fn check_module(
         .iter()
         .map(|(f, a, _, _)| (f.clone(), a.clone()))
         .collect();
-    let bin = match build(tc, m, &runs, dir, name) {
-        Ok(b) => b,
+    // The program as compiled, and with `-O` when that changes it.
+    let mut builds = vec![("native", m.clone())];
+    match fir::backend::prepare(src, true) {
+        Ok(o) if o.render(false) != m.render(false) => builds.push(("native -O", o)),
+        Ok(_) => {}
         Err(e) => {
-            tally.lock().unwrap().fails.push(format!("{name}: {e}"));
+            tally.lock().unwrap().fails.push(format!("{name}: -O: {e}"));
             return false;
         }
-    };
-    for (k, (f, args, _, want)) in comparable.iter().enumerate() {
-        let got = run_native(tc, &bin, k);
-        if matches(want, &got) {
-            tally.lock().unwrap().count("native matches");
-        } else if differs(want, &got, "native") {
-            ok = false;
-            tally.lock().unwrap().fails.push(format!(
-                "{name} @{f}({}): native\n  want {want}\n  got  {got}",
-                args.join(", ")
-            ));
+    }
+    for (what, bm) in &builds {
+        let bname = if *what == "native" {
+            name.to_owned()
+        } else {
+            format!("{name}-O")
+        };
+        let bin = match build(tc, bm, &runs, dir, &bname) {
+            Ok(b) => b,
+            Err(e) => {
+                tally
+                    .lock()
+                    .unwrap()
+                    .fails
+                    .push(format!("{name} ({what}): {e}"));
+                return false;
+            }
+        };
+        for (k, (f, args, _, want)) in comparable.iter().enumerate() {
+            let got = run_native(tc, &bin, k);
+            if matches(want, &got) {
+                let mut t = tally.lock().unwrap();
+                t.count(format!("{what} matches"));
+                if !blocks.is_empty() {
+                    t.count(format!("{what} matches (building blocks)"));
+                }
+            } else if differs(want, &got, what) {
+                ok = false;
+                tally.lock().unwrap().fails.push(format!(
+                    "{name} @{f}({}): {what}\n  want {want}\n  got  {got}",
+                    args.join(", ")
+                ));
+            }
         }
     }
     ok
@@ -696,6 +804,41 @@ fn run_lines(text: &str) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
+/// `m` with only the functions and external functions that `roots` reach through calls and
+/// function addresses, and those that globals' initializers name.
+fn prune(m: &Module, roots: &[&str]) -> Module {
+    use fir::OpKind as K;
+    let mut keep: Vec<String> = roots.iter().map(|r| (*r).to_owned()).collect();
+    let mut syms = Vec::new();
+    for g in 0..m.globals.len() {
+        m.globals.syms(m.globals.init(g), &mut syms);
+    }
+    keep.extend(syms.into_iter().map(str::to_owned));
+    let mut i = 0;
+    while i < keep.len() {
+        if let Some(f) = m.funcs.iter().find(|f| f.name == keep[i]) {
+            let b = &f.body;
+            let mut stack = vec![b.entry()];
+            while let Some(r) = stack.pop() {
+                for op in b.ops(r) {
+                    if let K::Call { callee } | K::FuncAddr { callee } = b.kind(op) {
+                        let name = b.str(callee);
+                        if !keep.iter().any(|k| k == name) {
+                            keep.push(name.to_owned());
+                        }
+                    }
+                    stack.extend_from_slice(b.regions(op));
+                }
+            }
+        }
+        i += 1;
+    }
+    let mut out = m.clone();
+    out.funcs.retain(|f| keep.contains(&f.name));
+    out.externs.retain(|x| keep.contains(&x.name));
+    out
+}
+
 #[test]
 fn fixtures_run_natively() {
     let dir = scratch("aarch64-fixtures");
@@ -722,15 +865,26 @@ fn fixtures_run_natively() {
             tally.lock().unwrap().count("module skipped: already LFIR");
             continue;
         }
-        if let Err(e) = a64::select(&m) {
-            eprintln!("  {name}: not compiled: {e}");
-            tally
-                .lock()
-                .unwrap()
-                .count(format!("module skipped ({} runs)", runs.len()));
+        // Each run needs the functions it reaches to compile; the others are left out.
+        let compiles =
+            |m: &Module| fir::backend::prepare(m, false).and_then(|l| a64::select(&l).map(|_| ()));
+        let mut kept = Vec::new();
+        for (f, a) in runs {
+            match compiles(&prune(&m, &[&f])) {
+                Ok(()) => kept.push((f, a)),
+                Err(e) => {
+                    eprintln!("  {name}: @{f}: not compiled: {e}");
+                    tally.lock().unwrap().count("run skipped: not compiled");
+                }
+            }
+        }
+        if kept.is_empty() {
             continue;
         }
+        let roots: Vec<&str> = kept.iter().map(|(f, _)| f.as_str()).collect();
+        let m = prune(&m, &roots);
         modules += 1;
+        let runs = kept;
         let runs: Vec<_> = runs
             .into_iter()
             .map(|(f, a)| (f, a, fir::interp::DEFAULT_FUEL))
@@ -791,7 +945,7 @@ fn random_programs_run_natively() {
                     if !check_module(tc.as_ref(), lean, &m, &runs, &dir, &name, &tally) {
                         std::fs::write(dir.join(format!("{name}.fir")), &prog.text).unwrap();
                     } else {
-                        for ext in ["", ".s", ".c"] {
+                        for ext in ["", ".s", ".c", "-O", "-O.s", "-O.c"] {
                             let _ = std::fs::remove_file(dir.join(format!("{name}{ext}")));
                         }
                     }

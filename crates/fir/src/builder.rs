@@ -338,7 +338,7 @@ impl ModuleBuilder {
     /// Continue building a module, such as a parsed one: its functions, external functions,
     /// and globals can be referred to by name ([`ModuleBuilder::func_ref`],
     /// [`ModuleBuilder::global_ref`]), and new functions are added after its own.
-    pub fn from_module(module: Module) -> Result<ModuleBuilder, BuildError> {
+    pub fn from_module(mut module: Module) -> Result<ModuleBuilder, BuildError> {
         let mut mb = ModuleBuilder::new();
         for i in 0..module.globals.len() {
             mb.globals_by_name
@@ -347,13 +347,16 @@ impl ModuleBuilder {
         for x in &module.externs {
             mb.add_sym(&x.name, &x.params, &x.rets, SymKind::Extern)?;
         }
+        // A function's signature is in its body's type table; symbols keep the module's.
+        let types = &mut module.globals.types;
         for f in &module.funcs {
-            let params: Vec<Ty> = f
-                .body
-                .params(f.body.entry())
-                .map(|v| f.body.ty(v))
+            let b = &f.body;
+            let params: Vec<Ty> = b
+                .params(b.entry())
+                .map(|v| types.import(b.types(), b.ty(v)))
                 .collect();
-            mb.add_sym(&f.name, &params, &f.rets, SymKind::Defined)?;
+            let rets: Vec<Ty> = f.rets.iter().map(|&t| types.import(b.types(), t)).collect();
+            mb.add_sym(&f.name, &params, &rets, SymKind::Defined)?;
         }
         mb.module = module;
         Ok(mb)
@@ -385,7 +388,7 @@ impl ModuleBuilder {
         self.module.layer
     }
 
-    /// The table of the module's struct, array, and function types.
+    /// The table of the module's struct, array, union, and function types.
     pub fn types(&self) -> &Types {
         &self.module.globals.types
     }
@@ -400,6 +403,15 @@ impl ModuleBuilder {
     pub fn array_ty(&mut self, n: u64, elem: Ty) -> Result<Ty, BuildError> {
         self.check_tys(&[elem])?;
         Ok(self.module.globals.types.array(n, elem))
+    }
+
+    /// `union<variants>`, an HFIR value type: at least one variant, each a value type.
+    pub fn union_ty(&mut self, variants: &[Ty]) -> Result<Ty, BuildError> {
+        self.check_tys(variants)?;
+        if variants.is_empty() {
+            return err("a union needs at least one variant");
+        }
+        Ok(self.module.globals.types.union(variants))
     }
 
     /// `func<(params) -> rets>`, for `func.call.indirect`.
@@ -423,9 +435,13 @@ impl ModuleBuilder {
         Ok(())
     }
 
+    /// Every type is a value type: a scalar, or for a function (`what` is `func`) of an HFIR
+    /// module also an aggregate, a union, or a slice.
     fn value_tys(&self, what: &str, name: &str, ts: &[Ty]) -> Result<(), BuildError> {
         self.check_tys(ts)?;
-        if let Some(&t) = ts.iter().find(|t| !t.is_value()) {
+        let hfir = what == "func" && self.module.layer == crate::Layer::Hfir;
+        let ok = |t: Ty| t.is_value() || (hfir && self.types().is_hvalue(t));
+        if let Some(&t) = ts.iter().find(|&&t| !ok(t)) {
             return err(format!(
                 "{what} @{name}: {} is not a value type",
                 self.types().show(t)
@@ -456,7 +472,8 @@ impl ModuleBuilder {
     }
 
     /// Declare a function, to call it or take its address before it is defined (with
-    /// [`ModuleBuilder::define`]). Parameters and results are value types.
+    /// [`ModuleBuilder::define`]). Parameters and results are value types: scalars, or in HFIR
+    /// also aggregates, unions, and slices.
     pub fn declare_func(
         &mut self,
         name: &str,
@@ -541,10 +558,17 @@ impl ModuleBuilder {
         }
         let st = &mut self.st;
         st.body.clear();
+        st.ty_map.clear();
         let entry = st.body.entry();
+        let types = &self.module.globals.types;
+        let params: Vec<Ty> = sym
+            .params
+            .iter()
+            .map(|&t| import(types, &mut st.body, &mut st.ty_map, t))
+            .collect();
         st.body.set_params(
             entry,
-            sym.params.iter().map(|&ty| ValueSpec {
+            params.into_iter().map(|ty| ValueSpec {
                 name: "",
                 ty,
                 facts: Vec::new(),
@@ -554,7 +578,6 @@ impl ModuleBuilder {
         st.file = None;
         st.at = Some(InsertPoint::End(entry));
         st.loc = None;
-        st.ty_map.clear();
         st.func_names.clear();
         st.global_names.clear();
         st.blocks.clear();
@@ -708,6 +731,11 @@ impl<'m> FuncBuilder<'m> {
         for (op, blocks) in std::mem::take(&mut st.blocks) {
             st.body.set_regions(op, &blocks);
         }
+        let rets: Vec<Ty> = m.syms[f.index()]
+            .rets
+            .iter()
+            .map(|&t| import(&m.module.globals.types, &mut st.body, &mut st.ty_map, t))
+            .collect();
         let mut digits = String::new();
         for v in 0..st.body.num_values() as u32 {
             let v = ValueId::from_raw(v);
@@ -731,7 +759,7 @@ impl<'m> FuncBuilder<'m> {
         sym.kind = SymKind::Defined;
         m.module.funcs.push(Func {
             name: sym.name.clone(),
-            rets: sym.rets.clone(),
+            rets,
             file: st.file.take(),
             body,
         });
@@ -1248,15 +1276,24 @@ impl<'m> FuncBuilder<'m> {
             }
             Res::Callee(f) => {
                 let sym = self.m.sym(f)?;
-                if ins != sym.params.as_slice() {
+                let (params, rets) = (sym.params.clone(), sym.rets.clone());
+                let params = self.import_list(&params)?;
+                if ins != params.as_slice() {
+                    let name = &self.m.syms[f.index()].name;
                     return err(format!(
-                        "arguments of @{}: expected {} but got {}",
-                        sym.name,
-                        self.show_list(&sym.params),
+                        "arguments of @{name}: expected {} but got {}",
+                        self.show_list(&params),
                         self.show_list(ins)
                     ));
                 }
-                outs.extend_from_slice(&sym.rets);
+                for &t in &rets {
+                    outs.push(import(
+                        &self.m.module.globals.types,
+                        &mut self.m.st.body,
+                        &mut self.m.st.ty_map,
+                        t,
+                    ));
+                }
             }
             Res::Sig(t) => {
                 let types = self.m.st.body.types();
@@ -1285,6 +1322,7 @@ impl<'m> FuncBuilder<'m> {
             TyE::Ptr => Ty::Ptr,
             TyE::Addr => addr,
             TyE::Int(w) => Ty::Int(w),
+            TyE::Slice => Ty::Slice,
             TyE::Var(i) => vars[usize::from(i)],
             TyE::Field(i) => match kind.imm(i.into()) {
                 Some(Imm::Ty(t)) => t,
@@ -1373,7 +1411,8 @@ impl<'m> FuncBuilder<'m> {
                         return err(msg);
                     }
                 }
-                // Integer ranges, layouts, and names are left to the verifier.
+                // Integer ranges, layouts, names, and the shapes of aggregate and union types are
+                // left to the verifier.
                 Check::Fits(..)
                 | Check::Loadable(..)
                 | Check::Call(_)
@@ -1381,7 +1420,12 @@ impl<'m> FuncBuilder<'m> {
                 | Check::Field(..)
                 | Check::Sig(_)
                 | Check::Global(_)
-                | Check::Func(_) => {}
+                | Check::Func(_)
+                | Check::Parts(_)
+                | Check::Part(..)
+                | Check::Variant(..)
+                | Check::Union(_)
+                | Check::Scalar(_) => {}
             }
         }
         Ok(())
@@ -1435,6 +1479,10 @@ fn import(from: &Types, body: &mut Body, map: &mut Vec<u32>, t: Ty) -> Ty {
             let ps = list(ps, body, map);
             let rs = list(rs, body, map);
             body.types_mut().func(&ps, &rs)
+        }
+        Shape::Union(vs) => {
+            let vs = list(vs, body, map);
+            body.types_mut().union(&vs)
         }
     };
     if let Ty::Agg(new) = out {

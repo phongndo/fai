@@ -21,7 +21,8 @@ pub unsafe extern "C" fn fir_int_const(fb: *mut FirBuilder, result: FirType, n: 
     }
 }
 
-/// `poison`: an integer `poison` value.
+/// `poison`: a `poison` value of a scalar type (`iN`, `ptr`, or `bN`, whose bytes are all
+/// `poison`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_poison(fb: *mut FirBuilder, result: FirType) -> FirValue {
     unsafe {
@@ -494,6 +495,145 @@ pub unsafe extern "C" fn fir_func_call_indirect(fb: *mut FirBuilder, sig: FirTyp
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.func_call_indirect(crate::ty(sig)?, Operand::from_raw(p), crate::values(args, nargs)).map(|r| r.op.raw())
+        })
+    }
+}
+
+/// `agg.make %a, %b`: a struct value from its fields, or an array value from its elements;
+/// the result type says which.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_agg_make(fb: *mut FirBuilder, result: FirType, args: *const FirValue, nargs: usize) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.agg_make(crate::ty(result)?, crate::values(args, nargs)).map(|v| v.raw())
+        })
+    }
+}
+
+/// `agg.extract %s, 1`: field `1` of a struct value, or element `1` of an array value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_agg_extract(fb: *mut FirBuilder, result: FirType, a: FirValue, index: u32) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.agg_extract(crate::ty(result)?, Operand::from_raw(a), index).map(|v| v.raw())
+        })
+    }
+}
+
+/// `agg.insert %s, %v, 1`: `%s` with field or element `1` replaced by `%v`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_agg_insert(fb: *mut FirBuilder, a: FirValue, v: FirValue, index: u32) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.agg_insert(Operand::from_raw(a), Operand::from_raw(v), index).map(|v| v.raw())
+        })
+    }
+}
+
+/// `int.add.overflow.s %a, %b`: the wrapped result and whether the operation overflowed
+/// (signed, or unsigned with `.u`), as `int.add.s.trap` would trap; `int.sub` and `int.mul` too.
+/// `poison` in, `poison` out (both results).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_int_overflow(fb: *mut FirBuilder, op: FirArithOp, signed: bool, a: FirValue, b: FirValue) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.int_overflow(ArithOp::from_c(op)?, signed, Operand::from_raw(a), Operand::from_raw(b)).map(|r| r.op.raw())
+        })
+    }
+}
+
+/// `union.make %v, 1`: the union (the result type) holding variant `1`, `%v`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_union_make(fb: *mut FirBuilder, result: FirType, v: FirValue, index: u32) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.union_make(crate::ty(result)?, Operand::from_raw(v), index).map(|v| v.raw())
+        })
+    }
+}
+
+/// `union.tag %u`: which variant `%u` holds, as an `i32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_union_tag(fb: *mut FirBuilder, u: FirValue) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.union_tag(Operand::from_raw(u)).map(|v| v.raw())
+        })
+    }
+}
+
+/// `union.get.trap %u, 1`: the payload of variant `1`; if `%u` holds another variant, UB
+/// (`.ub`) or a trap with reason `tag` (`.trap`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_union_get(fb: *mut FirBuilder, result: FirType, trap: bool, u: FirValue, index: u32) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.union_get(crate::ty(result)?, trap, Operand::from_raw(u), index).map(|v| v.raw())
+        })
+    }
+}
+
+/// `slice.make %p, %n`: the slice of `%n` elements at `%p`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_slice_make(fb: *mut FirBuilder, p: FirValue, n: FirValue) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.slice_make(Operand::from_raw(p), Operand::from_raw(n)).map(|v| v.raw())
+        })
+    }
+}
+
+/// `slice.ptr %s`
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_slice_ptr(fb: *mut FirBuilder, s: FirValue) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.slice_ptr(Operand::from_raw(s)).map(|v| v.raw())
+        })
+    }
+}
+
+/// `slice.len %s`
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_slice_len(fb: *mut FirBuilder, s: FirValue) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.slice_len(Operand::from_raw(s)).map(|v| v.raw())
+        })
+    }
+}
+
+/// `slice.get.trap %s, %i, align 4`: load element `%i` (unsigned) of the slice, of the result
+/// type. An index not below the length is UB (`.ub`) or traps with reason `bounds` (`.trap`); a
+/// `poison` index or length is UB. The element is at `ptr.offset.inbounds` by `%i` times the
+/// stride, wrapped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_slice_get(fb: *mut FirBuilder, result: FirType, trap: bool, s: FirValue, n: FirValue, align: u32) -> FirValue {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.slice_get(crate::ty(result)?, trap, Operand::from_raw(s), Operand::from_raw(n), align).map(|v| v.raw())
+        })
+    }
+}
+
+/// `slice.set.trap i32 %v, %s, %i, align 4`: store element `%i` of the slice, checked like
+/// `slice.get`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_slice_set(fb: *mut FirBuilder, trap: bool, ty: FirType, value: FirValue, s: FirValue, n: FirValue, align: u32) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.slice_set(trap, crate::ty(ty)?, Operand::from_raw(value), Operand::from_raw(s), Operand::from_raw(n), align).map(|op| op.raw())
+        })
+    }
+}
+
+/// `cf.check.bounds %ok`: nothing if `%ok` is 1; a trap with that reason if it is 0; UB if it
+/// is `poison`. The lowered form of HFIR's checks.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_cf_check(fb: *mut FirBuilder, reason: FirTrapReason, x: FirValue) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.cf_check(TrapReason::from_c(reason)?, Operand::from_raw(x)).map(|op| op.raw())
         })
     }
 }

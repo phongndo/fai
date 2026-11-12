@@ -106,6 +106,7 @@ def tyName : TyE → String
   | .ptr => "p"
   | .addr => "n"
   | .int _ => "x"
+  | .slice => "s"
   | .name _ => "value"
 
 /-- Number repeated names: `p, p` → `p, p1`. -/

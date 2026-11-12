@@ -32,6 +32,10 @@ fn copy_ty(from: &Types, t: Ty, mb: &mut ModuleBuilder) -> Ty {
             let rs: Vec<Ty> = rs.iter().map(|&t| copy_ty(from, t, mb)).collect();
             mb.func_ty(&ps, &rs).unwrap()
         }
+        Shape::Union(vs) => {
+            let vs: Vec<Ty> = vs.iter().map(|&t| copy_ty(from, t, mb)).collect();
+            mb.union_ty(&vs).unwrap()
+        }
     }
 }
 
@@ -80,8 +84,16 @@ fn rebuild(m: &Module) -> Result<Module, BuildError> {
     let mut refs = Vec::new();
     for f in &m.funcs {
         let b = &f.body;
-        let ps: Vec<Ty> = b.params(b.entry()).map(|v| b.ty(v)).collect();
-        refs.push(mb.declare_func(&f.name, &ps, &f.rets)?);
+        let ps: Vec<Ty> = b
+            .params(b.entry())
+            .map(|v| copy_ty(b.types(), b.ty(v), &mut mb))
+            .collect();
+        let rs: Vec<Ty> = f
+            .rets
+            .iter()
+            .map(|&t| copy_ty(b.types(), t, &mut mb))
+            .collect();
+        refs.push(mb.declare_func(&f.name, &ps, &rs)?);
     }
     let g = &m.globals;
     for i in 0..g.len() {
@@ -379,6 +391,33 @@ impl<'a> Replay<'a> {
                 let sig = self.ty(f, sig);
                 new_op = Some(f.func_call_indirect(sig, ops[0], &ops[1..])?.op);
             }
+            OpKind::AggMake => made = one(f.agg_make(res[0], &ops)?),
+            OpKind::AggExtract { index } => made = one(f.agg_extract(res[0], ops[0], index)?),
+            OpKind::AggInsert { index } => made = one(f.agg_insert(ops[0], ops[1], index)?),
+            OpKind::Overflow { op: a, signed } => {
+                made = None;
+                new_op = Some(f.int_overflow(a, signed, ops[0], ops[1])?.op);
+            }
+            OpKind::UnionMake { index } => made = one(f.union_make(res[0], ops[0], index)?),
+            OpKind::UnionTag => made = one(f.union_tag(ops[0])?),
+            OpKind::UnionGet { trap, index } => {
+                made = one(f.union_get(res[0], trap, ops[0], index)?)
+            }
+            OpKind::SliceMake => made = one(f.slice_make(ops[0], ops[1])?),
+            OpKind::SlicePtr => made = one(f.slice_ptr(ops[0])?),
+            OpKind::SliceLen => made = one(f.slice_len(ops[0])?),
+            OpKind::SliceGet { trap, align } => {
+                made = one(f.slice_get(res[0], trap, ops[0], ops[1], align)?)
+            }
+            OpKind::SliceSet { trap, ty, align } => {
+                made = None;
+                let ty = self.ty(f, ty);
+                new_op = Some(f.slice_set(trap, ty, ops[0], ops[1], ops[2], align)?);
+            }
+            OpKind::Check(reason) => {
+                made = None;
+                new_op = Some(f.cf_check(reason, ops[0])?);
+            }
             OpKind::A64Code => {
                 // The `_begin` form, with the blocks made and ended by hand, as the C API does.
                 made = None;
@@ -567,6 +606,11 @@ fn builder_rebuilds_backend_lfir() {
     let mut fails = Vec::new();
     let mut rebuilt = 0;
     let mut lfir = |name: &str, m: &Module, fails: &mut Vec<String>| {
+        // HFIR compiles through its lowering, as `fir compile` does.
+        let Ok(m) = fir::backend::prepare(m, false) else {
+            return;
+        };
+        let m = &m;
         let Ok(mut mm) = a64::select(m) else { return };
         let before = a64::lfir::to_module(m, &mm);
         a64::allocate(m, &mut mm);
@@ -704,10 +748,26 @@ fn calls_check_the_signature_and_declarations_clash() {
         "@g is defined more than once"
     );
     let s = mb.struct_ty(Policy::C, &[i32()]).unwrap();
+    mb.set_layer(Layer::Mfir);
     assert_eq!(
         message(mb.declare_func("h", &[s], &[])),
         "func @h: struct<C>{i32} is not a value type"
     );
+    mb.set_layer(Layer::Hfir);
+    let sig = mb.func_ty(&[], &[]).unwrap();
+    assert_eq!(
+        message(mb.declare_func("h", &[sig], &[])),
+        "func @h: func<()> is not a value type"
+    );
+    // HFIR passes aggregates, unions, and slices by value.
+    let u = mb.union_ty(&[i32(), s]).unwrap();
+    let h = mb.declare_func("h", &[s, u, Ty::Slice], &[s]).unwrap();
+    let mut hb = mb.define(h).unwrap();
+    let ps: Vec<Operand> = (0..3).map(|i| hb.param(i).into()).collect();
+    let r = hb.func_call(h, &ps).unwrap().get(0);
+    assert_eq!(hb.body().types().show(hb.ty(r)), "struct<C>{i32}");
+    hb.func_ret(&[r.into()]).unwrap();
+    hb.finish().unwrap();
     assert_eq!(
         message(mb.global("g", i32(), false, 1, Init::Zero)),
         "@g is defined more than once"

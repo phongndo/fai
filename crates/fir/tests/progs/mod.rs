@@ -177,7 +177,7 @@ fn make_vtys(rng: &mut Rng) {
             }
             match rng.below(10) {
                 0..=1 => T::P,
-                2 if !layout => T::I(rng.pick(&[1, 7, 65])),
+                2 if !layout => T::I(rng.width(&[1, 7, 65])),
                 3 => T::B(32),
                 _ => T::I(rng.pick(&[8, 16, 32, 64])),
             }
@@ -1983,8 +1983,14 @@ impl Gen<'_> {
 
     /// `int.add.overflow.s` and friends.
     fn overflow_op(&mut self) {
-        let t = self.int_type();
         let op = self.rng.pick(&["add", "sub", "mul"]);
+        // The lowering checks at one more bit (twice the bits for `mul`), which a narrow program
+        // keeps to 64.
+        let t = match (self.rng.1, op) {
+            (false, _) => self.int_type(),
+            (true, "mul") => T::I(self.rng.pick(&[1, 7, 8, 16, 32])),
+            (true, _) => T::I(self.rng.pick(&[1, 7, 8, 16, 32, 63])),
+        };
         let sign = self.rng.pick(&["s", "u"]);
         let (a, b) = (self.operand(t), self.operand(t));
         let (r, o) = (self.fresh(), self.fresh());

@@ -768,7 +768,8 @@ fir_ops
     effects read write alloc free trap diverge
     rule
       sig sig
-  /-- `agg.make %a, %b` (HFIR building blocks, lowered by `Fir.Lower`): a struct value from its fields, or an array value from its elements;
+  -- HFIR building blocks, lowered by `Fir.Lower`.
+  /-- `agg.make %a, %b`: a struct value from its fields, or an array value from its elements;
   the result type says which. -/
   op aggMake
     name "agg.make"

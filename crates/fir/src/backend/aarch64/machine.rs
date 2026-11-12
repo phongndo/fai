@@ -386,7 +386,7 @@ impl<'m> Lfir<'m> {
                 Ok(Value::Bytes { start, len: n / 8 })
             }
             Ty::Int(_) | Ty::Byte(_) => stuck(loc, format!("{t} is wider than a register")),
-            Ty::Agg(_) => stuck(loc, "not a value type"),
+            Ty::Agg(_) | Ty::Slice => stuck(loc, "not a value type"),
         }
     }
 
@@ -406,6 +406,7 @@ impl<'m> Lfir<'m> {
                 let bs = self.m.byte_vals[Span { start, len }.range()].to_vec();
                 self.word_of_bytes(loc, &bs)?
             }
+            Value::Agg { .. } => return stuck(loc, "an aggregate is not a register value"),
             Value::Unset => return stuck(loc, "no value"),
         })
     }

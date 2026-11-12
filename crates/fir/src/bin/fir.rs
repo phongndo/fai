@@ -6,7 +6,7 @@
 //! fir fmt FILE [--no-locs] [--unverified]     print canonical text (--unverified: parse only)
 //! fir opt FILE [-O | --passes P,...] [--remarks] [--stats] [--verify-each] [--no-locs]
 //!                                            optimize, print canonical text
-//! fir compile FILE [-o OUT] [--emit asm|lfir|lfir-vregs] [--os linux|darwin]
+//! fir compile FILE [-O] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]
 //!                                            compile to AArch64 (see `compile`)
 //! fir lower FILE [--no-locs]                  lower an HFIR module to MFIR and print it
 //! ```
@@ -96,7 +96,7 @@ fn run(args: &[&str]) -> Result<(), ExitCode> {
         }
         _ => {
             eprintln!(
-                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--remarks] [--stats] [--verify-each] [--no-locs]\n  fir compile FILE [-o OUT] [--emit asm|lfir|lfir-vregs] [--os linux|darwin]\n  fir lower FILE [--no-locs]"
+                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--remarks] [--stats] [--verify-each] [--no-locs]\n  fir compile FILE [-O] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]\n  fir lower FILE [--no-locs]"
             );
             Err(ExitCode::from(2))
         }
@@ -147,9 +147,11 @@ fn opt(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     Ok(())
 }
 
-/// `fir compile FILE`: compile an MFIR (or core-op HFIR) module to AArch64. `--emit lfir` and
-/// `--emit lfir-vregs` print the LFIR after and before register allocation; `--emit asm` (or
-/// `-o` naming a `.s` file) the assembly. Otherwise `-o OUT` is an object file (`.o`) or an
+/// `fir compile FILE`: compile an HFIR or MFIR module to AArch64. HFIR is lowered to MFIR first
+/// (what `fir lower` prints), and `-O` runs the default pass pipeline on the MFIR (what `fir opt`
+/// does); `--emit mfir` prints the MFIR that is compiled. `--emit lfir` and `--emit lfir-vregs`
+/// print the LFIR after and before register allocation; `--emit asm` (or `-o` naming a `.s`
+/// file) the assembly. Otherwise `-o OUT` is an object file (`.o`) or an
 /// executable, assembled and linked by `$FIR_CC`, or else by `cc` on an AArch64 host and by
 /// `aarch64-unknown-linux-gnu-cc` (from the dev shell) elsewhere. Linux ELF by default, or the
 /// host's format on macOS; `--os` picks one.
@@ -161,9 +163,14 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     };
     let mut out = None;
     let mut emit = None;
+    let mut optimize = false;
     let mut o = a64::Options::default();
     let mut it = opts.iter();
     while let Some(&opt) = it.next() {
+        if opt == "-O" {
+            optimize = true;
+            continue;
+        }
         match (opt, it.next()) {
             ("-o", Some(&v)) => out = Some(v),
             ("--emit", Some(&v)) => emit = Some(v),
@@ -177,7 +184,7 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     }
     let m = fir::parse_module(&read(file)?).map_err(fail)?;
     fir::verify_module(&m).map_err(fail)?;
-    let mut mm = a64::select(&m).map_err(fail)?;
+    let m = fir::backend::prepare(&m, optimize).map_err(fail)?;
     let write = |text: String| -> Result<(), ExitCode> {
         match out {
             Some(p) => std::fs::write(p, text).map_err(|e| {
@@ -190,6 +197,10 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
             }
         }
     };
+    if emit == Some("mfir") {
+        return write(m.render(true));
+    }
+    let mut mm = a64::select(&m).map_err(fail)?;
     if emit == Some("lfir-vregs") {
         return write(a64::lfir::to_module(&m, &mm).render(true));
     }

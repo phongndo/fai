@@ -7,7 +7,8 @@
 //! `aarch64.bl.free` (`bl free`). A branch to the next block is left out. Every output defines a
 //! weak `__fir_trap` that executes `brk #1000`; a program (or the test harness) can define its
 //! own to report traps, which it receives as `__fir_trap(reason, line, col)` with reason codes
-//! `div0` 0, `overflow` 1, `shift` 2, `oom` 3, and line and column `0xffffffff` for no location.
+//! `div0` 0, `overflow` 1, `shift` 2, `oom` 3, `bounds` 4, `tag` 5, and line and column
+//! `0xffffffff` for no location.
 
 use std::fmt::Write;
 
@@ -62,6 +63,8 @@ pub fn trap_code(r: TrapReason) -> u32 {
         TrapReason::Overflow => 1,
         TrapReason::Shift => 2,
         TrapReason::Oom => 3,
+        TrapReason::Bounds => 4,
+        TrapReason::Tag => 5,
     }
 }
 
@@ -507,7 +510,7 @@ impl Emitter<'_> {
                             put(i * stride, e, item, out, relocs);
                         }
                     }
-                    Shape::Func(..) => {}
+                    Shape::Func(..) | Shape::Union(_) => {}
                 }
             }
             _ => out.resize(start + size, 0),
