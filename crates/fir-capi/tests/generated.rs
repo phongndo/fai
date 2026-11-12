@@ -7,6 +7,9 @@
 //! * `include/fir.h` is what cbindgen makes of this crate (regenerate with the command in its
 //!   first lines). cbindgen is the dev shell's, or the path in `CBINDGEN`.
 
+#[path = "../../fir/tests/common/evidence.rs"]
+mod evidence;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -32,6 +35,7 @@ fn output(cmd: &mut Command, what: &str) -> String {
 #[test]
 fn generated_ops_are_up_to_date() {
     if std::env::var("FIR_REF").is_ok_and(|s| s == "none") {
+        evidence::require("FIR_REF=none skips the generated C API check");
         return;
     }
     let tool = match std::env::var("FIR_GEN_BUILDER") {

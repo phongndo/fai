@@ -104,6 +104,15 @@ fn lowering_matches_reference_and_refines() {
             }
         }
     }
+    let ev = common::evidence::Evidence::new("lower_fixtures");
+    ev.count("modules lowered", lowered);
+    ev.count("runs compared (HFIR against its lowering)", runs);
+    ev.count(
+        "lowering compared with fir-ref lower",
+        if tool.is_some() { lowered } else { 0 },
+    );
+    ev.count("failures", fails.len() as u64);
+    ev.write();
     assert!(lowered > 0 && runs > 0);
     assert!(fails.is_empty(), "{}", fails.join("\n"));
 }

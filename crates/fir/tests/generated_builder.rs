@@ -5,12 +5,16 @@
 //! The generator is `spec/.lake/build/bin/gen-builder` (built by `lake build` in `spec/`), or the
 //! path in `FIR_GEN_BUILDER`. `FIR_REF=none` skips this test with the other Lean comparisons.
 
+#[path = "common/evidence.rs"]
+mod evidence;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[test]
 fn generated_builder_is_up_to_date() {
     if std::env::var("FIR_REF").is_ok_and(|s| s == "none") {
+        evidence::require("FIR_REF=none skips the generated builder check");
         return;
     }
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

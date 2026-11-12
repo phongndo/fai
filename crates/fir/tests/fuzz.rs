@@ -32,11 +32,14 @@ fn env_u64(name: &str, default: u64) -> u64 {
 /// What a run prints: stdout, stderr, and the exit code.
 type Printed = (String, String, i32);
 
-fn ours(m: &fir::Module, args: &[String], fuel: u64) -> Printed {
+fn ours(m: &fir::Module, args: &[String], fuel: u64) -> (Printed, fir::interp::ExecutionProfile) {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    match fir::interp::run(m, "f0", &args, fuel) {
-        Ok(s) => (format!("{s}\n"), String::new(), 0),
-        Err(e) => (String::new(), format!("{e}\n"), 1),
+    match fir::interp::run_detail(m, "f0", &args, fuel, false) {
+        Ok(r) => ((format!("{}\n", r.line), String::new(), 0), r.profile),
+        Err(e) => (
+            (String::new(), format!("{e}\n"), 1),
+            fir::interp::ExecutionProfile::default(),
+        ),
     }
 }
 
@@ -92,11 +95,15 @@ fn kind(p: &Printed) -> String {
 
 #[test]
 fn interpreter_matches_reference_on_random_programs() {
+    let ev = common::evidence::Evidence::new("interp_fuzz");
     let Some(tool) = common::reference() else {
+        ev.skip("no Lean reference");
+        ev.write();
         return;
     };
     let count = env_u64("FIR_FUZZ", 200);
     let seed = env_u64("FIR_FUZZ_SEED", 1);
+    ev.fact("seed", seed.to_string());
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fuzz");
     std::fs::create_dir_all(&dir).unwrap();
     let stats = Mutex::new(BTreeMap::<String, u64>::new());
@@ -174,7 +181,7 @@ fn interpreter_matches_reference_on_random_programs() {
                         None
                     };
                     for (args, fuel) in &prog.runs {
-                        let (a, b) = (ours(&m, args, *fuel), theirs(&tool, &file, args, *fuel));
+                        let ((a, profile), b) = (ours(&m, args, *fuel), theirs(&tool, &file, args, *fuel));
                         let mut st = stats.lock().unwrap();
                         *st.entry(kind(&b)).or_default() += 1;
                         let n = events(&b) as u64;
@@ -201,6 +208,8 @@ fn interpreter_matches_reference_on_random_programs() {
                                 b,
                                 a
                             ));
+                        } else if a.2 == 0 {
+                            ev.executed(&profile);
                         }
                         let Some((l, lfile)) = &lowered else { continue };
                         let strs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -226,7 +235,7 @@ fn interpreter_matches_reference_on_random_programs() {
                                 tgt.line
                             ));
                         }
-                        let (a, b) = (
+                        let ((a, profile), b) = (
                             ours(l, args, 16 * fuel),
                             theirs(&tool, lfile, args, 16 * fuel),
                         );
@@ -240,6 +249,8 @@ fn interpreter_matches_reference_on_random_programs() {
                                 b,
                                 a
                             ));
+                        } else if a.2 == 0 {
+                            ev.executed(&profile);
                         }
                     }
                     if !keep {
@@ -261,7 +272,12 @@ fn interpreter_matches_reference_on_random_programs() {
     eprintln!("{count} programs, {runs} runs (seed {seed}); outcomes:");
     for (k, n) in &stats {
         eprintln!("  {n:6}  {k}");
+        ev.count(k.clone(), *n);
     }
+    ev.count("programs", count);
+    ev.count("runs compared with fir-ref run", runs);
+    ev.count("failures", fails.lock().unwrap().len() as u64);
+    ev.write();
     let fails = fails.into_inner().unwrap();
     assert!(
         fails.is_empty(),

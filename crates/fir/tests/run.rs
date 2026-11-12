@@ -68,12 +68,17 @@ fn show(out: &Output) -> String {
 fn run_matches_reference() {
     let fir = Path::new(env!("CARGO_BIN_EXE_fir"));
     let tool = reference();
+    let ev = common::evidence::Evidence::new("run_fixtures");
     let mut fails = Vec::new();
     let mut checked = 0;
     for file in &fir_files() {
         let name = display_name(file);
         let text = std::fs::read_to_string(file).unwrap();
-        for (func, args, want) in run_lines(&text) {
+        let lines = run_lines(&text);
+        let module = fir::parse_module(&text)
+            .and_then(|m| fir::verify_module(&m).map(|_| m))
+            .ok();
+        for (func, args, want) in lines {
             checked += 1;
             let call = format!("{name}: @{func}({})", args.join(", "));
             let got = run(fir, file, &func, &args);
@@ -82,6 +87,7 @@ fn run_matches_reference() {
                 fails.push(format!("{call}: expected '{want}' but got {}", show(&got)));
             }
             if let Some(tool) = &tool {
+                ev.count("runs compared with fir-ref run", 1);
                 let reference = run(tool, file, &func, &args);
                 if (&got.stdout, &got.stderr, got.status.code())
                     != (
@@ -95,11 +101,30 @@ fn run_matches_reference() {
                         show(&reference),
                         show(&got)
                     ));
+                } else if got.status.success()
+                    && stdout.trim_end() == want
+                    && let Some(m) = &module
+                {
+                    // Compare this profiled run too, so coverage is about the same function,
+                    // arguments, fuel and result as the successful CLI/reference comparison.
+                    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                    let r =
+                        fir::interp::run_detail(m, &func, &args, fir::interp::DEFAULT_FUEL, false)
+                            .unwrap();
+                    assert_eq!(
+                        format!("{}\n", r.line).as_bytes(),
+                        got.stdout,
+                        "{call}: profiled run differs"
+                    );
+                    ev.executed(&r.profile);
                 }
             }
         }
     }
     assert!(checked > 0);
+    ev.count("run lines", checked);
+    ev.count("failures", fails.len() as u64);
+    ev.write();
     assert!(fails.is_empty(), "{}", fails.join("\n"));
 }
 

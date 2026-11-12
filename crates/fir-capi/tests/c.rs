@@ -12,8 +12,19 @@
 //! The compiler is `$CC`, or `clang` (the dev shell's). `FIR_CAPI_SANITIZE=address` (or another
 //! `-fsanitize=` value) builds the programs with that sanitizer.
 
+#[path = "../../fir/tests/common/evidence.rs"]
+mod evidence;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// The evidence name for a test, by sanitizer, so ASan and plain runs record separately.
+fn evidence_name(test: &str) -> String {
+    match std::env::var("FIR_CAPI_SANITIZE") {
+        Ok(s) => format!("capi_{test}_{s}"),
+        Err(_) => format!("capi_{test}"),
+    }
+}
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -114,6 +125,11 @@ fn aarch64_toolchain() -> Option<(String, String)> {
 
 #[test]
 fn c_programs_pass() {
+    let ev = evidence::Evidence::new(&evidence_name("programs"));
+    ev.fact(
+        "sanitize",
+        std::env::var("FIR_CAPI_SANITIZE").unwrap_or_default(),
+    );
     let out_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("capi");
     std::fs::create_dir_all(&out_dir).unwrap();
     for file in c_files() {
@@ -130,13 +146,20 @@ fn c_programs_pass() {
             file.display(),
             String::from_utf8_lossy(&ran.stderr)
         );
+        ev.count("C programs passed", 1);
     }
+    ev.write();
 }
 
 /// The round's end-to-end test (see the module docs and `tests/capi/e2e.c`). Its output, printed
 /// with `--nocapture`, lists each run's outcome in the interpreter and natively.
 #[test]
 fn end_to_end_through_the_c_api() {
+    let ev = evidence::Evidence::new(&evidence_name("e2e"));
+    ev.fact(
+        "sanitize",
+        std::env::var("FIR_CAPI_SANITIZE").unwrap_or_default(),
+    );
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("e2e");
     std::fs::create_dir_all(&dir).unwrap();
     let exe = dir.join("e2e-host");
@@ -149,7 +172,10 @@ fn end_to_end_through_the_c_api() {
                 .env("FIR_E2E_RUN", runner)
                 .env("FIR_E2E_DIR", &dir);
         }
-        None => eprintln!("e2e: no AArch64 toolchain or emulator; the native half is skipped"),
+        None => {
+            evidence::require("e2e: no AArch64 toolchain or emulator for the native half");
+            ev.skip("native half: no AArch64 toolchain or emulator");
+        }
     }
     let ran = cmd.output().unwrap();
     let stdout = String::from_utf8_lossy(&ran.stdout);
@@ -159,12 +185,15 @@ fn end_to_end_through_the_c_api() {
         "e2e failed:\n{stdout}\n{}",
         String::from_utf8_lossy(&ran.stderr)
     );
+    ev.count("e2e passed", 1);
     if tc.is_some() {
         assert!(
             stdout.contains("native: 14 of 14 runs match fir run"),
             "the native runs didn't all happen:\n{stdout}"
         );
+        ev.count("native runs matching fir run", 14);
     }
+    ev.write();
 }
 
 /// Every function in the header is called by some C test.

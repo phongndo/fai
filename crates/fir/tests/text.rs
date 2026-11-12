@@ -110,4 +110,8 @@ fn text_matches_reference() {
     eprintln!(
         "{matched} files print like fir-ref, {rejected_alike} fail to parse alike, {name_errors} fail on names as expected"
     );
+    let ev = common::evidence::Evidence::new("text_fixtures");
+    ev.count("files printed like fir-ref", matched as u64);
+    ev.count("files rejected alike", rejected_alike as u64);
+    ev.write();
 }
