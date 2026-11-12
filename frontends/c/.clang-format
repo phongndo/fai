@@ -1,0 +1,4 @@
+# fai-cc's C++ sources (src/): LLVM's style, 100 columns. The test programs under tests/ are
+# inputs, laid out by hand (Duff's device among them), and aren't formatted.
+BasedOnStyle: LLVM
+ColumnLimit: 100
