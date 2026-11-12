@@ -42,11 +42,17 @@ theorem simpleOp_eq (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : Lis
 theorem evalSimple_copy (loc : Option Loc) (r : Result) (x : RVal) (c : Core) :
     evalSimple loc .copy [r] [x] c = .ok ([x], c) := rfl
 
-theorem evalSimple_load (loc : Option Loc) (A : Nat) (r : Result) (p : Option Ptr) (c : Core) :
+/-- A load of a scalar type is `loadC`. -/
+theorem loadAny_value {loc : Option Loc} {T : Ty} {A : Nat} {p : Option Ptr}
+    (hT : T.isValue = true) : loadAny loc T A p = loadC loc T A p := by
+  simp [loadAny, hT]
+
+theorem evalSimple_load (loc : Option Loc) (A : Nat) (r : Result) (p : Option Ptr) (c : Core)
+    (hT : r.ty.isValue = true) :
     evalSimple loc (.load A) [r] [.ptr p] c =
       (loadC loc r.ty A p c).bind fun q => .ok ([q.1], q.2) := by
   simp only [evalSimple, bind, StateT.bind, get, getThe, MonadStateOf.get, StateT.get, pure,
-    StateT.pure, Except.bind, asPtr, Except.pure]
+    StateT.pure, Except.bind, asPtr, Except.pure, loadAny_value hT]
 
 theorem loadC_some (loc : Option Loc) (T : Ty) (A : Nat) (p : Ptr) (c : Core) :
     loadC loc T A (some p) c =
@@ -127,10 +133,15 @@ theorem markAll_read {tags : Std.ExtTreeMap Nat (Option Nat)} {loc : Option Loc}
 
 /-! ## Decoding what was encoded -/
 
-/-- Types whose values come back unchanged from memory. Integer widths must be whole bytes. -/
+/-- Scalar types whose values come back unchanged from memory. Integer widths must be whole
+bytes. (Aggregates are HFIR only; the rewrite is for MFIR's scalar loads and stores.) -/
 def Exact : Ty → Prop
   | .int w => w % 8 = 0 ∧ 0 < w
-  | _ => True
+  | .ptr | .byte _ => True
+  | _ => False
+
+theorem Exact.isValue {T : Ty} (h : Exact T) : T.isValue = true := by
+  cases T <;> simp_all [Exact, Ty.isValue]
 
 theorem mapM_fragToBits (loc : Option Loc) :
     ∀ (bs : List Byte), (∀ b ∈ bs, ∀ p i, b ≠ .frag p i) → ∀ c : Core,
@@ -156,6 +167,7 @@ theorem decodeAs_encode {loc : Option Loc} {v : RVal} {T : Ty} {c : Core} {cfg :
     decodeAs loc T (v.encode cfg) c = .ok (v, c) := by
   subst hcfg
   cases v with
+  | agg vs => cases T <;> simp [Exact, RVal.hasTy] at hT hv
   | int w x =>
     cases T with
     | int w' =>
@@ -201,7 +213,7 @@ theorem load_after_store {loc1 loc2 : Option Loc} {T : Ty} {A1 A2 : Nat} {w pv :
     (e : simpleOp loc1 (.store T A1) [] [w, pv] c = .ok (outs, c1)) :
     (∃ h, evalSimple loc2 (.load A2) [r] [pv] c1 = .error h ∧ Escape h) ∨
     evalSimple loc2 (.load A2) [r] [pv] c1 = evalSimple loc2 .copy [r] [w] c1 := by
-  rw [Dse.simpleOp_store] at e
+  rw [Dse.simpleOp_store _ _ _ _ _ _ hT.isValue] at e
   obtain ⟨pp, rfl⟩ : ∃ pp, pv = .ptr pp := by
     cases pv <;> first | exact ⟨_, rfl⟩ | cases e
   simp only at e
@@ -211,7 +223,7 @@ theorem load_after_store {loc1 loc2 : Option Loc} {T : Ty} {A1 A2 : Nat} {w pv :
   cases hty : w.hasTy T with
   | false => rw [Dse.storeC_ill_typed hty] at e; cases e
   | true =>
-  rw [Dse.storeC_typed hty] at e
+  rw [Dse.storeC_typed hty hT.isValue] at e
   cases hc : checkAccess c loc1 p (T.size c.space) A1 with
   | error h => rw [hc] at e; cases e
   | ok x =>
@@ -224,7 +236,8 @@ theorem load_after_store {loc1 loc2 : Option Loc} {T : Ty} {A1 A2 : Nat} {w pv :
   rw [hm] at e
   simp only [Except.ok.injEq, Prod.mk.injEq] at e
   obtain ⟨rfl, rfl⟩ := e
-  simp only [evalSimple_load, evalSimple_copy, loadC_some, access_eq, checkAccess_written, hr]
+  simp only [evalSimple_load _ _ _ _ _ (hr ▸ hT.isValue), evalSimple_copy, loadC_some, access_eq,
+    checkAccess_written, hr]
   rw [show (Dse.written c M x.1 x.2.2 (w.encode c.space)).space = c.space from rfl]
   cases hc2 : checkAccess c loc2 p (T.size c.space) A2 with
   | error h => exact .inl ⟨h, rfl, Dse.checkAccess_error hc2⟩
@@ -237,7 +250,7 @@ theorem load_after_store {loc1 loc2 : Option Loc} {T : Ty} {A1 A2 : Nat} {w pv :
   dsimp only [Except.bind]
   rw [markAll_read loc2 hm (Dse.nodup_scopes c)]
   dsimp only
-  simp only [Dse.written, Std.ExtTreeMap.getD_insert_self, ← Dse.encode_length hty c.space,
+  simp only [Dse.written, Std.ExtTreeMap.getD_insert_self, ← Dse.encode_length hty hT.isValue c.space,
     MemRules.read_write_same]
   rw [decodeAs_encode (cfg := c.space) hty hT ?_ hsp]
   all_goals rfl

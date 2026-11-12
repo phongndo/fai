@@ -48,7 +48,42 @@ inductive RVal where
   | ptr (p : Option Ptr)
   /-- A value of a byte type `bN`: raw bytes, copied exactly. -/
   | bytes (bs : List Byte)
-  deriving DecidableEq, Repr
+  /-- An HFIR aggregate value: a struct's fields or an array's elements in order, a slice's
+  pointer and length, or a union's tag (an `i32`) and its variant's payload. There is no
+  aggregate `poison`: `poison` stays in the scalars. -/
+  | agg (vs : List RVal)
+  deriving Repr
+
+mutual
+  /-- Equality of runtime values, by structure. (`deriving` doesn't handle the nested list.) -/
+  def RVal.decEq : (a b : RVal) → Decidable (a = b)
+    | .int w v, .int w' v' =>
+      if h : w = w' then
+        if hv : h ▸ v = v' then isTrue (by subst h; subst hv; rfl)
+        else isFalse (by intro e; cases e; exact hv rfl)
+      else isFalse (by intro e; cases e; exact h rfl)
+    | .ptr p, .ptr p' =>
+      if h : p = p' then isTrue (h ▸ rfl) else isFalse (by intro e; cases e; exact h rfl)
+    | .bytes bs, .bytes bs' =>
+      if h : bs = bs' then isTrue (h ▸ rfl) else isFalse (by intro e; cases e; exact h rfl)
+    | .agg vs, .agg vs' =>
+      match RVal.decEqList vs vs' with
+      | isTrue h => isTrue (h ▸ rfl)
+      | isFalse h => isFalse (by intro e; cases e; exact h rfl)
+    | .int .., .ptr _ | .int .., .bytes _ | .int .., .agg _ | .ptr _, .int .. | .ptr _, .bytes _
+    | .ptr _, .agg _ | .bytes _, .int .. | .bytes _, .ptr _ | .bytes _, .agg _ | .agg _, .int ..
+    | .agg _, .ptr _ | .agg _, .bytes _ => isFalse (by intro e; cases e)
+  def RVal.decEqList : (a b : List RVal) → Decidable (a = b)
+    | [], [] => isTrue rfl
+    | v :: vs, v' :: vs' =>
+      match RVal.decEq v v', RVal.decEqList vs vs' with
+      | isTrue h1, isTrue h2 => isTrue (by rw [h1, h2])
+      | isFalse h, _ => isFalse (by intro e; cases e; exact h rfl)
+      | _, isFalse h => isFalse (by intro e; cases e; exact h rfl)
+    | [], _ :: _ | _ :: _, [] => isFalse (by intro e; cases e)
+end
+
+instance : DecidableEq RVal := RVal.decEq
 
 /-- Why a trap happened. Traps are precise and observable, so a correct rewrite must keep them. -/
 inductive TrapReason where
@@ -57,6 +92,10 @@ inductive TrapReason where
   | shift
   /-- `mem.alloc.trap` failed. -/
   | oom
+  /-- An index outside a slice (`slice.get.trap`, `slice.set.trap`). -/
+  | bounds
+  /-- A union read as a variant it doesn't hold (`union.get.trap`). -/
+  | tag
   deriving DecidableEq, Repr
 
 /-- Which rule a program broke when its behavior is undefined. Refinement ignores the kind;
@@ -94,6 +133,10 @@ inductive UBKind where
   /-- An indirect call through a pointer that isn't the start of a function of the call's
   signature. -/
   | badCall
+  /-- An index outside a slice (`slice.get.ub`, `slice.set.ub`). -/
+  | bounds
+  /-- A union read as a variant it doesn't hold (`union.get.ub`). -/
+  | tag
   deriving DecidableEq, Repr
 
 /-- The outcome of evaluating one op with result width `w`. -/
@@ -147,6 +190,8 @@ def TrapReason.name : TrapReason → String
   | .overflow => "overflow"
   | .shift => "shift"
   | .oom => "oom"
+  | .bounds => "bounds"
+  | .tag => "tag"
 
 def UBKind.name : UBKind → String
   | .div0 => "div0"
@@ -168,5 +213,7 @@ def UBKind.name : UBKind → String
   | .constWrite => "const-write"
   | .funcAccess => "func-access"
   | .badCall => "bad-call"
+  | .bounds => "bounds"
+  | .tag => "tag"
 
 end Fir

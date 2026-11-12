@@ -159,8 +159,8 @@ def nat : P Nat := do
   let n ← int
   if n < 0 then fail "expected a non-negative integer" else pure n.toNat
 
-/-- A type: `i32`, `ptr`, `b8`, `struct<C>{i32, ptr}`, `array<4 x i32>`, or
-`func<(i32, ptr) -> i32>`. -/
+/-- A type: `i32`, `ptr`, `b8`, `struct<C>{i32, ptr}`, `array<4 x i32>`,
+`func<(i32, ptr) -> i32>`, `union<i32, ptr>`, or `slice`. -/
 partial def ty : P Ty := do
   let s ← ident
   match s with
@@ -182,6 +182,10 @@ partial def ty : P Ty := do
     let t ← ty
     expectSym ">"
     pure (.array n t)
+  | "slice" => pure .slice
+  | "union" =>
+    expectSym "<"
+    pure (.union (← sepBy ty ">"))
   | "func" =>
     expectSym "<"
     expectSym "("

@@ -122,62 +122,116 @@ theorem Byte.Refines.trans {a b c : Byte} : a.Refines b → b.Refines c → a.Re
 
 /-! ## Runtime values -/
 
-/-- `t.Refines s` for runtime values: the same kind and width, with `poison` replaceable by any
-value of its type. -/
-def RVal.Refines : RVal → RVal → Prop
-  | .int w v, .int w' v' => ∃ h : w = w', Val.Refines (h ▸ v) v'
-  | .ptr _, .ptr none => True
-  | .ptr (some p), .ptr (some p') => p = p'
-  | .bytes bs, .bytes bs' => Forall2 Byte.Refines bs bs'
-  | _, _ => False
+mutual
+  /-- `t.Refines s` for runtime values: the same kind and width, with `poison` replaceable by any
+  value of its type. Aggregates refine part by part. -/
+  def RVal.Refines : RVal → RVal → Prop
+    | .int w v, .int w' v' => ∃ h : w = w', Val.Refines (h ▸ v) v'
+    | .ptr _, .ptr none => True
+    | .ptr (some p), .ptr (some p') => p = p'
+    | .bytes bs, .bytes bs' => Forall2 Byte.Refines bs bs'
+    | .agg ts, .agg ss => RVal.RefinesParts ts ss
+    | _, _ => False
+  /-- `Forall2 RVal.Refines`, spelled out for the nested recursion (`RVal.refinesParts_eq`). -/
+  def RVal.RefinesParts : List RVal → List RVal → Prop
+    | [], [] => True
+    | t :: ts, s :: ss => RVal.Refines t s ∧ RVal.RefinesParts ts ss
+    | _, _ => False
+end
 
-def RVal.refines : RVal → RVal → Bool
-  | .int w v, .int w' v' => if h : w = w' then Val.refines (h ▸ v) v' else false
-  | .ptr _, .ptr none => true
-  | .ptr (some p), .ptr (some p') => p == p'
-  | .bytes bs, .bytes bs' => all2 Byte.refines bs bs'
-  | _, _ => false
+mutual
+  def RVal.refines : RVal → RVal → Bool
+    | .int w v, .int w' v' => if h : w = w' then Val.refines (h ▸ v) v' else false
+    | .ptr _, .ptr none => true
+    | .ptr (some p), .ptr (some p') => p == p'
+    | .bytes bs, .bytes bs' => all2 Byte.refines bs bs'
+    | .agg ts, .agg ss => RVal.refinesParts ts ss
+    | _, _ => false
+  def RVal.refinesParts : List RVal → List RVal → Bool
+    | [], [] => true
+    | t :: ts, s :: ss => RVal.refines t s && RVal.refinesParts ts ss
+    | _, _ => false
+end
 
-theorem RVal.refines_iff {t s : RVal} : t.refines s = true ↔ t.Refines s := by
-  cases t with
-  | int w v =>
-    cases s with
-    | int w' v' =>
+theorem RVal.refinesParts_eq : ∀ (ts ss : List RVal), RVal.RefinesParts ts ss = Forall2 RVal.Refines ts ss
+  | [], [] => rfl
+  | t :: ts, s :: ss => by simp only [RVal.RefinesParts, Forall2, RVal.refinesParts_eq ts ss]
+  | [], _ :: _ => rfl
+  | _ :: _, [] => rfl
+
+mutual
+  theorem RVal.refines_iff : ∀ {t s : RVal}, t.refines s = true ↔ t.Refines s
+    | .int w v, .int w' v' => by
       simp only [RVal.refines, RVal.Refines]
       split
       · rename_i h
         exact ⟨fun hr => ⟨h, Val.refines_iff.mp hr⟩, fun ⟨_, hr⟩ => Val.refines_iff.mpr hr⟩
       · rename_i h
         simp [h]
-    | _ => simp [RVal.refines, RVal.Refines]
-  | ptr p => cases s with
-    | ptr q => cases p <;> cases q <;> simp [RVal.refines, RVal.Refines]
-    | _ => simp [RVal.refines, RVal.Refines]
-  | bytes bs => cases s with
-    | bytes bs' => simp [RVal.refines, RVal.Refines, all2_iff (fun _ _ => Byte.refines_iff)]
-    | _ => simp [RVal.refines, RVal.Refines]
+    | .ptr p, .ptr q => by cases p <;> cases q <;> simp [RVal.refines, RVal.Refines]
+    | .bytes bs, .bytes bs' => by
+      simp [RVal.refines, RVal.Refines, all2_iff (fun _ _ => Byte.refines_iff)]
+    | .agg ts, .agg ss => by
+      simp only [RVal.refines, RVal.Refines]; exact RVal.refinesParts_iff
+    | .int .., .ptr _ | .int .., .bytes _ | .int .., .agg _ | .ptr _, .int .. | .ptr _, .bytes _
+    | .ptr _, .agg _ | .bytes _, .int .. | .bytes _, .ptr _ | .bytes _, .agg _ | .agg _, .int ..
+    | .agg _, .ptr _ | .agg _, .bytes _ => by simp [RVal.refines, RVal.Refines]
+  theorem RVal.refinesParts_iff : ∀ {ts ss : List RVal},
+      RVal.refinesParts ts ss = true ↔ RVal.RefinesParts ts ss
+    | [], [] => by simp [RVal.refinesParts, RVal.RefinesParts]
+    | t :: ts, s :: ss => by
+      simp only [RVal.refinesParts, RVal.RefinesParts, Bool.and_eq_true]
+      exact and_congr RVal.refines_iff RVal.refinesParts_iff
+    | [], _ :: _ | _ :: _, [] => by simp [RVal.refinesParts, RVal.RefinesParts]
+end
 
-theorem RVal.Refines.refl (v : RVal) : v.Refines v := by
-  cases v with
-  | int w v => exact ⟨rfl, Val.Refines.refl v⟩
-  | ptr p => cases p <;> simp [RVal.Refines]
-  | bytes bs => exact Forall2.refl Byte.Refines.refl bs
+mutual
+  theorem RVal.Refines.refl : ∀ (v : RVal), v.Refines v
+    | .int w v => ⟨rfl, Val.Refines.refl v⟩
+    | .ptr p => by cases p <;> simp [RVal.Refines]
+    | .bytes bs => Forall2.refl Byte.Refines.refl bs
+    | .agg vs => by simp only [RVal.Refines]; exact RVal.RefinesParts.refl vs
+  theorem RVal.RefinesParts.refl : ∀ (vs : List RVal), RVal.RefinesParts vs vs
+    | [] => trivial
+    | v :: vs => ⟨RVal.Refines.refl v, RVal.RefinesParts.refl vs⟩
+end
 
-theorem RVal.Refines.trans {a b c : RVal} : a.Refines b → b.Refines c → a.Refines c := by
-  intro h₁ h₂
-  cases a <;> cases b <;> cases c <;> simp only [RVal.Refines] at h₁ h₂ ⊢
-  case int.int.int =>
-    obtain ⟨hab, h₁⟩ := h₁
-    obtain ⟨hbc, h₂⟩ := h₂
-    subst hab hbc
-    exact ⟨rfl, Val.Refines.trans h₁ h₂⟩
-  case bytes.bytes.bytes => exact Forall2.trans (r := Byte.Refines) (fun _ _ _ => Byte.Refines.trans) h₁ h₂
-  all_goals
-    first
-    | trivial
-    | contradiction
-    | (rename_i p q r; cases p <;> cases q <;> cases r <;>
-        simp_all)
+mutual
+  theorem RVal.Refines.trans : ∀ {a b c : RVal}, a.Refines b → b.Refines c → a.Refines c
+    | .agg as, .agg bs, .agg cs, h₁, h₂ => by
+      simp only [RVal.Refines] at h₁ h₂ ⊢; exact RVal.RefinesParts.trans h₁ h₂
+    | .int .., .int .., .int .., h₁, h₂ => by
+      simp only [RVal.Refines] at h₁ h₂ ⊢
+      obtain ⟨hab, h₁⟩ := h₁
+      obtain ⟨hbc, h₂⟩ := h₂
+      subst hab hbc
+      exact ⟨rfl, Val.Refines.trans h₁ h₂⟩
+    | .bytes _, .bytes _, .bytes _, h₁, h₂ => by
+      simp only [RVal.Refines] at h₁ h₂ ⊢
+      exact Forall2.trans (r := Byte.Refines) (fun _ _ _ => Byte.Refines.trans) h₁ h₂
+    | .ptr p, .ptr q, .ptr r, h₁, h₂ => by
+      cases p <;> cases q <;> cases r <;> simp_all [RVal.Refines]
+    | .int .., .ptr _, _, h₁, _ | .int .., .bytes _, _, h₁, _ | .int .., .agg _, _, h₁, _
+    | .ptr _, .int .., _, h₁, _ | .ptr _, .bytes _, _, h₁, _ | .ptr _, .agg _, _, h₁, _
+    | .bytes _, .int .., _, h₁, _ | .bytes _, .ptr _, _, h₁, _ | .bytes _, .agg _, _, h₁, _
+    | .agg _, .int .., _, h₁, _ | .agg _, .ptr _, _, h₁, _ | .agg _, .bytes _, _, h₁, _ => by
+      cases h₁
+    | .int .., .int .., .ptr _, _, h₂ | .int .., .int .., .bytes _, _, h₂
+    | .int .., .int .., .agg _, _, h₂ | .ptr _, .ptr _, .int .., _, h₂
+    | .ptr _, .ptr (some _), .bytes _, _, h₂ | .ptr _, .ptr (some _), .agg _, _, h₂
+    | .ptr _, .ptr none, .bytes _, _, h₂ | .ptr _, .ptr none, .agg _, _, h₂
+    | .bytes _, .bytes _, .int .., _, h₂ | .bytes _, .bytes _, .ptr _, _, h₂
+    | .bytes _, .bytes _, .agg _, _, h₂ | .agg _, .agg _, .int .., _, h₂
+    | .agg _, .agg _, .ptr _, _, h₂ | .agg _, .agg _, .bytes _, _, h₂ => by
+      simp [RVal.Refines] at h₂
+  theorem RVal.RefinesParts.trans : ∀ {as bs cs : List RVal},
+      RVal.RefinesParts as bs → RVal.RefinesParts bs cs → RVal.RefinesParts as cs
+    | [], [], [], _, _ => trivial
+    | _ :: _, _ :: _, _ :: _, ⟨h₁, t₁⟩, ⟨h₂, t₂⟩ =>
+      ⟨RVal.Refines.trans h₁ h₂, RVal.RefinesParts.trans t₁ t₂⟩
+    | [], _ :: _, _, h, _ | _ :: _, [], _, h, _ => by cases h
+    | [], [], _ :: _, _, h | _ :: _, _ :: _, [], _, h => by cases h
+end
 
 /-- Element-wise refinement of value lists of equal length. -/
 abbrev RVal.RefinesList := Forall2 RVal.Refines

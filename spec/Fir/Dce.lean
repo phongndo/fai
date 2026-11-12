@@ -160,7 +160,9 @@ theorem const_pure (n : Int) (r : Result) (loc : Option Loc) :
 theorem poison_pure (r : Result) (loc : Option Loc) : Pure (.mk .poison [r] [] [] loc) := by
   refine ⟨.poison, _, _, loc, rfl, rfl, rfl, rfl, by simp, fun vs c => ?_⟩
   match vs with
-  | [] => exact .inr ⟨_, rfl⟩
+  | [] =>
+    obtain ⟨n, ty, facts⟩ := r
+    cases ty <;> exact .inr ⟨_, rfl⟩
   | _ :: _ => exact .inl ⟨_, rfl, trivial⟩
 
 /-! ## Steps -/

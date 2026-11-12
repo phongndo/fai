@@ -149,6 +149,7 @@ def rustItem (d : OpDecl) : Item → String
 def rustTyE (d : OpDecl) (env : List String) : TyE → String
   | .ptr => "TyE::Ptr"
   | .addr => "TyE::Addr"
+  | .slice => "TyE::Slice"
   | .int w => s!"TyE::Int({w})"
   | .name n => match env.idxOf? n with
     | some i => s!"TyE::Var({i})"
@@ -185,6 +186,11 @@ def rustRule (d : OpDecl) (checks : List Check) : Except String (List String) :=
       | .sig f => pure s!"Check::Sig({immIndex d f})"
       | .global f => pure s!"Check::Global({immIndex d f})"
       | .func f => pure s!"Check::Func({immIndex d f})"
+      | .parts x => pure s!"Check::Parts({t x})"
+      | .part a i x => pure s!"Check::Part({t a}, {immIndex d i}, {t x})"
+      | .variant u i x => pure s!"Check::Variant({t u}, {immIndex d i}, {t x})"
+      | .isUnion u => pure s!"Check::Union({t u})"
+      | .scalar x => pure s!"Check::Scalar({t x})"
     out := out ++ [s]
   if env.length > 4 then throw s!"{d.ctor}: a rule names at most 4 types"
   pure out

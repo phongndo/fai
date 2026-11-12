@@ -229,11 +229,66 @@ def bindTop (rs : List Result) (vs : List RVal) : List Frame → List Frame
   | .block ops ids env :: fs => .block ops ids (env.bindAll rs vs) :: fs
   | fs => fs
 
-def RVal.hasTy : RVal → Ty → Bool
-  | .int w _, .int w' => w == w'
-  | .ptr _, .ptr => true
-  | .bytes bs, .byte w => bs.length * 8 == w
-  | _, _ => false
+mutual
+  /-- Whether a value has a type. An aggregate has its type's shape: a struct's fields, an
+  array's elements, a slice's pointer and integer length, or a union's `i32` tag and the payload of
+  the variant it names. -/
+  def RVal.hasTy : RVal → Ty → Bool
+    | .int w _, .int w' => w == w'
+    | .ptr _, .ptr => true
+    | .bytes bs, .byte w => bs.length * 8 == w
+    | .agg vs, .struct _ fs => RVal.hasTys vs fs
+    | .agg vs, .array n e => vs.length == n && RVal.allHaveTy vs e
+    | .agg [.ptr _, .int _ _], .slice => true
+    | .agg [.int 32 (.bits t), v], .union ts =>
+      match ts[t.toNat]? with
+      | some u => RVal.hasTy v u
+      | none => false
+    | _, _ => false
+  def RVal.hasTys : List RVal → List Ty → Bool
+    | [], [] => true
+    | v :: vs, t :: ts => RVal.hasTy v t && RVal.hasTys vs ts
+    | _, _ => false
+  def RVal.allHaveTy : List RVal → Ty → Bool
+    | [], _ => true
+    | v :: vs, t => RVal.hasTy v t && RVal.allHaveTy vs t
+end
+
+mutual
+  /-- An aggregate's scalars, depth first; a scalar is its own. -/
+  def RVal.leaves : RVal → List RVal
+    | .agg vs => RVal.leavesList vs
+    | v => [v]
+  def RVal.leavesList : List RVal → List RVal
+    | [] => []
+    | v :: vs => RVal.leaves v ++ RVal.leavesList vs
+end
+
+/-- `n` values of one shape, each built by `f` from the front of a list of scalars. -/
+def buildN (f : List RVal → Option (RVal × List RVal)) : Nat → List RVal → Option (List RVal × List RVal)
+  | 0, vs => some ([], vs)
+  | n + 1, vs => do
+    let (x, vs) ← f vs
+    let (xs, vs) ← buildN f n vs
+    pure (x :: xs, vs)
+
+mutual
+  /-- A value of a type with a layout, from the front of a list of its scalars (`Ty.leaves`), and
+  the scalars left over. -/
+  def Ty.build : Ty → List RVal → Option (RVal × List RVal)
+    | .struct _ fs, vs => (Ty.buildList fs vs).map fun (xs, rest) => (.agg xs, rest)
+    | .array n e, vs => (buildN (Ty.build e) n vs).map fun (xs, rest) => (.agg xs, rest)
+    | .slice, p :: n :: rest => some (.agg [p, n], rest)
+    | .slice, _ => none
+    | _, v :: rest => some (v, rest)
+    | _, [] => none
+  def Ty.buildList : List Ty → List RVal → Option (List RVal × List RVal)
+    | [], vs => some ([], vs)
+    | t :: ts, vs => do
+      let (x, vs) ← Ty.build t vs
+      let (xs, vs) ← Ty.buildList ts vs
+      pure (x :: xs, vs)
+end
 
 /-- Check that there is one value per result, of the result's type. -/
 def checkTypes (loc : Option Loc) : List Result → List RVal → CM Unit
@@ -603,6 +658,68 @@ def offsetBy (loc : Option Loc) (inbounds : Bool) (p : Ptr) (n : Int) : CM (Opti
       | none => false
     pure (if keep.isEmpty then none else some (.abs addr' keep))
 
+/-! ## Aggregates, unions, and slices -/
+
+/-- Where the leaf at offset `off` of an aggregate at `p` is: `p` moved by `off`, as
+`ptr.offset.wrap` by the address-sized integer `off`. -/
+def leafPtr (loc : Option Loc) (p : Option Ptr) (off : Nat) : CM (Option Ptr) := do
+  let c ← get
+  match p with
+  | none => pure none
+  | some p => offsetBy loc false p (BitVec.ofInt c.space.addrBits off).toInt
+
+/-- Load leaves `(offset, type)` of an aggregate at `p`, each as `mem.load` of its scalar type
+with the alignment its offset keeps. -/
+def loadLeaves (loc : Option Loc) (align : Nat) (p : Option Ptr) :
+    List (Nat × Ty) → CM (List RVal)
+  | [] => pure []
+  | (off, t) :: ls => do
+    let v ← loadC loc t (Nat.gcd align off) (← leafPtr loc p off)
+    let vs ← loadLeaves loc align p ls
+    pure (v :: vs)
+
+/-- Store scalars at leaves `(offset, type)` of an aggregate at `p`, each as `mem.store`. -/
+def storeLeaves (loc : Option Loc) (align : Nat) (p : Option Ptr) :
+    List (Nat × Ty) → List RVal → CM Unit
+  | (off, t) :: ls, v :: vs => do
+    storeC loc t (Nat.gcd align off) v (← leafPtr loc p off)
+    storeLeaves loc align p ls vs
+  | _, _ => pure ()
+
+/-- Load a value of type `ty`: a scalar as itself, an aggregate leaf by leaf, in order, padding
+untouched (decision: Aggregate values). -/
+def loadAny (loc : Option Loc) (ty : Ty) (align : Nat) (p : Option Ptr) : CM RVal := do
+  if ty.isValue then loadC loc ty align p else
+  let vs ← loadLeaves loc align p (ty.leaves (← get).space)
+  match ty.build vs with
+  | some (v, []) => pure v
+  | _ => halt (.stuck s!"{ty} is not a value type") loc
+
+/-- Store a value of type `ty`: a scalar as itself, an aggregate leaf by leaf. -/
+def storeAny (loc : Option Loc) (ty : Ty) (align : Nat) (v : RVal) (p : Option Ptr) : CM Unit := do
+  if ty.isValue then storeC loc ty align v p else
+  unless v.hasTy ty do halt (.stuck s!"the stored value isn't a {ty}") loc
+  storeLeaves loc align p (ty.leaves (← get).space) v.leaves
+
+/-- Where element `i` of slice `s` of `ty`s is, after checking `i` against the length: an index
+not below it traps (`trap`) or is UB, and a `poison` index or length is UB. The element is at
+`ptr.offset.inbounds` by `i` times the stride, wrapped to the address size. -/
+def sliceElem (loc : Option Loc) (trap : Bool) (ty : Ty) (s i : RVal) : CM (Option Ptr) := do
+  let c ← get
+  let aw := c.space.addrBits
+  let .agg [pv, nv] := s | halt (.stuck "expected a slice") loc
+  let p ← asPtr loc pv
+  let n ← asInt loc aw nv
+  let i ← asInt loc aw i
+  match i, n with
+  | .bits x, .bits m =>
+    unless x.ult m do
+      if trap then halt (.trap .bounds) loc else ub .bounds loc s!"index {x.toNat}, length {m.toNat}"
+    match p with
+    | none => pure none
+    | some p => offsetBy loc true p (x * BitVec.ofInt aw (ty.stride c.space)).toInt
+  | _, _ => ub .poison loc "slice index or length is poison"
+
 /-- Evaluate an op without regions that doesn't touch the stack. -/
 def evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVal) :
     CM (List RVal) := do
@@ -610,7 +727,11 @@ def evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVa
   let aw := c.space.addrBits
   match k, rs, vs with
   | .const n, [r], [] => pure [.int _ (Sem.const r.ty.width n)]
-  | .poison, [r], [] => pure [.int r.ty.width .poison]
+  | .poison, [r], [] =>
+    match r.ty with
+    | .ptr => pure [.ptr none]
+    | .byte w => pure [.bytes (List.replicate (w / 8) .poison)]
+    | t => pure [.int t.width .poison]
   | .freeze, [_], [.int w .poison] => pure [.int w (.bits (BitVec.ofInt w (← choose)))]
   | .freeze, [_], [v] => pure [v]
   | .copy, [_], [v] => pure [v]
@@ -637,8 +758,8 @@ def evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVa
       | .trap => halt (.trap .oom) loc
     pure [.ptr (some (← newAlloc loc size.toNat align (.heap family)))]
   | .memFree family, [], [p] => do freePtr loc family (← asPtr loc p); pure []
-  | .load align, [r], [p] => do pure [← loadC loc r.ty align (← asPtr loc p)]
-  | .store ty align, [], [v, p] => do storeC loc ty align v (← asPtr loc p); pure []
+  | .load align, [r], [p] => do pure [← loadAny loc r.ty align (← asPtr loc p)]
+  | .store ty align, [], [v, p] => do storeAny loc ty align v (← asPtr loc p); pure []
   -- Pointers
   | .ptrNull, [_], [] => pure [.ptr (some .null)]
   | .ptrOffset inbounds, [_], [p, n] => do
@@ -671,8 +792,9 @@ def evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVa
     let some p ← asPtr loc p | return [.ptr none]
     pure [.ptr (← offsetBy loc inbounds p ((ty.fieldOffset? c.space i).getD 0))]
   | .ptrIndex inbounds ty, [_], [p, i] => do
+    let i ← asInt loc aw i
     let some p ← asPtr loc p | return [.ptr none]
-    let .bits i ← asInt loc aw i | return [.ptr none]
+    let .bits i := i | return [.ptr none]
     let n := i.toInt * ty.stride c.space
     let wrapped := (BitVec.ofInt aw n).toInt
     if inbounds && wrapped != n then return [.ptr none]
@@ -693,6 +815,41 @@ def evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVa
     let p ← newAlloc loc 0 1 (.func f)
     modify fun c => { c with addrs := c.addrs.insert f p }
     pure [.ptr (some p)]
+  -- Building blocks
+  | .aggMake, [_], vs => pure [.agg vs]
+  | .aggExtract i, [_], [.agg vs] =>
+    match vs[i]? with
+    | some v => pure [v]
+    | none => halt (.stuck s!"no part {i}") loc
+  | .aggInsert i, [_], [.agg vs, v] =>
+    if i < vs.length then pure [.agg (vs.set i v)] else halt (.stuck s!"no part {i}") loc
+  | .overflow op signed, [r, _], [a, b] => do
+    match ← asInt loc r.ty.width a, ← asInt loc r.ty.width b with
+    | .bits x, .bits y =>
+      pure [.int _ (.bits (Sem.wrapOp op x y)),
+        .int 1 (.bits (BitVec.ofBool (Sem.overflow signed op x y)))]
+    | _, _ => pure [.int r.ty.width .poison, .int 1 .poison]
+  | .unionMake i, [_], [v] => pure [.agg [.int 32 (.bits (BitVec.ofNat 32 i)), v]]
+  | .unionTag, [_], [.agg [.int 32 t, _]] => pure [.int 32 t]
+  | .unionGet trap i, [_], [.agg [.int 32 (.bits t), v]] =>
+    if t.toNat = i then pure [v]
+    else if trap then halt (.trap .tag) loc
+    else ub .tag loc s!"the union holds variant {t.toNat}"
+  | .sliceMake, [_], [p, n] => do
+    let p ← asPtr loc p
+    let n ← asInt loc aw n
+    pure [.agg [.ptr p, .int aw n]]
+  | .slicePtr, [_], [.agg [p@(.ptr _), _]] => pure [p]
+  | .sliceLen, [_], [.agg [_, n@(.int _ _)]] => pure [n]
+  | .sliceGet trap align, [r], [sv, i] => do
+    pure [← loadAny loc r.ty align (← sliceElem loc trap r.ty sv i)]
+  | .sliceSet trap ty align, [], [v, sv, i] => do
+    storeAny loc ty align v (← sliceElem loc trap ty sv i)
+    pure []
+  | .check reason, [], [x] => do
+    match ← asInt loc 1 x with
+    | .poison => ub .poison loc "check of poison"
+    | .bits b => if b = 1 then pure [] else halt (.trap reason) loc
   | _, _, _ => halt (.stuck "malformed op") loc
 
 /-- Compute an op without regions that doesn't touch the stack, from its operands' values, and

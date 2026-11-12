@@ -293,6 +293,43 @@ theorem keeps_callTarget (loc : Option Loc) (callee : Callee) (vs : List RVal) :
   unfold callTarget; keeps
 macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_callTarget)
 
+theorem keeps_leafPtr (loc : Option Loc) (p : Option Ptr) (off : Nat) :
+    KeepsFixed sp (leafPtr loc p off) := by
+  unfold leafPtr; keeps
+macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_leafPtr)
+
+theorem keeps_loadLeaves (loc : Option Loc) (A : Nat) (p : Option Ptr) :
+    ∀ ls, KeepsFixed sp (loadLeaves loc A p ls)
+  | [] => by unfold loadLeaves; keeps
+  | _ :: ls => by
+    unfold loadLeaves; keeps
+    all_goals exact keeps_loadLeaves loc A p ls
+macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_loadLeaves)
+
+theorem keeps_storeLeaves (loc : Option Loc) (A : Nat) (p : Option Ptr) :
+    ∀ ls vs, KeepsFixed sp (storeLeaves loc A p ls vs)
+  | (_, _) :: ls, _ :: vs => by
+    unfold storeLeaves; keeps
+    all_goals exact keeps_storeLeaves loc A p ls vs
+  | [], _ => by unfold storeLeaves; keeps
+  | _ :: _, [] => by unfold storeLeaves; keeps
+macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_storeLeaves)
+
+theorem keeps_loadAny (loc : Option Loc) (T : Ty) (A : Nat) (p : Option Ptr) :
+    KeepsFixed sp (loadAny loc T A p) := by
+  unfold loadAny; keeps
+macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_loadAny)
+
+theorem keeps_storeAny (loc : Option Loc) (T : Ty) (A : Nat) (v : RVal) (p : Option Ptr) :
+    KeepsFixed sp (storeAny loc T A v p) := by
+  unfold storeAny; keeps
+macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_storeAny)
+
+theorem keeps_sliceElem (loc : Option Loc) (trap : Bool) (T : Ty) (s i : RVal) :
+    KeepsFixed sp (sliceElem loc trap T s i) := by
+  unfold sliceElem; keeps
+macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_sliceElem)
+
 theorem keeps_evalSimple (loc : Option Loc) (k : OpKind) (rs : List Result) (vs : List RVal) :
     KeepsFixed sp (evalSimple loc k rs vs) := by
   unfold evalSimple; keeps

@@ -103,5 +103,7 @@ def RVal.encode (cfg : SpaceCfg) : RVal → List Byte
   | .int w v => encodeInt w v
   | .ptr p => encodePtr cfg p
   | .bytes bs => bs
+  -- Aggregates are stored leaf by leaf (`Fir.Interp`), never encoded whole.
+  | .agg _ => []
 
 end Fir

@@ -53,10 +53,11 @@ theorem length_digits (k n : Nat) : (digits k n).length = k := by
   | zero => rfl
   | succ k ih => simp [digits, ih]
 
-/-- A value of type `T` takes `T.size` bytes. -/
-theorem encode_length {v : RVal} {T : Ty} (h : v.hasTy T = true) (cfg : SpaceCfg) :
-    (v.encode cfg).length = T.size cfg := by
+/-- A value of a scalar type `T` takes `T.size` bytes. -/
+theorem encode_length {v : RVal} {T : Ty} (h : v.hasTy T = true) (hT : T.isValue = true)
+    (cfg : SpaceCfg) : (v.encode cfg).length = T.size cfg := by
   cases v with
+  | agg vs => cases T <;> simp [Ty.isValue, RVal.hasTy] at hT h
   | int w x =>
     cases T with
     | int w' =>
@@ -332,20 +333,30 @@ def written (c : Core) (marks : Std.ExtTreeMap Nat Marks) (a off : Nat) (bs : Li
   { c with marks := marks, mem := c.mem.insert a (writeBytes (c.mem.getD a ∅) off bs) }
 
 /-- A store of a value of the right type: check the access, record it in the scopes, write. -/
-theorem storeC_typed {loc : Option Loc} {T : Ty} {A : Nat} {v : RVal} {p : Ptr} {c : Core}
+theorem storeC_typed' {loc : Option Loc} {T : Ty} {A : Nat} {v : RVal} {p : Ptr} {c : Core}
     (h : v.hasTy T = true) :
+    storeC loc T A v (some p) c =
+      (checkAccess c loc p (v.encode c.space).length A).bind fun r =>
+      (markAll c.tags loc r.1 r.2.1 r.2.2 (v.encode c.space).length true c.scopes.toList
+        c.marks).bind fun marks => .ok ((), written c marks r.1 r.2.2 (v.encode c.space)) := by
+  simp only [storeC, h, access, ↓reduceIte]
+  cases checkAccess c loc p (v.encode c.space).length A with
+  | error e => rfl
+  | ok r =>
+    simp only [bind, Except.bind, pure, Except.pure]
+    cases markAll c.tags loc r.1 r.2.1 r.2.2 (v.encode c.space).length true c.scopes.toList
+      c.marks with
+    | error e => rfl
+    | ok m => rfl
+
+/-- A store of a value of the right scalar type writes `T.size` bytes. -/
+theorem storeC_typed {loc : Option Loc} {T : Ty} {A : Nat} {v : RVal} {p : Ptr} {c : Core}
+    (h : v.hasTy T = true) (hT : T.isValue = true) :
     storeC loc T A v (some p) c =
       (checkAccess c loc p (T.size c.space) A).bind fun r =>
       (markAll c.tags loc r.1 r.2.1 r.2.2 (T.size c.space) true c.scopes.toList c.marks).bind
         fun marks => .ok ((), written c marks r.1 r.2.2 (v.encode c.space)) := by
-  simp only [storeC, h, access, encode_length h, ↓reduceIte]
-  cases checkAccess c loc p (T.size c.space) A with
-  | error e => rfl
-  | ok r =>
-    simp only [bind, Except.bind, pure, Except.pure]
-    cases markAll c.tags loc r.1 r.2.1 r.2.2 (T.size c.space) true c.scopes.toList c.marks with
-    | error e => rfl
-    | ok m => rfl
+  rw [storeC_typed' h, encode_length h hT]
 
 theorem storeC_error {loc : Option Loc} {T : Ty} {A : Nat} {v : RVal} {p : Option Ptr} {c : Core}
     {h : Halt} (e : storeC loc T A v p c = .error h) : Escape h := by
@@ -355,13 +366,14 @@ theorem storeC_error {loc : Option Loc} {T : Ty} {A : Nat} {v : RVal} {p : Optio
     cases hty : v.hasTy T with
     | false => rw [storeC_ill_typed hty] at e; cases e; exact .inl trivial
     | true =>
-      rw [storeC_typed hty] at e
-      cases hc : checkAccess c loc p (T.size c.space) A with
+      rw [storeC_typed' hty] at e
+      cases hc : checkAccess c loc p (v.encode c.space).length A with
       | error h' => rw [hc] at e; cases e; exact checkAccess_error hc
       | ok r =>
         rw [hc] at e
         dsimp only [Except.bind] at e
-        cases hm : markAll c.tags loc r.1 r.2.1 r.2.2 (T.size c.space) true c.scopes.toList c.marks with
+        cases hm : markAll c.tags loc r.1 r.2.1 r.2.2 (v.encode c.space).length true
+            c.scopes.toList c.marks with
         | error h' => rw [hm] at e; cases e; exact markAll_error hm
         | ok m => rw [hm] at e; cases e
 
@@ -375,13 +387,14 @@ theorem insert_insert {α : Type} {m : Std.ExtTreeMap Nat α} {k : Nat} {x y : �
 /-- The heart of the proof: after a store, a second store of the same size through the same
 pointer does exactly what it would have done alone. -/
 theorem store_twice {loc1 loc2 : Option Loc} {T1 T2 : Ty} {A1 A2 : Nat} {v1 v2 : RVal}
-    {p : Ptr} {c c1 : Core} (hsz : ∀ cfg, T1.size cfg = T2.size cfg)
+    {p : Ptr} {c c1 : Core} (hsz : ∀ cfg, T1.size cfg = T2.size cfg) (hT1 : T1.isValue = true)
+    (hT2 : T2.isValue = true)
     (e1 : storeC loc1 T1 A1 v1 (some p) c = .ok ((), c1)) :
     storeC loc2 T2 A2 v2 (some p) c1 = storeC loc2 T2 A2 v2 (some p) c := by
   cases hty1 : v1.hasTy T1 with
   | false => rw [storeC_ill_typed hty1] at e1; cases e1
   | true =>
-  rw [storeC_typed hty1] at e1
+  rw [storeC_typed hty1 hT1] at e1
   cases hc1 : checkAccess c loc1 p (T1.size c.space) A1 with
   | error h => rw [hc1] at e1; cases e1
   | ok r =>
@@ -395,7 +408,7 @@ theorem store_twice {loc1 loc2 : Option Loc} {T1 T2 : Ty} {A1 A2 : Nat} {v1 v2 :
   cases hty2 : v2.hasTy T2 with
   | false => rw [storeC_ill_typed hty2, storeC_ill_typed hty2]
   | true =>
-  rw [storeC_typed hty2, storeC_typed hty2]
+  rw [storeC_typed hty2 hT2, storeC_typed hty2 hT2]
   simp only [← hsz]
   -- The second access checks the same things on both cores.
   show (checkAccess c loc2 p (T1.size c.space) A2).bind _ = (checkAccess c loc2 p (T1.size c.space) A2).bind _
@@ -408,18 +421,20 @@ theorem store_twice {loc1 loc2 : Option Loc} {T1 T2 : Ty} {A1 A2 : Nat} {v1 v2 :
   rw [markAll_idem hm1 (nodup_scopes c) |> markAll_loc (loc' := loc2)]
   rw [markAll_loc (loc' := loc2) hm1]
   have hlen : (v1.encode c.space).length = (v2.encode c.space).length := by
-    rw [encode_length hty1, encode_length hty2, hsz]
+    rw [encode_length hty1 hT1, encode_length hty2 hT2, hsz]
   rw [insert_insert, Std.ExtTreeMap.getD_insert_self, MemRules.writeBytes_writeBytes _ _ _ _ hlen]
 
 /-! ## The rewrite -/
 
-/-- `s1` stores through `%p`, and `s2` stores the same number of bytes through `%p`. The value
-`s1` stores must be a variable (deleting a hole would change which hole a run reaches). -/
+/-- `s1` stores through `%p`, and `s2` stores the same number of bytes through `%p`, both of
+scalar types (an aggregate store writes only its leaves, so it doesn't hide an earlier store's
+bytes under its padding). The value `s1` stores must be a variable (deleting a hole would change
+which hole a run reaches). -/
 def Pat (s1 s2 : Op) : Prop :=
   ∃ T1 A1 x1 xp loc1 T2 A2 v2 loc2,
     s1 = .mk (.store T1 A1) [] [.var x1, .var xp] [] loc1 ∧
     s2 = .mk (.store T2 A2) [] [v2, .var xp] [] loc2 ∧
-    ∀ cfg, T1.size cfg = T2.size cfg
+    (∀ cfg, T1.size cfg = T2.size cfg) ∧ T1.isValue = true ∧ T2.isValue = true
 
 /-- The rewrite: the target has `[s2]` where the source has `[s1, s2]`. -/
 def L (pt ps _ : List Op) : Prop := ∃ s1 s2, pt = [s2] ∧ ps = [s1, s2] ∧ Pat s1 s2
@@ -431,7 +446,13 @@ theorem checkResults_nil (loc : Option Loc) (vs : List RVal) (c : Core) :
       | _ => .error { outcome := .stuck "wrong number of values", loc := loc } := by
   cases vs <;> rfl
 
-theorem simpleOp_store (loc : Option Loc) (T : Ty) (A : Nat) (v pv : RVal) (c : Core) :
+/-- A store of a scalar type is `storeC`. -/
+theorem storeAny_value {loc : Option Loc} {T : Ty} {A : Nat} {v : RVal} {p : Option Ptr}
+    (hT : T.isValue = true) : storeAny loc T A v p = storeC loc T A v p := by
+  simp [storeAny, hT]
+
+theorem simpleOp_store (loc : Option Loc) (T : Ty) (A : Nat) (v pv : RVal) (c : Core)
+    (hT : T.isValue = true) :
     simpleOp loc (.store T A) [] [v, pv] c =
       match pv with
       | .ptr p => (storeC loc T A v p c).bind fun r => .ok ([], r.2)
@@ -440,7 +461,7 @@ theorem simpleOp_store (loc : Option Loc) (T : Ty) (A : Nat) (v pv : RVal) (c : 
     pure, StateT.pure, Except.bind]
   cases pv with
   | ptr p =>
-    simp only [asPtr, pure, StateT.pure, Except.pure]
+    simp only [asPtr, pure, StateT.pure, Except.pure, storeAny_value hT]
     cases storeC loc T A v p c with
     | error h => rfl
     | ok r => rfl
@@ -449,12 +470,13 @@ theorem simpleOp_store (loc : Option Loc) (T : Ty) (A : Nat) (v pv : RVal) (c : 
 /-- Running the deleted store either escapes, or leaves a core on which the next store does
 exactly what it does without the deleted one. -/
 theorem dse_core {loc1 loc2 : Option Loc} {T1 T2 : Ty} {A1 A2 : Nat}
-    (hsz : ∀ cfg, T1.size cfg = T2.size cfg) (w1 pv : RVal) (c : Core) :
+    (hsz : ∀ cfg, T1.size cfg = T2.size cfg) (hT1 : T1.isValue = true) (hT2 : T2.isValue = true)
+    (w1 pv : RVal) (c : Core) :
     (∃ h, simpleOp loc1 (.store T1 A1) [] [w1, pv] c = .error h ∧ Escape h) ∨
     (∃ c1, simpleOp loc1 (.store T1 A1) [] [w1, pv] c = .ok ([], c1) ∧
       ∀ w2, simpleOp loc2 (.store T2 A2) [] [w2, pv] c1 =
         simpleOp loc2 (.store T2 A2) [] [w2, pv] c) := by
-  rw [simpleOp_store]
+  rw [simpleOp_store _ _ _ _ _ _ hT1]
   cases pv with
   | ptr p =>
     simp only
@@ -463,10 +485,10 @@ theorem dse_core {loc1 loc2 : Option Loc} {T1 T2 : Ty} {A1 A2 : Nat}
     | ok r =>
       obtain ⟨⟨⟩, c1⟩ := r
       refine .inr ⟨c1, rfl, fun w2 => ?_⟩
-      rw [simpleOp_store, simpleOp_store]
+      rw [simpleOp_store _ _ _ _ _ _ hT2, simpleOp_store _ _ _ _ _ _ hT2]
       cases p with
       | none => rfl
-      | some p => simp only [store_twice hsz hs]
+      | some p => simp only [store_twice hsz hT1 hT2 hs]
   | _ => exact .inl ⟨_, rfl, .inl trivial⟩
 
 /-! ## Steps -/
@@ -479,7 +501,7 @@ theorem step_dse {mt ms : Machine} {s1 s2 : Op} {t s : List Op} {ids : List Nat}
     (hag : EnvAgree D et es) (hnr : NoReads D ([s2] ++ t))
     (ht : mt.stack = .block ([s2] ++ t) ids et :: ft)
     (hs : ms.stack = .block ([s1, s2] ++ s) ids es :: fs) : StepMatch (MRel L) mt ms := by
-  obtain ⟨T1, A1, x1, xp, loc1, T2, A2, v2, loc2, rfl, rfl, hsz⟩ := hp
+  obtain ⟨T1, A1, x1, xp, loc1, T2, A2, v2, loc2, rfl, rfl, hsz, hT1, hT2⟩ := hp
   obtain ⟨c, stt⟩ := mt
   obtain ⟨cs, sts⟩ := ms
   dsimp only at hc ht hs
@@ -510,7 +532,7 @@ theorem step_dse {mt ms : Machine} {s1 s2 : Op} {t s : List Op} {ids : List Nat}
   | ok pv =>
   rw [operands_pair, hx1, hxp] at step1
   simp only [Except.bind] at step1
-  rcases dse_core (loc2 := loc2) (A2 := A2) hsz w1 pv c with ⟨h, e1, hesc⟩ | ⟨c1, e1, e2⟩
+  rcases dse_core (loc2 := loc2) (A2 := A2) hsz hT1 hT2 w1 pv c with ⟨h, e1, hesc⟩ | ⟨c1, e1, e2⟩
   · have esc : Escapes c.trace ⟨c, _⟩ :=
       Escapes.one (by rw [runSteps_one, step1, e1]) hesc (Events.Refines.refl _)
     exact ⟨fun _ _ => .inl esc, fun _ _ => .inl esc⟩

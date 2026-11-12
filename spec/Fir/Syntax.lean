@@ -1,3 +1,4 @@
+import Fir.Basic
 import Fir.OpDSL
 import Fir.AArch64Syntax
 
@@ -49,6 +50,12 @@ inductive Ty where
   | array (n : Nat) (elem : Ty)
   /-- `func<(i32, ptr) -> i32>` -/
   | func (params rets : List Ty)
+  /-- `union<i32, ptr>`: an HFIR tagged union, holding one of its variants and a tag saying
+  which. Unions are SSA values only: they have no layout. -/
+  | union (variants : List Ty)
+  /-- `slice`: an HFIR pointer and a length (an address-sized integer, counting elements), laid
+  out as `struct<C>{ptr, iA}`. Like `ptr`, it doesn't name its element type; the ops do. -/
+  | slice
   deriving Repr, Inhabited
 
 mutual
@@ -76,13 +83,24 @@ mutual
       | isTrue h1, isTrue h2 => isTrue (by rw [h1, h2])
       | isFalse h, _ => isFalse (by intro e; cases e; exact h rfl)
       | _, isFalse h => isFalse (by intro e; cases e; exact h rfl)
+    | .union vs, .union vs' =>
+      match Ty.decEqList vs vs' with
+      | isTrue h => isTrue (by rw [h])
+      | isFalse h => isFalse (by intro e; cases e; exact h rfl)
+    | .slice, .slice => isTrue rfl
     | .int _, .ptr | .int _, .byte _ | .int _, .struct .. | .int _, .array .. | .int _, .func ..
-    | .ptr, .int _ | .ptr, .byte _ | .ptr, .struct .. | .ptr, .array .. | .ptr, .func ..
-    | .byte _, .int _ | .byte _, .ptr | .byte _, .struct .. | .byte _, .array .. | .byte _, .func ..
-    | .struct .., .int _ | .struct .., .ptr | .struct .., .byte _ | .struct .., .array ..
-    | .struct .., .func .. | .array .., .int _ | .array .., .ptr | .array .., .byte _
-    | .array .., .struct .. | .array .., .func .. | .func .., .int _ | .func .., .ptr
-    | .func .., .byte _ | .func .., .struct .. | .func .., .array .. =>
+    | .int _, .union _ | .int _, .slice | .ptr, .int _ | .ptr, .byte _ | .ptr, .struct ..
+    | .ptr, .array .. | .ptr, .func .. | .ptr, .union _ | .ptr, .slice | .byte _, .int _
+    | .byte _, .ptr | .byte _, .struct .. | .byte _, .array .. | .byte _, .func ..
+    | .byte _, .union _ | .byte _, .slice | .struct .., .int _ | .struct .., .ptr
+    | .struct .., .byte _ | .struct .., .array .. | .struct .., .func .. | .struct .., .union _
+    | .struct .., .slice | .array .., .int _ | .array .., .ptr | .array .., .byte _
+    | .array .., .struct .. | .array .., .func .. | .array .., .union _ | .array .., .slice
+    | .func .., .int _ | .func .., .ptr | .func .., .byte _ | .func .., .struct ..
+    | .func .., .array .. | .func .., .union _ | .func .., .slice | .union _, .int _
+    | .union _, .ptr | .union _, .byte _ | .union _, .struct .. | .union _, .array ..
+    | .union _, .func .. | .union _, .slice | .slice, .int _ | .slice, .ptr | .slice, .byte _
+    | .slice, .struct .. | .slice, .array .. | .slice, .func .. | .slice, .union _ =>
       isFalse (by intro e; cases e)
   def Ty.decEqList : (a b : List Ty) → Decidable (a = b)
     | [], [] => isTrue rfl
@@ -105,10 +123,16 @@ def Ty.isInt : Ty → Bool
   | .int _ => true
   | _ => false
 
-/-- The types SSA values can have. -/
+/-- The scalar value types, the only types SSA values can have outside HFIR. -/
 def Ty.isValue : Ty → Bool
   | .int _ | .ptr | .byte _ => true
   | _ => false
+
+/-- The types HFIR values can have: everything but function types (decision: Aggregate values).
+The verifier checks the parts. -/
+def Ty.isHValue : Ty → Bool
+  | .func .. => false
+  | _ => true
 
 /-- `-> T` or `-> (T, U)`, or nothing, as function headers and types write results. -/
 def retsText (rs : List String) : String :=
@@ -125,6 +149,8 @@ mutual
     | .struct p fs => s!"struct<{p.name}>\{{", ".intercalate (Ty.renderList fs)}}"
     | .array n t => s!"array<{n} x {t.render}>"
     | .func ps rs => s!"func<({", ".intercalate (Ty.renderList ps)}){retsText (Ty.renderList rs)}>"
+    | .union vs => s!"union<{", ".intercalate (Ty.renderList vs)}>"
+    | .slice => "slice"
   def Ty.renderList : List Ty → List String
     | [] => []
     | t :: ts => t.render :: Ty.renderList ts
@@ -298,6 +324,17 @@ instance : Spelled TruncMode := ⟨[sp "wrap" .wrap, sp "nsw" .nsw, sp "nuw" .nu
 
 instance : Spelled AllocFail := ⟨[sp "null" .null, sp "trap" .trap]⟩
 
+/-- `int.add.overflow.s` and `int.add.overflow.u` -/
+def signs : List (Spelling Bool) := [sp "s" true, sp "u" false]
+
+/-- What `union.get` and the slice accesses do on a bad tag or index: `.ub` or `.trap`
+(decision: Edge-case vocabulary). -/
+def edgeModes : List (Spelling Bool) := [sp "ub" false, sp "trap" true]
+
+instance : Spelled TrapReason := ⟨[sp "div0" TrapReason.div0, sp "overflow" TrapReason.overflow,
+  sp "shift" TrapReason.shift, sp "oom" TrapReason.oom, sp "bounds" TrapReason.bounds,
+  sp "tag" TrapReason.tag]⟩
+
 /-- `ptr.offset.inbounds` and `ptr.offset.wrap` -/
 def offsetModes : List (Spelling Bool) := [sp "inbounds" true, sp "wrap" false]
 
@@ -360,7 +397,8 @@ fir_ops
       results t "int.const has one result"
       ints t
       fits n t
-  /-- `poison`: an integer `poison` value. -/
+  /-- `poison`: a `poison` value of a scalar type (`iN`, `ptr`, or `bN`, whose bytes are all
+  `poison`). -/
   op poison
     name "poison"
     dialect value
@@ -368,7 +406,7 @@ fir_ops
     rule
       operands []
       results t "poison has one result"
-      ints t
+      scalar t
   /-- `freeze %x`: `%x`, or an arbitrary value if it is `poison`. -/
   op freeze
     name "freeze"
@@ -730,6 +768,133 @@ fir_ops
     effects read write alloc free trap diverge
     rule
       sig sig
+  /-- `agg.make %a, %b` (HFIR building blocks, lowered by `Fir.Lower`): a struct value from its fields, or an array value from its elements;
+  the result type says which. -/
+  op aggMake
+    name "agg.make"
+    format "%*"
+    layers hfir
+    rule
+      results t "agg.make has one result"
+      parts t
+  /-- `agg.extract %s, 1`: field `1` of a struct value, or element `1` of an array value. -/
+  op aggExtract (index : Index)
+    name "agg.extract"
+    format "%, {index}"
+    layers hfir
+    rule
+      operands a "agg.extract takes one operand"
+      results t "agg.extract has one result"
+      part a index t
+  /-- `agg.insert %s, %v, 1`: `%s` with field or element `1` replaced by `%v`. -/
+  op aggInsert (index : Index)
+    name "agg.insert"
+    format "%, %, {index}"
+    layers hfir
+    rule
+      operands a v "agg.insert takes two operands"
+      part a index v
+      results [a]
+  /-- `int.add.overflow.s %a, %b`: the wrapped result and whether the operation overflowed
+  (signed, or unsigned with `.u`), as `int.add.s.trap` would trap; `int.sub` and `int.mul` too.
+  `poison` in, `poison` out (both results). -/
+  op overflow (op : ArithOp) (signed : Bool)
+    name "int.{op}.overflow.{signed : signs}"
+    format "%, %"
+    layers hfir
+    rule
+      operands a b "this op takes two operands"
+      same "operands" [b] [a]
+      ints a
+      results [a, i1]
+  /-- `union.make %v, 1`: the union (the result type) holding variant `1`, `%v`. -/
+  op unionMake (index : Index)
+    name "union.make"
+    format "%, {index}"
+    layers hfir
+    rule
+      operands v "union.make takes one operand"
+      results t "union.make has one result"
+      variant t index v
+  /-- `union.tag %u`: which variant `%u` holds, as an `i32`. -/
+  op unionTag
+    name "union.tag"
+    format "%"
+    layers hfir
+    rule
+      operands u "union.tag takes one operand"
+      union u
+      results [i32]
+  /-- `union.get.trap %u, 1`: the payload of variant `1`; if `%u` holds another variant, UB
+  (`.ub`) or a trap with reason `tag` (`.trap`). -/
+  op unionGet (trap : Bool) (index : Index)
+    name "union.get.{trap : edgeModes}"
+    format "%, {index}"
+    layers hfir
+    effects trap
+    rule
+      operands u "union.get takes one operand"
+      results t "union.get has one result"
+      variant u index t
+  /-- `slice.make %p, %n`: the slice of `%n` elements at `%p`. -/
+  op sliceMake
+    name "slice.make"
+    format "%, %"
+    layers hfir
+    rule
+      operands [ptr, addr]
+      results [slice]
+  /-- `slice.ptr %s` -/
+  op slicePtr
+    name "slice.ptr"
+    format "%"
+    layers hfir
+    rule
+      operands [slice]
+      results [ptr]
+  /-- `slice.len %s` -/
+  op sliceLen
+    name "slice.len"
+    format "%"
+    layers hfir
+    rule
+      operands [slice]
+      results [addr]
+  /-- `slice.get.trap %s, %i, align 4`: load element `%i` (unsigned) of the slice, of the result
+  type. An index not below the length is UB (`.ub`) or traps with reason `bounds` (`.trap`); a
+  `poison` index or length is UB. The element is at `ptr.offset.inbounds` by `%i` times the
+  stride, wrapped. -/
+  op sliceGet (trap : Bool) (align : Align)
+    name "slice.get.{trap : edgeModes}"
+    format "%, %, align {align}"
+    layers hfir
+    effects read trap
+    rule
+      pow2 align
+      operands [slice, addr]
+      results t "slice.get has one result"
+      loadable t "loaded"
+  /-- `slice.set.trap i32 %v, %s, %i, align 4`: store element `%i` of the slice, checked like
+  `slice.get`. -/
+  op sliceSet (trap : Bool) (ty : Ty) (align : Align)
+    name "slice.set.{trap : edgeModes}"
+    format "{ty} %, %, %, align {align}"
+    layers hfir
+    effects write trap
+    rule
+      pow2 align
+      operands [ty, slice, addr]
+      loadable ty "stored"
+      noResults
+  /-- `cf.check.bounds %ok`: nothing if `%ok` is 1; a trap with that reason if it is 0; UB if it
+  is `poison`. The lowered form of HFIR's checks. -/
+  op check (reason : TrapReason)
+    name "cf.check.{reason}"
+    format "%"
+    effects trap
+    rule
+      operands [i1]
+      noResults
   -- AArch64 (LFIR): the `aarch64` dialect, in machine form. Instructions name their registers
   -- as immediates, a function's code is `aarch64.code`, and blocks end in explicit branches
   -- (decision: LFIR for AArch64). Semantics: `Fir.AArch64` (the instructions) and
@@ -952,6 +1117,12 @@ def Layer.kind : Layer → LayerKind
   | .hfir => .hfir
   | .mfir => .mfir
   | .lfir _ => .lfir
+
+/-- The types values can have in a layer: HFIR's include aggregates, unions, and slices
+(decision: Aggregate values); MFIR's and LFIR's are the scalars. -/
+def Layer.valueTy : Layer → Ty → Bool
+  | .hfir, t => t.isHValue
+  | _, t => t.isValue
 
 def Layer.render : Layer → String
   | .lfir t => s!"lfir {t}"

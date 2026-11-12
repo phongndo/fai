@@ -160,6 +160,7 @@ check or naming a `Ty` field. -/
 inductive TyE where
   | ptr
   | addr
+  | slice
   | int (w : Nat)
   | name (n : String)
   deriving DecidableEq, Repr, Inhabited
@@ -206,6 +207,16 @@ inductive Check where
   | global (field : String)
   /-- `func f`: the function exists. -/
   | func (field : String)
+  /-- `parts t`: `t` is a struct or an array, and the operands are its fields or elements. -/
+  | parts (t : TyE)
+  /-- `part a i t`: `a` is a struct or an array whose field or element `i` has type `t`. -/
+  | part (a : TyE) (index : String) (t : TyE)
+  /-- `variant u i t`: `u` is a union whose variant `i` has type `t`. -/
+  | variant (u : TyE) (index : String) (t : TyE)
+  /-- `union u`: `u` is a union. -/
+  | isUnion (u : TyE)
+  /-- `scalar t`: `t` is a scalar value type (`iN`, `ptr`, `bN`). -/
+  | scalar (t : TyE)
   deriving Repr, Inhabited
 
 /-- Effect categories (decision: Effects); resource tags come later. -/
@@ -403,6 +414,7 @@ def tyE (stx : TSyntax `firArg) : MacroM Term := do
   match id.getId.toString with
   | "ptr" => `(TyE.ptr)
   | "addr" => `(TyE.addr)
+  | "slice" => `(TyE.slice)
   | s =>
     match s.toList with
     | 'i' :: ds =>
@@ -459,6 +471,11 @@ def checkTerm (stx : TSyntax `firCheck) : MacroM Term := do
   | "sig", [f] => `(Check.sig $(quote (← argIdent f)))
   | "global", [f] => `(Check.global $(quote (← argIdent f)))
   | "func", [f] => `(Check.func $(quote (← argIdent f)))
+  | "parts", [t] => `(Check.parts $(← tyE t))
+  | "part", [a, i, t] => `(Check.part $(← tyE a) $(quote (← argIdent i)) $(← tyE t))
+  | "variant", [u, i, t] => `(Check.variant $(← tyE u) $(quote (← argIdent i)) $(← tyE t))
+  | "union", [u] => `(Check.isUnion $(← tyE u))
+  | "scalar", [t] => `(Check.scalar $(← tyE t))
   | _, _ => Macro.throwErrorAt stx "unknown check"
 
 partial def flatArg : TSyntax `firArg → List String
@@ -588,7 +605,7 @@ def validate (d : Decl) : MacroM Unit := do
     for c in checks do
       let (binds, reads) ← ruleNames c
       for r in reads do
-        let ok := bound.contains r || ["ptr", "addr", "i1"].contains r ||
+        let ok := bound.contains r || ["ptr", "addr", "slice", "i1"].contains r ||
           (r.startsWith "i" && ((r.drop 1).toString.toNat?).isSome) ||
           (fieldNamed r).isSome
         unless ok do Macro.throwErrorAt c s!"{ctor}: '{r}' is not bound"

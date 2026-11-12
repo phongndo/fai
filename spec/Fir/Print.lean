@@ -237,14 +237,21 @@ def Byte.render : Byte → String
   | .poison => "poison"
   | .frag p i => s!"{p.render}[{i}]"
 
-/-- Integers print signed, except `i1`, which prints as `0` or `1`. Pointers print as their
-allocation and offset (`#2+8`), or as an address. -/
-def RVal.render : RVal → String
-  | .int w .poison => s!"i{w} poison"
-  | .int w (.bits b) => if w = 1 then s!"i1 {b.toNat}" else s!"i{w} {b.toInt}"
-  | .ptr none => "ptr poison"
-  | .ptr (some p) => s!"ptr {p.render}"
-  | .bytes bs => s!"b{bs.length * 8} ({commas (bs.map Byte.render)})"
+mutual
+  /-- Integers print signed, except `i1`, which prints as `0` or `1`. Pointers print as their
+  allocation and offset (`#2+8`), or as an address. An aggregate prints its parts in braces: a
+  union its tag, then its payload. -/
+  def RVal.render : RVal → String
+    | .int w .poison => s!"i{w} poison"
+    | .int w (.bits b) => if w = 1 then s!"i1 {b.toNat}" else s!"i{w} {b.toInt}"
+    | .ptr none => "ptr poison"
+    | .ptr (some p) => s!"ptr {p.render}"
+    | .bytes bs => s!"b{bs.length * 8} ({commas (bs.map Byte.render)})"
+    | .agg vs => "{" ++ commas (RVal.renderList vs) ++ "}"
+  def RVal.renderList : List RVal → List String
+    | [] => []
+    | v :: vs => RVal.render v :: RVal.renderList vs
+end
 
 def renderHaltLoc : Option Loc → String
   | some l => s!" @{l.line}:{l.col}"

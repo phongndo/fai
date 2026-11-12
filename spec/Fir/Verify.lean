@@ -10,9 +10,11 @@ The rules a well-formed module must follow. A verified module never gets `stuck`
 interpreter.
 
 * Types: `iN` has `N ≥ 1`; `bN` has `N` a positive multiple of 8. Values (results, parameters,
-  function results, holes) have value types: `iN`, `ptr`, `bN`. Struct fields and array elements
-  have a layout (no function types, and no integers whose size isn't whole bytes); function
-  types take value types; a struct's or array's size is below `2^addrBits`. Memory spaces have
+  function results, holes) have the layer's value types (`Layer.valueTy`): `iN`, `ptr`, `bN`,
+  and in HFIR also structs, arrays, unions, and slices. Struct fields and array elements have a
+  layout (no function types, unions, or integers whose size isn't whole bytes); a union has at
+  least one variant, each a value type; function types take value types; a struct's or array's
+  size is below `2^addrBits`. Memory spaces have
   positive sizes that are multiples of 8, with the address size at most the pointer size, and
   power-of-two alignments for pointers and integers, the integers listed by increasing width.
 * Globals: names are unique among globals and functions; the type has a layout; the alignment
@@ -100,9 +102,16 @@ partial def checkTy (loc : Option Loc) : Ty → VM Unit
     unless e.hasLayout do verr loc s!"{e} can't be part of {t}"
     checkSize t
   | t@(.func ps rs) => do
+    let l := (← get).layer
     for x in ps ++ rs do
       checkTy loc x
-      unless x.isValue do verr loc s!"{x} can't be a parameter or result of {t}"
+      unless l.valueTy x do verr loc s!"{x} can't be a parameter or result of {t}"
+  | .slice => pure ()
+  | t@(.union vs) => do
+    if vs.isEmpty then verr loc s!"{t} needs at least one variant"
+    for v in vs do
+      checkTy loc v
+      unless v.isHValue do verr loc s!"{v} can't be a variant of {t}"
 where
   checkSize (t : Ty) : VM Unit := do
     let sp := (← get).space
@@ -111,7 +120,7 @@ where
 /-- Check that a value's type is a well-formed value type. -/
 def checkValueTy (loc : Option Loc) (t : Ty) : VM Unit := do
   checkTy loc t
-  unless t.isValue do verr loc s!"{t} is not a value type"
+  unless (← get).layer.valueTy t do verr loc s!"{t} is not a value type"
 
 /-- Check that a type is well formed and has a layout. -/
 def checkSized (loc : Option Loc) (t : Ty) : VM Unit := do
@@ -161,11 +170,16 @@ def expectTys (loc : Option Loc) (what : String) (got want : List Ty) : VM Unit 
   if got == want then pure ()
   else verr loc s!"{what}: expected {tys want} but got {tys got}"
 
-def isLoadable (space : SpaceCfg) : Ty → Bool
+def isLoadableScalar (space : SpaceCfg) : Ty → Bool
   | .int w => w % 8 == 0
   | .ptr => space.ptrBits % 8 == 0
   | .byte _ => true
   | _ => false
+
+/-- A scalar in whole bytes, or an aggregate with a layout whose leaves are. -/
+def isLoadable (space : SpaceCfg) (t : Ty) : Bool :=
+  if t.isValue then isLoadableScalar space t
+  else t.hasLayout && (t.leaves space).all (isLoadableScalar space ·.2)
 
 /-- Check the operand and result types of an op without regions, by its declared rule. -/
 def checkSimple (loc : Option Loc) (k : OpKind) (ins outs : List Ty) : VM Unit := do
@@ -179,6 +193,7 @@ def checkSimple (loc : Option Loc) (k : OpKind) (ins outs : List Ty) : VM Unit :
       | .ptr => .ptr
       | .addr => addr
       | .int w => .int w
+      | .slice => .slice
       | .name n => match env.lookup n, k.imm n with
         | some t, _ => t
         | none, some (.ty t) => t
@@ -212,7 +227,8 @@ def checkSimple (loc : Option Loc) (k : OpKind) (ins outs : List Ty) : VM Unit :
       unless t.width < a.width do verr loc s!"cannot truncate {a} to {t}"
     | .loadable t verb =>
       let t := ty t
-      unless t.isValue do verr loc s!"{t} can't be {verb}: it is not a value type"
+      unless st.layer.valueTy t do verr loc s!"{t} can't be {verb}: it is not a value type"
+      unless t.isValue || t.hasLayout do verr loc s!"{t} can't be {verb}: it has no layout"
       unless isLoadable st.space t do verr loc s!"{t} can't be {verb}: its size isn't whole bytes"
     | .deny names msg => if names.contains k.name then verr loc msg
     | .call f =>
@@ -240,6 +256,40 @@ def checkSimple (loc : Option Loc) (k : OpKind) (ins outs : List Ty) : VM Unit :
     | .func f =>
       let some (.str g) := k.imm f | verr loc "malformed op"
       unless st.sigs.contains g do verr loc s!"no function @{g}"
+    | .parts t =>
+      match ty t with
+      | .struct _ fs => expectTys loc "operands" ins fs
+      | t@(.array n e) =>
+        unless ins.length == n && ins.all (· == e) do
+          verr loc s!"operands: expected {n} values of type {e} for {t} but got {tys ins}"
+      | t => verr loc s!"{t} is not a struct or an array"
+    | .part a f t =>
+      let (a, t) := (ty a, ty t)
+      let some (.nat i) := k.imm f | verr loc "malformed op"
+      let part? := match a with
+        | .struct _ fs => fs[i]?
+        | .array n e => if i < n then some e else none
+        | _ => none
+      match a, part? with
+      | .struct .., some p | .array .., some p => expectTys loc s!"part {i} of {a}" [t] [p]
+      | .struct .., none | .array .., none => verr loc s!"{a} has no part {i}"
+      | _, _ => verr loc s!"{a} is not a struct or an array"
+    | .variant u f t =>
+      let (u, t) := (ty u, ty t)
+      let some (.nat i) := k.imm f | verr loc "malformed op"
+      match u with
+      | .union vs =>
+        match vs[i]? with
+        | some v => expectTys loc s!"variant {i} of {u}" [t] [v]
+        | none => verr loc s!"{u} has no variant {i}"
+      | _ => verr loc s!"{u} is not a union"
+    | .isUnion u =>
+      match ty u with
+      | .union _ => pure ()
+      | u => verr loc s!"{u} is not a union"
+    | .scalar t =>
+      let t := ty t
+      unless t.isValue do verr loc s!"{t} is not a scalar type"
 
 def nearestLoop : List RegionCtx → Option (List Ty × List Ty)
   | [] => none
@@ -475,7 +525,7 @@ def verifyModule (m : Module) : Except String (Array Hole) := do
   -- Signatures, then bodies.
   for f in m.funcs do
     for t in f.params.map (·.ty) ++ f.rets do
-      unless t.isValue do throw s!"in @{f.name}: @?: {t} is not a value type"
+      unless m.layer.valueTy t do throw s!"in @{f.name}: @?: {t} is not a value type"
   let (_, st) ← (m.funcs.forM fun f =>
     tryCatch (verifyFunc f) fun e => throw s!"in @{f.name}: {e}").run st
   pure st.holes

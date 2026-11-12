@@ -18,7 +18,9 @@ Where each part of a struct or array goes in memory, from the memory space's dat
   `ty.offset` report.
 * `array<N x T>` is `N` strides of `T`, with `T`'s alignment.
 
-Function types have no layout; the verifier keeps them out of memory.
+* `slice` is laid out as `struct<C>{ptr, iA}`, with `A` the address size.
+
+Function types and unions have no layout; the verifier keeps them out of memory.
 -/
 
 namespace Fir
@@ -49,6 +51,15 @@ def placeFields (p : Policy) (ds : List (Nat × Nat)) : List Nat × Nat × Nat :
     ((List.range ds.length).map fun i => ((offs.find? (·.1 == i)).map (·.2)).getD 0,
       alignUp size align, align)
 
+/-- The size and alignment of `iN` and `bN`. -/
+def SpaceCfg.intDims (sp : SpaceCfg) (w : Nat) : Nat × Nat := (w / 8, sp.intAlign w)
+
+/-- A slice's layout, as `struct<C>{ptr, iA}`: the length's offset, the size, and the alignment. -/
+def SpaceCfg.sliceLayout (sp : SpaceCfg) : Nat × Nat × Nat :=
+  let (ls, la) := sp.intDims sp.addrBits
+  match placeFields .c [(alignUp (sp.ptrBits / 8) sp.ptrAlign, sp.ptrAlign), (alignUp ls la, la)] with
+  | (offs, size, align) => (offs.getD 1 0, size, align)
+
 mutual
   /-- A type's size and alignment. -/
   def Ty.dims (sp : SpaceCfg) : Ty → Nat × Nat
@@ -56,7 +67,8 @@ mutual
     | .ptr => (sp.ptrBits / 8, sp.ptrAlign)
     | .struct p fs => let (_, size, align) := placeFields p (Ty.strides sp fs); (size, align)
     | .array n t => let (s, a) := t.dims sp; (n * alignUp s a, a)
-    | .func .. => (0, 1)
+    | .func .. | .union _ => (0, 1)
+    | .slice => (sp.sliceLayout.2.1, sp.sliceLayout.2.2)
   /-- Each type's stride and alignment. -/
   def Ty.strides (sp : SpaceCfg) : List Ty → List (Nat × Nat)
     | [] => []
@@ -79,11 +91,28 @@ def Ty.fieldOffset? (sp : SpaceCfg) : Ty → Nat → Option Nat
   | .struct p fs, i => (placeFields p (Ty.strides sp fs)).1[i]?
   | _, _ => none
 
-/-- Whether values of the type can be part of memory: everything but function types and integers
-whose size isn't whole bytes. (The verifier checks the parts of structs and arrays.) -/
+/-- Whether values of the type can be part of memory: everything but function types, unions, and
+integers whose size isn't whole bytes. (The verifier checks the parts of structs and arrays.) -/
 def Ty.hasLayout : Ty → Bool
   | .int w => w % 8 == 0
-  | .func .. => false
+  | .func .. | .union _ => false
   | _ => true
+
+mutual
+  /-- The scalars a value of type `t` is stored as, in order (fields and elements depth first),
+  with their offsets: an aggregate load or store accesses exactly these (decision: Aggregate
+  values). A scalar is its own only leaf; types without a layout have none that matter. -/
+  def Ty.leaves (sp : SpaceCfg) : Ty → List (Nat × Ty)
+    | .struct p fs => Ty.leavesAt sp (placeFields p (Ty.strides sp fs)).1 fs
+    | .array n e =>
+      let ls := e.leaves sp
+      (List.range n).flatMap fun j => ls.map fun (o, t) => (j * e.stride sp + o, t)
+    | .slice => [(0, .ptr), (sp.sliceLayout.1, .int sp.addrBits)]
+    | t => [(0, t)]
+  /-- The leaves of fields at these offsets. -/
+  def Ty.leavesAt (sp : SpaceCfg) : List Nat → List Ty → List (Nat × Ty)
+    | o :: os, f :: fs => (f.leaves sp).map (fun (x, t) => (o + x, t)) ++ Ty.leavesAt sp os fs
+    | _, _ => []
+end
 
 end Fir
