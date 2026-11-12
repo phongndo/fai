@@ -9,7 +9,16 @@ fir-ref check FILE                             verify; list holes
 fir-ref fmt FILE [--no-locs] [--unverified]    print canonical text (--unverified: parse only)
 fir-ref test PATH...                           run the test files (.fir) under PATH
 fir-ref lower FILE [--no-locs]                 lower an HFIR module to MFIR and print it
+fir-ref check-dce SRC TGT                      check that TGT is a dead code elimination of SRC
 ```
+
+`check-dce` runs the proved checker `Fir.Dce.checkFunc` (`Fir.Dce.checkFunc_sound`: acceptance
+implies that each target function refines its source function in the source module) on each
+pair of functions, which must come in the same order with the same names; everything outside the
+functions must print the same. It prints `ok N` for N checked functions, followed by canonical
+source and target snapshots. Callers must match this receipt to their immutable inputs; `ok N`
+alone is not an approval of whatever module a caller subsequently chooses. This remains a
+per-function theorem in a fixed module, conditional on `Decided`, not a module composition proof.
 
 Arguments are integers, floats (`1.5`, `-inf`, `nan(0x1)`; see `Fir.FloatText`), `null` (for
 pointers), or `poison`; a variadic function's variadic arguments carry their types (`i32 5`,
@@ -249,12 +258,27 @@ def withModule (file : String) (k : Module → Array Hole → IO UInt32) : IO UI
   | .error e => IO.eprintln s!"{file}: {e}"; pure 1
   | .ok (m, holes) => k m holes
 
+/-- Check that `tgt` is `src` with dead code eliminated, function by function, with the proved
+checker. The rest of the modules must be the same; that comparison is by printed text. -/
+def checkDce (src tgt : Module) : Except String Nat := do
+  let outside (m : Module) := ({ m with funcs := [] } : Module).render (showLocs := true)
+  unless outside src == outside tgt do throw "the modules differ outside their functions"
+  unless src.funcs.length == tgt.funcs.length do
+    throw s!"the source has {src.funcs.length} functions, the target {tgt.funcs.length}"
+  for s in src.funcs, t in tgt.funcs do
+    unless s.name == t.name do throw s!"function @{t.name} is where the source has @{s.name}"
+    unless s.file == t.file do throw s!"@{s.name}: the function's source file changed"
+    unless Dce.checkFunc t s do
+      throw s!"@{s.name}: rejected: not the source with deletable unread ops removed"
+  pure src.funcs.length
+
 def usage : String := "usage:
   fir-ref run FILE [@FUNC] [ARG...] [--fuel N]
   fir-ref check FILE
   fir-ref fmt FILE [--no-locs] [--unverified]
   fir-ref test PATH...
-  fir-ref lower FILE [--no-locs]"
+  fir-ref lower FILE [--no-locs]
+  fir-ref check-dce SRC TGT"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -291,4 +315,11 @@ def main (args : List String) : IO UInt32 := do
       match lowerChecked m with
       | .ok l => IO.print (l.render (showLocs := !opts.contains "--no-locs")); pure 0
       | .error e => IO.eprintln s!"{file}: {e}"; pure 1
+  | ["check-dce", srcFile, tgtFile] =>
+    withModule srcFile fun src _ => withModule tgtFile fun tgt _ => do
+      match checkDce src tgt with
+      | .ok n =>
+        IO.print s!"ok {n}\nsource:\n{src.render (showLocs := true)}target:\n{tgt.render (showLocs := true)}"
+        pure 0
+      | .error e => IO.eprintln s!"{tgtFile}: {e}"; pure 1
   | _ => IO.eprintln usage; pure 2

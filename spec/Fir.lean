@@ -24,6 +24,8 @@ import Fir.Space
 import Fir.Fwd
 import Fir.CopyProp
 import Fir.Dce
+import Fir.DceKinds
+import Fir.DceCheck
 import Fir.AArch64Syntax
 import Fir.AArch64
 import Fir.AArch64Proofs
