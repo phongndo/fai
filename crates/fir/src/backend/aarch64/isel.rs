@@ -237,6 +237,12 @@ fn check_ty(loc: Option<Loc>, t: Ty) -> Result<()> {
             "{}{t} is wider than 64 bits, which the AArch64 backend doesn't support yet",
             at(loc)
         )),
+        // Aggregate, union, and slice values are HFIR's: core ops over them (a `mem.load` of a
+        // struct) select only after the lowering has scalarized them.
+        _ if !t.is_value() => Err(format!(
+            "{}a value of an aggregate, union, or slice type is HFIR only: lower the module to MFIR first",
+            at(loc)
+        )),
         _ => Ok(()),
     }
 }

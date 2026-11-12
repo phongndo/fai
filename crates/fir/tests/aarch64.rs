@@ -1443,3 +1443,28 @@ fn pointer_bytes_taint_only_where_pointers_go() {
     assert!(!taint_of(&text("{null, 5}")).exempt("f", "returned i64 0", "returned i64 7"));
     assert!(taint_of(&text("{@x, 5}")).exempt("f", "returned i64 4096", "returned i64 7"));
 }
+
+/// Found by the coverage gate's direct-HFIR builds (random program s1-p102 at 200 programs):
+/// instruction selection accepted a `mem.load` of a struct, a core op over an HFIR value, and
+/// emitted it as one wide integer (`lsl x0, x0, #64`, which doesn't assemble). It refuses such
+/// values now; the lowering scalarizes them first.
+#[test]
+fn aggregate_values_need_lowering() {
+    let m = fir::parse_module(
+        "func @f(%p: ptr, %q: ptr) {
+  %s: struct<C>{i64, i32} = mem.load %p, align 8
+  mem.store struct<C>{i64, i32} %s, %q, align 8
+  func.ret
+}
+",
+    )
+    .unwrap();
+    fir::verify_module(&m).unwrap();
+    let e = a64::select(&m).unwrap_err();
+    assert!(
+        e.contains("HFIR only: lower the module to MFIR first"),
+        "{e}"
+    );
+    let lowered = fir::backend::prepare(&m, false).unwrap();
+    a64::compile(&lowered, &a64::Options::default()).unwrap();
+}
