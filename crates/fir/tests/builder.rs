@@ -50,6 +50,7 @@ fn copy_init(g: &Globals, init: Init, mb: &mut ModuleBuilder) -> Result<Init, Bu
     Ok(match init {
         Init::Zero | Init::Null => init,
         Init::Int(i) => mb.init_int(g.int(i).clone()),
+        Init::Float(f, i) => mb.init_float(f, g.float(i)),
         Init::Sym(r) => {
             let name = g.text(r);
             match (mb.func_ref(name), mb.global_ref(name)) {

@@ -5,7 +5,7 @@
 
 use num_bigint::BigInt;
 
-use crate::ir::Ty;
+use crate::ir::{FloatTy, Ty};
 use crate::types::Types;
 
 /// A run of entries in one of the pools.
@@ -38,6 +38,8 @@ pub enum Init {
     Zero,
     /// An integer, for an `iN` or `bN`: an index into the integers.
     Int(u32),
+    /// A float of the format, for a global of that type: an index into the floats' bits.
+    Float(FloatTy, u32),
     /// `null`
     Null,
     /// `@name`: the address of a global or a function (a run of the names' text).
@@ -67,6 +69,7 @@ pub struct Globals {
     /// Names: the globals' and the ones initializers take the address of.
     text: String,
     ints: Vec<BigInt>,
+    floats: Vec<u64>,
     bytes: Vec<u8>,
     items: Vec<Init>,
 }
@@ -112,6 +115,12 @@ impl Globals {
         Init::Int((self.ints.len() - 1) as u32)
     }
 
+    /// A float of format `f` with these bits.
+    pub fn float_init(&mut self, f: FloatTy, bits: u64) -> Init {
+        self.floats.push(bits);
+        Init::Float(f, (self.floats.len() - 1) as u32)
+    }
+
     pub fn sym_init(&mut self, name: &str) -> Init {
         Init::Sym(self.add_text(name))
     }
@@ -151,6 +160,11 @@ impl Globals {
 
     pub fn int(&self, i: u32) -> &BigInt {
         &self.ints[i as usize]
+    }
+
+    /// A float initializer's bits.
+    pub fn float(&self, i: u32) -> u64 {
+        self.floats[i as usize]
     }
 
     pub fn bytes(&self, r: Run) -> &[u8] {

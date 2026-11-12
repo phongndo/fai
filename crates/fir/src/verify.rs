@@ -199,6 +199,22 @@ fn check_init(
                 show(t)
             ));
         }
+        (Init::Float(f, i), _) => {
+            if t != Ty::Float(f) {
+                return Err(format!(
+                    "global @{g}: an {} can't initialize {}",
+                    f.name(),
+                    show(t)
+                ));
+            }
+            let b = gs.float(i);
+            if !crate::float::fits(f, b) {
+                return Err(format!(
+                    "global @{g}: {b} is not the bits of an {}",
+                    f.name()
+                ));
+            }
+        }
         (Init::Null, Ty::Ptr) => {}
         (Init::Null, _) => return Err(format!("global @{g}: null can't initialize {}", show(t))),
         (Init::Sym(r), Ty::Ptr) => {

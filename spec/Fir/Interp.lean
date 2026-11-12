@@ -1482,6 +1482,9 @@ mutual
   def initBytes (sp : SpaceCfg) (addrs : Std.ExtTreeMap String Ptr) : Ty → Init → List Byte
     | t, .zero => List.replicate (t.size sp) (.bits 0)
     | .int w, .int n | .byte w, .int n => encodeInt w (Sem.const w n)
+    | .float f, .float g b =>
+      if f = g then encodeInt f.width (.bits (BitVec.ofNat _ b))
+      else List.replicate ((Ty.float f).size sp) .poison
     | .ptr, .null => encodePtr sp (some .null)
     | .ptr, .sym s => encodePtr sp addrs[s]?
     | _, .bytes bs => bs.map fun b => .bits (BitVec.ofNat 8 b)

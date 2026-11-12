@@ -554,8 +554,10 @@ def hexBytes (s : String) : Option (List Nat) :=
     | [_] => none
   go s.toList
 
-/-- `zero`, an integer, `null`, `@name`, `bytes "00ff"`, or `{init, …}`. -/
-partial def init : P Init := do
+/-- `zero`, an integer, a float, `null`, `@name`, `bytes "00ff"`, or `{init, …}`, read for the
+type `t` it initializes when that is known: a float type reads a float literal of its format
+(`1.5`, `1`, `-0.0`, `inf`, `nan(0x1)`), and a list reads each item for its field or element. -/
+partial def init (t : Option Ty) : P Init := do
   match ← peek with
   | .ident "zero" => discard next; pure .zero
   | .ident "null" => discard next; pure .null
@@ -567,10 +569,26 @@ partial def init : P Init := do
       discard next
       pure (.bytes bs)
     | t => fail s!"expected a string of hex digits but found {t.describe}"
-  | .int n => discard next; pure (.int n)
   | .global s => discard next; pure (.sym s)
-  | .sym "{" => discard next; pure (.list (← sepBy init "}"))
-  | t => fail s!"expected an initializer but found {t.describe}"
+  | .sym "{" =>
+    discard next
+    let tys : List Ty := match t with
+      | some (.struct _ fs) => fs
+      | some (.array n e) => List.replicate n e
+      | _ => []
+    if ← trySym "}" then return .list []
+    let mut items : Array Init := #[← init tys[0]?]
+    while ← trySym "," do items := items.push (← init tys[items.size]?)
+    expectSym "}"
+    pure (.list items.toList)
+  | tok =>
+    match t, tok with
+    | some (.float f), _ =>
+      match (← floatLit).toBits f.fmt with
+      | some b => pure (.float f b.toNat)
+      | none => fail s!"the NaN payload doesn't fit {f.name}"
+    | _, .int n => discard next; pure (.int n)
+    | _, tok => fail s!"expected an initializer but found {tok.describe}"
 
 /-- `global [const] @name: T [align N] = INIT` -/
 def global : P Global := do
@@ -580,7 +598,7 @@ def global : P Global := do
   let t ← ty
   let align ← if ← tryIdent "align" then nat else pure 1
   expectSym "="
-  pure { name, ty := t, const, align, init := ← init }
+  pure { name, ty := t, const, align, init := ← init (some t) }
 
 /-- `args`, `exposed`, or `globals`. -/
 def memClass : P MemClass := do

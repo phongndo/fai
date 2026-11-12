@@ -213,6 +213,7 @@ def hexByte (b : Nat) : String :=
 partial def Init.render : Init → String
   | .zero => "zero"
   | .int n => toString n
+  | .float t b => Float.render (F := t.fmt) (BitVec.ofNat _ b)
   | .null => "null"
   | .sym s => s!"@{s}"
   | .bytes bs => s!"bytes \"{String.join (bs.map hexByte)}\""

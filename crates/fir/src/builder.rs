@@ -649,6 +649,21 @@ impl ModuleBuilder {
         self.module.globals.int_init(n)
     }
 
+    /// A float initializer of format `f` with these bits, for a global of that type.
+    pub fn init_float(&mut self, f: FloatTy, bits: u64) -> Init {
+        self.module.globals.float_init(f, bits)
+    }
+
+    /// An `f32` initializer.
+    pub fn init_f32(&mut self, x: f32) -> Init {
+        self.init_float(FloatTy::F32, u64::from(x.to_bits()))
+    }
+
+    /// An `f64` initializer.
+    pub fn init_f64(&mut self, x: f64) -> Init {
+        self.init_float(FloatTy::F64, x.to_bits())
+    }
+
     /// `@f`: a function's address.
     pub fn init_func(&mut self, f: FuncRef) -> Result<Init, BuildError> {
         self.sym(f)?;

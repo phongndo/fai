@@ -501,6 +501,7 @@ fn push_init(out: &mut String, g: &Globals, init: Init) {
     match init {
         Init::Zero => out.push_str("zero"),
         Init::Int(i) => write!(out, "{}", g.int(i)).unwrap(),
+        Init::Float(f, i) => out.push_str(&crate::float::render(f, g.float(i))),
         Init::Null => out.push_str("null"),
         Init::Sym(r) => {
             out.push('@');

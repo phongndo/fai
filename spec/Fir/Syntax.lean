@@ -1443,6 +1443,9 @@ inductive Init where
   | zero
   /-- An integer, for an `iN` or `bN`. -/
   | int (n : Int)
+  /-- A float of format `t`, for a global of that type: its bits, written as `float.const`
+  writes them (`1.5`, `-0.0`, `inf`, `nan(0x1)`; decision: Float text). -/
+  | float (t : FloatTy) (bits : Nat)
   /-- `null` -/
   | null
   /-- `@g`: the address of a global or a function. -/

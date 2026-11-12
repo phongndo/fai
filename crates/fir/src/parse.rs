@@ -1078,8 +1078,10 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `zero`, an integer, `null`, `@name`, `bytes "00ff"`, or `{init, …}`.
-    fn init(&mut self) -> PResult<Init> {
+    /// `zero`, an integer, a float, `null`, `@name`, `bytes "00ff"`, or `{init, …}`, read for the
+    /// type `t` it initializes when that is known (Lean's `init`): a float type reads a float
+    /// literal of its format, and a list reads each item for its field or element.
+    fn init(&mut self, t: Option<Ty>) -> PResult<Init> {
         Ok(match self.peek() {
             Tok::Ident("zero") => {
                 self.bump()?;
@@ -1101,26 +1103,56 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 self.globals.bytes_init(bs)
             }
-            Tok::Int(text) => {
-                self.bump()?;
-                self.globals.int_init(int_value(text))
-            }
             Tok::Global(name) => {
                 self.bump()?;
                 self.globals.sym_init(name)
             }
             Tok::Sym(Sym::LBrace) => {
                 self.bump()?;
-                let items = self.sep_by(Self::init, Sym::RBrace)?;
+                let mut items = Vec::new();
+                if !self.try_sym(Sym::RBrace)? {
+                    loop {
+                        let it = self.item_ty(t, items.len());
+                        items.push(self.init(it)?);
+                        if !self.try_sym(Sym::Comma)? {
+                            break;
+                        }
+                    }
+                    self.expect_sym(Sym::RBrace)?;
+                }
                 self.globals.list_init(items)
             }
-            t => {
-                return self.fail(format!(
-                    "expected an initializer but found {}",
-                    t.describe()
-                ));
-            }
+            tok => match (t, tok) {
+                (Some(Ty::Float(f)), _) => {
+                    let lit = self.float_lit()?;
+                    match lit.to_bits(f) {
+                        Some(b) => self.globals.float_init(f, b),
+                        None => {
+                            return self.fail(format!("the NaN payload doesn't fit {}", f.name()));
+                        }
+                    }
+                }
+                (_, Tok::Int(text)) => {
+                    self.bump()?;
+                    self.globals.int_init(int_value(text))
+                }
+                (_, t) => {
+                    return self.fail(format!(
+                        "expected an initializer but found {}",
+                        t.describe()
+                    ));
+                }
+            },
         })
+    }
+
+    /// The type of item `i` of a list initializing `t`: a field or an element.
+    fn item_ty(&self, t: Option<Ty>, i: usize) -> Option<Ty> {
+        match self.globals.types.shape_of(t?)? {
+            crate::types::Shape::Struct(_, fs) => fs.get(i).copied(),
+            crate::types::Shape::Array(n, e) => ((i as u64) < n).then_some(e),
+            _ => None,
+        }
     }
 
     /// `global [const] @name: T [align N] = INIT`, after `global`.
@@ -1138,7 +1170,7 @@ impl<'a> Parser<'a> {
             1
         };
         self.expect_sym(Sym::Eq)?;
-        let init = self.init()?;
+        let init = self.init(Some(ty))?;
         self.globals.push(name, ty, constant, align, init);
         Ok(())
     }

@@ -636,6 +636,10 @@ impl<'m> Machine<'m> {
                 sem::to_le_bytes(w, &sem::konst(w, gs.int(i)), &mut raw);
                 out.extend(raw.into_iter().map(Byte::Bits));
             }
+            (Init::Float(f, i), Ty::Float(g)) if f == g => {
+                let b = gs.float(i);
+                out.extend((0..f.width() / 8).map(|k| Byte::Bits((b >> (8 * k)) as u8)));
+            }
             (Init::Null, Ty::Ptr) => self.push_ptr_bytes(Some(NULL), out),
             (Init::Sym(r), Ty::Ptr) => {
                 let p = self.sym_ptr(gs.text(r));

@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 // The API's version: the major version times 65536, plus the minor version.
-#define FIR_API_VERSION ((1 << 16) | 2)
+#define FIR_API_VERSION ((1 << 16) | 3)
 
 // No id: what a call returns when it fails.
 #define FIR_INVALID UINT32_MAX
@@ -707,6 +707,12 @@ FirInit fir_init_int(struct FirModule *m, int64_t n);
 
 // `bytes "…"`: the whole object's bytes.
 FirInit fir_init_bytes(struct FirModule *m, const uint8_t *bytes, size_t n);
+
+// An `f32`, for a global of that type.
+FirInit fir_init_f32(struct FirModule *m, float x);
+
+// An `f64`, for a global of that type.
+FirInit fir_init_f64(struct FirModule *m, double x);
 
 // `@f`: a function's address.
 FirInit fir_init_func(struct FirModule *m, FirFunc f);

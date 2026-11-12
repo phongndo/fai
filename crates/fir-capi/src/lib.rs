@@ -85,7 +85,7 @@ mod ops;
 pub use ops::*;
 
 /// The API's version: the major version times 65536, plus the minor version.
-pub const FIR_API_VERSION: u32 = (1 << 16) | 2;
+pub const FIR_API_VERSION: u32 = (1 << 16) | 3;
 
 /// No id: what a call returns when it fails.
 pub const FIR_INVALID: u32 = u32::MAX;
@@ -1390,6 +1390,28 @@ pub unsafe extern "C" fn fir_init_bytes(m: *mut FirModule, bytes: *const u8, n: 
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             let init = m.mb.init_bytes(list(bytes, n));
+            Ok(m.add_init(init))
+        })
+    }
+}
+
+/// An `f32`, for a global of that type.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_init_f32(m: *mut FirModule, x: f32) -> FirInit {
+    unsafe {
+        module_id(m, FIR_INVALID, |m| {
+            let init = m.mb.init_f32(x);
+            Ok(m.add_init(init))
+        })
+    }
+}
+
+/// An `f64`, for a global of that type.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_init_f64(m: *mut FirModule, x: f64) -> FirInit {
+    unsafe {
+        module_id(m, FIR_INVALID, |m| {
+            let init = m.mb.init_f64(x);
             Ok(m.add_init(init))
         })
     }

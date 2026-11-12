@@ -1076,6 +1076,14 @@ static void floats(void) {
   FirType f32 = FIR_TYPE_F32, f64 = FIR_TYPE_F64, i1 = fir_type_int(1), i32 = fir_type_int(32),
           i64 = fir_type_int(64);
 
+  /* Float globals: a double, and a float inside a struct. */
+  FirGlobal scale =
+      ID(fir_global_declare(m, "scale", f64, true, 1, ID(fir_init_f64(m, 2.5))));
+  FirType wf[2] = {i32, f32};
+  FirInit wi[2] = {ID(fir_init_int(m, 3)), ID(fir_init_f32(m, -0.75f))};
+  ID(fir_global_declare(m, "weight", ID(fir_type_struct(m, FIR_POLICY_C, wf, 2)), false, 1,
+                        ID(fir_init_list(m, wi, 2))));
+
   /* @hypot(%a, %b) = sqrt(fma(a, a, b * b)), and whether it is below 10. */
   FirType two[2] = {f64, f64};
   FirType rets[2] = {f64, i1};
@@ -1085,7 +1093,9 @@ static void floats(void) {
   OK(fir_value_set_name(b, bb, "b"));
   FirValue sq = ID(fir_float_bin(b, FIR_FBIN_OP_MUL, bb, bb));
   FirValue sum = ID(fir_float_fma(b, a, a, sq));
-  FirValue h = ID(fir_float_un(b, FIR_FUN_OP_SQRT, sum));
+  FirValue h0 = ID(fir_float_un(b, FIR_FUN_OP_SQRT, sum));
+  FirValue sc = ID(fir_mem_load(b, f64, ID(fir_mem_global(b, scale)), 8));
+  FirValue h = ID(fir_float_bin(b, FIR_FBIN_OP_DIV, h0, sc));
   FirValue ten = ID(fir_float_const_f64(b, 10.0));
   FirValue small = ID(fir_float_cmp(b, FIR_FPRED_OLT, h, ten));
   FirValue out[2] = {h, small};
@@ -1128,13 +1138,19 @@ static void floats(void) {
   OK(fir_module_verify(m));
 
   expect_text(m, false,
+              "global const @scale: f64 = 2.5\n"
+              "global @weight: struct<C>{i32, f32} = {3, -0.75}\n"
+              "\n"
               "func @hypot(%a: f64, %b: f64) -> (f64, i1) {\n"
               "  %2: f64 = float.mul %b, %b\n"
               "  %3: f64 = float.fma %a, %a, %2\n"
               "  %4: f64 = float.sqrt %3\n"
-              "  %5: f64 = float.const 10.0\n"
-              "  %6: i1 = float.cmp.olt %4, %5\n"
-              "  func.ret %4, %6\n"
+              "  %5: ptr = mem.global @scale\n"
+              "  %6: f64 = mem.load %5, align 8\n"
+              "  %7: f64 = float.div %4, %6\n"
+              "  %8: f64 = float.const 10.0\n"
+              "  %9: i1 = float.cmp.olt %7, %8\n"
+              "  func.ret %7, %9\n"
               "}\n"
               "\n"
               "func @conv(%x: f64) -> (i32, i64, f32, f64, i32) {\n"
@@ -1164,7 +1180,7 @@ static void floats(void) {
               "  func.ret %0, %2, %3, %5, %7, %11\n"
               "}\n");
   const char *hargs[] = {"3.0", "4.0"};
-  expect_run(m, "hypot", hargs, 2, "returned f64 5.0, i1 1");
+  expect_run(m, "hypot", hargs, 2, "returned f64 2.0, i1 1");
   /* b * b underflows to 0, and so does a * a + 0, rounded once. */
   const char *hargs2[] = {"5e-324", "5e-324"};
   expect_run(m, "hypot", hargs2, 2, "returned f64 0.0, i1 1");
@@ -1204,6 +1220,13 @@ static void floats(void) {
   CHECK(fir_float_from_bits(b, f64, n) == FIR_INVALID);
   expect_error("float.from_bits: i32 and f64 have different widths", __LINE__);
   fir_func_abandon(b);
+  fir_module_free(m);
+
+  /* A float initializer of the wrong format. */
+  m = cur = fir_module_new();
+  ID(fir_global_declare(m, "bad", f64, false, 1, ID(fir_init_f32(m, 1.0f))));
+  CHECK(fir_module_verify(m) == FIR_ERR_VERIFY);
+  expect_error("global @bad: an f32 can't initialize f64", __LINE__);
   fir_module_free(m);
 }
 

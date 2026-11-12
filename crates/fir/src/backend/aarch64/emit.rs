@@ -515,6 +515,10 @@ impl Emitter<'_> {
                 bytes.resize((w / 8) as usize, 0);
                 out.extend_from_slice(&bytes);
             }
+            (Init::Float(f, i), Ty::Float(g)) if f == g => {
+                let b = gs.float(i);
+                out.extend((0..f.width() / 8).map(|k| (b >> (8 * k)) as u8));
+            }
             (Init::Sym(r), Ty::Ptr) => {
                 let name = gs.text(r);
                 let s = if gs_has(gs, name) || self.m.funcs.iter().any(|f| f.name == name) {

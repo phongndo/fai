@@ -507,6 +507,9 @@ partial def checkInit (g : String) (syms : Std.HashSet String) (sp : SpaceCfg) :
     | .int w | .byte w =>
       unless fitsSigned w n || fitsUnsigned w n do throw s!"global @{g}: {n} does not fit in {t}"
     | _ => throw s!"global @{g}: an integer can't initialize {t}"
+  | t, .float f b => do
+    unless t == Ty.float f do throw s!"global @{g}: an {f.name} can't initialize {t}"
+    unless b < 2 ^ f.width do throw s!"global @{g}: {b} is not the bits of an {f.name}"
   | .ptr, .null => pure ()
   | t, .null => throw s!"global @{g}: null can't initialize {t}"
   | .ptr, .sym s => unless syms.contains s do throw s!"global @{g}: no global or function @{s}"
