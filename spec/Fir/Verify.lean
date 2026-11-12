@@ -106,93 +106,58 @@ def isLoadable (space : SpaceCfg) : Ty → Bool
   | .ptr => space.ptrBits % 8 == 0
   | .byte _ => true
 
-/-- Check the operand and result types of an op without regions. -/
+/-- Check the operand and result types of an op without regions, by its declared rule. -/
 def checkSimple (loc : Option Loc) (k : OpKind) (ins outs : List Ty) : VM Unit := do
   let st ← get
   let addr := Ty.int st.space.addrBits
-  let one (t : Ty) := expectTys loc "results" outs [t]
-  let ints (ts : List Ty) := unless ts.all Ty.isInt do verr loc s!"expected integers but got {tys ts}"
-  match k with
-  | .const n =>
-    expectTys loc "operands" ins []
-    let [t] := outs | verr loc "int.const has one result"
-    ints [t]
-    unless fitsSigned t.width n || fitsUnsigned t.width n do
-      verr loc s!"{n} does not fit in {t}"
-  | .poison =>
-    expectTys loc "operands" ins []
-    let [t] := outs | verr loc "poison has one result"
-    ints [t]
-  | .freeze =>
-    let [t] := ins | verr loc "freeze takes one operand"
-    ints [t]
-    one t
-  | .copy =>
-    let [t] := ins | verr loc "copy takes one operand"
-    one t
-  | .select =>
-    let [c, a, b] := ins | verr loc "select takes three operands"
-    expectTys loc "select" [c, b] [.int 1, a]
-    ints [a]
-    one a
-  | .arith .. | .bit _ | .div .. | .shift .. =>
-    let [a, b] := ins | verr loc "this op takes two operands"
-    expectTys loc "operands" [b] [a]
-    ints [a]
-    one a
-  | .cmp _ =>
-    let [a, b] := ins | verr loc "int.cmp takes two operands"
-    expectTys loc "operands" [b] [a]
-    ints [a]
-    one (.int 1)
-  | .zext | .sext =>
-    let [a] := ins | verr loc "this op takes one operand"
-    let [t] := outs | verr loc "this op has one result"
-    ints [a, t]
-    unless t.width > a.width do verr loc s!"cannot extend {a} to {t}"
-  | .trunc _ =>
-    let [a] := ins | verr loc "int.trunc takes one operand"
-    let [t] := outs | verr loc "int.trunc has one result"
-    ints [a, t]
-    unless t.width < a.width do verr loc s!"cannot truncate {a} to {t}"
-  | .memStack _ align =>
-    unless isPow2 align do verr loc "alignment must be a power of two"
-    expectTys loc "operands" ins []
-    one .ptr
-  | .memAlloc _ _ align =>
-    unless isPow2 align do verr loc "alignment must be a power of two"
-    expectTys loc "mem.alloc size" ins [addr]
-    one .ptr
-  | .memFree _ =>
-    expectTys loc "operands" ins [.ptr]
-    one' loc outs
-  | .load align =>
-    unless isPow2 align do verr loc "alignment must be a power of two"
-    expectTys loc "operands" ins [.ptr]
-    let [t] := outs | verr loc "mem.load has one result"
-    unless isLoadable st.space t do verr loc s!"{t} can't be loaded: its size isn't whole bytes"
-  | .store t align =>
-    unless isPow2 align do verr loc "alignment must be a power of two"
-    expectTys loc "operands" ins [t, .ptr]
-    unless isLoadable st.space t do verr loc s!"{t} can't be stored: its size isn't whole bytes"
-    one' loc outs
-  | .ptrOffset _ => expectTys loc "operands" ins [.ptr, addr]; one .ptr
-  | .ptrAddr | .ptrExpose => expectTys loc "operands" ins [.ptr]; one addr
-  | .ptrFromExposed => expectTys loc "operands" ins [addr]; one .ptr
-  | .ptrWithAddr => expectTys loc "operands" ins [.ptr, addr]; one .ptr
-  | .ptrNull => expectTys loc "operands" ins []; one .ptr
-  | .ptrCmp p =>
-    if p matches .slt | .sle | .sgt | .sge then verr loc "pointer comparisons are unsigned"
-    expectTys loc "operands" ins [.ptr, .ptr]
-    one (.int 1)
-  | .call callee =>
-    let some (params, rets) := st.sigs[callee]? | verr loc s!"no function @{callee}"
-    expectTys loc s!"arguments of @{callee}" ins params
-    expectTys loc s!"results of @{callee}" outs rets
-  | _ => verr loc "unexpected op"
-where
-  one' (loc : Option Loc) (outs : List Ty) : VM Unit :=
-    unless outs.isEmpty do verr loc "this op has no results"
+  let some rule := k.decl.rule | verr loc "unexpected op"
+  -- The types named so far.
+  let mut env : List (String × Ty) := []
+  for c in rule do
+    let ty : TyE → Ty := fun
+      | .ptr => .ptr
+      | .addr => addr
+      | .int w => .int w
+      | .name n => match env.lookup n, k.imm n with
+        | some t, _ => t
+        | none, some (.ty t) => t
+        | none, _ => .ptr
+    match c with
+    | .takeIns vs msg =>
+      unless ins.length == vs.length do verr loc msg
+      env := env ++ vs.zip ins
+    | .takeOuts vs msg =>
+      unless outs.length == vs.length do verr loc msg
+      env := env ++ vs.zip outs
+    | .ins label want => expectTys loc label ins (want.map ty)
+    | .outs want => expectTys loc "results" outs (want.map ty)
+    | .noOuts => unless outs.isEmpty do verr loc "this op has no results"
+    | .same label got want => expectTys loc label (got.map ty) (want.map ty)
+    | .ints ts =>
+      let ts := ts.map ty
+      unless ts.all Ty.isInt do verr loc s!"expected integers but got {tys ts}"
+    | .pow2 f =>
+      let some (.nat a) := k.imm f | verr loc "malformed op"
+      unless isPow2 a do verr loc "alignment must be a power of two"
+    | .fits f t =>
+      let some (.int n) := k.imm f | verr loc "malformed op"
+      let t := ty t
+      unless fitsSigned t.width n || fitsUnsigned t.width n do verr loc s!"{n} does not fit in {t}"
+    | .widens a t =>
+      let (a, t) := (ty a, ty t)
+      unless t.width > a.width do verr loc s!"cannot extend {a} to {t}"
+    | .narrows a t =>
+      let (a, t) := (ty a, ty t)
+      unless t.width < a.width do verr loc s!"cannot truncate {a} to {t}"
+    | .loadable t verb =>
+      let t := ty t
+      unless isLoadable st.space t do verr loc s!"{t} can't be {verb}: its size isn't whole bytes"
+    | .deny names msg => if names.contains k.name then verr loc msg
+    | .call f =>
+      let some (.str callee) := k.imm f | verr loc "malformed op"
+      let some (params, rets) := st.sigs[callee]? | verr loc s!"no function @{callee}"
+      expectTys loc s!"arguments of @{callee}" ins params
+      expectTys loc s!"results of @{callee}" outs rets
 
 def nearestLoop : List RegionCtx → Option (List Ty × List Ty)
   | [] => none

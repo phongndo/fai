@@ -1,3 +1,5 @@
+import Fir.OpDSL
+
 /-!
 # Syntax
 
@@ -156,65 +158,334 @@ inductive AllocFail where
   | trap
   deriving DecidableEq, Repr
 
-inductive OpKind where
-  /-- `int.const n` -/
-  | const (n : Int)
-  | poison
-  | freeze
-  /-- `copy %x`: the same value, of any type. Rewrites produce it (store-to-load forwarding
-  turns a load into a copy of the stored value), and copy propagation removes it. -/
-  | copy
-  /-- `select %c, %a, %b` -/
-  | select
-  | arith (op : ArithOp) (ovf : Ovf)
-  | bit (op : BitOp)
-  | div (op : DivOp) (zero ovf : Edge)
-  | shift (op : ShiftOp) (edge : ShiftEdge)
-  | cmp (p : Pred)
-  | zext
-  | sext
-  | trunc (mode : TruncMode)
-  /-- `mem.stack 16, align 4`: stack memory, freed when its region ends. -/
-  | memStack (size align : Nat)
-  /-- `mem.alloc.null c.malloc %n, align 16`: heap memory from an allocator family. -/
-  | memAlloc (fail : AllocFail) (family : String) (align : Nat)
-  /-- `mem.free c.malloc %p` -/
-  | memFree (family : String)
-  /-- `mem.load %p, align 4`: the result type is the accessed type. -/
-  | load (align : Nat)
-  /-- `mem.store i32 %v, %p, align 4` -/
-  | store (ty : Ty) (align : Nat)
-  /-- `ptr.offset.inbounds %p, %n` (poison if it leaves the allocation) or `ptr.offset.wrap`. -/
-  | ptrOffset (inbounds : Bool)
-  /-- `ptr.addr %p`: the address, without exposing the allocation. -/
-  | ptrAddr
-  /-- `ptr.expose %p`: the address, and `ptr.from_exposed` may reach the allocation from now on. -/
-  | ptrExpose
-  | ptrFromExposed
-  /-- `ptr.with_addr %p, %a`: a new address in `%p`'s allocation. -/
-  | ptrWithAddr
-  | ptrNull
-  /-- `ptr.cmp.eq` and friends; ordered comparisons are unsigned. -/
-  | ptrCmp (p : Pred)
-  /-- `func.call @f(%a, %b)` -/
-  | call (callee : String)
-  /-- `cf.if %c { … } else { … }`: two regions. -/
-  | if_
-  /-- `cf.loop [progress] iter(…) { … }`: one region whose parameters are the loop state. -/
-  | loop (progress : Bool)
-  /-- `cf.yield`: ends a `cf.if` region with the `cf.if`'s results. -/
-  | yield
-  /-- `cf.break`: leaves the nearest loop with the loop's results. -/
-  | brk
-  /-- `cf.continue`: starts the next iteration with new loop state. -/
-  | cont
-  /-- `func.ret` -/
-  | ret
+/-! ## Modifier vocabularies
+
+How each modifier is spelled in op names (decision: Modifier spelling). The first spelling of a
+value is the one printed. -/
+
+instance : Spelled ArithOp := ⟨[sp "add" .add, sp "sub" .sub, sp "mul" .mul]⟩
+
+instance : Spelled Ovf := ⟨[sp "wrap" .wrap, sp "nsw" .nsw, sp "nuw" .nuw, sp "nsw.nuw" .nswNuw,
+  sp "s.trap" (.trap true), sp "u.trap" (.trap false), sp "s.sat" (.sat true),
+  sp "u.sat" (.sat false), sp "s.ub" (.ub true), sp "u.ub" (.ub false)]⟩
+
+instance : Spelled BitOp := ⟨[sp "and" .and, sp "or" .or, sp "xor" .xor]⟩
+
+instance : Spelled ShiftOp := ⟨[sp "shl" .shl, sp "shr.u" .shrU, sp "shr.s" .shrS]⟩
+
+instance : Spelled ShiftEdge := ⟨[sp "ub" .ub, sp "trap" .trap, sp "mask" .mask, sp "total" .total]⟩
+
+instance : Spelled Pred := ⟨[sp "eq" .eq, sp "ne" .ne, sp "slt" .slt, sp "sle" .sle,
+  sp "sgt" .sgt, sp "sge" .sge, sp "ult" .ult, sp "ule" .ule, sp "ugt" .ugt, sp "uge" .uge]⟩
+
+instance : Spelled TruncMode := ⟨[sp "wrap" .wrap, sp "nsw" .nsw, sp "nuw" .nuw]⟩
+
+instance : Spelled AllocFail := ⟨[sp "null" .null, sp "trap" .trap]⟩
+
+/-- `ptr.offset.inbounds` and `ptr.offset.wrap` -/
+def offsetModes : List (Spelling Bool) := [sp "inbounds" true, sp "wrap" false]
+
+def Edge.all : List Edge := [.ub, .trap, .total, .wrap]
+
+def Edge.name : Edge → String
+  | .ub => "ub"
+  | .trap => "trap"
+  | .total => "total"
+  | .wrap => "wrap"
+
+/-- Signed division and remainder edges `(zero, overflow)`: one modifier when it covers both
+cases, otherwise two. A zero edge of `wrap` or an overflow edge of `total` doesn't parse. -/
+def signedEdges : List (Spelling (Edge × Edge)) :=
+  [sp "ub" (.ub, .ub), sp "trap" (.trap, .trap), sp "total" (.total, .wrap)] ++
+  Edge.all.flatMap fun z => Edge.all.map fun o =>
+    sp s!"{z.name}.{o.name}" (z, o) (parses := z != .wrap && o != .total)
+
+/-- Unsigned division and remainder name the zero edge only; the overflow edge follows from it. -/
+def unsignedEdges : List (Spelling (Edge × Edge)) :=
+  [sp "ub" (.ub, .ub), sp "trap" (.trap, .trap), sp "total" (.total, .wrap)] ++
+  Edge.all.flatMap fun z => Edge.all.map fun o => sp z.name (z, o) (parses := false)
+
+/-- An op's immediate: a value written in its text that isn't an operand (`align 4`,
+`c.malloc`, `@f`). -/
+inductive Imm where
+  | int (n : Int)
+  | nat (n : Nat)
+  | str (s : String)
+  | ty (t : Ty)
+  | flag (b : Bool)
   deriving DecidableEq, Repr
 
-def OpKind.isTerminator : OpKind → Bool
-  | .yield | .brk | .cont | .ret => true
-  | _ => false
+/-! ## Ops
+
+Every op, declared once (see `Fir.OpDSL`). This generates `OpKind` and `OpKind.isTerminator`, and
+the tables the parser, printer, and verifier read. -/
+
+fir_ops
+  /-- `int.const n` -/
+  op const (n : Int)
+    name "int.const"
+    format "{n}"
+    rule
+      operands []
+      results t "int.const has one result"
+      ints t
+      fits n t
+  /-- `poison`: an integer `poison` value. -/
+  op poison
+    name "poison"
+    format ""
+    rule
+      operands []
+      results t "poison has one result"
+      ints t
+  /-- `freeze %x`: `%x`, or an arbitrary value if it is `poison`. -/
+  op freeze
+    name "freeze"
+    format "%"
+    rule
+      operands t "freeze takes one operand"
+      ints t
+      results [t]
+  /-- `copy %x`: the same value, of any type. Rewrites produce it (store-to-load forwarding
+  turns a load into a copy of the stored value), and copy propagation removes it. -/
+  op copy
+    name "copy"
+    format "%"
+    rule
+      operands t "copy takes one operand"
+      results [t]
+  /-- `select %c, %a, %b` -/
+  op select
+    name "select"
+    format "%, %, %"
+    rule
+      operands c a b "select takes three operands"
+      same "select" [c, b] [i1, a]
+      ints a
+      results [a]
+  /-- `int.add.nsw %a, %b` and friends: `int.add`, `int.sub`, `int.mul` with an overflow
+  modifier. -/
+  op arith (op : ArithOp) (ovf : Ovf)
+    name "int.{op}.{ovf}"
+    format "%, %"
+    effects trap
+    rule
+      operands a b "this op takes two operands"
+      same "operands" [b] [a]
+      ints a
+      results [a]
+  /-- `int.and`, `int.or`, `int.xor` -/
+  op bit (op : BitOp)
+    name "int.{op}"
+    format "%, %"
+    rule
+      operands a b "this op takes two operands"
+      same "operands" [b] [a]
+      ints a
+      results [a]
+  /-- `int.div.s.ub %a, %b` and friends; see `Edge`. -/
+  op div (op : DivOp) (zero ovf : Edge)
+    name "int.div.s.{zero ovf : signedEdges}" with op := .divS
+    name "int.div.u.{zero ovf : unsignedEdges}" with op := .divU
+    name "int.rem.s.{zero ovf : signedEdges}" with op := .remS
+    name "int.rem.u.{zero ovf : unsignedEdges}" with op := .remU
+    format "%, %"
+    effects trap
+    rule
+      operands a b "this op takes two operands"
+      same "operands" [b] [a]
+      ints a
+      results [a]
+  /-- `int.shl.mask %a, %b`, `int.shr.u`, `int.shr.s`; see `ShiftEdge`. -/
+  op shift (op : ShiftOp) (edge : ShiftEdge)
+    name "int.{op}.{edge}"
+    format "%, %"
+    effects trap
+    rule
+      operands a b "this op takes two operands"
+      same "operands" [b] [a]
+      ints a
+      results [a]
+  /-- `int.cmp.slt %a, %b` and friends. -/
+  op cmp (p : Pred)
+    name "int.cmp.{p}"
+    format "%, %"
+    rule
+      operands a b "int.cmp takes two operands"
+      same "operands" [b] [a]
+      ints a
+      results [i1]
+  /-- `int.zext %a`: the result type is the wider type. -/
+  op zext
+    name "int.zext"
+    format "%"
+    rule
+      operands a "this op takes one operand"
+      results t "this op has one result"
+      ints a t
+      widens a t
+  /-- `int.sext %a` -/
+  op sext
+    name "int.sext"
+    format "%"
+    rule
+      operands a "this op takes one operand"
+      results t "this op has one result"
+      ints a t
+      widens a t
+  /-- `int.trunc.nsw %a`; see `TruncMode`. -/
+  op trunc (mode : TruncMode)
+    name "int.trunc.{mode}"
+    format "%"
+    rule
+      operands a "int.trunc takes one operand"
+      results t "int.trunc has one result"
+      ints a t
+      narrows a t
+  /-- `mem.stack 16, align 4`: stack memory, freed when its region ends. -/
+  op memStack (size : Nat) (align : Align)
+    name "mem.stack"
+    format "{size}, align {align}"
+    effects alloc
+    rule
+      pow2 align
+      operands []
+      results [ptr]
+  /-- `mem.alloc.null c.malloc %n, align 16`: heap memory from an allocator family. -/
+  op memAlloc (fail : AllocFail) (family : Symbol) (align : Align)
+    name "mem.alloc.{fail}"
+    format "{family} %, align {align}"
+    effects alloc trap
+    rule
+      pow2 align
+      operands "mem.alloc size" [addr]
+      results [ptr]
+  /-- `mem.free c.malloc %p` -/
+  op memFree (family : Symbol)
+    name "mem.free"
+    format "{family} %"
+    effects free
+    rule
+      operands [ptr]
+      noResults
+  /-- `mem.load %p, align 4`: the result type is the accessed type. -/
+  op load (align : Align)
+    name "mem.load"
+    format "%, align {align}"
+    effects read
+    rule
+      pow2 align
+      operands [ptr]
+      results t "mem.load has one result"
+      loadable t "loaded"
+  /-- `mem.store i32 %v, %p, align 4` -/
+  op store (ty : Ty) (align : Align)
+    name "mem.store"
+    format "{ty} %, %, align {align}"
+    effects write
+    rule
+      pow2 align
+      operands [ty, ptr]
+      loadable ty "stored"
+      noResults
+  /-- `ptr.offset.inbounds %p, %n` (poison if it leaves the allocation) or `ptr.offset.wrap`. -/
+  op ptrOffset (inbounds : Bool)
+    name "ptr.offset.{inbounds : offsetModes}"
+    format "%, %"
+    rule
+      operands [ptr, addr]
+      results [ptr]
+  /-- `ptr.addr %p`: the address, without exposing the allocation. -/
+  op ptrAddr
+    name "ptr.addr"
+    format "%"
+    rule
+      operands [ptr]
+      results [addr]
+  /-- `ptr.expose %p`: the address, and `ptr.from_exposed` may reach the allocation from now on. -/
+  op ptrExpose
+    name "ptr.expose"
+    format "%"
+    effects write
+    rule
+      operands [ptr]
+      results [addr]
+  /-- `ptr.from_exposed %a`: a pointer to an exposed allocation at that address. -/
+  op ptrFromExposed
+    name "ptr.from_exposed"
+    format "%"
+    effects read
+    rule
+      operands [addr]
+      results [ptr]
+  /-- `ptr.with_addr %p, %a`: a new address in `%p`'s allocation. -/
+  op ptrWithAddr
+    name "ptr.with_addr"
+    format "%, %"
+    rule
+      operands [ptr, addr]
+      results [ptr]
+  /-- `ptr.null` -/
+  op ptrNull
+    name "ptr.null"
+    format ""
+    rule
+      operands []
+      results [ptr]
+  /-- `ptr.cmp.eq` and friends; ordered comparisons are unsigned. -/
+  op ptrCmp (p : Pred)
+    name "ptr.cmp.{p}"
+    format "%, %"
+    rule
+      deny ["ptr.cmp.slt", "ptr.cmp.sle", "ptr.cmp.sgt", "ptr.cmp.sge"]
+        "pointer comparisons are unsigned"
+      operands [ptr, ptr]
+      results [i1]
+  /-- `func.call @f(%a, %b)` -/
+  op call (callee : Func)
+    name "func.call"
+    format "{callee}(%*)"
+    effects read write alloc free trap diverge
+    rule
+      call callee
+  /-- `cf.if %c { … } else { … }`: two regions. -/
+  op if_
+    name "cf.if"
+    format "% region else region"
+  /-- `cf.loop [progress] [iter(…)] { … }`: one region whose parameters are the loop state. -/
+  op loop (progress : Flag)
+    name "cf.loop"
+    format "{progress} %iter region"
+    effects diverge
+  /-- `cf.yield`: ends a `cf.if` region with the `cf.if`'s results. -/
+  op yield
+    name "cf.yield"
+    format "%*"
+    terminator
+  /-- `cf.break`: leaves the nearest loop with the loop's results. -/
+  op brk
+    name "cf.break"
+    format "%*"
+    terminator
+    rust Break
+  /-- `cf.continue`: starts the next iteration with new loop state. -/
+  op cont
+    name "cf.continue"
+    format "%*"
+    terminator
+    rust Continue
+  /-- `func.ret` -/
+  op ret
+    name "func.ret"
+    format "%*"
+    terminator
+
+/-- The op's name with its modifiers, as printed. -/
+def OpKind.name (k : OpKind) : String :=
+  let e := k.erase
+  match opNames.find? (·.value == e) with
+  | some s => s.text
+  | none => "?"
 
 /-- An operand: a value, or a hole `?name: T` standing for a value not written yet. -/
 inductive Operand where

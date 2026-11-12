@@ -1,4 +1,5 @@
 import Fir.Basic
+import Fir.OpDSL
 import Fir.Refinement
 import Fir.Syntax
 import Fir.Sem

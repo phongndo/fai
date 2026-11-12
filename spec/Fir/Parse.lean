@@ -24,7 +24,24 @@ func @sum(%n: i32) -> i32 loc "sum.c" {
 ```
 
 An op's location goes after its operands and before its regions. Op names carry their modifiers
-(`int.add.nsw`, `int.div.s.trap.wrap`).
+(`int.add.nsw`, `int.div.s.trap.wrap`). Each op's readable form is declared with the op (see
+`Fir.OpDSL` and the declarations in `Fir.Syntax`); this parser reads it from the op table.
+
+Every op also has a generic form, the same for all ops:
+
+```
+op       ::= [result, … "="] STRING "(" [operand, …] ")" [attrs] [LOC] [regions]
+attrs    ::= "{" [IDENT "=" value, …] "}"
+regions  ::= "(" [region, …] ")"
+region   ::= ["(" [result, …] ")"] "{" op* "}"
+```
+
+`%s: i32 = "int.add.nsw"(%a, %b)`, `"mem.store"(%v, %p) {ty = i32, align = 4} @3:5`,
+`%r: i32 = "cf.loop"(%z) {progress = false} ((%i: i32) { … })`. The string is the op's name with
+its modifiers. The attributes are the op's immediates, named after its fields, each given once in
+any order; their values are written as in the readable form, except that a flag is `true` or
+`false`. Operand and region counts aren't checked here; the verifier checks them. The printer
+uses the readable form whenever the op's shape fits it, and the generic form otherwise.
 -/
 
 namespace Fir
@@ -151,134 +168,104 @@ def operand : P Operand := do
   | .hole s => discard next; expectSym ":"; pure (.hole s (← ty))
   | t => fail s!"expected an operand but found {t.describe}"
 
-/-- Exactly `n` comma-separated operands. -/
-def operands (n : Nat) : P (List Operand) := do
-  let mut acc := #[]
-  for i in [0:n] do
-    if i > 0 then expectSym ","
-    acc := acc.push (← operand)
-  pure acc.toList
-
-/-- Zero or more comma-separated operands (for terminators). -/
+/-- Zero or more comma-separated operands. -/
 def variadic : P (List Operand) := do
   match ← peek with
   | .value _ | .hole _ => sepBy1 operand
   | _ => pure []
-
-/-- `, align N` -/
-def alignArg : P Nat := do
-  expectSym ","
-  unless ← tryIdent "align" do fail "expected 'align'"
-  nat
 
 def optLoc : P (Option Loc) := do
   match ← peek with
   | .loc l c => discard next; pure (some ⟨l, c⟩)
   | _ => pure none
 
-def ovf : List String → Option Ovf
-  | ["wrap"] => some .wrap
-  | ["nsw"] => some .nsw
-  | ["nuw"] => some .nuw
-  | ["nsw", "nuw"] => some .nswNuw
-  | ["s", "trap"] => some (.trap true)
-  | ["u", "trap"] => some (.trap false)
-  | ["s", "sat"] => some (.sat true)
-  | ["u", "sat"] => some (.sat false)
-  | ["s", "ub"] => some (.ub true)
-  | ["u", "ub"] => some (.ub false)
-  | _ => none
-
-def zeroEdge : String → Option Edge
-  | "ub" => some .ub
-  | "trap" => some .trap
-  | "total" => some .total
-  | _ => none
-
-def ovfEdge : String → Option Edge
-  | "ub" => some .ub
-  | "trap" => some .trap
-  | "wrap" => some .wrap
-  | _ => none
-
-/-- `(zero, overflow)` edges. One modifier covers both cases. -/
-def divEdges (signed : Bool) : List String → Option (Edge × Edge)
-  | [z] => do
-    let z ← zeroEdge z
-    pure (z, if z == .total then .wrap else z)
-  | [z, o] => if signed then do pure (← zeroEdge z, ← ovfEdge o) else none
-  | _ => none
-
-def shiftEdge : List String → Option ShiftEdge
-  | ["ub"] => some .ub
-  | ["trap"] => some .trap
-  | ["mask"] => some .mask
-  | ["total"] => some .total
-  | _ => none
-
-def pred : String → Option Pred
-  | "eq" => some .eq | "ne" => some .ne
-  | "slt" => some .slt | "sle" => some .sle | "sgt" => some .sgt | "sge" => some .sge
-  | "ult" => some .ult | "ule" => some .ule | "ugt" => some .ugt | "uge" => some .uge
-  | _ => none
-
-/-- Decode an op name with its modifiers. -/
+/-- The kind an op name spells, with its immediates reset (see `opNames`). -/
 def opKind (name : String) : Option OpKind :=
-  match name.splitOn "." with
-  | ["int", "const"] => some (.const 0)
-  | ["poison"] => some .poison
-  | ["freeze"] => some .freeze
-  | ["copy"] => some .copy
-  | ["select"] => some .select
-  | "int" :: "add" :: m => (ovf m).map (.arith .add)
-  | "int" :: "sub" :: m => (ovf m).map (.arith .sub)
-  | "int" :: "mul" :: m => (ovf m).map (.arith .mul)
-  | ["int", "and"] => some (.bit .and)
-  | ["int", "or"] => some (.bit .or)
-  | ["int", "xor"] => some (.bit .xor)
-  | "int" :: "div" :: "s" :: m => (divEdges true m).map fun (z, o) => .div .divS z o
-  | "int" :: "div" :: "u" :: m => (divEdges false m).map fun (z, o) => .div .divU z o
-  | "int" :: "rem" :: "s" :: m => (divEdges true m).map fun (z, o) => .div .remS z o
-  | "int" :: "rem" :: "u" :: m => (divEdges false m).map fun (z, o) => .div .remU z o
-  | "int" :: "shl" :: m => (shiftEdge m).map (.shift .shl)
-  | "int" :: "shr" :: "u" :: m => (shiftEdge m).map (.shift .shrU)
-  | "int" :: "shr" :: "s" :: m => (shiftEdge m).map (.shift .shrS)
-  | ["int", "cmp", p] => (pred p).map .cmp
-  | ["int", "zext"] => some .zext
-  | ["int", "sext"] => some .sext
-  | ["int", "trunc", "wrap"] => some (.trunc .wrap)
-  | ["int", "trunc", "nsw"] => some (.trunc .nsw)
-  | ["int", "trunc", "nuw"] => some (.trunc .nuw)
-  | ["cf", "if"] => some .if_
-  | ["cf", "loop"] => some (.loop false)
-  | ["cf", "yield"] => some .yield
-  | ["cf", "break"] => some .brk
-  | ["cf", "continue"] => some .cont
-  | ["func", "ret"] => some .ret
-  | ["ptr", "offset", "inbounds"] => some (.ptrOffset true)
-  | ["ptr", "offset", "wrap"] => some (.ptrOffset false)
-  | ["ptr", "addr"] => some .ptrAddr
-  | ["ptr", "expose"] => some .ptrExpose
-  | ["ptr", "from_exposed"] => some .ptrFromExposed
-  | ["ptr", "with_addr"] => some .ptrWithAddr
-  | ["ptr", "null"] => some .ptrNull
-  | ["ptr", "cmp", p] => (pred p).map .ptrCmp
-  | ["mem", "stack"] => some (.memStack 0 1)
-  | ["mem", "alloc", "null"] => some (.memAlloc .null "" 1)
-  | ["mem", "alloc", "trap"] => some (.memAlloc .trap "" 1)
-  | ["mem", "free"] => some (.memFree "")
-  | ["mem", "load"] => some (.load 1)
-  | ["mem", "store"] => some (.store .ptr 1)
-  | ["func", "call"] => some (.call "")
-  | _ => none
+  (opNames.find? fun s => s.parses && s.text == name).map (·.value)
 
-/-- How many operands an op without regions takes, or `none` if variadic. -/
-def arity : OpKind → Option Nat
-  | .const _ | .poison | .ptrNull => some 0
-  | .freeze | .copy | .zext | .sext | .trunc _ | .ptrAddr | .ptrExpose | .ptrFromExposed => some 1
-  | .select => some 3
-  | .yield | .brk | .cont | .ret => none
-  | _ => some 2
+/-- `@name` -/
+def funcName : P String := do
+  match ← peek with
+  | .global s => discard next; pure s
+  | t => fail s!"expected a function name like @f but found {t.describe}"
+
+/-- An immediate, as the readable form writes it. A flag is a keyword named after its field. -/
+def imm (f : Field) : P Imm :=
+  match f.ty with
+  | .int => .int <$> int
+  | .nat | .align => .nat <$> nat
+  | .symbol => .str <$> ident
+  | .func => .str <$> funcName
+  | .ty => .ty <$> ty
+  | .flag | .mod _ => .flag <$> tryIdent f.name
+
+/-- `%name: type = %init` -/
+def iterArg : P (Result × Operand) := do
+  let r ← result
+  expectSym "="
+  pure (r, ← operand)
+
+/-- The readable form after the op name, up to its location: the kind with its immediates, the
+operands, and the parameters `%iter` gives the first region. -/
+def head (kind : OpKind) (d : OpDecl) : P (OpKind × List Operand × List Result) := do
+  let mut kind := kind
+  let mut args := []
+  let mut params := []
+  for item in d.head do
+    match item with
+    | .imm f => kind := kind.setImm f (← imm ((d.field? f).getD default))
+    | .operand => args := args ++ [← operand]
+    | .comma => expectSym ","
+    | .keyword kw => unless ← tryIdent kw do fail s!"expected '{kw}'"
+    | .variadic => args := args ++ (← variadic)
+    | .args => expectSym "("; args := args ++ (← sepBy operand ")")
+    | .iter =>
+      if ← tryIdent "iter" then
+        expectSym "("
+        let iter ← sepBy iterArg ")"
+        params := iter.map (·.1)
+        args := args ++ iter.map (·.2)
+    | .region _ => pure ()
+  pure (kind, args, params)
+
+/-- A generic-form attribute value: as in the readable form, except that a flag is `true` or
+`false`. -/
+def attrValue (f : Field) : P Imm :=
+  match f.ty with
+  | .flag => do
+    match ← peek with
+    | .ident "true" => discard next; pure (.flag true)
+    | .ident "false" => discard next; pure (.flag false)
+    | t => fail s!"expected true or false but found {t.describe}"
+  | _ => imm f
+
+/-- `key = value`, for the op `name`, whose attributes `seen` are already given. -/
+def attr (d : OpDecl) (name : String) (seen : List String) : P (String × Imm) := do
+  let key ← match ← peek with
+    | .ident key => pure key
+    | t => fail s!"expected a name but found {t.describe}"
+  let some f := d.imms.find? (·.name == key) | fail s!"{name} has no attribute '{key}'"
+  if seen.contains key then fail s!"attribute '{key}' is given twice"
+  discard next
+  expectSym "="
+  pure (key, ← attrValue f)
+
+/-- `{key = value, …}`: every immediate of the op `name`, each once, in any order. -/
+def attrs (kind : OpKind) (name : String) : P OpKind := do
+  let d := kind.decl
+  let mut kind := kind
+  let mut seen := []
+  if ← trySym "{" then
+    if !(← trySym "}") then
+      repeat
+        let (key, v) ← attr d name seen
+        kind := kind.setImm key v
+        seen := key :: seen
+        if !(← trySym ",") then break
+      expectSym "}"
+  for f in d.imms do
+    unless seen.contains f.name do fail s!"{name} needs the attribute '{f.name}'"
+  pure kind
 
 mutual
   partial def region (params : List Result) : P Region := do
@@ -289,6 +276,11 @@ mutual
       ops := ops.push (← op)
     pure (.mk params ops.toList)
 
+  /-- A region in the generic form: `(%x: T, …) { … }`, the parameters optional. -/
+  partial def genericRegion : P Region := do
+    let params ← if ← trySym "(" then sepBy result ")" else pure []
+    region params
+
   partial def op : P Op := do
     let results ←
       match ← peek with
@@ -297,69 +289,30 @@ mutual
         expectSym "="
         pure rs
       | _ => pure []
-    let name ← ident
-    let some kind := opKind name | fail s!"unknown op '{name}'"
-    match kind with
-    | .const _ =>
-      let n ← int
-      pure (.mk (.const n) results [] [] (← optLoc))
-    | .memStack .. =>
-      let size ← nat
-      let align ← alignArg
-      pure (.mk (.memStack size align) results [] [] (← optLoc))
-    | .memAlloc fail .. =>
-      let family ← ident
-      let n ← operand
-      let align ← alignArg
-      pure (.mk (.memAlloc fail family align) results [n] [] (← optLoc))
-    | .memFree _ =>
-      let family ← ident
-      let p ← operand
-      pure (.mk (.memFree family) results [p] [] (← optLoc))
-    | .load _ =>
-      let p ← operand
-      let align ← alignArg
-      pure (.mk (.load align) results [p] [] (← optLoc))
-    | .store .. =>
-      let t ← ty
-      let v ← operand
-      expectSym ","
-      let p ← operand
-      let align ← alignArg
-      pure (.mk (.store t align) results [v, p] [] (← optLoc))
-    | .call _ =>
-      let callee ← match ← peek with
-        | .global s => discard next; pure s
-        | t => fail s!"expected a function name like @f but found {t.describe}"
+    match ← peek with
+    | .str name =>
+      -- The generic form.
+      discard next
+      let some kind := opKind name | fail s!"unknown op '{name}'"
       expectSym "("
       let args ← sepBy operand ")"
-      pure (.mk (.call callee) results args [] (← optLoc))
-    | .if_ =>
-      let c ← operand
+      let kind ← attrs kind name
       let loc ← optLoc
-      let thn ← region []
-      let els ← if ← tryIdent "else" then region [] else pure (.mk [] [])
-      pure (.mk .if_ results [c] [thn, els] loc)
-    | .loop _ =>
-      let progress ← tryIdent "progress"
-      let iter ← if ← tryIdent "iter" then do
-          expectSym "("
-          sepBy iterArg ")"
-        else pure []
+      let regions ← if ← trySym "(" then sepBy genericRegion ")" else pure []
+      pure (.mk kind results args regions loc)
+    | _ =>
+      let name ← ident
+      let some kind := opKind name | fail s!"unknown op '{name}'"
+      let d := kind.decl
+      let (kind, args, params) ← head kind d
       let loc ← optLoc
-      let body ← region (iter.map (·.1))
-      pure (.mk (.loop progress) results (iter.map (·.2)) [body] loc)
-    | k =>
-      let args ← match arity k with
-        | some n => operands n
-        | none => variadic
-      pure (.mk k results args [] (← optLoc))
-
-  /-- `%name: type = %init` -/
-  partial def iterArg : P (Result × Operand) := do
-    let r ← result
-    expectSym "="
-    pure (r, ← operand)
+      let mut regions := #[]
+      for kw in d.regions do
+        let r ← match kw with
+          | none => region (if regions.isEmpty then params else [])
+          | some kw => if ← tryIdent kw then region [] else pure (.mk [] [])
+        regions := regions.push r
+      pure (.mk kind results args regions.toList loc)
 end
 
 def func : P Func := do

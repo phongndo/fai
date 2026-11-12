@@ -5,83 +5,12 @@ import Fir.Interp
 /-!
 # Printer
 
-Prints modules in canonical text, which the parser reads back unchanged.
+Prints modules in canonical text, which the parser reads back unchanged. Each op prints in its
+declared readable form, or in the generic form (see `Fir.Parse`) when its operands or regions
+don't fit that form; only modules that fail to verify have such ops.
 -/
 
 namespace Fir
-
-def Ovf.suffix : Ovf → String
-  | .wrap => "wrap"
-  | .nsw => "nsw"
-  | .nuw => "nuw"
-  | .nswNuw => "nsw.nuw"
-  | .trap s => if s then "s.trap" else "u.trap"
-  | .sat s => if s then "s.sat" else "u.sat"
-  | .ub s => if s then "s.ub" else "u.ub"
-
-def Edge.name : Edge → String
-  | .ub => "ub"
-  | .trap => "trap"
-  | .total => "total"
-  | .wrap => "wrap"
-
-def ShiftEdge.name : ShiftEdge → String
-  | .ub => "ub"
-  | .trap => "trap"
-  | .mask => "mask"
-  | .total => "total"
-
-def Pred.name : Pred → String
-  | .eq => "eq" | .ne => "ne"
-  | .slt => "slt" | .sle => "sle" | .sgt => "sgt" | .sge => "sge"
-  | .ult => "ult" | .ule => "ule" | .ugt => "ugt" | .uge => "uge"
-
-/-- The division modifiers: one when it covers both edge cases, otherwise two. -/
-def divSuffix (signed : Bool) (zero ovf : Edge) : String :=
-  if !signed || (zero, ovf) == (.ub, .ub) || (zero, ovf) == (.trap, .trap) ||
-      (zero, ovf) == (.total, .wrap) then zero.name
-  else s!"{zero.name}.{ovf.name}"
-
-def OpKind.name : OpKind → String
-  | .const _ => "int.const"
-  | .poison => "poison"
-  | .freeze => "freeze"
-  | .copy => "copy"
-  | .select => "select"
-  | .arith op o =>
-    let n := match op with | .add => "add" | .sub => "sub" | .mul => "mul"
-    s!"int.{n}.{o.suffix}"
-  | .bit op => match op with | .and => "int.and" | .or => "int.or" | .xor => "int.xor"
-  | .div op z o =>
-    let n := match op with
-      | .divS => "div.s" | .divU => "div.u" | .remS => "rem.s" | .remU => "rem.u"
-    s!"int.{n}.{divSuffix op.signed z o}"
-  | .shift op e =>
-    let n := match op with | .shl => "shl" | .shrU => "shr.u" | .shrS => "shr.s"
-    s!"int.{n}.{e.name}"
-  | .cmp p => s!"int.cmp.{p.name}"
-  | .zext => "int.zext"
-  | .sext => "int.sext"
-  | .trunc m => s!"int.trunc.{match m with | .wrap => "wrap" | .nsw => "nsw" | .nuw => "nuw"}"
-  | .if_ => "cf.if"
-  | .loop _ => "cf.loop"
-  | .yield => "cf.yield"
-  | .brk => "cf.break"
-  | .cont => "cf.continue"
-  | .ret => "func.ret"
-  | .memStack .. => "mem.stack"
-  | .memAlloc f .. => s!"mem.alloc.{match f with | .null => "null" | .trap => "trap"}"
-  | .memFree _ => "mem.free"
-  | .load _ => "mem.load"
-  | .store .. => "mem.store"
-  | .ptrOffset ib => if ib then "ptr.offset.inbounds" else "ptr.offset.wrap"
-  | .ptrAddr => "ptr.addr"
-  | .ptrExpose => "ptr.expose"
-  | .ptrFromExposed => "ptr.from_exposed"
-  | .ptrWithAddr => "ptr.with_addr"
-  | .ptrNull => "ptr.null"
-  | .ptrCmp p => s!"ptr.cmp.{p.name}"
-  | .call _ => "func.call"
 
 def Trust.name : Trust → String
   | .assume => "assume"
@@ -114,38 +43,89 @@ def renderOpLoc (showLocs : Bool) : Option Loc → String
 
 def commas (xs : List String) : String := ", ".intercalate xs
 
+/-- An immediate's value as text. -/
+def Imm.render (f : Field) : Imm → String
+  | .int n => toString n
+  | .nat n => toString n
+  | .str s => if f.ty == .func then "@" ++ s else s
+  | .ty t => toString t
+  | .flag b => toString b
+
+/-- Whether the readable form can show an op with these operands and regions: as many operands
+as the format holds, and the regions it lists, with parameters only where `%iter` gives them. -/
+def OpDecl.fits (d : OpDecl) (args : List Operand) (regions : List Region) : Bool :=
+  let iter := d.items.contains .iter
+  regions.length == d.regions.length &&
+  (regions.zipIdx.all fun (r, i) => r.params.isEmpty || (iter && i == 0)) &&
+  (if d.items.contains .variadic || d.items.contains .args then true
+   else if iter then some args.length == regions.head?.map (·.params.length)
+   else args.length == (d.items.filter (· == .operand)).length)
+
 mutual
   partial def renderRegion (showLocs : Bool) (indent : String) (r : Region) : String :=
     let body := r.ops.map (renderOp showLocs (indent ++ "  "))
     "{\n" ++ String.join body ++ indent ++ "}"
 
+  /-- The readable form, from the op's declared format. -/
+  partial def renderReadable (showLocs : Bool) (indent : String) (op : Op) : String := Id.run do
+    let d := op.kind.decl
+    let mut out := op.kind.name
+    let mut args := op.args
+    for item in d.head do
+      match item with
+      | .imm f =>
+        match (d.field? f).getD default, op.kind.imm f with
+        | { ty := .flag, .. }, some (.flag b) => if b then out := out ++ " " ++ f
+        | field, some v => out := out ++ " " ++ v.render field
+        | _, none => pure ()
+      | .operand =>
+        if let a :: rest := args then
+          out := out ++ " " ++ a.render
+          args := rest
+      | .comma => out := out ++ ","
+      | .keyword kw => out := out ++ " " ++ kw
+      | .variadic =>
+        unless args.isEmpty do out := out ++ " " ++ commas (args.map Operand.render)
+        args := []
+      | .args =>
+        out := out ++ "(" ++ commas (args.map Operand.render) ++ ")"
+        args := []
+      | .iter =>
+        let params := (op.regions.head?.map (·.params)).getD []
+        unless params.isEmpty do
+          let items := (params.zip args).map fun (r, a) => s!"{r.render} = {a.render}"
+          out := out ++ " iter(" ++ commas items ++ ")"
+        args := []
+      | .region _ => pure ()
+    out := out ++ renderOpLoc showLocs op.loc
+    for kw in d.regions, r in op.regions do
+      match kw with
+      | none => out := out ++ " " ++ renderRegion showLocs indent r
+      | some kw =>
+        unless r.ops.isEmpty do out := out ++ " " ++ kw ++ " " ++ renderRegion showLocs indent r
+    pure out
+
+  /-- The generic form: `"name"(operands) {attrs} @loc (regions)`. -/
+  partial def renderGeneric (showLocs : Bool) (indent : String) (op : Op) : String :=
+    let d := op.kind.decl
+    let attrs := if d.imms.isEmpty then "" else
+      let items := d.imms.map fun f =>
+        f.name ++ " = " ++ (((op.kind.imm f.name).map (·.render f)).getD "")
+      " {" ++ commas items ++ "}"
+    let region (r : Region) :=
+      let params := if r.params.isEmpty then "" else
+        "(" ++ commas (r.params.map Result.render) ++ ") "
+      params ++ renderRegion showLocs indent r
+    let regions := if op.regions.isEmpty then "" else
+      " (" ++ commas (op.regions.map region) ++ ")"
+    "\"" ++ op.kind.name ++ "\"(" ++ commas (op.args.map Operand.render) ++ ")" ++ attrs ++
+      renderOpLoc showLocs op.loc ++ regions
+
   partial def renderOp (showLocs : Bool) (indent : String) (op : Op) : String :=
     let results := if op.results.isEmpty then "" else
       commas (op.results.map Result.render) ++ " = "
-    let loc := renderOpLoc showLocs op.loc
-    let args := commas (op.args.map Operand.render)
-    let line := match op.kind, op.regions with
-      | .const n, _ => s!"int.const {n}{loc}"
-      | .if_, [thn, els] =>
-        let elsText := if els.ops.isEmpty then "" else
-          " else " ++ renderRegion showLocs indent els
-        s!"cf.if {args}{loc} " ++ renderRegion showLocs indent thn ++ elsText
-      | .loop p, [body] =>
-        let prog := if p then " progress" else ""
-        let iter := if body.params.isEmpty then "" else
-          let items := (body.params.zip op.args).map fun (r, a) =>
-            s!"{r.render} = {a.render}"
-          s!" iter({commas items})"
-        s!"cf.loop{prog}{iter}{loc} " ++ renderRegion showLocs indent body
-      | .memStack size align, _ => s!"mem.stack {size}, align {align}{loc}"
-      | .memAlloc _ family align, _ => s!"{op.kind.name} {family} {args}, align {align}{loc}"
-      | .memFree family, _ => s!"mem.free {family} {args}{loc}"
-      | .load align, _ => s!"mem.load {args}, align {align}{loc}"
-      | .store t align, _ => s!"mem.store {t} {args}, align {align}{loc}"
-      | .call callee, _ => s!"func.call @{callee}({args}){loc}"
-      | k, _ =>
-        let sep := if args.isEmpty then "" else " "
-        s!"{k.name}{sep}{args}{loc}"
+    let line := if op.kind.decl.fits op.args op.regions then renderReadable showLocs indent op
+      else renderGeneric showLocs indent op
     indent ++ results ++ line ++ "\n"
 end
 
