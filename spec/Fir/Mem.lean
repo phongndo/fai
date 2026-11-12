@@ -88,12 +88,6 @@ def encodePtr (cfg : SpaceCfg) : Option Ptr → List Byte
   | none => List.replicate (cfg.ptrBits / 8) .poison
   | some p => (List.range (cfg.ptrBits / 8)).map (.frag p)
 
-/-- Whether a byte reads as `poison` in an integer: `poison` itself, or a `va_list` cursor's byte,
-which only `va.arg` gives a meaning (decision: va_list). -/
-def Byte.opaque : Byte → Bool
-  | .poison | .va .. => true
-  | _ => false
-
 /-- Read bytes back as an integer, if none of them is a pointer fragment. (The interpreter first
 turns fragments into address bytes, exposing their pointers.) Any `poison` byte, or byte of a
 `va_list` cursor, makes the result `poison`. -/

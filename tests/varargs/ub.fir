@@ -13,7 +13,7 @@
 // run: @ended(i64 1) -> ub va-arg @32:8 (the va_list holds no cursor from va.start)
 // run: @clobbered(i64 1) -> ub va-arg @41:8 (the va_list holds no cursor from va.start)
 // run: @dangling() -> ub use-after-free @62:8 (the variadic arguments of a call from @57:8, which has returned)
-// run: @peek(i64 5) -> returned i64 poison, i32 poison
+// run: @peek(i64 5) -> returned i64 poison, i32 poison, b16 (va(#1, 0)[24], va(#1, 0)[25])
 func @past(...) -> i64 {
   %ap: ptr = mem.stack.of va_list, align 8
   va.start %ap
@@ -75,13 +75,15 @@ func @dangling() -> i64 {
   func.ret %x
 }
 
-// The bytes of a va_list mean nothing to loads: they read as poison.
-func @peek(...) -> (i64, i32) {
+// The bytes of a va_list mean nothing to loads: they read as poison, and as bytes they are the
+// cursor's, which any bytes refine (decision: va_list).
+func @peek(...) -> (i64, i32, b16) {
   %ap: ptr = mem.stack.of va_list, align 8
   va.start %ap
   %a: i64 = mem.load %ap, align 8
   %off: i64 = int.const 24
   %q: ptr = ptr.offset.inbounds %ap, %off
   %b: i32 = mem.load %q, align 4
-  func.ret %a, %b
+  %c: b16 = mem.load %q, align 2
+  func.ret %a, %b, %c
 }

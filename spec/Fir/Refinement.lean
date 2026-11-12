@@ -103,10 +103,11 @@ theorem Forall2.trans {r : α → α → Prop} (h : ∀ a b c, r a b → r b c �
 
 /-! ## Bytes -/
 
-/-- A `poison` byte may be replaced by any byte; other bytes must stay the same. -/
-def Byte.Refines (t s : Byte) : Prop := s = .poison ∨ t = s
+/-- A `poison` byte, or a byte of a `va_list` cursor, may be replaced by any byte: what a
+target's `va_list` holds is its own (decision: va_list). Other bytes must stay the same. -/
+def Byte.Refines (t s : Byte) : Prop := s.opaque = true ∨ t = s
 
-def Byte.refines (t s : Byte) : Bool := s == .poison || t == s
+def Byte.refines (t s : Byte) : Bool := s.opaque || t == s
 
 theorem Byte.refines_iff {t s : Byte} : t.refines s = true ↔ t.Refines s := by
   simp [Byte.refines, Byte.Refines]

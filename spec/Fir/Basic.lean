@@ -74,6 +74,12 @@ inductive Byte where
   | va (area tag pos i : Nat)
   deriving DecidableEq, Repr
 
+/-- Whether a byte is unspecified to everything but `va.arg`: `poison` itself, or a `va_list`
+cursor's byte (decision: va_list). It reads as `poison`, and any byte refines it. -/
+def Byte.opaque : Byte → Bool
+  | .poison | .va .. => true
+  | _ => false
+
 /-- A runtime value. -/
 inductive RVal where
   | int (w : Nat) (v : Val w)

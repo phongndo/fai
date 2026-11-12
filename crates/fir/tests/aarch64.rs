@@ -28,7 +28,8 @@
 //!   choice too. A run whose output differs only in tainted values, and only in their numbers,
 //!   or where one run ends in an arithmetic or conversion trap at a tainted location and the
 //!   other ends otherwise, is counted, not failed.
-//! * Where `fir run` prints `poison`, any value matches; a non-null pointer prints as `ptr ?`
+//! * Where `fir run` prints `poison` or a byte of a `va_list` cursor, any value matches; a
+//!   non-null pointer prints as `ptr ?`
 //!   (allocation numbers are the interpreter's); leak notes are dropped (counted).
 //!
 //! HFIR modules (the fixtures under `tests/blocks/` and most random programs, which use the
@@ -645,8 +646,15 @@ fn normalize(reference: &str) -> Result<(String, bool), String> {
         .into_iter()
         .filter(|p| !p.starts_with("leak:"))
         .collect();
+    // A `va_list` cursor's byte (`va(#2, 1)[0]`) is the target's own: any byte refines it
+    // (decision: va_list).
+    let mut joined = kept.join("; ");
+    while let Some(at) = joined.find("va(#") {
+        let end = joined[at..].find(']').map_or(joined.len(), |e| at + e + 1);
+        joined.replace_range(at..end, "?");
+    }
     let mut out = String::new();
-    for (i, tok) in kept.join("; ").split(' ').enumerate() {
+    for (i, tok) in joined.split(' ').enumerate() {
         if i > 0 {
             out.push(' ');
         }
