@@ -278,6 +278,29 @@ theorem refines_copy {mod : Module} {tgt src : Func} {pre post : List Op} {x y :
     (.refl post)
   simpa using this
 
+/-- **Inside a block of `cf.blocks` too.** In a function whose body is `pre`, then a `cf.blocks`
+whose first block holds `bpre`, `%y = copy %x`, and `bpost`, then `post`, where no op in `bpost`
+reads `%y` at any depth, deleting the copy gives a function that refines the original. Jumps
+need nothing special: `refines` covers code at any depth, blocks included. -/
+theorem refines_copy_in_block {mod : Module} {tgt src : Func} {pre post bpre bpost : List Op}
+    {rest : List Region} {p : Bool} {res : List Result} {ps : List Result} {lbl : Option String}
+    {loc cloc : Option Loc} {x y : String} {T : Ty} {facts : List TrustedFact}
+    (hparams : tgt.params = src.params) (hrets : tgt.rets = src.rets)
+    (ht : tgt.body.ops =
+      pre ++ .mk (.blocks p) res [] (.mk ps (bpre ++ bpost) lbl :: rest) loc :: post)
+    (hs : src.body.ops = pre ++
+      .mk (.blocks p) res []
+        (.mk ps (bpre ++ CopyProp.copyOp x y T facts cloc :: bpost) lbl :: rest) loc :: post)
+    (hunread : opsReads y bpost = false) (dec : src.Decided mod) : tgt.Refines mod src := by
+  refine refines hparams hrets ?_ dec
+  rw [ht, hs]
+  refine OpsRel.prefix (.cons (.regions (.cons ?_ (RegionsRel.refl _))) (.refl _)) pre
+  refine OpsRel.prefix ?_ bpre
+  have := OpsRel.rw (L := L) (pt := []) (ps := [CopyProp.copyOp x y T facts cloc]) (t := bpost)
+    (s := bpost) ⟨_, rfl, rfl, copy_pure x y T facts cloc, by simpa [CopyProp.copyOp, Op.results]⟩
+    (.refl bpost)
+  simpa using this
+
 /-! ## Look-alikes that are wrong -/
 
 /-- A copy whose result is read later can't be deleted: the target gets stuck where the source
