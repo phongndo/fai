@@ -622,6 +622,72 @@ impl FuncBuilder<'_> {
         self.simple(kind, Res::None)
     }
 
+    /// `cf.try { … } catch(%e: ptr) { … }`: run the first region; an exception thrown in it (by
+    /// `exn.throw` there, or in a function it calls) that nothing inside catches unwinds to here, and
+    /// the second region runs with the exception bound to its parameter. Either region's `cf.yield`
+    /// gives the op's results. Jumps can't leave either region.
+    ///
+    /// Makes the op with empty regions; see the closure form.
+    pub fn cf_try_begin(&mut self, results: &[Ty]) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let kind = OpKind::Try;
+        self.region_op_fixed(kind, results, &[&[], &[Ty::Ptr]])
+    }
+
+    /// `cf.try { … } catch(%e: ptr) { … }`: run the first region; an exception thrown in it (by
+    /// `exn.throw` there, or in a function it calls) that nothing inside catches unwinds to here, and
+    /// the second region runs with the exception bound to its parameter. Either region's `cf.yield`
+    /// gives the op's results. Jumps can't leave either region.
+    ///
+    /// Builds each region in a closure, with the insertion point at its end, and returns to
+    /// the insertion point after the op.
+    pub fn cf_try(&mut self, results: &[Ty], body: impl FnOnce(&mut Self) -> Result<(), BuildError>, catch_: impl FnOnce(&mut Self, Values) -> Result<(), BuildError>) -> Result<Results, BuildError> {
+        let op = self.cf_try_begin(results)?;
+        let r = self.region(op, 0)?;
+        self.in_region(r, body)?;
+        let r = self.region(op, 1)?;
+        let params = self.region_params(r)?;
+        self.in_region(r, |f| catch_(f, params))?;
+        Ok(self.all_results(op))
+    }
+
+    /// `exn.throw %e`: throw the exception `%e`. Unwinding pops frames (ending their stack memory,
+    /// and a call's `noalias` scopes) up to the nearest `cf.try` region or `func.invoke` handler, in
+    /// this function or a calling one; an exception that leaves the function the run started in is
+    /// the run's outcome, `threw`.
+    pub fn exn_throw(&mut self, p: impl Into<Operand>) -> Result<OpId, BuildError> {
+        self.begin_op();
+        self.operand(p.into());
+        let kind = OpKind::Throw;
+        self.simple(kind, Res::None)
+    }
+
+    /// `func.invoke @f(%a) unwind ^h`: `func.call`, except that an exception the callee throws
+    /// jumps to block `^h` of the nearest `cf.blocks`, whose one parameter takes it, instead of going
+    /// on to the caller (a plain `func.call` passes it on).
+    pub fn func_invoke(&mut self, callee: FuncRef, args: &[Operand], unwind: Target<'_>) -> Result<Results, BuildError> {
+        self.begin_op();
+        let callee_id = self.func_imm(callee)?;
+        self.operand_list(args);
+        let unwind_id = self.succ(unwind)?;
+        let kind = OpKind::Invoke { callee: callee_id, unwind: unwind_id };
+        let made = self.simple(kind, Res::Callee(callee))?;
+        Ok(self.all_results(made))
+    }
+
+    /// `func.invoke.indirect func<(i32) -> i32> %p(%a) unwind ^h`: `func.call.indirect` with a
+    /// handler, as `func.invoke`.
+    pub fn func_invoke_indirect(&mut self, sig: Ty, p: impl Into<Operand>, args: &[Operand], unwind: Target<'_>) -> Result<Results, BuildError> {
+        self.begin_op();
+        let sig_id = self.ty_imm(sig)?;
+        self.operand(p.into());
+        self.operand_list(args);
+        let unwind_id = self.succ(unwind)?;
+        let kind = OpKind::InvokeIndirect { sig: sig_id, unwind: unwind_id };
+        let made = self.simple(kind, Res::Sig(sig_id))?;
+        Ok(self.all_results(made))
+    }
+
     /// `aarch64.code { ^entry: … ^b1: … }`: a function's machine code, as labeled blocks entered
     /// at the first. Each block ends with a branch, `aarch64.ret`, or `aarch64.trap`. It is the whole
     /// body of an LFIR function, which finds its arguments where the calling convention puts them.
@@ -811,6 +877,33 @@ impl FuncBuilder<'_> {
         self.begin_op();
         let family_id = self.str_imm(family)?;
         let kind = OpKind::A64BlAlloc { family: family_id, align };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.exn.set x0`: make `x0` the pending exception (decision: Exceptions at run time):
+    /// store it in the thread's exception slot, `__fir_exn`. A function that throws sets it, then
+    /// returns.
+    pub fn aarch64_exn_set(&mut self, n: Reg) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let n_r = self.reg(n)?;
+        let kind = OpKind::A64ExnSet { n: n_r };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.exn.take x0`: `x0` gets the pending exception, which is no longer pending.
+    pub fn aarch64_exn_take(&mut self, d: Reg) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let d_r = self.reg(d)?;
+        let kind = OpKind::A64ExnTake { d: d_r };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.b.exn ^t, ^f`: jump to `^t` if an exception is pending, otherwise to `^f`.
+    pub fn aarch64_b_exn(&mut self, t: Target<'_>, f: Target<'_>) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let t_id = self.succ(t)?;
+        let f_id = self.succ(f)?;
+        let kind = OpKind::A64BExn { t: t_id, f: f_id };
         self.simple(kind, Res::None)
     }
 

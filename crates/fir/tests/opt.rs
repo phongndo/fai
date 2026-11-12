@@ -10,7 +10,10 @@
 //! * otherwise both print the same line: the same events, then the same ending.
 //!
 //! The optimized module must also verify, print, and parse back to the same text, and for the
-//! fixtures `fir-ref check` must accept it too.
+//! fixtures `fir-ref check` must accept it too. Random HFIR programs are also lowered to MFIR,
+//! whose exceptions are calls that name their handlers (`func.invoke`) and blocks that pass them
+//! on, and the lowering is optimized and compared the same way (with 16 times the fuel); the
+//! statistics count the programs with exceptions and their runs.
 //!
 //! By default 200 programs run; `FIR_FUZZ=N` runs N, `FIR_FUZZ_SEED=S` picks another seed (as in
 //! `fuzz.rs`). The test prints how often each pass fired and how the runs compared. Failing
@@ -196,6 +199,8 @@ fn optimized_random_programs_refine_the_originals() {
     // Per pass: changes, and programs it changed.
     let fired = Mutex::new(vec![(0u64, 0u64); PASSES.len()]);
     let compared = Mutex::new(BTreeMap::<Cmp, u64>::new());
+    let lowered = Mutex::new(BTreeMap::<Cmp, u64>::new());
+    let exceptions = Mutex::new(BTreeMap::<&'static str, u64>::new());
     let fails = Mutex::new(Vec::<String>::new());
     let next = Mutex::new(0u64);
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
@@ -241,8 +246,18 @@ fn optimized_random_programs_refine_the_originals() {
                             x.1 += u64::from(c > 0);
                         }
                     }
+                    let throws = ["cf.try", "exn.throw", "func.invoke"]
+                        .iter()
+                        .any(|op| prog.text.contains(op));
                     for (args, fuel) in &prog.runs {
                         let (s, t) = (run(&m, "f0", args, *fuel), run(&opt, "f0", args, *fuel));
+                        if throws {
+                            let mut x = exceptions.lock().unwrap();
+                            *x.entry("runs of programs with exceptions").or_default() += 1;
+                            if s.as_ref().is_ok_and(|l| l.contains("threw ")) {
+                                *x.entry("runs that threw").or_default() += 1;
+                            }
+                        }
                         match refines(&t, &s) {
                             Ok(c) => *compared.lock().unwrap().entry(c).or_default() += 1,
                             Err(e) => keep(
@@ -251,6 +266,42 @@ fn optimized_random_programs_refine_the_originals() {
                                     args.join(" ")
                                 ),
                                 Some(&opt),
+                            ),
+                        }
+                    }
+                    // The lowering, optimized: MFIR with handlers.
+                    if m.layer != fir::Layer::Hfir {
+                        continue;
+                    }
+                    let Ok(l) = fir::lower_checked(&m) else {
+                        keep("the lowering failed".into(), None);
+                        continue;
+                    };
+                    let (lopt, _) = match optimize(&l) {
+                        Ok(x) => x,
+                        Err(e) => {
+                            keep(format!("optimizing the lowering: {e}"), Some(&l));
+                            continue;
+                        }
+                    };
+                    if l.render(false).contains("func.invoke") {
+                        *exceptions
+                            .lock()
+                            .unwrap()
+                            .entry("lowered programs with func.invoke")
+                            .or_default() += 1;
+                    }
+                    for (args, fuel) in &prog.runs {
+                        let fuel = 16 * fuel;
+                        let (s, t) = (run(&l, "f0", args, fuel), run(&lopt, "f0", args, fuel));
+                        match refines(&t, &s) {
+                            Ok(c) => *lowered.lock().unwrap().entry(c).or_default() += 1,
+                            Err(e) => keep(
+                                format!(
+                                    "lowered: @f0 {} --fuel {fuel}: {e}\n  original:  {s:?}\n  optimized: {t:?}",
+                                    args.join(" ")
+                                ),
+                                Some(&lopt),
                             ),
                         }
                     }
@@ -266,6 +317,14 @@ fn optimized_random_programs_refine_the_originals() {
     eprintln!("runs compared:");
     for (c, n) in compared.into_inner().unwrap() {
         eprintln!("  {n:8}  {c:?}");
+    }
+    eprintln!("runs of lowered HFIR programs compared:");
+    for (c, n) in lowered.into_inner().unwrap() {
+        eprintln!("  {n:8}  {c:?}");
+    }
+    eprintln!("exceptions:");
+    for (c, n) in exceptions.into_inner().unwrap() {
+        eprintln!("  {n:8}  {c}");
     }
     let fails = fails.into_inner().unwrap();
     assert!(

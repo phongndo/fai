@@ -364,6 +364,20 @@ theorem keeps_callExtern (loc : Option Loc) (x : Extern) (vs : List RVal) :
   unfold callExtern; keeps
 macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_callExtern)
 
+theorem keeps_unwindStack : ∀ (fs : List Frame), KeepsFixed sp (unwindStack fs)
+  | [] => by unfold unwindStack; keeps
+  | .block _ _ _ :: fs => by
+    unfold unwindStack; keeps
+    all_goals exact keeps_unwindStack fs
+  | .try_ .. :: _ => by unfold unwindStack; keeps
+  | .call _ _ _ _ uw :: fs => by
+    unfold unwindStack; keeps
+    all_goals exact keeps_unwindStack fs
+  | .ifJoin .. :: fs => by unfold unwindStack; exact keeps_unwindStack fs
+  | .loop .. :: fs => by unfold unwindStack; exact keeps_unwindStack fs
+  | .blocks .. :: fs => by unfold unwindStack; exact keeps_unwindStack fs
+macro_rules | `(tactic| keeps_lemma) => `(tactic| with_reducible apply keeps_unwindStack)
+
 end
 
 /-! ## Steps -/
@@ -454,6 +468,11 @@ theorem jump_grows {m : Machine} (hm : Grows sp tr m) (loc : Option Loc)
     (s : Succ) (vs : List RVal) : EndsIn sp tr (jump m loc s vs) := by
   unfold jump; ends_in
 macro_rules | `(tactic| ends_lemma) => `(tactic| exact jump_grows (by assumption) _ _ _)
+
+theorem throwExn_grows {m : Machine} (hm : Grows sp tr m) (loc : Option Loc) (v : RVal) :
+    EndsIn sp tr (throwExn m loc v) := by
+  unfold throwExn; ends_in
+macro_rules | `(tactic| ends_lemma) => `(tactic| exact throwExn_grows (by assumption) _ _)
 
 theorem terminate_grows {m : Machine} (hm : Grows sp tr m) (loc : Option Loc)
     (k : OpKind) (vs : List RVal) : EndsIn sp tr (terminate m loc k vs) := by

@@ -1,9 +1,10 @@
 //! Lowering HFIR to MFIR, mirroring `spec/Fir/Lower.lean` so that the result prints exactly as
 //! `fir-ref lower` prints Lean's.
 //!
-//! Lean lowers each function in two passes: scalarizing (aggregates, unions, and slices become
-//! their scalars, and the building-block ops become core ops) and expanding (checked arithmetic,
-//! `ptr.field`, and `ptr.index` become core ops). The ops expanding changes take and give
+//! Lean lowers each function in three passes: scalarizing (aggregates, unions, and slices become
+//! their scalars, and the building-block ops become core ops), lowering exceptions (`cf.try`
+//! becomes `cf.blocks` with its handler as a block; see [`lower_exn`]), and expanding (checked
+//! arithmetic, `ptr.field`, and `ptr.index` become core ops). The ops expanding changes take and give
 //! scalars, and scalarizing passes them through, so one walk does both here: it scalarizes each
 //! op into a new [`Body`], expanding those ops as it emits them. Each pass numbers its own
 //! temporaries (`%.s0`, … and `%.e0`, …) in the order its ops are emitted, which is the same
@@ -32,8 +33,9 @@ pub fn lower_module(m: &Module) -> Result<Module, String> {
         ));
     }
     let mut funcs = Vec::with_capacity(m.funcs.len());
+    let ext: Vec<String> = m.externs.iter().map(|x| x.name.clone()).collect();
     for f in &m.funcs {
-        funcs.push(lower_func(&m.space, f).map_err(|e| format!("in @{}: {e}", f.name))?);
+        funcs.push(lower_func(&m.space, &ext, f).map_err(|e| format!("in @{}: {e}", f.name))?);
     }
     Ok(Module {
         layer: Layer::Mfir,
@@ -88,7 +90,7 @@ struct Lowerer<'a> {
     e_count: u32,
 }
 
-fn lower_func(sp: &SpaceCfg, f: &Func) -> Result<Func, String> {
+fn lower_func(sp: &SpaceCfg, ext: &[String], f: &Func) -> Result<Func, String> {
     let src = &f.body;
     let mut lw = Lowerer {
         sp,
@@ -116,6 +118,9 @@ fn lower_func(sp: &SpaceCfg, f: &Func) -> Result<Func, String> {
         }
     }
     let mut body = lw.dst;
+    if has_try(src) {
+        body = lower_exn(&body, ext);
+    }
     body.shrink_to_fit();
     Ok(Func {
         name: f.name.clone(),
@@ -132,62 +137,12 @@ impl<'a> Lowerer<'a> {
 
     /// A source fact, with its integers stored in the target.
     fn import_fact(&mut self, f: TrustedFact) -> TrustedFact {
-        let fact = match f.fact {
-            Fact::RangeS(lo, hi) => Fact::RangeS(self.import_int(lo), self.import_int(hi)),
-            Fact::RangeU(lo, hi) => Fact::RangeU(self.import_int(lo), self.import_int(hi)),
-            x => x,
-        };
-        TrustedFact {
-            fact,
-            trust: f.trust,
-        }
-    }
-
-    fn import_int(&mut self, n: crate::body::IntId) -> crate::body::IntId {
-        match self.src.int(n) {
-            Int::Small(n) => self.dst.add_small_int(n),
-            Int::Big(n) => self.dst.add_int(n.clone()),
-        }
+        import_fact(self.src, &mut self.dst, f)
     }
 
     /// A kind with its immediates stored in the target.
     fn import_kind(&mut self, k: OpKind) -> OpKind {
-        let mut k = k;
-        for i in 0..k.decl().imms.len() {
-            let v = match k.imm(i) {
-                Some(Imm::Int(n)) => Imm::Int(self.import_int(n)),
-                Some(Imm::Str(s)) => Imm::Str(self.dst.add_str(self.src.str(s))),
-                Some(Imm::Ty(t)) => Imm::Ty(self.import_ty(t)),
-                Some(Imm::Succ(s)) => {
-                    let s = self.src.succ(s);
-                    let label = self.dst.add_str(self.src.str(s.label));
-                    Imm::Succ(self.dst.add_succ(Succ {
-                        label,
-                        nargs: s.nargs,
-                    }))
-                }
-                Some(Imm::Cases(c)) => {
-                    let cases: Vec<Case> = self.src.cases(c).to_vec();
-                    let mut out = Vec::with_capacity(cases.len());
-                    for c in cases {
-                        let key = self.import_int(c.key);
-                        let label = self.dst.add_str(self.src.str(c.succ.label));
-                        out.push(Case {
-                            key,
-                            succ: Succ {
-                                label,
-                                nargs: c.succ.nargs,
-                            },
-                        });
-                    }
-                    Imm::Cases(self.dst.add_cases(out))
-                }
-                Some(x) => x,
-                None => continue,
-            };
-            k.set_imm(i, v);
-        }
-        k
+        import_kind(self.src, &mut self.dst, k)
     }
 
     /// The scalar types of a source type, in the target's table (Lean's `scalars`).
@@ -936,6 +891,468 @@ impl<'a> Lowerer<'a> {
             }
             (_, k2) => (k2, self.explode_all(args)),
         }
+    }
+}
+
+fn import_int(src: &Body, dst: &mut Body, n: crate::body::IntId) -> crate::body::IntId {
+    match src.int(n) {
+        Int::Small(n) => dst.add_small_int(n),
+        Int::Big(n) => dst.add_int(n.clone()),
+    }
+}
+
+/// A fact of `src`, with its integers stored in `dst`.
+fn import_fact(src: &Body, dst: &mut Body, f: TrustedFact) -> TrustedFact {
+    let fact = match f.fact {
+        Fact::RangeS(lo, hi) => Fact::RangeS(import_int(src, dst, lo), import_int(src, dst, hi)),
+        Fact::RangeU(lo, hi) => Fact::RangeU(import_int(src, dst, lo), import_int(src, dst, hi)),
+        x => x,
+    };
+    TrustedFact {
+        fact,
+        trust: f.trust,
+    }
+}
+
+/// A kind of `src`, with its immediates stored in `dst`.
+fn import_kind(src: &Body, dst: &mut Body, k: OpKind) -> OpKind {
+    let mut k = k;
+    for i in 0..k.decl().imms.len() {
+        let v = match k.imm(i) {
+            Some(Imm::Int(n)) => Imm::Int(import_int(src, dst, n)),
+            Some(Imm::Str(s)) => Imm::Str(dst.add_str(src.str(s))),
+            Some(Imm::Ty(t)) => Imm::Ty(dst.types_mut().import(src.types(), t)),
+            Some(Imm::Succ(s)) => {
+                let s = src.succ(s);
+                let label = dst.add_str(src.str(s.label));
+                Imm::Succ(dst.add_succ(Succ {
+                    label,
+                    nargs: s.nargs,
+                }))
+            }
+            Some(Imm::Cases(c)) => {
+                let cases: Vec<Case> = src.cases(c).to_vec();
+                let mut out = Vec::with_capacity(cases.len());
+                for c in cases {
+                    let key = import_int(src, dst, c.key);
+                    let label = dst.add_str(src.str(c.succ.label));
+                    out.push(Case {
+                        key,
+                        succ: Succ {
+                            label,
+                            nargs: c.succ.nargs,
+                        },
+                    });
+                }
+                Imm::Cases(dst.add_cases(out))
+            }
+            Some(x) => x,
+            None => continue,
+        };
+        k.set_imm(i, v);
+    }
+    k
+}
+
+/// Whether a body has a `cf.try`, which only [`lower_exn`] lowers.
+fn has_try(b: &Body) -> bool {
+    fn region(b: &Body, r: RegionId) -> bool {
+        b.ops(r)
+            .any(|op| b.kind(op) == OpKind::Try || b.regions(op).iter().any(|&r| region(b, r)))
+    }
+    region(b, b.entry())
+}
+
+/// Lower a scalar body's exceptions (Lean's `lowerExn`): `cf.try` becomes `cf.blocks` whose
+/// second block is the handler, and in it each throw a jump to the handler and each call that may
+/// throw a `func.invoke` of it; a `cf.blocks` that exceptions must leave gets a block that leaves
+/// it with two more results, a flag and the exception, and a `cf.if` after it jumps on. Lean
+/// lowers exceptions between scalarizing and expanding; the ops expanding changes never throw
+/// and stay in order, so lowering them here, after both, gives the same text. Temporaries and
+/// labels are `.x0`, `.x1`, … in Lean's order.
+fn lower_exn(src: &Body, ext: &[String]) -> Body {
+    let mut ex = Exn {
+        src,
+        dst: Body::new(),
+        map: vec![None; src.num_values()],
+        ext,
+        x: 0,
+    };
+    let entry = src.entry();
+    let specs_ = ex.value_specs(src.params(entry));
+    let dentry = ex.dst.entry();
+    ex.dst.set_params(dentry, specs(&specs_));
+    let ps: Vec<ValueId> = src.params(entry).collect();
+    let dps: Vec<ValueId> = ex.dst.params(dentry).collect();
+    ex.map_all(&ps, &dps);
+    ex.region(entry, dentry, None, Mode::Plain);
+    let mut body = ex.dst;
+    body.shrink_to_fit();
+    body
+}
+
+/// How [`Exn::region`] ends a region: as it is; or as a `cf.try` region, which may fall off its
+/// end and becomes a block, or a block of `cf.blocks`; `defer` holds back its final `cf.yield`,
+/// for a `cf.blocks` that exceptions leave.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Plain,
+    Try { defer: bool },
+    Block { defer: bool },
+}
+
+/// A `cf.yield` held back: its operands and location.
+type Deferred = Option<(Vec<Operand>, Option<Loc>)>;
+
+struct Exn<'a> {
+    src: &'a Body,
+    dst: Body,
+    map: Vec<Option<ValueId>>,
+    ext: &'a [String],
+    x: u32,
+}
+
+impl<'a> Exn<'a> {
+    fn fresh(&mut self) -> String {
+        self.x += 1;
+        format!(".x{}", self.x - 1)
+    }
+
+    fn label(&mut self, l: &str, nargs: u32) -> crate::body::SuccId {
+        let label = self.dst.add_str(l);
+        self.dst.add_succ(Succ { label, nargs })
+    }
+
+    /// Lean's `throwsKind`.
+    fn throws_kind(&self, k: OpKind) -> bool {
+        match k {
+            OpKind::Throw | OpKind::CallIndirect(_) | OpKind::InvokeIndirect { .. } => true,
+            OpKind::Call { callee } | OpKind::Invoke { callee, .. } => {
+                let name = self.src.str(callee);
+                !self.ext.iter().any(|x| x == name)
+            }
+            _ => false,
+        }
+    }
+
+    /// Lean's `mayThrowRegions` of one region.
+    fn may_throw(&self, r: RegionId) -> bool {
+        let b = self.src;
+        b.ops(r).any(|op| {
+            self.throws_kind(b.kind(op)) || b.regions(op).iter().any(|&r| self.may_throw(r))
+        })
+    }
+
+    fn value_specs(&mut self, vs: impl Iterator<Item = ValueId>) -> Vec<Spec> {
+        let src = self.src;
+        vs.map(|v| {
+            let facts = src.facts(v).to_vec();
+            Spec {
+                name: src.name(v).to_owned(),
+                ty: self.dst.types_mut().import(src.types(), src.ty(v)),
+                facts: facts
+                    .into_iter()
+                    .map(|f| import_fact(src, &mut self.dst, f))
+                    .collect(),
+            }
+        })
+        .collect()
+    }
+
+    fn map_all(&mut self, from: &[ValueId], to: &[ValueId]) {
+        for (&a, &b) in from.iter().zip(to) {
+            self.map[a.index()] = Some(b);
+        }
+    }
+
+    fn operands(&mut self, op: OpId) -> Vec<Operand> {
+        let src = self.src;
+        src.operands(op)
+            .iter()
+            .map(|&o| match o.get() {
+                OperandKind::Value(v) => Operand::value(self.map[v.index()].expect("defined")),
+                OperandKind::Hole(h) => {
+                    let t = self.dst.types_mut().import(src.types(), src.hole_ty(h));
+                    self.dst.add_hole(src.hole_name(h), t)
+                }
+            })
+            .collect()
+    }
+
+    /// Lower the ops of `sr` into `dr`, where exceptions go to block `h` (Lean's `exnOps`), and
+    /// end the region as `mode` says. Gives the `cf.yield` held back, if any.
+    fn region(&mut self, sr: RegionId, dr: RegionId, h: Option<&str>, mode: Mode) -> Deferred {
+        let ops: Vec<OpId> = self.src.ops(sr).collect();
+        let defer = matches!(
+            mode,
+            Mode::Try { defer: true } | Mode::Block { defer: true }
+        );
+        let mut last = None;
+        for (i, &op) in ops.iter().enumerate() {
+            let k = self.src.kind(op);
+            if defer && i + 1 == ops.len() && k == OpKind::Yield && self.src.results(op).len() == 0
+            {
+                return Some((self.operands(op), self.src.loc(op)));
+            }
+            self.op(op, dr, h);
+            last = Some(op);
+        }
+        // A `cf.try` region may fall off its end (Lean's `endYield`).
+        if matches!(mode, Mode::Try { .. }) {
+            let loc = last.and_then(|op| self.src.loc(op));
+            if !last.is_some_and(|op| self.src.kind(op).is_terminator()) {
+                if defer {
+                    return Some((Vec::new(), loc));
+                }
+                self.dst.append_op(dr, OpKind::Yield, [], [], [], loc);
+            }
+        }
+        None
+    }
+
+    fn copy(&mut self, op: OpId, r: RegionId, k: OpKind) -> OpId {
+        let src = self.src;
+        let operands = self.operands(op);
+        let results = self.value_specs(src.results(op));
+        let mut params = Vec::new();
+        for &sr in src.regions(op) {
+            params.push(self.value_specs(src.params(sr)));
+        }
+        let dop = self.dst.append_op(
+            r,
+            k,
+            operands,
+            specs(&results),
+            params.iter().map(|ps| specs(ps).collect::<Vec<_>>()),
+            src.loc(op),
+        );
+        let rs: Vec<ValueId> = src.results(op).collect();
+        let ds: Vec<ValueId> = self.dst.results(dop).collect();
+        self.map_all(&rs, &ds);
+        dop
+    }
+
+    /// Lean's `exnOp`.
+    fn op(&mut self, op: OpId, r: RegionId, h: Option<&str>) {
+        let src = self.src;
+        let k = src.kind(op);
+        let loc = src.loc(op);
+        let regions = src.regions(op);
+        match (k, regions, h) {
+            (OpKind::Throw, [], Some(l)) => {
+                let operands = self.operands(op);
+                let dest = self.label(l, operands.len() as u32);
+                self.dst
+                    .append_op(r, OpKind::Br { dest }, operands, [], [], loc);
+            }
+            (OpKind::Call { callee }, [], Some(l)) if self.throws_kind(k) => {
+                let callee = self.dst.add_str(src.str(callee));
+                let unwind = self.label(l, 0);
+                self.copy(op, r, OpKind::Invoke { callee, unwind });
+            }
+            (OpKind::CallIndirect(sig), [], Some(l)) => {
+                let sig = self.dst.types_mut().import(src.types(), sig);
+                let unwind = self.label(l, 0);
+                self.copy(op, r, OpKind::InvokeIndirect { sig, unwind });
+            }
+            (OpKind::Try, &[body, handler], _) => {
+                let t = self.fresh();
+                let c = self.fresh();
+                let escape = h.is_some() && self.may_throw(handler);
+                let results = self.value_specs(src.results(op));
+                let n = results.len();
+                let mut specs_ = results;
+                if escape {
+                    specs_.push(Lowerer::spec(String::new(), Ty::Int(1)));
+                    specs_.push(Lowerer::spec(String::new(), Ty::Ptr));
+                }
+                let dop = self.dst.append_op(
+                    r,
+                    OpKind::Blocks { progress: false },
+                    [],
+                    specs(&specs_),
+                    [],
+                    loc,
+                );
+                let rs: Vec<ValueId> = src.results(op).collect();
+                let ds: Vec<ValueId> = self.dst.results(dop).take(n).collect();
+                self.map_all(&rs, &ds);
+                let tl = self.dst.add_str(&t);
+                let entry = self.dst.new_block(dop, tl, []);
+                let cps = self.value_specs(src.params(handler));
+                let cl = self.dst.add_str(&c);
+                let catch = self.dst.new_block(dop, cl, specs(&cps));
+                let sps: Vec<ValueId> = src.params(handler).collect();
+                let dps: Vec<ValueId> = self.dst.params(catch).collect();
+                self.map_all(&sps, &dps);
+                let y1 = self.region(body, entry, Some(&c), Mode::Try { defer: escape });
+                if let (true, Some(l)) = (escape, h) {
+                    let xe = self.fresh();
+                    let y2 = self.region(handler, catch, Some(&xe), Mode::Try { defer: true });
+                    self.escape(dop, r, l, &xe, vec![(entry, y1), (catch, y2)], loc);
+                } else {
+                    self.region(handler, catch, None, Mode::Try { defer: false });
+                    self.dst.set_regions(dop, &[entry, catch]);
+                }
+            }
+            (OpKind::Blocks { .. }, _, Some(l)) if regions.iter().any(|&b| self.may_throw(b)) => {
+                let xe = self.fresh();
+                let k = import_kind(src, &mut self.dst, k);
+                let mut specs_ = self.value_specs(src.results(op));
+                let n = specs_.len();
+                specs_.push(Lowerer::spec(String::new(), Ty::Int(1)));
+                specs_.push(Lowerer::spec(String::new(), Ty::Ptr));
+                let dop = self.dst.append_op(r, k, [], specs(&specs_), [], loc);
+                let rs: Vec<ValueId> = src.results(op).collect();
+                let ds: Vec<ValueId> = self.dst.results(dop).take(n).collect();
+                self.map_all(&rs, &ds);
+                let mut blocks = Vec::new();
+                for &sb in regions {
+                    let ps = self.value_specs(src.params(sb));
+                    let label = src.label(sb).map(|l| src.str(l)).unwrap_or_default();
+                    let label = self.dst.add_str(label);
+                    let db = self.dst.new_block(dop, label, specs(&ps));
+                    let sps: Vec<ValueId> = src.params(sb).collect();
+                    let dps: Vec<ValueId> = self.dst.params(db).collect();
+                    self.map_all(&sps, &dps);
+                    let y = self.region(sb, db, Some(&xe), Mode::Block { defer: true });
+                    blocks.push((db, y));
+                }
+                self.escape(dop, r, l, &xe, blocks, loc);
+            }
+            (OpKind::Blocks { .. }, _, _) => {
+                let k = import_kind(src, &mut self.dst, k);
+                let dop = self.copy(op, r, k);
+                let drs: Vec<RegionId> = self.dst.regions(dop).to_vec();
+                for (i, &sb) in regions.iter().enumerate() {
+                    if let Some(l) = src.label(sb) {
+                        let l = self.dst.add_str(src.str(l));
+                        self.dst.set_label(drs[i], l);
+                    }
+                    let sps: Vec<ValueId> = src.params(sb).collect();
+                    let dps: Vec<ValueId> = self.dst.params(drs[i]).collect();
+                    self.map_all(&sps, &dps);
+                    self.region(sb, drs[i], None, Mode::Plain);
+                }
+            }
+            _ => {
+                let k = import_kind(src, &mut self.dst, k);
+                let dop = self.copy(op, r, k);
+                let drs: Vec<RegionId> = self.dst.regions(dop).to_vec();
+                for (i, &sr) in regions.iter().enumerate() {
+                    if let Some(l) = src.label(sr) {
+                        let l = self.dst.add_str(src.str(l));
+                        self.dst.set_label(drs[i], l);
+                    }
+                    let sps: Vec<ValueId> = src.params(sr).collect();
+                    let dps: Vec<ValueId> = self.dst.params(drs[i]).collect();
+                    self.map_all(&sps, &dps);
+                    self.region(sr, drs[i], h, Mode::Plain);
+                }
+            }
+        }
+    }
+
+    /// Finish a `cf.blocks` that exceptions leave (Lean's `escape`): each held-back `cf.yield`
+    /// also gives `0` and a `poison` exception; block `^xe` gives `poison` results, `1`, and the
+    /// exception; and after the op, a `cf.if` on the flag jumps to `^l` with the exception.
+    fn escape(
+        &mut self,
+        dop: OpId,
+        parent: RegionId,
+        l: &str,
+        xe: &str,
+        blocks: Vec<(RegionId, Deferred)>,
+        loc: Option<Loc>,
+    ) {
+        let mut regions = Vec::with_capacity(blocks.len() + 1);
+        for (b, y) in blocks {
+            if let Some((mut args, yloc)) = y {
+                let f = self.fresh();
+                let p = self.fresh();
+                let zero = OpKind::Const(self.dst.add_small_int(0));
+                let op = self.dst.append_op(
+                    b,
+                    zero,
+                    [],
+                    specs(&[Lowerer::spec(f, Ty::Int(1))]),
+                    [],
+                    yloc,
+                );
+                args.push(Operand::value(self.dst.results(op).next().unwrap()));
+                let op = self.dst.append_op(
+                    b,
+                    OpKind::Poison,
+                    [],
+                    specs(&[Lowerer::spec(p, Ty::Ptr)]),
+                    [],
+                    yloc,
+                );
+                args.push(Operand::value(self.dst.results(op).next().unwrap()));
+                self.dst.append_op(b, OpKind::Yield, args, [], [], yloc);
+            }
+            regions.push(b);
+        }
+        let e = self.fresh();
+        let rtys: Vec<Ty> = self.dst.results(dop).map(|v| self.dst.ty(v)).collect();
+        let n = rtys.len() - 2;
+        let ps: Vec<String> = (0..n).map(|_| self.fresh()).collect();
+        let one = self.fresh();
+        let xl = self.dst.add_str(xe);
+        let eb = self
+            .dst
+            .new_block(dop, xl, specs(&[Lowerer::spec(e, Ty::Ptr)]));
+        let ev = self.dst.params(eb).next().unwrap();
+        let mut args = Vec::with_capacity(n + 2);
+        for (p, &t) in ps.into_iter().zip(&rtys) {
+            let op = self.dst.append_op(
+                eb,
+                OpKind::Poison,
+                [],
+                specs(&[Lowerer::spec(p, t)]),
+                [],
+                loc,
+            );
+            args.push(Operand::value(self.dst.results(op).next().unwrap()));
+        }
+        let k1 = OpKind::Const(self.dst.add_small_int(1));
+        let op = self.dst.append_op(
+            eb,
+            k1,
+            [],
+            specs(&[Lowerer::spec(one, Ty::Int(1))]),
+            [],
+            loc,
+        );
+        args.push(Operand::value(self.dst.results(op).next().unwrap()));
+        args.push(Operand::value(ev));
+        self.dst.append_op(eb, OpKind::Yield, args, [], [], loc);
+        regions.push(eb);
+        self.dst.set_regions(dop, &regions);
+        let flag_name = self.fresh();
+        let exn_name = self.fresh();
+        let rs: Vec<ValueId> = self.dst.results(dop).collect();
+        let (flag, exn) = (rs[n], rs[n + 1]);
+        self.dst.set_name(flag, &flag_name);
+        self.dst.set_name(exn, &exn_name);
+        let dif = self.dst.append_op(
+            parent,
+            OpKind::If,
+            [Operand::value(flag)],
+            [],
+            [Vec::new(), Vec::new()],
+            loc,
+        );
+        let then = self.dst.regions(dif)[0];
+        let dest = self.label(l, 1);
+        self.dst.append_op(
+            then,
+            OpKind::Br { dest },
+            [Operand::value(exn)],
+            [],
+            [],
+            loc,
+        );
     }
 }
 

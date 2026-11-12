@@ -325,17 +325,20 @@ impl Printer<'_> {
                     self.out.push_str(kw);
                 }
                 Item::Variadic => {
-                    if next < operands.len() {
+                    // Every operand but the branch targets' arguments, which come after.
+                    let end = operands.len().saturating_sub(kind.succ_args(b)).max(next);
+                    if next < end {
                         self.out.push(' ');
-                        self.operand_list(&operands[next..]);
+                        self.operand_list(&operands[next..end]);
                     }
-                    next = operands.len();
+                    next = end;
                 }
                 Item::Args => {
+                    let end = operands.len().saturating_sub(kind.succ_args(b)).max(next);
                     self.out.push('(');
-                    self.operand_list(&operands[next.min(operands.len())..]);
+                    self.operand_list(&operands[next.min(end)..end]);
                     self.out.push(')');
-                    next = operands.len();
+                    next = end;
                 }
                 Item::Iter => {
                     if let Some(&body) = b.regions(op).first()
@@ -365,9 +368,14 @@ impl Printer<'_> {
                     self.region(depth, r);
                 }
                 Some(kw) => {
-                    if !b.is_empty(r) {
+                    if !b.is_empty(r) || b.params(r).len() > 0 {
                         self.out.push(' ');
                         self.out.push_str(kw);
+                        if b.params(r).len() > 0 {
+                            self.out.push('(');
+                            self.values(b.params(r));
+                            self.out.push(')');
+                        }
                         self.out.push(' ');
                         self.region(depth, r);
                     }

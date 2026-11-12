@@ -130,6 +130,13 @@ def operandNames (d : OpDecl) : List String :=
   let clash := names.any (fun x => d.fields.any (·.name == x)) || dedupe names != names
   if clash then (List.range n).map fun i => String.singleton (Char.ofNat ('a'.toNat + i)) else names
 
+/-- The parameters a region always has, which the builder makes: a `catch` region takes the
+exception, a `ptr` (decision: Exceptions). -/
+def fixedParams (kw : Option String) : List String :=
+  if kw == some "catch" then ["Ty::Ptr"] else []
+
+def hasFixedParams (d : OpDecl) : Bool := d.regions.any fun kw => !(fixedParams kw).isEmpty
+
 /-- A closure's name for each region. -/
 def regionNames (d : OpDecl) : List String :=
   let rs := d.regions
@@ -137,6 +144,7 @@ def regionNames (d : OpDecl) : List String :=
     | some k => k ++ "_"
     | none =>
       if (rs.drop (i + 1)).any (· == some "else") then "then_"
+      else if (rs.drop (i + 1)).any (· == some "catch") then "body"
       else if rs.length == 1 then "body" else s!"region{i}"
 
 /-- One parameter: its name, its Rust and C types, the statements that convert it (Rust, C),
@@ -276,7 +284,11 @@ def rustOp (d : OpDecl) (i : Nat) : List String := Id.run do
   | .regions =>
     let iter := d.items.contains .iter
     let results := if hasResults d then "results" else "&[]"
-    out := out ++ [s!"        self.region_op(kind, {results}, {nRegions d}, {iter})"]
+    if hasFixedParams d then
+      let fixed := d.regions.map fun kw => "&[" ++ ", ".intercalate (fixedParams kw) ++ "]"
+      out := out ++ [s!"        self.region_op_fixed(kind, {results}, &[{", ".intercalate fixed}])"]
+    else
+      out := out ++ [s!"        self.region_op(kind, {results}, {nRegions d}, {iter})"]
   | .none => out := out ++ [s!"        self.simple(kind, {res})"]
   | .implied 1 | .given 1 =>
     out := out ++ [s!"        let made = self.simple(kind, {res})?;", "        Ok(self.result(made, 0))"]
@@ -286,8 +298,10 @@ def rustOp (d : OpDecl) (i : Nat) : List String := Id.run do
   if !isRegions then return out
   -- The closure form.
   let iter := d.items.contains .iter
+  let takesParams (j : Nat) : Bool :=
+    (iter && j == 0) || !(fixedParams (d.regions.getD j none)).isEmpty
   let closures := (regionNames d).mapIdx fun j r =>
-    if iter && j == 0 then (r, "impl FnOnce(&mut Self, Values) -> Result<(), BuildError>")
+    if takesParams j then (r, "impl FnOnce(&mut Self, Values) -> Result<(), BuildError>")
     else (r, "impl FnOnce(&mut Self) -> Result<(), BuildError>")
   let closures := if d.hasBlocks then
       closures ++ [("blocks", "impl FnOnce(&mut Self, OpId) -> Result<(), BuildError>")]
@@ -305,7 +319,7 @@ def rustOp (d : OpDecl) (i : Nat) : List String := Id.run do
       out := out ++ ["        self.in_blocks(op, blocks)?;"]
     else
       out := out ++ [s!"        let r = self.region(op, {j})?;"]
-      if iter && j == 0 then
+      if takesParams j then
         out := out ++ ["        let params = self.region_params(r)?;",
           s!"        self.in_region(r, |f| {r}(f, params))?;"]
       else

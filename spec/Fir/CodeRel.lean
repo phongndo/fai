@@ -205,11 +205,13 @@ inductive StackRel (L : List Op → List Op → List Op → Prop) :
       StackRel L D (.ifJoin rs loc :: ft) (.ifJoin rs loc :: fs)
   | loop {D p bt bs rs loc ft fs} : StackRel L D ft fs → RegionsRel L [bt] [bs] →
       NoReads D bt.ops → StackRel L D (.loop p bt rs loc :: ft) (.loop p bs rs loc :: fs)
-  | call {D D' rs rets scopes loc ft fs} : StackRel L D' ft fs →
-      StackRel L D (.call rs rets scopes loc :: ft) (.call rs rets scopes loc :: fs)
+  | call {D D' rs rets scopes loc uw ft fs} : StackRel L D' ft fs →
+      StackRel L D (.call rs rets scopes loc uw :: ft) (.call rs rets scopes loc uw :: fs)
   | blocks {D p bt bs rs loc ft fs} : StackRel L D ft fs → RegionsRel L bt bs →
       (∀ b ∈ bt, NoReads D b.ops) →
       StackRel L D (.blocks p bt rs loc :: ft) (.blocks p bs rs loc :: fs)
+  | try_ {D bt bs rs loc ft fs} : StackRel L D ft fs → RegionsRel L [bt] [bs] →
+      NoReads D bt.ops → StackRel L D (.try_ bt rs loc :: ft) (.try_ bs rs loc :: fs)
 
 /-- Machines with the same core whose stacks hold related code and related environments. -/
 def MRel (L : List Op → List Op → List Op → Prop) (mt ms : Machine) : Prop :=
@@ -246,6 +248,7 @@ theorem lookup (h : StackRel L D ft fs) {n : String} (hn : ¬ D n) :
   | loop _ _ _ ih => exact ih hn
   | call => rfl
   | blocks _ _ _ ih => exact ih hn
+  | try_ _ _ _ ih => exact ih hn
 
 theorem operandIn (h : StackRel L D ft fs) (loc : Option Loc) {a : Operand}
     (ha : ∀ n, D n → a.reads n = false) : Fir.operandIn ft loc a = Fir.operandIn fs loc a := by
@@ -275,6 +278,7 @@ theorem tail {f f' : Frame} (h : StackRel L D (f :: ft) (f' :: fs)) : ∃ D', St
   | loop h => exact ⟨_, h⟩
   | call h => exact ⟨_, h⟩
   | blocks h => exact ⟨_, h⟩
+  | try_ h => exact ⟨_, h⟩
 
 theorem length_eq (h : StackRel L D ft fs) : ft.length = fs.length := by
   induction h <;> simp_all
@@ -298,6 +302,7 @@ theorem bindTop (h : StackRel L D ft fs) (rs : List Result) (vs : List RVal) :
   | loop h hb hnr => exact .loop h hb hnr
   | call h => exact .call h
   | blocks h hb hnr => exact .blocks h hb hnr
+  | try_ h hb hnr => exact .try_ h hb hnr
 
 theorem addAllocId (h : StackRel L D ft fs) (id : Nat) :
     StackRel L D (Fir.addAllocId id ft) (Fir.addAllocId id fs) := by
@@ -308,6 +313,7 @@ theorem addAllocId (h : StackRel L D ft fs) (id : Nat) :
   | loop h hb hnr => exact .loop h hb hnr
   | call h => exact .call h
   | blocks h hb hnr => exact .blocks h hb hnr
+  | try_ h hb hnr => exact .try_ h hb hnr
 
 /-- A new block on top, holding related code that reads no hidden name, with the same
 environment on both sides. -/
@@ -341,6 +347,12 @@ theorem splitLoop (h : StackRel L D ft fs) :
     exact .inr ⟨[], [], _, _, _, _, _, _, _, _, rfl, rfl, rfl, .loop h hb hnr⟩
   | call => exact .inl ⟨rfl, rfl⟩
   | blocks _ _ _ ih =>
+    simp only [splitStack, pickLoop, Frame.isCall, Bool.false_eq_true, ite_false]
+    rcases ih with ⟨e1, e2⟩ | ⟨at', as', p, bt, bs, rs, loc, bt', bs', D', e1, e2, hids, hr⟩
+    · exact .inl ⟨by rw [e1]; rfl, by rw [e2]; rfl⟩
+    · exact .inr ⟨_, _, p, bt, bs, rs, loc, bt', bs', D', by rw [e1]; rfl, by rw [e2]; rfl,
+        by simp [Fir.blockIds, hids], hr⟩
+  | try_ _ _ _ ih =>
     simp only [splitStack, pickLoop, Frame.isCall, Bool.false_eq_true, ite_false]
     rcases ih with ⟨e1, e2⟩ | ⟨at', as', p, bt, bs, rs, loc, bt', bs', D', e1, e2, hids, hr⟩
     · exact .inl ⟨by rw [e1]; rfl, by rw [e2]; rfl⟩
@@ -380,6 +392,12 @@ theorem splitCall (h : StackRel L D ft fs) :
     · exact .inl ⟨by rw [e1]; rfl, by rw [e2]; rfl⟩
     · exact .inr ⟨_, _, x, bt', bs', D', by rw [e1]; rfl, by rw [e2]; rfl,
         by simp [Fir.blockIds, hids], hr⟩
+  | try_ _ _ _ ih =>
+    simp only [splitStack, pickCall, Frame.isCall, Bool.false_eq_true, ite_false]
+    rcases ih with ⟨e1, e2⟩ | ⟨at', as', x, bt', bs', D', e1, e2, hids, hr⟩
+    · exact .inl ⟨by rw [e1]; rfl, by rw [e2]; rfl⟩
+    · exact .inr ⟨_, _, x, bt', bs', D', by rw [e1]; rfl, by rw [e2]; rfl,
+        by simp [Fir.blockIds, hids], hr⟩
 
 /-- Where a jump goes: the same `cf.blocks` on both sides, with related frames below it. -/
 theorem splitBlocks (h : StackRel L D ft fs) :
@@ -412,6 +430,12 @@ theorem splitBlocks (h : StackRel L D ft fs) :
   | call => exact .inl ⟨rfl, rfl⟩
   | blocks h hb hnr _ =>
     exact .inr ⟨[], [], _, _, _, _, _, _, _, _, rfl, rfl, rfl, .blocks h hb hnr⟩
+  | try_ _ _ _ ih =>
+    simp only [splitStack, pickBlocks, Frame.isCall, Bool.false_eq_true, ite_false]
+    rcases ih with ⟨e1, e2⟩ | ⟨at', as', p, bt, bs, rs, loc, bt', bs', D', e1, e2, hids, hr⟩
+    · exact .inl ⟨by rw [e1]; rfl, by rw [e2]; rfl⟩
+    · exact .inr ⟨_, _, p, bt, bs, rs, loc, bt', bs', D', by rw [e1]; rfl, by rw [e2]; rfl,
+        by simp [Fir.blockIds, hids], hr⟩
 
 end StackRel
 
@@ -468,6 +492,63 @@ theorem jump_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : Stack
         refine lockstep_exec rfl fun _ core => ?_
         exact enterBody_eq (.blocks h0 hb hnr) loc hbb (hnr b hm) vs
 
+/-! ## Exceptions -/
+
+/-- What unwinding related stacks gives: the same halt, or the same core and handlers of related
+code with related frames below them. -/
+def UnwindRel (L : List Op → List Op → List Op → Prop) :
+    Except Halt (Option (Catch × List Frame) × Core) →
+    Except Halt (Option (Catch × List Frame) × Core) → Prop
+  | .error h, .error h' => h = h'
+  | .ok (none, c), .ok (none, c') => c = c'
+  | .ok (some (.region bt rs loc, ft), c), .ok (some (.region bs rs' loc', fs), c') =>
+    c = c' ∧ rs = rs' ∧ loc = loc' ∧
+      ∃ D, StackRel L D ft fs ∧ RegionsRel L [bt] [bs] ∧ NoReads D bt.ops
+  | .ok (some (.block s, ft), c), .ok (some (.block s', fs), c') =>
+    c = c' ∧ s = s' ∧ ∃ D, StackRel L D ft fs
+  | _, _ => False
+
+theorem StackRel.unwind {D : String → Prop} {ft fs : List Frame} (h : StackRel L D ft fs)
+    (c : Core) : UnwindRel L ((unwindStack ft).run c) ((unwindStack fs).run c) := by
+  induction h generalizing c with
+  | nil => simp [unwindStack, UnwindRel, StateT.run, pure, StateT.pure, Except.pure]
+  | @block _ _ _ _ ids _ _ _ _ _ _ _ _ _ ih =>
+    simp only [unwindStack, StateT.run, bind, StateT.bind, Except.bind] at ih ⊢
+    cases releaseIds ids c with
+    | error h => exact rfl
+    | ok p => exact ih p.2
+  | ifJoin _ ih => simp only [unwindStack]; exact ih c
+  | loop _ _ _ ih => simp only [unwindStack]; exact ih c
+  | blocks _ _ _ ih => simp only [unwindStack]; exact ih c
+  | try_ h hb hnr => exact ⟨rfl, rfl, rfl, _, h, hb, hnr⟩
+  | @call _ _ _ _ scopes _ uw _ _ h ih =>
+    simp only [unwindStack, StateT.run, bind, StateT.bind, Except.bind] at ih ⊢
+    cases closeScopes scopes c with
+    | error h => exact rfl
+    | ok p =>
+      cases uw with
+      | some s => exact ⟨rfl, rfl, _, h⟩
+      | none => exact ih p.2
+
+/-- Throwing from related stacks: to related handlers, or out of the call the same way. -/
+theorem throwExn_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : StackRel L D ft fs)
+    (loc : Option Loc) (v : RVal) :
+    Lockstep L (throwExn ⟨c, ft⟩ loc v) (throwExn ⟨c, fs⟩ loc v) := by
+  have hu := h.unwind c
+  simp only [throwExn, Machine.exec, bind, Except.bind]
+  revert hu
+  generalize (unwindStack ft).run c = rt
+  generalize (unwindStack fs).run c = rs
+  intro hu
+  rcases rt with ht | ⟨_ | ⟨_ | _, _⟩, ct⟩ <;> rcases rs with hs | ⟨_ | ⟨_ | _, _⟩, cs⟩ <;>
+    simp only [UnwindRel] at hu
+  · subst hu; exact .halt
+  · subst hu; exact .halt
+  · obtain ⟨rfl, rfl, rfl, D', h', hb, hnr⟩ := hu
+    exact enterBody_eq (.ifJoin h') loc hb hnr [v]
+  · obtain ⟨rfl, rfl, D', h'⟩ := hu
+    exact jump_eq h' loc _ [v]
+
 /-! ## Control flow -/
 
 theorem terminate_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : StackRel L D ft fs)
@@ -479,6 +560,7 @@ theorem terminate_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : 
     cases h with
     | ifJoin h => exact bindResults_eq h _ _ _
     | blocks h => exact bindResults_eq h _ _ _
+    | try_ h => exact bindResults_eq h _ _ _
     | nil => exact .halt
     | block => exact .halt
     | loop => exact .halt
@@ -513,6 +595,13 @@ theorem terminate_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : 
         · exact .halt
         · exact bindResults_eq hr _ _ _
   case br => exact jump_eq h loc _ vs
+  case throw_ =>
+    simp only [terminate]
+    split
+    · split
+      · exact throwExn_eq h loc _
+      · exact .halt
+    · exact .halt
   case condBr t f =>
     simp only [terminate]
     refine lockstep_exec rfl fun x core => ?_
@@ -583,6 +672,9 @@ theorem execFlat_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : S
     | blocks h' =>
       refine lockstep_exec rfl fun _ core => ?_
       exact terminate_eq h' loc kind vs
+    | try_ h' =>
+      refine lockstep_exec rfl fun _ core => ?_
+      exact terminate_eq h' loc kind vs
   · simp only [h.operands loc hargs]
     refine lockstep_bind fun vs => ?_
     refine lockstep_exec rfl fun _ core => ?_
@@ -636,7 +728,12 @@ theorem execOp_eq {c : Core} {D : String → Prop} {ft fs : List Frame} (h : Sta
         · simp only [hb, ite_false]
           refine Lockstep.ok (hj.push hops2 (fun n hn => ?_) _ _)
           have := hregs n hn; simp_all [regionsReads]
-    · exact .halt
+    · split
+      · refine Lockstep.ok ((StackRel.try_ h (.cons hops2 .nil) (fun n hn => ?_)).push hops1
+          (fun n hn => ?_) _ _)
+        · have := hregs n hn; simp_all [regionsReads, Region.ops]
+        · have := hregs n hn; simp_all [regionsReads]
+      · exact .halt
   · simp only [execOp, hk]; exact .halt
 
 /-- The step from related machines whose top blocks are not at a rewritten sequence. -/
@@ -712,6 +809,7 @@ theorem StepMatch.of_mrel {R : Machine → Machine → Prop} {mt ms : Machine} (
   | loop => exact (StepMatch.of_lockstep hshape (Events.Refines.refl _) .halt).mono lift
   | call => exact (StepMatch.of_lockstep hshape (Events.Refines.refl _) .halt).mono lift
   | blocks => exact (StepMatch.of_lockstep hshape (Events.Refines.refl _) .halt).mono lift
+  | try_ => exact (StepMatch.of_lockstep hshape (Events.Refines.refl _) .halt).mono lift
 
 /-- A source step that the target doesn't take, before a step match: the source runs one step
 ahead of the target. -/
@@ -798,6 +896,7 @@ theorem bindTop_nil (vs : List RVal) : ∀ fs : List Frame, bindTop [] vs fs = f
   | .loop .. :: _ => rfl
   | .call .. :: _ => rfl
   | .blocks .. :: _ => rfl
+  | .try_ .. :: _ => rfl
 
 /-- Lookups don't depend on the code left in a block. -/
 theorem lookup_ops (n : String) (o o' : List Op) (ids : List Nat) (env : Env) (fs : List Frame) :

@@ -74,7 +74,8 @@ def OpDecl.fits (d : OpDecl) (k : OpKind) (args : List Operand) (regions : List 
   let iter := d.items.contains .iter
   (if d.hasBlocks then regions.all (·.label.isSome)
    else regions.length == d.regions.length && regions.all (·.label.isNone) &&
-    regions.zipIdx.all fun (r, i) => r.params.isEmpty || (iter && i == 0)) &&
+    regions.zipIdx.all fun (r, i) =>
+      r.params.isEmpty || (iter && i == 0) || (d.regions[i]? matches some (some _))) &&
   (if d.items.contains .variadic || d.items.contains .args then true
    else if iter then some args.length == regions.head?.map (·.params.length)
    else args.length == (d.items.filter (· == .operand)).length + k.succArgs)
@@ -128,11 +129,13 @@ mutual
       | .comma => out := out ++ ","
       | .keyword kw => out := out ++ " " ++ kw
       | .variadic =>
-        unless args.isEmpty do out := out ++ " " ++ commas (args.map Operand.render)
-        args := []
+        let mine := args.take (args.length - op.kind.succArgs)
+        unless mine.isEmpty do out := out ++ " " ++ commas (mine.map Operand.render)
+        args := args.drop mine.length
       | .args =>
-        out := out ++ "(" ++ commas (args.map Operand.render) ++ ")"
-        args := []
+        let mine := args.take (args.length - op.kind.succArgs)
+        out := out ++ "(" ++ commas (mine.map Operand.render) ++ ")"
+        args := args.drop mine.length
       | .iter =>
         let params := (op.regions.head?.map (·.params)).getD []
         unless params.isEmpty do
@@ -145,7 +148,10 @@ mutual
       match kw with
       | none => out := out ++ " " ++ renderRegion showLocs indent r
       | some kw =>
-        unless r.ops.isEmpty do out := out ++ " " ++ kw ++ " " ++ renderRegion showLocs indent r
+        unless r.ops.isEmpty && r.params.isEmpty do
+          let params := if r.params.isEmpty then "" else
+            "(" ++ commas (r.params.map Result.render) ++ ")"
+          out := out ++ " " ++ kw ++ params ++ " " ++ renderRegion showLocs indent r
     if d.hasBlocks then out := out ++ " " ++ renderBlocks showLocs indent op.regions
     pure out
 
@@ -272,6 +278,7 @@ def renderHalt (h : Halt) : String :=
   let main := match h.outcome with
     | .ret [] => "returned"
     | .ret vs => s!"returned {commas (vs.map RVal.render)}"
+    | .threw v => s!"threw {v.render}"
     | .trap r => s!"trap {r.name}{l}"
     | .ub k => s!"ub {k.name}{l}"
     | .hole n => s!"hole ?{n}{l}"

@@ -418,6 +418,40 @@ impl<'a> Replay<'a> {
                 made = None;
                 new_op = Some(f.cf_check(reason, ops[0])?);
             }
+            OpKind::Try => {
+                // The `_begin` form, positioned by hand, as the C API builds it; the builder makes
+                // the catch region's parameter.
+                made = None;
+                let new = f.cf_try_begin(&res)?;
+                let at = f.insert_point();
+                let (body, catch) = (s.regions(op)[0], s.regions(op)[1]);
+                f.position_at_end(f.region(new, 0)?)?;
+                self.region(f, body)?;
+                let r = f.region(new, 1)?;
+                for (old, nv) in s.params(catch).zip(f.region_params(r)?.iter()) {
+                    self.define(f, old, nv)?;
+                }
+                f.position_at_end(r)?;
+                self.region(f, catch)?;
+                f.set_insert_point(at)?;
+                new_op = Some(new);
+            }
+            OpKind::Throw => {
+                made = None;
+                new_op = Some(f.exn_throw(ops[0])?);
+            }
+            OpKind::Invoke { callee, unwind } => {
+                made = None;
+                let callee = func(f, callee);
+                let t = Target::new(self.block(s.succ(unwind).label), &[]);
+                new_op = Some(f.func_invoke(callee, &ops, t)?.op);
+            }
+            OpKind::InvokeIndirect { sig, unwind } => {
+                made = None;
+                let sig = self.ty(f, sig);
+                let t = Target::new(self.block(s.succ(unwind).label), &[]);
+                new_op = Some(f.func_invoke_indirect(sig, ops[0], &ops[1..], t)?.op);
+            }
             OpKind::A64Code => {
                 // The `_begin` form, with the blocks made and ended by hand, as the C API does.
                 made = None;
@@ -456,7 +490,10 @@ impl<'a> Replay<'a> {
             | OpKind::A64Bl { .. }
             | OpKind::A64Blr { .. }
             | OpKind::A64BlAlloc { .. }
-            | OpKind::A64BlFree { .. }) => {
+            | OpKind::A64BlFree { .. }
+            | OpKind::A64ExnSet { .. }
+            | OpKind::A64ExnTake { .. }
+            | OpKind::A64BExn { .. }) => {
                 made = None;
                 new_op = Some(self.a64_op(f, k)?);
             }
@@ -534,6 +571,9 @@ impl Replay<'_> {
             }
             OpKind::A64BlAlloc { family, align } => f.aarch64_bl_alloc(s.str(family), align),
             OpKind::A64BlFree { family } => f.aarch64_bl_free(s.str(family)),
+            OpKind::A64ExnSet { n } => f.aarch64_exn_set(n),
+            OpKind::A64ExnTake { d } => f.aarch64_exn_take(d),
+            OpKind::A64BExn { t, f: e } => f.aarch64_b_exn(target(t), target(e)),
             _ => unreachable!("not an aarch64 instruction: {}", k.mnemonic()),
         }
     }

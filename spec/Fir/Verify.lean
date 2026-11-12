@@ -29,14 +29,17 @@ interpreter.
   else about the op.
 * Ops: operand counts and types match the op; constants and facts fit their type; alignments
   are powers of two; calls match the callee's signature.
-* Control flow: a terminator is the last op of its region. `cf.yield` ends a `cf.if` region or
-  a block; `cf.break` and `cf.continue` appear inside a loop; loop bodies and blocks end with a
+* Control flow: a terminator is the last op of its region. `cf.yield` ends a `cf.if` or
+  `cf.try` region or a block; `cf.break` and `cf.continue` appear inside a loop; loop bodies and blocks end with a
   terminator; a function body ends with `func.ret`.
 * Blocks: `cf.blocks` has at least one block; every block has a label, unique in its
   `cf.blocks`, and no other region has one; the first block has no parameters. `cf.br`,
   `cf.cond_br`, and `cf.switch` appear inside `cf.blocks` (possibly inside `cf.if` and `cf.loop`
   regions there) and name blocks of the nearest one, with arguments of the blocks' parameter
-  types. A switch is on an integer, with keys that fit its type and differ modulo `2^N`.
+  types. They can't leave a `cf.try` region.
+* Exceptions: `cf.try`'s first region has no parameters and its catch region one, a `ptr`;
+  `exn.throw` throws a `ptr`. `func.invoke`'s handler is a block of the nearest `cf.blocks` whose
+  only parameter is a `ptr`, and `unwind` passes no arguments. A switch is on an integer, with keys that fit its type and differ modulo `2^N`.
 * Target code (LFIR): a target's code op (`aarch64.code`) is a function's whole body. It has at
   least one block; every block has a label, unique in it, and no parameters, and ends with a
   terminator. The target's other ops appear directly in its blocks, its branches name blocks of
@@ -61,6 +64,8 @@ inductive RegionCtx where
   | block (blocks : List (String × List Ty)) (results : List Ty)
   /-- A block of a target's code op (`aarch64.code`): the op's name and its blocks' labels. -/
   | code (name : String) (labels : List String)
+  /-- A region of `cf.try`, with the op's results. Jumps can't leave it. -/
+  | tryRegion (results : List Ty)
 
 structure Hole where
   name : String
@@ -296,11 +301,18 @@ def nearestLoop : List RegionCtx → Option (List Ty × List Ty)
   | .loopBody ps rs :: _ => some (ps, rs)
   | _ :: rest => nearestLoop rest
 
-/-- The blocks of the nearest enclosing `cf.blocks`. -/
+/-- The blocks of the nearest enclosing `cf.blocks`, unless a `cf.try` region is nearer. -/
 def nearestBlocks : List RegionCtx → Option (List (String × List Ty))
   | [] => none
   | .block bs _ :: _ => some bs
+  | .tryRegion _ :: _ => none
   | _ :: rest => nearestBlocks rest
+
+/-- Why a jump has no blocks to go to. -/
+def noBlocks (what : String) : List RegionCtx → String
+  | [] => s!"{what} outside cf.blocks"
+  | .tryRegion _ :: _ => s!"{what} can't leave a cf.try region"
+  | _ :: rest => noBlocks what rest
 
 /-- Check a branch to `s` with arguments of types `args`. -/
 def checkSucc (loc : Option Loc) (bs : List (String × List Ty)) (s : Succ) (args : List Ty) :
@@ -332,6 +344,8 @@ mutual
       match ctx with
       | .ifBranch [] :: _ => pure ()
       | .ifBranch _ :: _ => verr regionLoc "this cf.if region must end with cf.yield"
+      | .tryRegion [] :: _ => pure ()
+      | .tryRegion _ :: _ => verr regionLoc "this cf.try region must end with cf.yield"
       | .loopBody .. :: _ => verr regionLoc "a loop body must end with cf.break or cf.continue"
       | .block .. :: _ | .code .. :: _ => verr regionLoc "a block must end with a terminator"
       | _ => verr regionLoc "the function body must end with func.ret"
@@ -351,8 +365,8 @@ mutual
     match op.kind, op.regions with
     | .yield, [] =>
       match ctx with
-      | .ifBranch rs :: _ | .block _ rs :: _ => expectTys loc "cf.yield" ins rs
-      | _ => verr loc "cf.yield must end a cf.if region or a block"
+      | .ifBranch rs :: _ | .block _ rs :: _ | .tryRegion rs :: _ => expectTys loc "cf.yield" ins rs
+      | _ => verr loc "cf.yield must end a cf.if or cf.try region or a block"
     | .brk, [] =>
       let some (_, rs) := nearestLoop ctx | verr loc "cf.break outside a loop"
       expectTys loc "cf.break" ins rs
@@ -363,16 +377,16 @@ mutual
       if let some (name, _) := nearestCode ctx then verr loc s!"func.ret can't be inside {name}"
       expectTys loc "func.ret" ins (funcRets ctx)
     | .br dest, [] =>
-      let some bs := nearestBlocks ctx | verr loc "cf.br outside cf.blocks"
+      let some bs := nearestBlocks ctx | verr loc (noBlocks "cf.br" ctx)
       unless ins.length == dest.nargs do verr loc "malformed op"
       checkSucc loc bs dest ins
     | .condBr t f, [] =>
-      let some bs := nearestBlocks ctx | verr loc "cf.cond_br outside cf.blocks"
+      let some bs := nearestBlocks ctx | verr loc (noBlocks "cf.cond_br" ctx)
       unless ins.length == 1 + t.nargs + f.nargs do verr loc "malformed op"
       expectTys loc "cf.cond_br condition" (ins.take 1) [.int 1]
       for (s, ts) in splitArgs [t, f] (ins.drop 1) do checkSucc loc bs s ts
     | .switch d cs, [] =>
-      let some bs := nearestBlocks ctx | verr loc "cf.switch outside cf.blocks"
+      let some bs := nearestBlocks ctx | verr loc (noBlocks "cf.switch" ctx)
       let targets := d :: cs.map (·.2)
       unless ins.length == 1 + (targets.map (·.nargs)).sum do verr loc "malformed op"
       let t := ins.headD (.int 1)
@@ -403,6 +417,26 @@ mutual
         unless r.params.isEmpty do verr loc "cf.if regions have no parameters"
         unless r.label.isNone do verr loc "only blocks of cf.blocks have labels"
         verifyOps (.ifBranch outs :: ctx) scope loc r.ops
+    | .try_, [body, handler] =>
+      unless ins.isEmpty do verr loc "malformed op"
+      unless body.params.isEmpty do verr loc "the first region of cf.try has no parameters"
+      unless body.label.isNone && handler.label.isNone do
+        verr loc "only blocks of cf.blocks have labels"
+      verifyOps (.tryRegion outs :: ctx) scope loc body.ops
+      unless (handler.params.map (·.ty)) == [.ptr] do
+        verr loc "the catch region of cf.try takes one parameter, the exception, a ptr"
+      let mut inner := scope
+      for r in handler.params do inner ← define loc inner r
+      verifyOps (.tryRegion outs :: ctx) inner loc handler.ops
+    | .throw_, [] =>
+      expectTys loc "exn.throw" ins [.ptr]
+      unless outs.isEmpty do verr loc "exn.throw has no results"
+    | k@(.invoke _ s), [] | k@(.invokeIndirect _ s), [] =>
+      unless s.nargs == 0 do verr loc "a handler takes the exception only; unwind passes no arguments"
+      checkSimple loc k ins outs
+      let some bs := nearestBlocks ctx | verr loc s!"{k.name} names a handler outside cf.blocks"
+      let some ps := bs.lookup s.label | verr loc s!"no block ^{s.label} in the enclosing cf.blocks"
+      expectTys loc s!"parameters of handler ^{s.label}" ps [.ptr]
     | .loop _, [body] =>
       unless body.label.isNone do verr loc "only blocks of cf.blocks have labels"
       let ps := body.params.map (·.ty)
@@ -419,7 +453,7 @@ mutual
           if let some (.succ s) := k.imm f.name then
             unless labels.contains s.label do verr loc s!"no block ^{s.label} in the enclosing {name}"
       else
-        if k.isTerminator || k matches .if_ || k matches .loop _ then
+        if k.isTerminator || k matches .if_ || k matches .loop _ || k matches .try_ then
           verr loc "malformed op"
         if targets.contains k.decl.dialect && !(ctx.head? matches some (.code ..)) then
           verr loc s!"{k.name} must be inside a block of a target's code"

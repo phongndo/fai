@@ -44,7 +44,8 @@ the parser accepts.
 `%*` zero or more operands, `(%*)` a parenthesized argument list, `%iter` a loop's optional
 `iter(%x: T = %init, …)` (its operands, and the first region's parameters), `,` a comma, and a
 word a keyword. `region` is a region; `else region` one introduced by a keyword, which may be
-left out when empty; `blocks` is any number of labeled regions (`cf.blocks`). The op's location
+left out when empty and empty of parameters, and whose parameters follow the keyword
+(`catch(%e: ptr) { … }`); `blocks` is any number of labeled regions (`cf.blocks`). The op's location
 goes after the format's last item before its regions.
 
 **Rule.** How `checkSimple` types an op without regions, as checks run in order (`Check`).

@@ -282,7 +282,7 @@ impl OpDecl {
     /// Whether the readable form can show an op with `operands` operands, `succ_args()` of
     /// them its branch targets' arguments, and regions with these parameter counts and labels:
     /// as many operands as the format holds, and the regions it lists, unlabeled and with
-    /// parameters only where `%iter` gives them; or, for `cf.blocks`, regions that all have
+    /// parameters only where `%iter` gives them or after a keyword; or, for `cf.blocks`, regions that all have
     /// labels. Otherwise the op prints in the generic form (Lean's `OpDecl.fits`).
     #[inline]
     pub fn fits(
@@ -293,6 +293,8 @@ impl OpDecl {
     ) -> bool {
         let (mut fixed, mut any, mut iter, mut n_regions, mut blocks) = (0, false, false, 0, false);
         let mut targets = false;
+        // Which regions are introduced by a keyword: those may have parameters.
+        let mut keyword_regions = 0u64;
         for item in self.items {
             match item {
                 Item::Operand => fixed += 1,
@@ -304,7 +306,12 @@ impl OpDecl {
                 }
                 Item::Variadic | Item::Args => any = true,
                 Item::Iter => iter = true,
-                Item::Region(_) => n_regions += 1,
+                Item::Region(kw) => {
+                    if kw.is_some() && n_regions < 64 {
+                        keyword_regions |= 1 << n_regions;
+                    }
+                    n_regions += 1;
+                }
                 Item::Blocks => blocks = true,
                 _ => {}
             }
@@ -322,7 +329,8 @@ impl OpDecl {
                 if i == 0 {
                     first = Some(n);
                 }
-                if labeled || (n != 0 && !(iter && i == 0)) {
+                let keyword = i < 64 && keyword_regions & (1 << i) != 0;
+                if labeled || (n != 0 && !(iter && i == 0) && !keyword) {
                     return false;
                 }
             }

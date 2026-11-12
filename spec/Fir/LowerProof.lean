@@ -1169,6 +1169,7 @@ theorem sim (sp : SpaceCfg) : SimulationS (R sp) := by
     | loop => exact StepMatch.stutter ((StepMatch.of_lockstep hshape (Events.Refines.refl _) .halt).mono lift)
     | call => exact StepMatch.stutter ((StepMatch.of_lockstep hshape (Events.Refines.refl _) .halt).mono lift)
     | blocks => exact StepMatch.stutter ((StepMatch.of_lockstep hshape (Events.Refines.refl _) .halt).mono lift)
+    | try_ => exact StepMatch.stutter ((StepMatch.of_lockstep hshape (Events.Refines.refl _) .halt).mono lift)
   · exact runs_step hsp hn hruns
 
 /-- Code related by expansions refines its source: the simulation theorem, with stuttering. -/
@@ -1574,13 +1575,17 @@ end Fir.Lower.Proof
 
 namespace Fir.Lower.Proof
 
-/-- **The lowering is correct where scalarizing changes nothing**: for a function with no
-aggregate, union, or slice values (scalarizing gives it back unchanged), in the expansion's domain,
-the lowered function refines the original. Scalarizing itself is not proved yet. -/
-theorem lowerFunc_refines {mod : Module} {f g : Func} (h : lowerFunc mod.space f = .ok g)
-    (hs : scalarize mod.space f = .ok f) (hv : opsVarArgs f.body.ops = true)
+/-- **The lowering is correct where scalarizing and lowering exceptions change nothing**: for a
+function with no aggregate, union, or slice values (scalarizing gives it back unchanged) and no
+`cf.try` (lowering exceptions gives it back unchanged), in the expansion's domain, the lowered
+function refines the original. Its throws and calls may unwind: the expansion is proved for
+them. Scalarizing and lowering `cf.try` are not proved yet. -/
+theorem lowerFunc_refines {mod : Module} {ext : List String} {f g : Func}
+    (h : lowerFunc mod.space ext f = .ok g)
+    (hs : scalarize mod.space f = .ok f) (hx : lowerExn ext f = .ok f)
+    (hv : opsVarArgs f.body.ops = true)
     (hno : NoTemps f.body.ops) (dec : f.Decided mod) : g.Refines mod f := by
-  simp only [lowerFunc, hs, bind, Except.bind, tryCatch, tryCatchThe, MonadExceptOf.tryCatch,
+  simp only [lowerFunc, hs, hx, bind, Except.bind, tryCatch, tryCatchThe, MonadExceptOf.tryCatch,
     Except.tryCatch] at h
   cases he : expand mod.space f with
   | error e => rw [he] at h; cases h

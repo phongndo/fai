@@ -6,7 +6,8 @@
 //! what `fir-ref lower` prints, both interpreters must run it alike, and each run of the
 //! lowering must agree with the run of the HFIR program (`RunOutput::lowers_to`: the same
 //! outcome, or the same events first where the HFIR run is UB), with 16 times the fuel. Runs of
-//! the HFIR program that run out of fuel are not compared.
+//! the HFIR program that run out of fuel are not compared. Programs throw and catch exceptions
+//! (`cf.try`, `exn.throw`, `func.invoke`); the statistics count them and the `threw` outcomes.
 //!
 //! By default 200 programs run. `FIR_FUZZ=N` runs N, and `FIR_FUZZ_SEED=S` picks another seed;
 //! program `k` of seed `S` is always the same, so a failure names the program to replay. Failing
@@ -122,6 +123,19 @@ fn interpreter_matches_reference_on_random_programs() {
                         .unwrap_or_else(|e| {
                             panic!("generated program {} is invalid: {e}", file.display())
                         });
+                    {
+                        // Exceptions, for the statistics.
+                        let mut st = stats.lock().unwrap();
+                        for (op, what) in [
+                            ("cf.try", "(programs with cf.try)"),
+                            ("exn.throw", "(programs with exn.throw)"),
+                            ("func.invoke", "(programs with func.invoke)"),
+                        ] {
+                            if prog.text.contains(op) {
+                                *st.entry(what.to_owned()).or_default() += 1;
+                            }
+                        }
+                    }
                     let show = std::env::var("FIR_FUZZ_SHOW").ok();
                     let mut keep = false;
                     // The lowering, for HFIR programs.

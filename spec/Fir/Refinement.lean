@@ -259,6 +259,7 @@ def Outcome.Refines : Outcome → Outcome → Prop
   | _, .ub _ => True
   | _, .stuck _ => True
   | .ret vs, .ret vs' => RVal.RefinesList vs vs'
+  | .threw v, .threw v' => RVal.Refines v v'
   | .trap r, .trap r' => r = r'
   | .diverge, .diverge => True
   | .hole n, .hole n' => n = n'
@@ -268,16 +269,18 @@ def Outcome.refines : Outcome → Outcome → Bool
   | _, .ub _ => true
   | _, .stuck _ => true
   | .ret vs, .ret vs' => RVal.refinesList vs vs'
+  | .threw v, .threw v' => RVal.refines v v'
   | .trap r, .trap r' => r == r'
   | .diverge, .diverge => true
   | .hole n, .hole n' => n == n'
   | _, _ => false
 
 theorem Outcome.refines_iff {t s : Outcome} : t.refines s = true ↔ t.Refines s := by
-  cases t <;> cases s <;> simp [Outcome.refines, Outcome.Refines, RVal.refinesList_iff]
+  cases t <;> cases s <;> simp [Outcome.refines, Outcome.Refines, RVal.refinesList_iff,
+    RVal.refines_iff]
 
 theorem Outcome.Refines.refl (b : Outcome) (h : b ≠ .ambiguous) : b.Refines b := by
-  cases b <;> simp_all [Outcome.Refines, RVal.RefinesList.refl]
+  cases b <;> simp_all [Outcome.Refines, RVal.RefinesList.refl, RVal.Refines.refl]
 
 /-- A source outcome that every target outcome refines: UB, or stuck. -/
 def Outcome.Absorbing : Outcome → Prop
@@ -291,7 +294,9 @@ theorem Outcome.Refines.trans {a b c : Outcome} :
     a.Refines b → b.Refines c → a.Refines c := by
   intro h₁ h₂
   cases a <;> cases b <;> cases c <;> simp only [Outcome.Refines] at h₁ h₂ ⊢
-  all_goals first | trivial | contradiction | exact RVal.RefinesList.trans h₁ h₂ | exact h₁.trans h₂
+  all_goals first
+    | trivial | contradiction | exact RVal.RefinesList.trans h₁ h₂
+    | exact RVal.Refines.trans h₁ h₂ | exact h₁.trans h₂
 
 theorem Outcome.Absorbing.of_refines {t s : Outcome} (ht : t.Absorbing) (h : t.Refines s) :
     s.Absorbing := by

@@ -289,6 +289,8 @@ enum RegionCtx<'a> {
         name: &'static str,
         labels: Vec<&'a str>,
     },
+    /// A region of `cf.try`, with the op's results. Jumps can't leave it.
+    TryRegion(Vec<Ty>),
 }
 
 /// Whether values of type `t` can exist in a module of this layer (Lean's `Layer.valueTy`):
@@ -1047,6 +1049,10 @@ impl<'a> FuncVerifier<'a> {
             Some(RegionCtx::IfBranch(_)) => {
                 return verr(region_loc, "this cf.if region must end with cf.yield");
             }
+            Some(RegionCtx::TryRegion(rs)) if rs.is_empty() => {}
+            Some(RegionCtx::TryRegion(_)) => {
+                return verr(region_loc, "this cf.try region must end with cf.yield");
+            }
             Some(RegionCtx::LoopBody { .. }) => {
                 return verr(
                     region_loc,
@@ -1069,12 +1075,26 @@ impl<'a> FuncVerifier<'a> {
         })
     }
 
-    /// The blocks of the nearest enclosing `cf.blocks`.
+    /// The blocks of the nearest enclosing `cf.blocks`, unless a `cf.try` region is nearer.
     fn nearest_blocks(&self) -> Option<&[(&'a str, Vec<Ty>)]> {
-        self.ctx.iter().rev().find_map(|c| match c {
-            RegionCtx::Block { blocks, .. } => Some(&blocks[..]),
-            _ => None,
-        })
+        for c in self.ctx.iter().rev() {
+            match c {
+                RegionCtx::Block { blocks, .. } => return Some(&blocks[..]),
+                RegionCtx::TryRegion(_) => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Why a jump has no blocks to go to (Lean's `noBlocks`).
+    fn no_blocks(&self, what: &str) -> String {
+        for c in self.ctx.iter().rev() {
+            if matches!(c, RegionCtx::TryRegion(_)) {
+                return format!("{what} can't leave a cf.try region");
+            }
+        }
+        format!("{what} outside cf.blocks")
     }
 
     /// The nearest enclosing target code op's name and labels (Lean's `nearestCode`).
@@ -1225,10 +1245,14 @@ impl<'a> FuncVerifier<'a> {
         }
         match (kind, body.regions(op)) {
             (OpKind::Yield, []) => match self.ctx.last() {
-                Some(RegionCtx::IfBranch(rs) | RegionCtx::Block { results: rs, .. }) => {
+                Some(
+                    RegionCtx::IfBranch(rs)
+                    | RegionCtx::Block { results: rs, .. }
+                    | RegionCtx::TryRegion(rs),
+                ) => {
                     expect_tys(body.types(), loc, "cf.yield", &ins, rs)?;
                 }
-                _ => return verr(loc, "cf.yield must end a cf.if region or a block"),
+                _ => return verr(loc, "cf.yield must end a cf.if or cf.try region or a block"),
             },
             (OpKind::Break, []) => {
                 let Some((_, rs)) = self.nearest_loop() else {
@@ -1250,7 +1274,7 @@ impl<'a> FuncVerifier<'a> {
             }
             (OpKind::Br { dest }, []) => {
                 if self.nearest_blocks().is_none() {
-                    return verr(loc, "cf.br outside cf.blocks");
+                    return verr(loc, self.no_blocks("cf.br"));
                 }
                 let dest = body.succ(dest);
                 if ins.len() != dest.nargs as usize {
@@ -1260,7 +1284,7 @@ impl<'a> FuncVerifier<'a> {
             }
             (OpKind::CondBr { t, f }, []) => {
                 if self.nearest_blocks().is_none() {
-                    return verr(loc, "cf.cond_br outside cf.blocks");
+                    return verr(loc, self.no_blocks("cf.cond_br"));
                 }
                 let (t, f) = (body.succ(t), body.succ(f));
                 if ins.len() != 1 + t.nargs as usize + f.nargs as usize {
@@ -1277,7 +1301,7 @@ impl<'a> FuncVerifier<'a> {
             }
             (OpKind::Switch { dflt, cases }, []) => {
                 if self.nearest_blocks().is_none() {
-                    return verr(loc, "cf.switch outside cf.blocks");
+                    return verr(loc, self.no_blocks("cf.switch"));
                 }
                 let (dflt, cases) = (body.succ(dflt), body.cases(cases));
                 let targets = || std::iter::once(dflt).chain(cases.iter().map(|c| c.succ));
@@ -1326,6 +1350,68 @@ impl<'a> FuncVerifier<'a> {
                     self.ctx.pop();
                 }
             }
+            (OpKind::Try, &[inner, handler]) => {
+                if !ins.is_empty() {
+                    return verr(loc, "malformed op");
+                }
+                if body.params(inner).len() != 0 {
+                    return verr(loc, "the first region of cf.try has no parameters");
+                }
+                if body.label(inner).is_some() || body.label(handler).is_some() {
+                    return verr(loc, "only blocks of cf.blocks have labels");
+                }
+                self.ctx.push(RegionCtx::TryRegion(outs.to_vec()));
+                self.ops(inner, loc)?;
+                self.ctx.pop();
+                let ps = body.params(handler);
+                if ps.len() != 1 || ps.clone().any(|v| body.ty(v) != Ty::Ptr) {
+                    return verr(
+                        loc,
+                        "the catch region of cf.try takes one parameter, the exception, a ptr",
+                    );
+                }
+                let mark = self.scope.len();
+                for v in body.params(handler) {
+                    self.define(loc, v, false)?;
+                }
+                self.ctx.push(RegionCtx::TryRegion(outs.to_vec()));
+                self.ops(handler, loc)?;
+                self.ctx.pop();
+                self.restore(mark);
+            }
+            (OpKind::Throw, []) => {
+                expect_tys(body.types(), loc, "exn.throw", &ins, &[Ty::Ptr])?;
+                if !outs.is_empty() {
+                    return verr(loc, "exn.throw has no results");
+                }
+            }
+            (k @ (OpKind::Invoke { unwind, .. } | OpKind::InvokeIndirect { unwind, .. }), []) => {
+                let s = body.succ(unwind);
+                if s.nargs != 0 {
+                    return verr(
+                        loc,
+                        "a handler takes the exception only; unwind passes no arguments",
+                    );
+                }
+                check_simple(&self.cx, body, loc, k, &ins, &outs)?;
+                let Some(blocks) = self.nearest_blocks() else {
+                    return verr(
+                        loc,
+                        format!("{} names a handler outside cf.blocks", k.mnemonic()),
+                    );
+                };
+                let label = body.str(s.label);
+                let Some((_, ps)) = blocks.iter().find(|(l, _)| *l == label) else {
+                    return verr(loc, format!("no block ^{label} in the enclosing cf.blocks"));
+                };
+                expect_tys(
+                    body.types(),
+                    loc,
+                    &format!("parameters of handler ^{label}"),
+                    ps,
+                    &[Ty::Ptr],
+                )?;
+            }
             (OpKind::Loop { .. }, &[inner]) => {
                 if body.label(inner).is_some() {
                     return verr(loc, "only blocks of cf.blocks have labels");
@@ -1363,7 +1449,8 @@ impl<'a> FuncVerifier<'a> {
                 }
             }
             (k, []) => {
-                if k.is_terminator() || matches!(k, OpKind::If | OpKind::Loop { .. }) {
+                if k.is_terminator() || matches!(k, OpKind::If | OpKind::Loop { .. } | OpKind::Try)
+                {
                     return verr(loc, "malformed op");
                 }
                 if TARGETS.contains(&k.decl().dialect)

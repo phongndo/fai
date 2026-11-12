@@ -8,7 +8,8 @@
 //!
 //! The pattern is `CopyProp.L` with the longest run of ops it allows: after `%y = copy %x` (the
 //! operand a variable), every op that follows in the same region up to (not including) the
-//! first op with regions or a call, terminators included, reads `%x` where it reads `%y`. The
+//! first op with regions or a call (`func.invoke` included), terminators included (`exn.throw`
+//! too), reads `%x` where it reads `%y`. The
 //! theorem's other condition, that no op in the run binds `%x` or `%y`, always holds in a
 //! verified function, where every name is defined once. Uses of `%y` in nested regions, and
 //! after a call or an op with regions, keep reading `%y` (the theorem doesn't cover them yet:
@@ -28,11 +29,17 @@ use crate::ir::OpKind;
 
 use super::{Remarks, at};
 
-/// Whether copy propagation stops at the op: it has regions, or calls a function (Lean's
-/// `Flat` fails).
+/// Whether copy propagation stops at the op: it has regions, or calls a function, with or
+/// without a handler (Lean's `Flat` fails: `callee?` is `some`).
 fn stops(body: &Body, op: OpId) -> bool {
     !body.regions(op).is_empty()
-        || matches!(body.kind(op), OpKind::Call { .. } | OpKind::CallIndirect(_))
+        || matches!(
+            body.kind(op),
+            OpKind::Call { .. }
+                | OpKind::CallIndirect(_)
+                | OpKind::Invoke { .. }
+                | OpKind::InvokeIndirect { .. }
+        )
 }
 
 /// Make the ops after each copy read its operand. Returns how many operands were rewritten.

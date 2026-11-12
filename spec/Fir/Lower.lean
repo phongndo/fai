@@ -7,7 +7,7 @@ import Fir.LowerBits
 
 `lowerModule` turns an HFIR module into an MFIR one: the building blocks become core ops, and
 `ptr.field` and `ptr.index` become `ptr.offset` by computed offsets (decisions: Layers, Layout,
-HFIR lowering). It runs two passes over each function.
+HFIR lowering). It runs three passes over each function.
 
 **Scalarizing** (`scalarize`) replaces every aggregate, union, and slice value by its scalars
 (`scalars`): a value `%s` of type `struct<C>{i32, ptr}` becomes `%s.0: i32` and `%s.1: ptr`. A
@@ -29,6 +29,15 @@ the calling convention passes an aggregate as its scalars. The building-block op
   `ptr.offset.wrap` by the leaf's offset (none for offset 0), with the alignment the offset keeps
   (`Nat.gcd`), as the interpreter defines aggregate accesses.
 
+**Lowering exceptions** (`lowerExn`, decision: Exceptions in MFIR) replaces `cf.try` by a
+`cf.blocks` whose entry block is its first region and whose second block (`^.x1`, …) is its
+handler; inside, `exn.throw` becomes a `cf.br` to the handler and a call that may throw (to a
+function of the module, or through a pointer) a `func.invoke` naming it. A `cf.blocks` between a
+throw and its handler, which can't be jumped out of, gets a block that leaves it by `cf.yield`
+with two more results, `1` and the exception (its other yields give `0` and `poison`), and a
+`cf.if` after it jumps on. Outside `cf.try`, throws and calls stay as they are and unwind to the
+caller. Its labels and temporaries are `.x0`, `.x1`, ….
+
 **Expanding** (`expand`) replaces the remaining HFIR-only ops, which take and give scalars:
 
 * `int.add.overflow.s %a, %b` (and `sub`, `mul`, `.u`): extend both operands to a width where the
@@ -45,7 +54,7 @@ address-sized integer, and an in-bounds index whose stride doesn't fit the addre
 huge types or alignments do either).
 
 New values that no HFIR value becomes are temporaries, numbered per function and pass: `%.s0`,
-`%.s1`, … while scalarizing and `%.e0`, … while expanding. Lowering expects a verified module
+`%.s1`, … while scalarizing, `%.x0`, … while lowering exceptions, and `%.e0`, … while expanding. Lowering expects a verified module
 (each name defined once); the result is checked by the verifier, so a name clash with a
 scalar's or temporary's name is reported rather than miscompiled.
 -/
@@ -405,16 +414,140 @@ def expand (sp : SpaceCfg) (f : Func) : Except String Func := do
   let (ops, _) ← (expandOps sp f.body.ops).run 0
   pure { f with body := .mk f.body.params ops f.body.label }
 
+/-! ## Exceptions -/
+
+/-- Whether an op kind may throw: `exn.throw`, a call that may reach a function of the module
+(a direct call to one, or any indirect call; external functions don't unwind). -/
+def throwsKind (ext : List String) : OpKind → Bool
+  | .throw_ | .callIndirect _ | .invokeIndirect .. => true
+  | .call f | .invoke f _ => !ext.contains f
+  | _ => false
+
+mutual
+  /-- Whether code may throw, at any depth. -/
+  def mayThrowOps (ext : List String) : List Op → Bool
+    | [] => false
+    | .mk k _ _ regs _ :: os => throwsKind ext k || mayThrowRegions ext regs || mayThrowOps ext os
+  def mayThrowRegions (ext : List String) : List Region → Bool
+    | [] => false
+    | .mk _ ops _ :: rs => mayThrowOps ext ops || mayThrowRegions ext rs
+end
+
+/-- A region's ops ending in a terminator: a `cf.try` region may fall off its end (an implicit
+`cf.yield`), a block may not. -/
+def endYield (ops : List Op) : List Op :=
+  match ops.getLast? with
+  | some o => if o.kind.isTerminator then ops else ops ++ [.mk .yield [] [] [] o.loc]
+  | none => [.mk .yield [] [] [] none]
+
+/-- A block whose `cf.yield` also gives `0` and a `poison` exception: the `cf.blocks` it belongs
+to gives exceptions back as two more results. -/
+def extendYield : Region → M Region
+  | .mk ps ops lbl =>
+    match ops.getLast? with
+    | some (.mk .yield [] args [] yloc) => do
+      let f ← fresh "x"
+      let p ← fresh "x"
+      pure (.mk ps (ops.dropLast ++ [.mk (.const 0) [res f (.int 1)] [] [] yloc,
+        .mk .poison [res p .ptr] [] [] yloc, .mk .yield [] (args ++ [.var f, .var p]) [] yloc]) lbl)
+    | _ => pure (.mk ps ops lbl)
+
+/-- A `cf.blocks` (results `rs`, blocks `bs`, whose exceptions go to its block `^xe`) inside the
+`cf.blocks` that handler `^l` belongs to. Jumps can't leave a `cf.blocks`, so `^xe` leaves it by
+`cf.yield`, with two more results: `1` and the exception (the other blocks give `0` and `poison`).
+A `cf.if` after it jumps to `^l` with the exception. -/
+def escape (l xe : String) (p : Bool) (rs : List Result) (bs : List Region) (loc : Option Loc) :
+    M (List Op) := do
+  let bs ← bs.mapM extendYield
+  let e ← fresh "x"
+  let ps ← rs.mapM fun r => do pure (res (← fresh "x") r.ty)
+  let one ← fresh "x"
+  let eb : Region := .mk [res e .ptr]
+    (ps.map (fun r => .mk .poison [r] [] [] loc) ++ [.mk (.const 1) [res one (.int 1)] [] [] loc,
+      .mk .yield [] (ps.map (fun r => .var r.name) ++ [.var one, .var e]) [] loc]) (some xe)
+  let flag ← fresh "x"
+  let exn ← fresh "x"
+  pure [.mk (.blocks p) (rs ++ [res flag (.int 1), res exn .ptr]) [] (bs ++ [eb]) loc,
+    .mk .if_ [] [.var flag] [.mk [] [.mk (.br ⟨l, 1⟩) [] [.var exn] [] loc] none, .mk [] [] none] loc]
+
+mutual
+  /-- Lower an op's exceptions, where `h` is the block of the nearest `cf.blocks` that this
+  function's exceptions go to (none: they leave the function). -/
+  def exnOp (ext : List String) (h : Option String) : Op → M (List Op)
+    | .mk .throw_ rs args [] loc =>
+      match h with
+      | some l => pure [.mk (.br ⟨l, args.length⟩) [] args [] loc]
+      | none => pure [.mk .throw_ rs args [] loc]
+    | .mk (.call f) rs args [] loc =>
+      match h with
+      | some l => pure [if ext.contains f then .mk (.call f) rs args [] loc
+          else .mk (.invoke f ⟨l, 0⟩) rs args [] loc]
+      | none => pure [.mk (.call f) rs args [] loc]
+    | .mk (.callIndirect sig) rs args [] loc =>
+      match h with
+      | some l => pure [.mk (.invokeIndirect sig ⟨l, 0⟩) rs args [] loc]
+      | none => pure [.mk (.callIndirect sig) rs args [] loc]
+    | .mk .try_ rs _ [.mk _ bops _, .mk hps hops _] loc => do
+      let t ← fresh "x"
+      let c ← fresh "x"
+      let body ← exnOps ext (some c) bops
+      let entry : Region := .mk [] (endYield body) (some t)
+      match h with
+      | some l =>
+        if mayThrowOps ext hops then do
+          let xe ← fresh "x"
+          let hops' ← exnOps ext (some xe) hops
+          escape l xe false rs [entry, .mk hps (endYield hops') (some c)] loc
+        else do
+          let hops' ← exnOps ext none hops
+          pure [.mk (.blocks false) rs [] [entry, .mk hps (endYield hops') (some c)] loc]
+      | none => do
+        let hops' ← exnOps ext none hops
+        pure [.mk (.blocks false) rs [] [entry, .mk hps (endYield hops') (some c)] loc]
+    | .mk (.blocks p) rs args regs loc =>
+      match h with
+      | some l =>
+        if mayThrowRegions ext regs then do
+          let xe ← fresh "x"
+          let regs' ← exnRegions ext (some xe) regs
+          escape l xe p rs regs' loc
+        else do pure [.mk (.blocks p) rs args (← exnRegions ext none regs) loc]
+      | none => do pure [.mk (.blocks p) rs args (← exnRegions ext none regs) loc]
+    | .mk k rs args regs loc => do pure [.mk k rs args (← exnRegions ext h regs) loc]
+  def exnOps (ext : List String) (h : Option String) : List Op → M (List Op)
+    | [] => pure []
+    | o :: os => do
+      let a ← exnOp ext h o
+      let b ← exnOps ext h os
+      pure (a ++ b)
+  def exnRegions (ext : List String) (h : Option String) : List Region → M (List Region)
+    | [] => pure []
+    | .mk ps ops lbl :: rs => do
+      let ops' ← exnOps ext h ops
+      let rs' ← exnRegions ext h rs
+      pure (.mk ps ops' lbl :: rs')
+end
+
+/-- Lower a function's exceptions: `cf.try` becomes `cf.blocks` with the handler as a block, and
+in it each throw a jump to the handler and each call that may throw a `func.invoke` of it. Outside
+`cf.try`, a throw stays `exn.throw` and a call a `func.call`, which unwind to the caller. -/
+def lowerExn (ext : List String) (f : Func) : Except String Func := do
+  let (ops, _) ← (exnOps ext none f.body.ops).run 0
+  pure { f with body := .mk f.body.params ops f.body.label }
+
 /-! ## Modules -/
 
-/-- Lower a function: scalarize, then expand. -/
-def lowerFunc (sp : SpaceCfg) (f : Func) : Except String Func := do
-  let g ← tryCatch (scalarize sp f >>= expand sp) fun e => throw s!"in @{f.name}: {e}"
+/-- Lower a function: scalarize, lower exceptions, then expand. `ext` names the external
+functions, which don't unwind. -/
+def lowerFunc (sp : SpaceCfg) (ext : List String) (f : Func) : Except String Func := do
+  let g ← tryCatch (scalarize sp f >>= lowerExn ext >>= expand sp) fun e =>
+    throw s!"in @{f.name}: {e}"
   pure g
 
 /-- Lower an HFIR module to MFIR. Globals and external functions stay as they are. -/
 def lowerModule (m : Module) : Except String Module := do
   unless m.layer == .hfir do throw s!"lowering takes an HFIR module, not layer {m.layer.render}"
-  pure { m with layer := .mfir, funcs := ← m.funcs.mapM (lowerFunc m.space) }
+  let ext := m.externs.map (·.name)
+  pure { m with layer := .mfir, funcs := ← m.funcs.mapM (lowerFunc m.space ext) }
 
 end Fir.Lower

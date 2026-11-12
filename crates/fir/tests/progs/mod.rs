@@ -28,8 +28,16 @@
 //! covered. Programs sometimes declare their layer: `layer hfir`, or `layer mfir`, where field and
 //! element addresses are `ptr.offset` by `ty.offset` or a multiplied stride instead of `ptr.field`
 //! and `ptr.index`. Stores are sometimes followed at once by another store or a load through the
-//! same pointer, and copies come in chains, so the passes' patterns occur. Each program comes
-//! with argument lists and fuel limits.
+//! same pointer, and copies come in chains, so the passes' patterns occur.
+//!
+//! Exceptions: HFIR programs catch with `cf.try` (results of any value type, handlers that use
+//! the exception, rethrow it, or fall through), anywhere a statement goes, loops and blocks
+//! included; `exn.throw` ends `cf.if` branches, blocks, try regions, and functions, so
+//! exceptions leave loops, `cf.blocks`, and calls, and sometimes the entry function (`threw`).
+//! What is thrown is usually a fresh heap object holding an `i32` that handlers load, sometimes
+//! a global, null, or any pointer. MFIR programs give some `cf.blocks` a handler block, which
+//! direct and indirect calls in it name (`func.invoke`). Each program comes with argument lists
+//! and fuel limits.
 
 use std::fmt::Write;
 
@@ -352,6 +360,8 @@ struct Blocks {
     labels: Vec<(String, Vec<T>)>,
     /// What a jump from the current block passes as the counter.
     next: String,
+    /// The label of its handler block (MFIR), which calls may name with `func.invoke`.
+    handler: Option<String>,
 }
 
 /// A constant of width `w`, biased toward edge cases. Written signed or unsigned.
@@ -778,6 +788,9 @@ impl Gen<'_> {
     /// One random op (possibly with regions).
     fn stmt(&mut self) {
         self.ops_left = self.ops_left.saturating_sub(1);
+        if !self.mfir && self.depth < 3 && self.rng.chance(4) {
+            return self.try_op();
+        }
         let blocks = !self.mfir && num_vtys() > 0;
         match self.rng.below(if blocks { 138 } else { 124 }) {
             118..=120 => self.store_pair(),
@@ -1101,7 +1114,9 @@ impl Gen<'_> {
             self.region(n, |g| {
                 // A branch without results may leave the enclosing loop, or jump to a block of
                 // the enclosing cf.blocks, instead.
-                if rets.is_empty() && !g.blocks.is_empty() && g.rng.chance(25) {
+                if g.rng.chance(5) {
+                    g.throw_term();
+                } else if rets.is_empty() && !g.blocks.is_empty() && g.rng.chance(25) {
                     g.jump();
                 } else if rets.is_empty() && !g.loops.is_empty() && g.rng.chance(30) {
                     g.loop_exit();
@@ -1304,9 +1319,11 @@ impl Gen<'_> {
         let loc = self.loc();
         write!(self.out, "cf.blocks{progress}{loc} {{").unwrap();
         self.newline();
+        let handler = (self.mfir && self.rng.chance(40)).then(|| "h".to_owned());
         self.blocks.push(Blocks {
             labels: labels.clone(),
             next: zero.trim_start_matches('%').to_owned(),
+            handler: handler.clone(),
         });
         let mark = self.mark();
         let exit = labels.len() - 1;
@@ -1374,6 +1391,36 @@ impl Gen<'_> {
                     self.op(&[], format!("cf.yield {}", vs.join(", ")).trim_end());
                 }
                 90..=94 if !self.loops.is_empty() => self.loop_exit(),
+                _ if self.rng.chance(25) => self.throw_term(),
+                _ => {
+                    let rets = self.sigs[self.func].rets.clone();
+                    let vs: Vec<String> = rets.iter().map(|t| self.operand(*t)).collect();
+                    self.op(&[], format!("func.ret {}", vs.join(", ")).trim_end());
+                }
+            }
+            self.depth -= 1;
+        }
+        if let Some(h) = handler {
+            // The handler block: it gets what calls naming it throw.
+            self.restore(mark);
+            let e = self.fresh();
+            self.indent();
+            write!(self.out, "^{h}(%{e}: ptr):").unwrap();
+            self.newline();
+            self.depth += 1;
+            self.catch_scope(&e);
+            for _ in 0..self.rng.below(3) {
+                if self.ops_left == 0 {
+                    break;
+                }
+                self.stmt();
+            }
+            match self.rng.below(10) {
+                0..=5 => {
+                    let vs: Vec<String> = rets.iter().map(|t| self.operand(*t)).collect();
+                    self.op(&[], format!("cf.yield {}", vs.join(", ")).trim_end());
+                }
+                6..=7 => self.op(&[], &format!("exn.throw %{e}")),
                 _ => {
                     let rets = self.sigs[self.func].rets.clone();
                     let vs: Vec<String> = rets.iter().map(|t| self.operand(*t)).collect();
@@ -1384,6 +1431,111 @@ impl Gen<'_> {
         }
         self.restore(mark);
         self.blocks.pop();
+        self.close();
+        self.newline();
+        self.scope.extend(names);
+    }
+
+    /// The handler of the innermost `cf.blocks`, if calls here may name it.
+    fn handler(&mut self) -> Option<String> {
+        let h = self.blocks.last().and_then(|b| b.handler.clone())?;
+        self.rng.chance(60).then_some(h)
+    }
+
+    /// What a throw throws: usually a fresh heap object holding an `i32`, which handlers load;
+    /// sometimes a global, null, or any pointer.
+    fn exn_value(&mut self) -> String {
+        match self.rng.below(10) {
+            0..=5 => {
+                let n = self.small(self.addr, 8, 8);
+                let p = self.def(T::P, &format!("mem.alloc.trap c.malloc {n}, align 8"));
+                let v = self.operand(T::I(32));
+                self.op(&[], &format!("mem.store i32 {v}, %{p}, align 8"));
+                format!("%{p}")
+            }
+            6 if !self.globals.is_empty() => {
+                let g = self.globals[self.rng.below(self.globals.len() as u64) as usize]
+                    .name
+                    .clone();
+                format!("%{}", self.def(T::P, &format!("mem.global @{g}")))
+            }
+            7 => format!("%{}", self.def(T::P, "ptr.null")),
+            _ => self.operand(T::P),
+        }
+    }
+
+    /// `exn.throw`, as a region's terminator.
+    fn throw_term(&mut self) {
+        let v = self.exn_value();
+        self.op(&[], &format!("exn.throw {v}"));
+    }
+
+    /// The exception `%e` in a handler: a value, and usually a heap object to load from (and
+    /// sometimes free) as `exn_value` makes them.
+    fn catch_scope(&mut self, e: &str) {
+        self.scope.push((e.to_owned(), T::P));
+        if self.rng.chance(70) {
+            self.mems.push(Mem {
+                name: e.to_owned(),
+                size: 8,
+                align: 8,
+                family: Some("c.malloc"),
+                agg: None,
+                constant: false,
+            });
+            if self.rng.chance(60) {
+                self.def(T::I(32), &format!("mem.load %{e}, align 8"));
+            }
+        }
+    }
+
+    /// How a `cf.try` region ends: `cf.yield` of its results, a throw, a loop exit, or (without
+    /// results) falling off its end.
+    fn try_end(&mut self, rets: &[T]) {
+        match self.rng.below(20) {
+            0..=1 => self.throw_term(),
+            2 if !self.loops.is_empty() && rets.is_empty() => self.loop_exit(),
+            3..=5 if rets.is_empty() => {}
+            _ => {
+                let vs: Vec<String> = rets.iter().map(|t| self.operand(*t)).collect();
+                self.op(&[], format!("cf.yield {}", vs.join(", ")).trim_end());
+            }
+        }
+    }
+
+    /// `cf.try { … } catch(%e: ptr) { … }` (HFIR). Jumps can't leave its regions, so the
+    /// enclosing `cf.blocks` are out of reach inside.
+    fn try_op(&mut self) {
+        let rets: Vec<T> = (0..self.rng.below(3)).map(|_| self.state_type()).collect();
+        let names: Vec<(String, T)> = rets.iter().map(|t| (self.fresh(), *t)).collect();
+        self.results_prefix(&names);
+        let loc = self.loc();
+        write!(self.out, "cf.try{loc} {{").unwrap();
+        self.newline();
+        let blocks = std::mem::take(&mut self.blocks);
+        let n = 1 + self.rng.below(6) as u32;
+        self.region(n, |g| g.try_end(&rets));
+        self.close();
+        let e = self.fresh();
+        write!(self.out, " catch(%{e}: ptr) {{").unwrap();
+        self.newline();
+        let mark = self.mark();
+        self.depth += 1;
+        self.catch_scope(&e);
+        for _ in 0..self.rng.below(4) {
+            if self.ops_left == 0 {
+                break;
+            }
+            self.stmt();
+        }
+        if self.rng.chance(15) {
+            self.op(&[], &format!("exn.throw %{e}"));
+        } else {
+            self.try_end(&rets);
+        }
+        self.depth -= 1;
+        self.restore(mark);
+        self.blocks = blocks;
         self.close();
         self.newline();
         self.scope.extend(names);
@@ -1821,10 +1973,14 @@ impl Gen<'_> {
             .iter()
             .map(|t| (self.fresh(), *t, String::new()))
             .collect();
-        self.op(
-            &results,
-            &format!("func.call.indirect {sig} {p}({})", args.join(", ")),
-        );
+        let call = match self.handler() {
+            Some(h) => format!(
+                "func.invoke.indirect {sig} {p}({}) unwind ^{h}",
+                args.join(", ")
+            ),
+            None => format!("func.call.indirect {sig} {p}({})", args.join(", ")),
+        };
+        self.op(&results, &call);
     }
 
     /// Load a function pointer from a global table, then sometimes call it.
@@ -2124,10 +2280,15 @@ impl Gen<'_> {
                 (self.fresh(), *t, facts)
             })
             .collect();
-        self.op(
-            &results,
-            &format!("func.call @{}({})", self.fn_name(callee), args.join(", ")),
-        );
+        let call = match self.handler() {
+            Some(h) => format!(
+                "func.invoke @{}({}) unwind ^{h}",
+                self.fn_name(callee),
+                args.join(", ")
+            ),
+            None => format!("func.call @{}({})", self.fn_name(callee), args.join(", ")),
+        };
+        self.op(&results, &call);
     }
 
     fn func(&mut self, idx: usize) {
@@ -2205,7 +2366,11 @@ impl Gen<'_> {
                 }
             })
             .collect();
-        self.op(&[], format!("func.ret {}", vs.join(", ")).trim_end());
+        if self.rng.chance(6) {
+            self.throw_term();
+        } else {
+            self.op(&[], format!("func.ret {}", vs.join(", ")).trim_end());
+        }
         self.out.push('}');
         self.newline();
         self.newline();

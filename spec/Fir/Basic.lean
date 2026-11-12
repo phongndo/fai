@@ -155,6 +155,9 @@ def OpOut.bind : OpOut w → (Val w → OpOut v) → OpOut v
 /-- How a run ends, after its events. -/
 inductive Outcome where
   | ret (vs : List RVal)
+  /-- An exception escaped the function that was called (`exn.throw` with nothing to catch it),
+  with this value. -/
+  | threw (v : RVal)
   | trap (r : TrapReason)
   | ub (k : UBKind)
   /-- Runs forever without another event. -/

@@ -453,7 +453,10 @@ mutual
       for kw in d.regions do
         let r ← match kw with
           | none => region (if regions.isEmpty then params else [])
-          | some kw => if ← tryIdent kw then region [] else pure (.mk [] [] none)
+          | some kw =>
+            if ← tryIdent kw then
+              region (← if ← trySym "(" then sepBy result ")" else pure [])
+            else pure (.mk [] [] none)
         regions := regions.push r
       if d.hasBlocks then regions := regions ++ (← blocks).toArray
       pure (.mk kind results args regions.toList loc)

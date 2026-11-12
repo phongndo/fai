@@ -23,6 +23,11 @@ stays on the stack while its blocks run above it, one at a time. A jump (`cf.br`
 `cf.switch`) pops the frames above the nearest `cf.blocks` frame, ending their stack memory, and
 starts the target block with only its parameters bound, as `cf.continue` starts an iteration.
 
+An exception (`exn.throw`, a pointer) unwinds in one step (`throwExn`): frames are popped, ending
+their stack memory and closing the scopes of the calls they leave, up to the nearest `cf.try`
+frame, whose handler region then runs in its place, or call frame of a `func.invoke`, which jumps
+to its handler block in the caller. One that leaves the outermost call ends the run: `threw`.
+
 The split is for proofs. Ops on values and memory are computations on the core alone (`CM`):
 they take their operands' values and return their results' values, and never see the stack or
 the environment. Only the control-flow layer (`step`, `execOp`, `terminate`) evaluates operands
@@ -56,11 +61,16 @@ inductive Frame where
   | ifJoin (results : List Result) (loc : Option Loc)
   /-- A running `cf.loop`. Its body runs in the frames above it. -/
   | loop (progress : Bool) (body : Region) (results : List Result) (loc : Option Loc)
-  /-- A function call: where the results go, the return types, and the `noalias` scopes the
-  call opened. Lookups stop here: a callee sees only its own frames. -/
+  /-- A function call: where the results go, the return types, the `noalias` scopes the call
+  opened, and the block of the caller's nearest `cf.blocks` that an exception the callee throws
+  jumps to (`func.invoke`), if any. Lookups stop here: a callee sees only its own frames. -/
   | call (results : List Result) (rets : List Ty) (scopes : List Nat) (loc : Option Loc)
+      (unwind : Option Succ)
   /-- A running `cf.blocks`. Its current block runs in the frames above it. -/
   | blocks (progress : Bool) (blocks : List Region) (results : List Result) (loc : Option Loc)
+  /-- A `cf.try` whose first region runs above it: `cf.yield` gives the op's results, and an
+  exception thrown above it runs the handler region in its place. -/
+  | try_ (handler : Region) (results : List Result) (loc : Option Loc)
 
 /-- An active `noalias` or `readonly` scope: one function parameter during one call, or a
 `const` global for the whole run (a `readonly` scope on its first tag, which every pointer to it
@@ -1097,7 +1107,7 @@ def pickLoop : Frame → Option (Bool × Region × List Result × Option Loc)
   | _ => none
 
 def pickCall : Frame → Option (List Result × List Ty × List Nat × Option Loc)
-  | .call rs rets scopes loc => some (rs, rets, scopes, loc)
+  | .call rs rets scopes loc _ => some (rs, rets, scopes, loc)
   | _ => none
 
 def pickBlocks : Frame → Option (Bool × List Region × List Result × Option Loc)
@@ -1139,6 +1149,36 @@ where
     | (k, s) :: cs, rest =>
       if (k % (2 ^ w : Int)).toNat == n then (s, rest.take s.nargs) else go cs (rest.drop s.nargs)
 
+/-- Where an exception is caught: a `cf.try`'s handler region (with the `cf.try`'s results), or a
+block of the nearest `cf.blocks` that a `func.invoke` named. -/
+inductive Catch where
+  | region (handler : Region) (results : List Result) (loc : Option Loc)
+  | block (s : Succ)
+
+/-- Unwind the frames `fs` for an exception, up to its handler: the nearest `cf.try` frame, or
+call frame whose op named a handler. Ends the stack memory of the blocks it pops and closes the
+scopes of the calls it pops. Gives the handler and the frames below it, or nothing if the
+exception leaves the outermost call. -/
+def unwindStack : List Frame → CM (Option (Catch × List Frame))
+  | [] => pure none
+  | .block _ ids _ :: fs => do releaseIds ids; unwindStack fs
+  | .try_ h rs loc :: fs => pure (some (.region h rs loc, fs))
+  | .call _ _ scopes _ uw :: fs => do
+    closeScopes scopes
+    match uw with
+    | some s => pure (some (.block s, fs))
+    | none => unwindStack fs
+  | _ :: fs => unwindStack fs
+
+/-- Throw the exception `v`: unwind to its handler and run it with `v`, or end the run with the
+outcome `threw v`. -/
+def throwExn (m : Machine) (loc : Option Loc) (v : RVal) : Except Halt Machine := do
+  let (r, m) ← m.exec (unwindStack m.stack)
+  match r with
+  | some (.region h rs loc', fs) => enterBody { m with stack := .ifJoin rs loc' :: fs } loc h [v]
+  | some (.block s, fs) => jump { m with stack := fs } loc s [v]
+  | none => throw { outcome := .threw v, loc, leaks := leaks m.core }
+
 /-- Run a terminator. The current block has already been popped. -/
 def terminate (m : Machine) (loc : Option Loc) (k : OpKind) (vs : List RVal) :
     Except Halt Machine :=
@@ -1147,6 +1187,7 @@ def terminate (m : Machine) (loc : Option Loc) (k : OpKind) (vs : List RVal) :
     match m.stack with
     | .ifJoin rs loc' :: rest => { m with stack := rest }.bindResults loc' rs vs
     | .blocks _ _ rs loc' :: rest => { m with stack := rest }.bindResults loc' rs vs
+    | .try_ _ rs loc' :: rest => { m with stack := rest }.bindResults loc' rs vs
     | .loop .. :: _ => halt (.stuck "a loop body must end with cf.break or cf.continue") loc
     | _ => halt (.stuck "the function ended without func.ret") loc
   | .br dest => jump m loc dest vs
@@ -1188,6 +1229,11 @@ def terminate (m : Machine) (loc : Option Loc) (k : OpKind) (vs : List RVal) :
           throw { outcome := .ret vs, loc, leaks := leaks m.core }
         { m with stack := below }.bindResults loc' rs vs
     | none => halt (.stuck "func.ret outside a function") loc
+  | .throw_ =>
+    match vs with
+    | [v] => if v.hasTy .ptr then throwExn m loc v
+      else halt (.stuck "exn.throw needs a ptr") loc
+    | _ => halt (.stuck "exn.throw takes one value") loc
   | _ => halt (.stuck "not a terminator") loc
 
 /-- What a call op calls: a function by name, or the function its first operand points at,
@@ -1199,6 +1245,14 @@ inductive Callee where
 def OpKind.callee? : OpKind → Option Callee
   | .call callee => some (.direct callee)
   | .callIndirect sig => some (.indirect sig)
+  | .invoke callee _ => some (.direct callee)
+  | .invokeIndirect sig _ => some (.indirect sig)
+  | _ => none
+
+/-- The block a call op's exceptions go to (`func.invoke`), if it names one. -/
+def OpKind.unwind? : OpKind → Option Succ
+  | .invoke _ s => some s
+  | .invokeIndirect _ s => some s
   | _ => none
 
 /-- A function a call can run. -/
@@ -1244,6 +1298,10 @@ def OpKind.isIf : OpKind → Bool
   | .if_ => true
   | _ => false
 
+def OpKind.isTry : OpKind → Bool
+  | .try_ => true
+  | _ => false
+
 def OpKind.blocksProgress? : OpKind → Option Bool
   | .blocks p => some p
   | _ => none
@@ -1260,13 +1318,14 @@ def execFlat (m : Machine) (kind : OpKind) (results : List Result) (args : List 
       let ((vs, scopes), m) ← m.exec (enterCall loc f.params vs)
       pure { m with
         stack := .block f.body.ops [] (Env.bindAll {} f.params vs) ::
-          .call results f.rets scopes loc :: m.stack }
+          .call results f.rets scopes loc kind.unwind? :: m.stack }
     | .extern x => do
       -- The call is an event: the environment answers it, and it is recorded at once.
       let (e, m) ← m.exec (callExtern loc x vs)
       let m := m.record e
       match e.results with
-      | some rs => pure { m with stack := externRet loc rs :: .call results x.rets [] loc :: m.stack }
+      | some rs => pure { m with
+          stack := externRet loc rs :: .call results x.rets [] loc kind.unwind? :: m.stack }
       | none => pure { m with stack := [hang] }
   | none =>
   match kind.stackAlloc? with
@@ -1313,6 +1372,8 @@ def execOp (m : Machine) : Op → Except Halt Machine
         | .bits b =>
           pure { m with
             stack := .block (if b = 1 then thn else els).ops [] {} :: .ifJoin results loc :: m.stack }
+      else if kind.isTry then
+        pure { m with stack := .block thn.ops [] {} :: .try_ els results loc :: m.stack }
       else halt (.stuck "malformed op") loc
     | _, _ => halt (.stuck "malformed op") loc
 
@@ -1399,7 +1460,8 @@ def Core.initial (oracle : Nat → Int) (world : World) (mod : Module) : Core :=
 def Machine.init (oracle : Nat → Int) (world : World) (mod : Module) (f : Func) (args : List RVal) :
     Except Halt Machine := do
   let ((vs, scopes), core) ← (enterCall none f.params args).run (Core.initial oracle world mod)
-  pure { core, stack := [.block f.body.ops [] (Env.bindAll {} f.params vs), .call [] f.rets scopes none] }
+  let top := Frame.block f.body.ops [] (Env.bindAll {} f.params vs)
+  pure { core, stack := [top, .call [] f.rets scopes none none] }
 
 /-- Run `n` steps. An `error` is a halted run. -/
 def runSteps : Nat → Machine → Except Halt Machine

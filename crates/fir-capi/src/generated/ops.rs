@@ -638,6 +638,60 @@ pub unsafe extern "C" fn fir_cf_check(fb: *mut FirBuilder, reason: FirTrapReason
     }
 }
 
+/// `cf.try { … } catch(%e: ptr) { … }`: run the first region; an exception thrown in it (by
+/// `exn.throw` there, or in a function it calls) that nothing inside catches unwinds to here, and
+/// the second region runs with the exception bound to its parameter. Either region's `cf.yield`
+/// gives the op's results. Jumps can't leave either region.
+///
+/// Makes the op with empty regions: fill them with `fir_position_at_end`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_cf_try_begin(fb: *mut FirBuilder, results: *const FirType, nresults: usize) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            let results = crate::tys(results, nresults)?;
+            builder.cf_try_begin(&results).map(|op| op.raw())
+        })
+    }
+}
+
+/// `exn.throw %e`: throw the exception `%e`. Unwinding pops frames (ending their stack memory,
+/// and a call's `noalias` scopes) up to the nearest `cf.try` region or `func.invoke` handler, in
+/// this function or a calling one; an exception that leaves the function the run started in is
+/// the run's outcome, `threw`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_exn_throw(fb: *mut FirBuilder, p: FirValue) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.exn_throw(Operand::from_raw(p)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `func.invoke @f(%a) unwind ^h`: `func.call`, except that an exception the callee throws
+/// jumps to block `^h` of the nearest `cf.blocks`, whose one parameter takes it, instead of going
+/// on to the caller (a plain `func.call` passes it on).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_func_invoke(fb: *mut FirBuilder, callee: FirFunc, args: *const FirValue, nargs: usize, unwind: FirTarget) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            let unwind_args = crate::values(unwind.args, unwind.nargs);
+            builder.func_invoke(FuncRef::from_raw(callee), crate::values(args, nargs), crate::target(unwind, unwind_args)).map(|r| r.op.raw())
+        })
+    }
+}
+
+/// `func.invoke.indirect func<(i32) -> i32> %p(%a) unwind ^h`: `func.call.indirect` with a
+/// handler, as `func.invoke`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_func_invoke_indirect(fb: *mut FirBuilder, sig: FirType, p: FirValue, args: *const FirValue, nargs: usize, unwind: FirTarget) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            let unwind_args = crate::values(unwind.args, unwind.nargs);
+            builder.func_invoke_indirect(crate::ty(sig)?, Operand::from_raw(p), crate::values(args, nargs), crate::target(unwind, unwind_args)).map(|r| r.op.raw())
+        })
+    }
+}
+
 /// `aarch64.code { ^entry: … ^b1: … }`: a function's machine code, as labeled blocks entered
 /// at the first. Each block ends with a branch, `aarch64.ret`, or `aarch64.trap`. It is the whole
 /// body of an LFIR function, which finds its arguments where the calling convention puts them.
@@ -841,6 +895,40 @@ pub unsafe extern "C" fn fir_aarch64_bl_alloc(fb: *mut FirBuilder, family: *cons
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_bl_alloc(crate::cstr(family)?, align).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.exn.set x0`: make `x0` the pending exception (decision: Exceptions at run time):
+/// store it in the thread's exception slot, `__fir_exn`. A function that throws sets it, then
+/// returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_exn_set(fb: *mut FirBuilder, n: FirReg) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_exn_set(Reg(n)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.exn.take x0`: `x0` gets the pending exception, which is no longer pending.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_exn_take(fb: *mut FirBuilder, d: FirReg) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_exn_take(Reg(d)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.b.exn ^t, ^f`: jump to `^t` if an exception is pending, otherwise to `^f`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_b_exn(fb: *mut FirBuilder, t: FirTarget, f: FirTarget) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            let t_args = crate::values(t.args, t.nargs);
+            let f_args = crate::values(f.args, f.nargs);
+            builder.aarch64_b_exn(crate::target(t, t_args), crate::target(f, f_args)).map(|op| op.raw())
         })
     }
 }

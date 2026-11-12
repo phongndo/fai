@@ -6,7 +6,9 @@
 //! nothing (Lean's `World.zero`). [`run`] prints the same one-line outcome as `fir-ref run`: the
 //! run's events (external calls), then how it ended. An external call exposes what the callee can
 //! reach, as in Lean, and returns its results one step later (`Frame::ExternRet`, Lean's
-//! synthesized `func.ret`), so the caller checks them as it checks any callee's.
+//! synthesized `func.ret`), so the caller checks them as it checks any callee's. An exception
+//! unwinds in one step, as Lean's `throwExn` does (`Machine::throw_exn`), and one that leaves the
+//! outermost call ends the run with `threw`.
 //!
 //! The machine follows the crate's data-oriented rules (see [`crate::Body`]):
 //!
@@ -152,11 +154,15 @@ enum Frame {
         progress: bool,
         allocs: u32,
     },
+    /// A `cf.try` whose first region runs above it; `allocs` is where that region's allocations
+    /// start. An exception thrown above it runs its handler region in its place.
+    Try { op: OpId, allocs: u32 },
     /// An external call that has returned, about to bind its results: Lean's synthesized
     /// `func.ret` block and the call frame under it. `ext` is the external function's index.
     ExternRet { op: OpId, ext: u32 },
-    /// A call: the call op (`None` for the call from outside), the caller's function and slots,
-    /// and where the callee's scopes and allocations start.
+    /// A call: the call op (`None` for the call from outside; a `func.invoke` names where the
+    /// callee's exceptions go), the caller's function and slots, and where the callee's scopes
+    /// and allocations start.
     Call {
         op: Option<OpId>,
         func: u32,
@@ -256,6 +262,8 @@ struct Allocs {
 #[derive(Debug)]
 enum Behavior {
     Ret(String),
+    /// An exception left the outermost call: the value, rendered.
+    Threw(String),
     Trap(TrapReason),
     Ub(UbKind),
     Hole(String),
@@ -282,6 +290,7 @@ impl Halt {
         let mut out = match &self.behavior {
             Behavior::Ret(vs) if vs.is_empty() => "returned".to_owned(),
             Behavior::Ret(vs) => format!("returned {vs}"),
+            Behavior::Threw(v) => format!("threw {v}"),
             Behavior::Trap(r) => format!("trap {}{l}", r.name()),
             Behavior::Ub(k) => format!("ub {}{l}", k.name()),
             Behavior::Hole(n) => format!("hole ?{n}{l}"),
@@ -2601,7 +2610,9 @@ impl<'m> Machine<'m> {
         let body = self.body();
         match k {
             OpKind::Yield => match self.frames.last() {
-                Some(&Frame::IfJoin { op } | &Frame::Blocks { op, .. }) => {
+                Some(
+                    &Frame::IfJoin { op } | &Frame::Blocks { op, .. } | &Frame::Try { op, .. },
+                ) => {
                     self.frames.pop();
                     self.bind(body.loc(op), body.results(op), vs)
                 }
@@ -2730,7 +2741,71 @@ impl<'m> Machine<'m> {
                 }
                 self.jump(loc, dflt, take(0, dflt.nargs))
             }
+            OpKind::Throw => match vs {
+                &[v] if self.has_ty(v, Ty::Ptr) => self.throw_exn(loc, v),
+                [_] => stuck(loc, "exn.throw needs a ptr"),
+                _ => stuck(loc, "exn.throw takes one value"),
+            },
             _ => stuck(loc, "not a terminator"),
+        }
+    }
+
+    /// Throw the exception `v` (Lean's `throwExn`): pop frames, ending their stack memory and
+    /// closing the scopes of the calls they leave, up to the nearest `cf.try` frame or call
+    /// frame of a `func.invoke`, and run its handler with `v`; or end the run with `threw`.
+    fn throw_exn(&mut self, loc: Option<Loc>, v: Value) -> R<()> {
+        loop {
+            match self.frames.last() {
+                None => {
+                    let mut out = String::new();
+                    self.render_value(v, &mut out);
+                    return Err(Box::new(Halt {
+                        behavior: Behavior::Threw(out),
+                        loc,
+                        note: String::new(),
+                        leaks: self.leaks(),
+                    }));
+                }
+                Some(&Frame::Block { allocs, .. }) => {
+                    self.frames.pop();
+                    self.release_from(allocs);
+                }
+                Some(&Frame::Try { op, allocs }) => {
+                    self.release_from(allocs);
+                    self.frames.pop();
+                    self.frames.push(Frame::IfJoin { op });
+                    let handler = self.body().regions(op)[1];
+                    return self.enter_body(loc, handler, &[v]);
+                }
+                Some(&Frame::Call {
+                    op,
+                    func,
+                    base,
+                    scopes,
+                    allocs,
+                }) => {
+                    self.release_from(allocs);
+                    self.scopes.truncate(scopes as usize);
+                    self.marks.truncate(scopes as usize);
+                    self.frames.pop();
+                    let Some(op) = op else {
+                        continue;
+                    };
+                    self.slots.truncate(self.base as usize);
+                    self.func = func;
+                    self.base = base;
+                    let body = self.body();
+                    if let OpKind::Invoke { unwind, .. } | OpKind::InvokeIndirect { unwind, .. } =
+                        body.kind(op)
+                    {
+                        return self.jump(loc, body.succ(unwind), &[v]);
+                    }
+                }
+                Some(Frame::IfJoin { .. } | Frame::Loop { .. } | Frame::Blocks { .. })
+                | Some(Frame::ExternRet { .. }) => {
+                    self.frames.pop();
+                }
+            }
         }
     }
 
@@ -2766,6 +2841,17 @@ impl<'m> Machine<'m> {
                 });
                 self.enter_body(loc, entry, &[])?;
             }
+            OpKind::Try => {
+                let regions = body.regions(op);
+                if regions.len() != 2 {
+                    return stuck(loc, "malformed op");
+                }
+                self.frames.push(Frame::Try {
+                    op,
+                    allocs: self.stack_allocs.len() as u32,
+                });
+                self.push_block(regions[0]);
+            }
             OpKind::Loop { progress } => {
                 self.operands(op, loc, &mut vs)?;
                 self.frames.push(Frame::Loop {
@@ -2775,17 +2861,22 @@ impl<'m> Machine<'m> {
                 });
                 self.enter_body(loc, body.regions(op)[0], &vs)?;
             }
-            OpKind::Call { .. } | OpKind::CallIndirect(_) => {
+            OpKind::Call { .. }
+            | OpKind::CallIndirect(_)
+            | OpKind::Invoke { .. }
+            | OpKind::InvokeIndirect { .. } => {
                 self.operands(op, loc, &mut vs)?;
                 let (f, args) = match kind {
-                    OpKind::Call { callee } => {
+                    OpKind::Call { callee } | OpKind::Invoke { callee, .. } => {
                         let name = body.str(callee);
                         let Some(&f) = self.funcs.get(name) else {
                             return stuck(loc, format!("no function @{name}"));
                         };
                         (f, 0)
                     }
-                    OpKind::CallIndirect(sig) => (self.call_target(loc, sig, &vs)?, 1),
+                    OpKind::CallIndirect(sig) | OpKind::InvokeIndirect { sig, .. } => {
+                        (self.call_target(loc, sig, &vs)?, 1)
+                    }
                     _ => unreachable!(),
                 };
                 if f >= self.nfuncs {
@@ -2832,7 +2923,8 @@ impl<'m> Machine<'m> {
             | OpKind::Ret
             | OpKind::Br { .. }
             | OpKind::CondBr { .. }
-            | OpKind::Switch { .. } => {
+            | OpKind::Switch { .. }
+            | OpKind::Throw => {
                 self.operands(op, loc, &mut vs)?;
                 if let Some(&Frame::Block { allocs, .. }) = self.frames.last() {
                     self.frames.pop();

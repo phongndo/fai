@@ -45,6 +45,13 @@
 //! used only where it is visible, so value ids and Lean's names agree. The pipeline verifies
 //! after every pass in development builds and names the pass that broke the module (decision:
 //! Verifier). Passes match core ops only, so they run on HFIR and MFIR modules alike.
+//!
+//! **Exceptions.** The theorems are stated over the semantics with unwinding (`exn.throw`,
+//! `cf.try`, and calls that name a handler, `func.invoke`), so they hold for MFIR with handlers
+//! as they are, and the passes treat whatever may throw conservatively: `dse` and `fwd` match
+//! only adjacent ops, so a call or an `exn.throw` between two accesses blocks them; `copyprop`
+//! stops at every call and `func.invoke`; `dce` never deletes a call, a throw, or an op with
+//! regions. The handler block a `func.invoke` names is reached only by unwinding, and stays.
 
 pub mod copyprop;
 pub mod dce;

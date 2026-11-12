@@ -729,7 +729,17 @@ impl<'a> Parser<'a> {
                 None => self.region(r, if i == 0 { &names } else { &[] })?,
                 Some(kw) => {
                     if self.try_ident(kw)? {
-                        self.region(r, &[])?;
+                        // A keyword's region may have parameters: `catch(%e: ptr) { … }`.
+                        let params = if self.try_sym(Sym::LParen)? {
+                            self.sep_by(Self::result, Sym::RParen)?
+                        } else {
+                            Vec::new()
+                        };
+                        let names: Vec<&'a str> = params.iter().map(|p| p.name).collect();
+                        if !params.is_empty() {
+                            self.body.set_params(r, params);
+                        }
+                        self.region(r, &names)?;
                     }
                 }
             }

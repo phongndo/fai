@@ -150,6 +150,23 @@ pub enum OpKind {
     /// `cf.check.bounds %ok`: nothing if `%ok` is 1; a trap with that reason if it is 0; UB if it
     /// is `poison`. The lowered form of HFIR's checks.
     Check(TrapReason),
+    /// `cf.try { … } catch(%e: ptr) { … }`: run the first region; an exception thrown in it (by
+    /// `exn.throw` there, or in a function it calls) that nothing inside catches unwinds to here, and
+    /// the second region runs with the exception bound to its parameter. Either region's `cf.yield`
+    /// gives the op's results. Jumps can't leave either region.
+    Try,
+    /// `exn.throw %e`: throw the exception `%e`. Unwinding pops frames (ending their stack memory,
+    /// and a call's `noalias` scopes) up to the nearest `cf.try` region or `func.invoke` handler, in
+    /// this function or a calling one; an exception that leaves the function the run started in is
+    /// the run's outcome, `threw`.
+    Throw,
+    /// `func.invoke @f(%a) unwind ^h`: `func.call`, except that an exception the callee throws
+    /// jumps to block `^h` of the nearest `cf.blocks`, whose one parameter takes it, instead of going
+    /// on to the caller (a plain `func.call` passes it on).
+    Invoke { callee: StrId, unwind: SuccId },
+    /// `func.invoke.indirect func<(i32) -> i32> %p(%a) unwind ^h`: `func.call.indirect` with a
+    /// handler, as `func.invoke`.
+    InvokeIndirect { sig: Ty, unwind: SuccId },
     /// `aarch64.code { ^entry: … ^b1: … }`: a function's machine code, as labeled blocks entered
     /// at the first. Each block ends with a branch, `aarch64.ret`, or `aarch64.trap`. It is the whole
     /// body of an LFIR function, which finds its arguments where the calling convention puts them.
@@ -200,13 +217,21 @@ pub enum OpKind {
     /// `aarch64.bl.alloc c.malloc, align 16`: allocate `x0` bytes from the family's allocator;
     /// `x0` is the memory, or null if allocation failed (a call to `malloc` or `aligned_alloc`).
     A64BlAlloc { family: StrId, align: u32 },
+    /// `aarch64.exn.set x0`: make `x0` the pending exception (decision: Exceptions at run time):
+    /// store it in the thread's exception slot, `__fir_exn`. A function that throws sets it, then
+    /// returns.
+    A64ExnSet { n: Reg },
+    /// `aarch64.exn.take x0`: `x0` gets the pending exception, which is no longer pending.
+    A64ExnTake { d: Reg },
+    /// `aarch64.b.exn ^t, ^f`: jump to `^t` if an exception is pending, otherwise to `^f`.
+    A64BExn { t: SuccId, f: SuccId },
     /// `aarch64.bl.free c.malloc`: free `x0` (a call to `free`).
     A64BlFree { family: StrId },
 }
 
 impl OpKind {
     pub fn is_terminator(&self) -> bool {
-        matches!(self, OpKind::Yield | OpKind::Break | OpKind::Continue | OpKind::Ret | OpKind::Br { .. } | OpKind::CondBr { .. } | OpKind::Switch { .. } | OpKind::A64Code | OpKind::A64B { .. } | OpKind::A64BCond { .. } | OpKind::A64Ret | OpKind::A64Trap(_))
+        matches!(self, OpKind::Yield | OpKind::Break | OpKind::Continue | OpKind::Ret | OpKind::Br { .. } | OpKind::CondBr { .. } | OpKind::Switch { .. } | OpKind::Throw | OpKind::A64Code | OpKind::A64B { .. } | OpKind::A64BCond { .. } | OpKind::A64Ret | OpKind::A64Trap(_) | OpKind::A64BExn { .. })
     }
 
     /// The op's name with its modifiers, as printed.
@@ -413,6 +438,10 @@ impl OpKind {
             OpKind::Check(TrapReason::Oom) => "cf.check.oom",
             OpKind::Check(TrapReason::Bounds) => "cf.check.bounds",
             OpKind::Check(TrapReason::Tag) => "cf.check.tag",
+            OpKind::Try => "cf.try",
+            OpKind::Throw => "exn.throw",
+            OpKind::Invoke { .. } => "func.invoke",
+            OpKind::InvokeIndirect { .. } => "func.invoke.indirect",
             OpKind::A64Code => "aarch64.code",
             OpKind::A64Alu { op: AluOp::Add, sf: Sf::W, .. } => "aarch64.add.w",
             OpKind::A64Alu { op: AluOp::Add, sf: Sf::X, .. } => "aarch64.add.x",
@@ -629,6 +658,9 @@ impl OpKind {
             OpKind::A64Bl { .. } => "aarch64.bl",
             OpKind::A64Blr { .. } => "aarch64.blr",
             OpKind::A64BlAlloc { .. } => "aarch64.bl.alloc",
+            OpKind::A64ExnSet { .. } => "aarch64.exn.set",
+            OpKind::A64ExnTake { .. } => "aarch64.exn.take",
+            OpKind::A64BExn { .. } => "aarch64.b.exn",
             OpKind::A64BlFree { .. } => "aarch64.bl.free",
         }
     }
@@ -695,26 +727,33 @@ impl OpKind {
             OpKind::SliceGet { .. } => &DECLS[56],
             OpKind::SliceSet { .. } => &DECLS[57],
             OpKind::Check(_) => &DECLS[58],
-            OpKind::A64Code => &DECLS[59],
-            OpKind::A64Alu { .. } => &DECLS[60],
-            OpKind::A64AluImm { .. } => &DECLS[61],
-            OpKind::A64ShiftImm { .. } => &DECLS[62],
-            OpKind::A64Ext { .. } => &DECLS[63],
-            OpKind::A64Mov { .. } => &DECLS[64],
-            OpKind::A64MovWide { .. } => &DECLS[65],
-            OpKind::A64Csel { .. } => &DECLS[66],
-            OpKind::A64Ldr { .. } => &DECLS[67],
-            OpKind::A64Str { .. } => &DECLS[68],
-            OpKind::A64Adrl { .. } => &DECLS[69],
-            OpKind::A64AdrlFunc { .. } => &DECLS[70],
-            OpKind::A64B { .. } => &DECLS[71],
-            OpKind::A64BCond { .. } => &DECLS[72],
-            OpKind::A64Ret => &DECLS[73],
-            OpKind::A64Trap(_) => &DECLS[74],
-            OpKind::A64Bl { .. } => &DECLS[75],
-            OpKind::A64Blr { .. } => &DECLS[76],
-            OpKind::A64BlAlloc { .. } => &DECLS[77],
-            OpKind::A64BlFree { .. } => &DECLS[78],
+            OpKind::Try => &DECLS[59],
+            OpKind::Throw => &DECLS[60],
+            OpKind::Invoke { .. } => &DECLS[61],
+            OpKind::InvokeIndirect { .. } => &DECLS[62],
+            OpKind::A64Code => &DECLS[63],
+            OpKind::A64Alu { .. } => &DECLS[64],
+            OpKind::A64AluImm { .. } => &DECLS[65],
+            OpKind::A64ShiftImm { .. } => &DECLS[66],
+            OpKind::A64Ext { .. } => &DECLS[67],
+            OpKind::A64Mov { .. } => &DECLS[68],
+            OpKind::A64MovWide { .. } => &DECLS[69],
+            OpKind::A64Csel { .. } => &DECLS[70],
+            OpKind::A64Ldr { .. } => &DECLS[71],
+            OpKind::A64Str { .. } => &DECLS[72],
+            OpKind::A64Adrl { .. } => &DECLS[73],
+            OpKind::A64AdrlFunc { .. } => &DECLS[74],
+            OpKind::A64B { .. } => &DECLS[75],
+            OpKind::A64BCond { .. } => &DECLS[76],
+            OpKind::A64Ret => &DECLS[77],
+            OpKind::A64Trap(_) => &DECLS[78],
+            OpKind::A64Bl { .. } => &DECLS[79],
+            OpKind::A64Blr { .. } => &DECLS[80],
+            OpKind::A64BlAlloc { .. } => &DECLS[81],
+            OpKind::A64ExnSet { .. } => &DECLS[82],
+            OpKind::A64ExnTake { .. } => &DECLS[83],
+            OpKind::A64BExn { .. } => &DECLS[84],
+            OpKind::A64BlFree { .. } => &DECLS[85],
         }
     }
 
@@ -759,6 +798,10 @@ impl OpKind {
             (OpKind::SliceGet { align: x, .. }, 0) => Imm::Align(*x),
             (OpKind::SliceSet { ty: x, .. }, 0) => Imm::Ty(*x),
             (OpKind::SliceSet { align: x, .. }, 1) => Imm::Align(*x),
+            (OpKind::Invoke { callee: x, .. }, 0) => Imm::Str(*x),
+            (OpKind::Invoke { unwind: x, .. }, 1) => Imm::Succ(*x),
+            (OpKind::InvokeIndirect { sig: x, .. }, 0) => Imm::Ty(*x),
+            (OpKind::InvokeIndirect { unwind: x, .. }, 1) => Imm::Succ(*x),
             (OpKind::A64Alu { d: x, .. }, 0) => Imm::Reg(*x),
             (OpKind::A64Alu { n: x, .. }, 1) => Imm::Reg(*x),
             (OpKind::A64Alu { m: x, .. }, 2) => Imm::Reg(*x),
@@ -797,6 +840,10 @@ impl OpKind {
             (OpKind::A64Blr { n: x, .. }, 1) => Imm::Reg(*x),
             (OpKind::A64BlAlloc { family: x, .. }, 0) => Imm::Str(*x),
             (OpKind::A64BlAlloc { align: x, .. }, 1) => Imm::Align(*x),
+            (OpKind::A64ExnSet { n: x }, 0) => Imm::Reg(*x),
+            (OpKind::A64ExnTake { d: x }, 0) => Imm::Reg(*x),
+            (OpKind::A64BExn { t: x, .. }, 0) => Imm::Succ(*x),
+            (OpKind::A64BExn { f: x, .. }, 1) => Imm::Succ(*x),
             (OpKind::A64BlFree { family: x }, 0) => Imm::Str(*x),
             _ => return None,
         })
@@ -843,6 +890,10 @@ impl OpKind {
             (OpKind::SliceGet { align: x, .. }, 0, Imm::Align(v)) => *x = v,
             (OpKind::SliceSet { ty: x, .. }, 0, Imm::Ty(v)) => *x = v,
             (OpKind::SliceSet { align: x, .. }, 1, Imm::Align(v)) => *x = v,
+            (OpKind::Invoke { callee: x, .. }, 0, Imm::Str(v)) => *x = v,
+            (OpKind::Invoke { unwind: x, .. }, 1, Imm::Succ(v)) => *x = v,
+            (OpKind::InvokeIndirect { sig: x, .. }, 0, Imm::Ty(v)) => *x = v,
+            (OpKind::InvokeIndirect { unwind: x, .. }, 1, Imm::Succ(v)) => *x = v,
             (OpKind::A64Alu { d: x, .. }, 0, Imm::Reg(v)) => *x = v,
             (OpKind::A64Alu { n: x, .. }, 1, Imm::Reg(v)) => *x = v,
             (OpKind::A64Alu { m: x, .. }, 2, Imm::Reg(v)) => *x = v,
@@ -881,6 +932,10 @@ impl OpKind {
             (OpKind::A64Blr { n: x, .. }, 1, Imm::Reg(v)) => *x = v,
             (OpKind::A64BlAlloc { family: x, .. }, 0, Imm::Str(v)) => *x = v,
             (OpKind::A64BlAlloc { align: x, .. }, 1, Imm::Align(v)) => *x = v,
+            (OpKind::A64ExnSet { n: x }, 0, Imm::Reg(v)) => *x = v,
+            (OpKind::A64ExnTake { d: x }, 0, Imm::Reg(v)) => *x = v,
+            (OpKind::A64BExn { t: x, .. }, 0, Imm::Succ(v)) => *x = v,
+            (OpKind::A64BExn { f: x, .. }, 1, Imm::Succ(v)) => *x = v,
             (OpKind::A64BlFree { family: x }, 0, Imm::Str(v)) => *x = v,
             _ => {}
         }
@@ -1058,6 +1113,10 @@ pub fn op_kind(name: &str) -> Option<OpKind> {
         "cf.check.oom" => OpKind::Check(TrapReason::Oom),
         "cf.check.bounds" => OpKind::Check(TrapReason::Bounds),
         "cf.check.tag" => OpKind::Check(TrapReason::Tag),
+        "cf.try" => OpKind::Try,
+        "exn.throw" => OpKind::Throw,
+        "func.invoke" => OpKind::Invoke { callee: StrId::PLACEHOLDER, unwind: SuccId::PLACEHOLDER },
+        "func.invoke.indirect" => OpKind::InvokeIndirect { sig: Ty::Ptr, unwind: SuccId::PLACEHOLDER },
         "aarch64.code" => OpKind::A64Code,
         "aarch64.add.w" => OpKind::A64Alu { op: AluOp::Add, sf: Sf::W, d: Reg::XZR, n: Reg::XZR, m: Reg::XZR },
         "aarch64.add.x" => OpKind::A64Alu { op: AluOp::Add, sf: Sf::X, d: Reg::XZR, n: Reg::XZR, m: Reg::XZR },
@@ -1274,6 +1333,9 @@ pub fn op_kind(name: &str) -> Option<OpKind> {
         "aarch64.bl" => OpKind::A64Bl { callee: StrId::PLACEHOLDER },
         "aarch64.blr" => OpKind::A64Blr { sig: Ty::Ptr, n: Reg::XZR },
         "aarch64.bl.alloc" => OpKind::A64BlAlloc { family: StrId::PLACEHOLDER, align: 1 },
+        "aarch64.exn.set" => OpKind::A64ExnSet { n: Reg::XZR },
+        "aarch64.exn.take" => OpKind::A64ExnTake { d: Reg::XZR },
+        "aarch64.b.exn" => OpKind::A64BExn { t: SuccId::PLACEHOLDER, f: SuccId::PLACEHOLDER },
         "aarch64.bl.free" => OpKind::A64BlFree { family: StrId::PLACEHOLDER },
         _ => return None,
     })
@@ -1282,7 +1344,7 @@ pub fn op_kind(name: &str) -> Option<OpKind> {
 /// The LFIR target dialects (Lean's `Fir.targets`).
 pub static TARGETS: [&str; 1] = ["aarch64"];
 
-static DECLS: [OpDecl; 79] = [
+static DECLS: [OpDecl; 86] = [
     OpDecl {
         ctor: "const",
         imms: &[Field { name: "n", ty: FieldTy::Int }],
@@ -1670,7 +1732,7 @@ static DECLS: [OpDecl; 79] = [
         rule: Some(&[
             Check::Call(0),
         ]),
-        effects: &[Effect::Read, Effect::Write, Effect::Alloc, Effect::Free, Effect::Trap, Effect::Diverge],
+        effects: &[Effect::Read, Effect::Write, Effect::Alloc, Effect::Free, Effect::Trap, Effect::Diverge, Effect::Unwind],
         tier: Tier::Verified,
         layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
         dialect: "func",
@@ -1930,7 +1992,7 @@ static DECLS: [OpDecl; 79] = [
         rule: Some(&[
             Check::Sig(0),
         ]),
-        effects: &[Effect::Read, Effect::Write, Effect::Alloc, Effect::Free, Effect::Trap, Effect::Diverge],
+        effects: &[Effect::Read, Effect::Write, Effect::Alloc, Effect::Free, Effect::Trap, Effect::Diverge, Effect::Unwind],
         tier: Tier::Verified,
         layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
         dialect: "func",
@@ -2127,6 +2189,57 @@ static DECLS: [OpDecl; 79] = [
         tier: Tier::Verified,
         layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
         dialect: "cf",
+    },
+    OpDecl {
+        ctor: "try_",
+        imms: &[],
+        items: &[Item::Region(None), Item::Region(Some("catch"))],
+        terminator: false,
+        rule: None,
+        effects: &[Effect::Unwind],
+        tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: false, lfir: false },
+        dialect: "cf",
+    },
+    OpDecl {
+        ctor: "throw_",
+        imms: &[],
+        items: &[Item::Operand],
+        terminator: true,
+        rule: Some(&[
+            Check::Ins("operands", &[TyE::Ptr]),
+            Check::NoOuts,
+        ]),
+        effects: &[Effect::Unwind],
+        tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: true, mfir: true, lfir: false },
+        dialect: "exn",
+    },
+    OpDecl {
+        ctor: "invoke",
+        imms: &[Field { name: "callee", ty: FieldTy::Func }, Field { name: "unwind", ty: FieldTy::Succ }],
+        items: &[Item::Imm(0), Item::Args, Item::Keyword("unwind"), Item::Imm(1)],
+        terminator: false,
+        rule: Some(&[
+            Check::Call(0),
+        ]),
+        effects: &[Effect::Read, Effect::Write, Effect::Alloc, Effect::Free, Effect::Trap, Effect::Diverge, Effect::Unwind],
+        tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: false, mfir: true, lfir: false },
+        dialect: "func",
+    },
+    OpDecl {
+        ctor: "invokeIndirect",
+        imms: &[Field { name: "sig", ty: FieldTy::Ty }, Field { name: "unwind", ty: FieldTy::Succ }],
+        items: &[Item::Imm(0), Item::Operand, Item::Args, Item::Keyword("unwind"), Item::Imm(1)],
+        terminator: false,
+        rule: Some(&[
+            Check::Sig(0),
+        ]),
+        effects: &[Effect::Read, Effect::Write, Effect::Alloc, Effect::Free, Effect::Trap, Effect::Diverge, Effect::Unwind],
+        tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: false, mfir: true, lfir: false },
+        dialect: "func",
     },
     OpDecl {
         ctor: "a64Code",
@@ -2392,6 +2505,48 @@ static DECLS: [OpDecl; 79] = [
             Check::NoOuts,
         ]),
         effects: &[Effect::Alloc],
+        tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: false, mfir: false, lfir: true },
+        dialect: "aarch64",
+    },
+    OpDecl {
+        ctor: "a64ExnSet",
+        imms: &[Field { name: "n", ty: FieldTy::Reg }],
+        items: &[Item::Imm(0)],
+        terminator: false,
+        rule: Some(&[
+            Check::Ins("operands", &[]),
+            Check::NoOuts,
+        ]),
+        effects: &[Effect::Write, Effect::Unwind],
+        tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: false, mfir: false, lfir: true },
+        dialect: "aarch64",
+    },
+    OpDecl {
+        ctor: "a64ExnTake",
+        imms: &[Field { name: "d", ty: FieldTy::Reg }],
+        items: &[Item::Imm(0)],
+        terminator: false,
+        rule: Some(&[
+            Check::Ins("operands", &[]),
+            Check::NoOuts,
+        ]),
+        effects: &[Effect::Read, Effect::Write],
+        tier: Tier::Verified,
+        layers: crate::decl::Layers { hfir: false, mfir: false, lfir: true },
+        dialect: "aarch64",
+    },
+    OpDecl {
+        ctor: "a64BExn",
+        imms: &[Field { name: "t", ty: FieldTy::Succ }, Field { name: "f", ty: FieldTy::Succ }],
+        items: &[Item::Imm(0), Item::Comma, Item::Imm(1)],
+        terminator: true,
+        rule: Some(&[
+            Check::Ins("operands", &[]),
+            Check::NoOuts,
+        ]),
+        effects: &[Effect::Read],
         tier: Tier::Verified,
         layers: crate::decl::Layers { hfir: false, mfir: false, lfir: true },
         dialect: "aarch64",

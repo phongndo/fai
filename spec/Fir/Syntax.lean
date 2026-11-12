@@ -617,7 +617,7 @@ fir_ops
   op call (callee : Func)
     name "func.call"
     format "{callee}(%*)"
-    effects read write alloc free trap diverge
+    effects read write alloc free trap diverge unwind
     rule
       call callee
   /-- `cf.if %c { … } else { … }`: two regions. -/
@@ -765,7 +765,7 @@ fir_ops
   op callIndirect (sig : Ty)
     name "func.call.indirect"
     format "{sig} %(%*)"
-    effects read write alloc free trap diverge
+    effects read write alloc free trap diverge unwind
     rule
       sig sig
   -- HFIR building blocks, lowered by `Fir.Lower`.
@@ -896,6 +896,50 @@ fir_ops
     rule
       operands [i1]
       noResults
+  -- Exceptions (decision: Exceptions). An exception is a pointer: what it points to is the
+  -- language's business. HFIR catches with `cf.try`; MFIR names each call's handler.
+  /-- `cf.try { … } catch(%e: ptr) { … }`: run the first region; an exception thrown in it (by
+  `exn.throw` there, or in a function it calls) that nothing inside catches unwinds to here, and
+  the second region runs with the exception bound to its parameter. Either region's `cf.yield`
+  gives the op's results. Jumps can't leave either region. -/
+  op try_
+    name "cf.try"
+    format "region catch region"
+    layers hfir
+    effects unwind
+    rust Try
+  /-- `exn.throw %e`: throw the exception `%e`. Unwinding pops frames (ending their stack memory,
+  and a call's `noalias` scopes) up to the nearest `cf.try` region or `func.invoke` handler, in
+  this function or a calling one; an exception that leaves the function the run started in is
+  the run's outcome, `threw`. -/
+  op throw_
+    name "exn.throw"
+    format "%"
+    terminator
+    effects unwind
+    rust Throw
+    rule
+      operands [ptr]
+      noResults
+  /-- `func.invoke @f(%a) unwind ^h`: `func.call`, except that an exception the callee throws
+  jumps to block `^h` of the nearest `cf.blocks`, whose one parameter takes it, instead of going
+  on to the caller (a plain `func.call` passes it on). -/
+  op invoke (callee : Func) (unwind : Succ)
+    name "func.invoke"
+    format "{callee}(%*) unwind {unwind}"
+    layers mfir
+    effects read write alloc free trap diverge unwind
+    rule
+      call callee
+  /-- `func.invoke.indirect func<(i32) -> i32> %p(%a) unwind ^h`: `func.call.indirect` with a
+  handler, as `func.invoke`. -/
+  op invokeIndirect (sig : Ty) (unwind : Succ)
+    name "func.invoke.indirect"
+    format "{sig} %(%*) unwind {unwind}"
+    layers mfir
+    effects read write alloc free trap diverge unwind
+    rule
+      sig sig
   -- AArch64 (LFIR): the `aarch64` dialect, in machine form. Instructions name their registers
   -- as immediates, a function's code is `aarch64.code`, and blocks end in explicit branches
   -- (decision: LFIR for AArch64). Semantics: `Fir.AArch64` (the instructions) and
@@ -1075,6 +1119,36 @@ fir_ops
     layers lfir
     rule
       pow2 align
+      operands []
+      noResults
+  /-- `aarch64.exn.set x0`: make `x0` the pending exception (decision: Exceptions at run time):
+  store it in the thread's exception slot, `__fir_exn`. A function that throws sets it, then
+  returns. -/
+  op a64ExnSet (n : Reg)
+    name "aarch64.exn.set"
+    format "{n}"
+    effects write unwind
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.exn.take x0`: `x0` gets the pending exception, which is no longer pending. -/
+  op a64ExnTake (d : Reg)
+    name "aarch64.exn.take"
+    format "{d}"
+    effects read write
+    layers lfir
+    rule
+      operands []
+      noResults
+  /-- `aarch64.b.exn ^t, ^f`: jump to `^t` if an exception is pending, otherwise to `^f`. -/
+  op a64BExn (t f : Succ)
+    name "aarch64.b.exn"
+    format "{t}, {f}"
+    terminator
+    effects read
+    layers lfir
+    rule
       operands []
       noResults
   /-- `aarch64.bl.free c.malloc`: free `x0` (a call to `free`). -/

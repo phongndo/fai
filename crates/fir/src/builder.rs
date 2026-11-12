@@ -1147,6 +1147,35 @@ impl<'m> FuncBuilder<'m> {
         r.map_err(|e| BuildError::new(format!("{}: {}", kind.mnemonic(), e.msg)))
     }
 
+    /// An op with regions whose parameters are fixed by the op (a `catch` region's exception),
+    /// not given by its operands.
+    pub(crate) fn region_op_fixed(
+        &mut self,
+        kind: OpKind,
+        results: &[Ty],
+        params: &[&[Ty]],
+    ) -> Result<OpId, BuildError> {
+        self.check_layer(kind)?;
+        let operands = std::mem::take(&mut self.m.st.operands);
+        let r = self.region_op_with(kind, &operands, results, params.len(), false);
+        self.m.st.operands = operands;
+        let op = r.map_err(|e| BuildError::new(format!("{}: {}", kind.mnemonic(), e.msg)))?;
+        for (i, ps) in params.iter().enumerate() {
+            if !ps.is_empty() {
+                let r = self.m.st.body.regions(op)[i];
+                self.m.st.body.set_params(
+                    r,
+                    ps.iter().map(|&ty| ValueSpec {
+                        name: "",
+                        ty,
+                        facts: Vec::new(),
+                    }),
+                );
+            }
+        }
+        Ok(op)
+    }
+
     fn region_op_with(
         &mut self,
         kind: OpKind,

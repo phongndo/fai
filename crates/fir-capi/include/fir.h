@@ -956,6 +956,38 @@ FirOp fir_slice_set(struct FirBuilder *fb,
 // is `poison`. The lowered form of HFIR's checks.
 FirOp fir_cf_check(struct FirBuilder *fb, FirTrapReason reason, FirValue x);
 
+// `cf.try { … } catch(%e: ptr) { … }`: run the first region; an exception thrown in it (by
+// `exn.throw` there, or in a function it calls) that nothing inside catches unwinds to here, and
+// the second region runs with the exception bound to its parameter. Either region's `cf.yield`
+// gives the op's results. Jumps can't leave either region.
+//
+// Makes the op with empty regions: fill them with `fir_position_at_end`.
+FirOp fir_cf_try_begin(struct FirBuilder *fb, const FirType *results, size_t nresults);
+
+// `exn.throw %e`: throw the exception `%e`. Unwinding pops frames (ending their stack memory,
+// and a call's `noalias` scopes) up to the nearest `cf.try` region or `func.invoke` handler, in
+// this function or a calling one; an exception that leaves the function the run started in is
+// the run's outcome, `threw`.
+FirOp fir_exn_throw(struct FirBuilder *fb, FirValue p);
+
+// `func.invoke @f(%a) unwind ^h`: `func.call`, except that an exception the callee throws
+// jumps to block `^h` of the nearest `cf.blocks`, whose one parameter takes it, instead of going
+// on to the caller (a plain `func.call` passes it on).
+FirOp fir_func_invoke(struct FirBuilder *fb,
+                      FirFunc callee,
+                      const FirValue *args,
+                      size_t nargs,
+                      struct FirTarget unwind);
+
+// `func.invoke.indirect func<(i32) -> i32> %p(%a) unwind ^h`: `func.call.indirect` with a
+// handler, as `func.invoke`.
+FirOp fir_func_invoke_indirect(struct FirBuilder *fb,
+                               FirType sig,
+                               FirValue p,
+                               const FirValue *args,
+                               size_t nargs,
+                               struct FirTarget unwind);
+
 // `aarch64.code { ^entry: … ^b1: … }`: a function's machine code, as labeled blocks entered
 // at the first. Each block ends with a branch, `aarch64.ret`, or `aarch64.trap`. It is the whole
 // body of an LFIR function, which finds its arguments where the calling convention puts them.
@@ -1052,6 +1084,17 @@ FirOp fir_aarch64_blr(struct FirBuilder *fb, FirType sig, FirReg n);
 // `aarch64.bl.alloc c.malloc, align 16`: allocate `x0` bytes from the family's allocator;
 // `x0` is the memory, or null if allocation failed (a call to `malloc` or `aligned_alloc`).
 FirOp fir_aarch64_bl_alloc(struct FirBuilder *fb, const char *family, uint32_t align);
+
+// `aarch64.exn.set x0`: make `x0` the pending exception (decision: Exceptions at run time):
+// store it in the thread's exception slot, `__fir_exn`. A function that throws sets it, then
+// returns.
+FirOp fir_aarch64_exn_set(struct FirBuilder *fb, FirReg n);
+
+// `aarch64.exn.take x0`: `x0` gets the pending exception, which is no longer pending.
+FirOp fir_aarch64_exn_take(struct FirBuilder *fb, FirReg d);
+
+// `aarch64.b.exn ^t, ^f`: jump to `^t` if an exception is pending, otherwise to `^f`.
+FirOp fir_aarch64_b_exn(struct FirBuilder *fb, struct FirTarget t, struct FirTarget f);
 
 // `aarch64.bl.free c.malloc`: free `x0` (a call to `free`).
 FirOp fir_aarch64_bl_free(struct FirBuilder *fb, const char *family);
