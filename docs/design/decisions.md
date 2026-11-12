@@ -78,7 +78,7 @@ Ordered by dependency.
 2. Control flow details: coroutines, async, and generators (an HFIR building block lowered to a state machine; decided in the building-blocks round)
 3. Types details: function and closure types, arrays, tagged unions (building-blocks round)
 4. ABI: C calling conventions, owned by FIR
-5. Representations: generating the parsers from declared op formats and adding the generic op form (the Lean parser and the Rust one in `crates/fir` are hand-written; the Rust parser and printer are checked against `fir-ref fmt --unverified` on every test file: same output, or the same parse error), Rust limits that Lean doesn't have (sizes are 64-bit; alignments, widths, memory-space sizes, and locations 32-bit), binary format, versioning
+5. Representations: generating the parsers from declared op formats and adding the generic op form (the Lean parser and the Rust one in `crates/fir` are hand-written; the Rust parser and printer are checked against `fir-ref fmt --unverified` on every test file: same output, or the same parse error; the Rust verifier is checked against `fir-ref check` the same way), Rust limits that Lean doesn't have (sizes are 64-bit; alignments, widths, memory-space sizes, and locations 32-bit), binary format, versioning
 6. Transformations: pass manager, rule DSL, analyses, incremental compilation
 7. Lowering: target description format, first targets, ISA semantics sources, register allocation, linking, debug info
 8. AOT driver: command line, compilation pipeline, object file output
