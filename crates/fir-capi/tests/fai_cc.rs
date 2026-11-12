@@ -2,13 +2,15 @@
 //!
 //! Builds `fai-cc` with CMake against this crate's static library, then compiles every program
 //! of the corpus (`frontends/c/tests/*.c`) three ways: by the reference compiler (the AArch64 C
-//! compiler: `$FIR_CC`, `cc` on AArch64, else `aarch64-unknown-linux-gnu-cc`, at `-O1`), by
-//! `fai-cc`, and by `fai-cc -O`. Each binary is linked with the output helpers of
-//! `frontends/c/tests/runtime/fai_runtime.c` and run (under `qemu-aarch64` off AArch64), and the
-//! three must print the same and exit with the same code. Each program's HFIR (`fai-cc --emit
-//! hfir`) also runs in the interpreter, whose calls of the output helpers (events) must spell the
-//! same text and whose result the same exit code; a program that calls other external
-//! functions isn't comparable there and is counted.
+//! compiler: `$FIR_CC`, `cc` on AArch64, else `aarch64-unknown-linux-gnu-cc`, at `-O1`, with
+//! `-ffp-contract=off`: `fai-cc` never fuses `a * b + c` into an `fma`), by `fai-cc`, and by
+//! `fai-cc -O`. Each binary is linked with the output helpers of
+//! `frontends/c/tests/runtime/fai_runtime.c` and libm, and run (under `qemu-aarch64` off
+//! AArch64), and the three must print the same and exit with the same code. Each program's HFIR
+//! (`fai-cc --emit hfir`) also runs in the interpreter, under Arm's NaN choice (the NaNs the
+//! hardware gives, as the backend's harness does), whose calls of the output helpers (events)
+//! must spell the same text and whose result the same exit code; a program that calls other
+//! external functions (libm's included) isn't comparable there and is counted.
 //!
 //! The programs under `frontends/c/tests/errors/` use what `fai-cc` doesn't support yet: each
 //! says where and what in `// expect: LINE:COL: TEXT` lines, and `fai-cc` must report exactly
@@ -206,7 +208,14 @@ fn run_native(tc: &Toolchain, exe: &Path) -> Result<Behavior, String> {
 fn run_fir(hfir: &str) -> Result<Option<Behavior>, String> {
     let m = fir::parse_module(hfir).map_err(|e| format!("the HFIR doesn't parse: {e}"))?;
     fir::verify_module(&m).map_err(|e| format!("the HFIR doesn't verify: {e}"))?;
-    let r = fir::interp::run_detail(&m, "main", &[], 2_000_000_000, false)?;
+    let r = fir::interp::run_detail_with(
+        &m,
+        "main",
+        &[],
+        2_000_000_000,
+        false,
+        fir::interp::NanRule::Arm,
+    )?;
     if r.out_of_fuel {
         return Err("fir run ran out of fuel".to_owned());
     }
@@ -275,10 +284,11 @@ fn one(file: &Path, fai: &Path, tc: &Toolchain, rt: &Path, out: &Path, tally: &M
     };
     let reference = out.join(format!("{name}.ref"));
     let built = Command::new(&tc.cc)
-        .args(["-O1", "-w", "-std=gnu17", "-I"])
+        .args(["-O1", "-w", "-std=gnu17", "-ffp-contract=off", "-I"])
         .arg(&inc)
         .arg(file)
         .arg(rt)
+        .arg("-lm")
         .arg("-o")
         .arg(&reference)
         .output()
@@ -301,6 +311,7 @@ fn one(file: &Path, fai: &Path, tc: &Toolchain, rt: &Path, out: &Path, tally: &M
             .arg("-I")
             .arg(&inc)
             .arg(rt)
+            .arg("-lm")
             .arg("-o")
             .arg(&exe);
         if opt {
