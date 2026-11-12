@@ -507,7 +507,16 @@ impl<'a> Replay<'a> {
             | OpKind::A64BlFree { .. }
             | OpKind::A64ExnSet { .. }
             | OpKind::A64ExnTake { .. }
-            | OpKind::A64BExn { .. }) => {
+            | OpKind::A64BExn { .. }
+            | OpKind::A64Falu { .. }
+            | OpKind::A64Funary { .. }
+            | OpKind::A64Fmadd { .. }
+            | OpKind::A64FmovImm { .. }
+            | OpKind::A64Fcmp { .. }
+            | OpKind::A64Fcsel { .. }
+            | OpKind::A64Fcvt { .. }
+            | OpKind::A64Cvtf { .. }
+            | OpKind::A64Fcvtz { .. }) => {
                 made = None;
                 new_op = Some(self.a64_op(f, k)?);
             }
@@ -588,6 +597,27 @@ impl Replay<'_> {
             OpKind::A64ExnSet { n } => f.aarch64_exn_set(n),
             OpKind::A64ExnTake { d } => f.aarch64_exn_take(d),
             OpKind::A64BExn { t, f: e } => f.aarch64_b_exn(target(t), target(e)),
+            OpKind::A64Falu { op, fs, d, n, m } => f.aarch64_falu(op, fs, d, n, m),
+            OpKind::A64Funary { op, fs, d, n } => f.aarch64_funary(op, fs, d, n),
+            OpKind::A64Fmadd { fs, d, n, m } => f.aarch64_fmadd(fs, d, n, m),
+            OpKind::A64FmovImm { fs, d, imm } => f.aarch64_fmov_imm(fs, d, imm),
+            OpKind::A64Fcmp { fs, n, m } => f.aarch64_fcmp(fs, n, m),
+            OpKind::A64Fcsel { c, fs, d, n, m } => f.aarch64_fcsel(c, fs, d, n, m),
+            OpKind::A64Fcvt { dst, src, d, n } => f.aarch64_fcvt(dst, src, d, n),
+            OpKind::A64Cvtf {
+                signed,
+                fs,
+                sf,
+                d,
+                n,
+            } => f.aarch64_cvtf(signed, fs, sf, d, n),
+            OpKind::A64Fcvtz {
+                signed,
+                sf,
+                fs,
+                d,
+                n,
+            } => f.aarch64_fcvtz(signed, sf, fs, d, n),
             _ => unreachable!("not an aarch64 instruction: {}", k.mnemonic()),
         }
     }

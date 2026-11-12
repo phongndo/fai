@@ -895,7 +895,8 @@ pub unsafe extern "C" fn fir_aarch64_csel(fb: *mut FirBuilder, op: FirCselOp, c:
     }
 }
 
-/// `aarch64.ldr.w x0, x1, 8`: load 1, 2, 4, or 8 bytes from `x1 + 8`, zero-extended.
+/// `aarch64.ldr.w x0, x1, 8`: load 1, 2, 4, or 8 bytes from `x1 + 8`, zero-extended. Into an
+/// FP register (`aarch64.ldr.w d0, x1, 8`) it is Arm's `ldr s0, [x1, #8]`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_ldr(fb: *mut FirBuilder, size: FirMemSize, d: FirReg, base: FirReg, off: i64) -> FirOp {
     unsafe {
@@ -905,12 +906,112 @@ pub unsafe extern "C" fn fir_aarch64_ldr(fb: *mut FirBuilder, size: FirMemSize, 
     }
 }
 
-/// `aarch64.str.w x0, x1, 8`: store the low 1, 2, 4, or 8 bytes of `x0` at `x1 + 8`.
+/// `aarch64.str.w x0, x1, 8`: store the low 1, 2, 4, or 8 bytes of `x0` at `x1 + 8`, an FP
+/// register's too (`aarch64.str.x d0, x1, 8` is `str d0, [x1, #8]`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_str(fb: *mut FirBuilder, size: FirMemSize, s: FirReg, base: FirReg, off: i64) -> FirOp {
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_str(MemSize::from_c(size)?, Reg(s), Reg(base), off).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.fadd.d d0, d1, d2` and friends: scalar FP arithmetic in the format; see
+/// `FAluOp`. A NaN result is Arm's (`AArch64.fpProcessNaNs`, default-NaN mode off).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_falu(fb: *mut FirBuilder, op: FirFAluOp, fs: FirFSize, d: FirReg, n: FirReg, m: FirReg) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_falu(FAluOp::from_c(op)?, FSize::from_c(fs)?, Reg(d), Reg(n), Reg(m)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.fsqrt.d d0, d1` and friends: scalar FP operations on one register; see
+/// `FUnaryOp`. `fmov` also moves bits between a general-purpose register and an FP one
+/// (`aarch64.fmov.d d0, x1`, `aarch64.fmov.s x1, d0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_funary(fb: *mut FirBuilder, op: FirFUnaryOp, fs: FirFSize, d: FirReg, n: FirReg) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_funary(FUnaryOp::from_c(op)?, FSize::from_c(fs)?, Reg(d), Reg(n)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.fmadd.d d0, d1, d2`: `d0 := d1 * d2 + d0`, rounded once: Arm's `fmadd d0, d1, d2,
+/// d0`, with the destination as the addend (four registers don't fit an op's immediates).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_fmadd(fb: *mut FirBuilder, fs: FirFSize, d: FirReg, n: FirReg, m: FirReg) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_fmadd(FSize::from_c(fs)?, Reg(d), Reg(n), Reg(m)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.fmov.imm.d d0, 112`: the float Arm's 8-bit immediate encodes (`VFPExpandImm`:
+/// 112 is 1.0, `fmov d0, #1.0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_fmov_imm(fb: *mut FirBuilder, fs: FirFSize, d: FirReg, imm: u32) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_fmov_imm(FSize::from_c(fs)?, Reg(d), imm).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.fcmp.d d0, d1`: compare, setting the flags (`0011` when unordered, `0110` when
+/// equal, `1000` when less, `0010` when greater).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_fcmp(fb: *mut FirBuilder, fs: FirFSize, n: FirReg, m: FirReg) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_fcmp(FSize::from_c(fs)?, Reg(n), Reg(m)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.fcsel.eq.d d0, d1, d2`: `d1` if the condition holds, else `d2`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_fcsel(fb: *mut FirBuilder, c: FirCond, fs: FirFSize, d: FirReg, n: FirReg, m: FirReg) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_fcsel(Cond::from_c(c)?, FSize::from_c(fs)?, Reg(d), Reg(n), Reg(m)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.fcvt.d.s d0, d1`: convert between the formats (to `d` from `s` here; exact one
+/// way, rounded the other).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_fcvt(fb: *mut FirBuilder, dst: FirFSize, src: FirFSize, d: FirReg, n: FirReg) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_fcvt(FSize::from_c(dst)?, FSize::from_c(src)?, Reg(d), Reg(n)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.scvtf.d.x d0, x1`: an integer of the size, signed (`scvtf`) or unsigned
+/// (`ucvtf`), to the format, rounded.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_cvtf(fb: *mut FirBuilder, signed: bool, fs: FirFSize, sf: FirSf, d: FirReg, n: FirReg) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_cvtf(signed, FSize::from_c(fs)?, Sf::from_c(sf)?, Reg(d), Reg(n)).map(|op| op.raw())
+        })
+    }
+}
+
+/// `aarch64.fcvtzs.x.d x0, d1`: a float to an integer of the size, signed (`fcvtzs`) or
+/// unsigned (`fcvtzu`), toward zero, saturating at the bounds, NaN giving 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_aarch64_fcvtz(fb: *mut FirBuilder, signed: bool, sf: FirSf, fs: FirFSize, d: FirReg, n: FirReg) -> FirOp {
+    unsafe {
+        with_builder(fb, FIR_INVALID, |builder| {
+            builder.aarch64_fcvtz(signed, Sf::from_c(sf)?, FSize::from_c(fs)?, Reg(d), Reg(n)).map(|op| op.raw())
         })
     }
 }

@@ -3,14 +3,21 @@
 //!
 //! It is a register machine over the interpreter's memory, allocations, and events (this module
 //! is a child of `interp`, so it uses the [`Machine`]'s private parts): registers `x0`…`x30` and
-//! `sp` hold words (64 bits, or a pointer with its provenance), NZCV holds the flags, and each
-//! call has a frame with its own virtual registers. Memory is flat: an integer address reaches
-//! whichever live allocation holds those bytes. Calls follow AAPCS64; external calls are events,
-//! answered with zeros, and leave the caller-saved registers zero (the oracle's choice).
+//! `sp` hold words (64 bits, or a pointer with its provenance), `d0`…`d31` the low 64 bits of the
+//! FP/SIMD registers, NZCV the flags, and each call has a frame with its own virtual registers
+//! of both classes. FP results follow Arm's NaN rules (`crate::float::NanRule::Arm`). Memory is
+//! flat: an integer address reaches whichever live allocation holds those bytes. Calls follow
+//! AAPCS64 (`super::abi`); external calls are events, answered with zeros, and leave the
+//! caller-saved registers zero (the oracle's choice).
 
 use super::*;
+use crate::backend::aarch64::abi::{self, ArgLoc};
 use crate::body::StrId;
 use crate::decl::Imm;
+use crate::float::NanRule;
+
+/// The callee-saved registers, as Lean's `calleeSaved` lists them.
+const NSAVED: usize = 20;
 
 /// The machine stack's size (Lean's `stackSize`).
 const STACK: u64 = 1 << 20;
@@ -28,21 +35,25 @@ struct LFrame {
     /// The function's `aarch64.code` op, whose regions are its blocks.
     code: OpId,
     next: Option<OpId>,
-    /// Where its virtual registers start in `vregs`.
+    /// Where its virtual registers start in `vregs` and `fvregs`.
     vbase: u32,
-    /// `x19`…`x29` and `sp` on entry.
-    saved: [Word; 12],
+    fvbase: u32,
+    /// `x19`…`x29`, `sp`, and `d8`…`d15` on entry.
+    saved: [Word; NSAVED],
 }
 
 struct Lfir<'m> {
     m: Machine<'m>,
     x: [Word; 31],
     sp: Word,
+    /// `d0`…`d31`: the low 64 bits of the FP/SIMD registers.
+    d: [u64; 32],
     nzcv: u8,
     frames: Vec<LFrame>,
     vregs: Vec<Option<Word>>,
-    /// How many virtual registers each function names, once computed.
-    nvregs: FxHashMap<u32, u32>,
+    fvregs: Vec<Option<u64>>,
+    /// How many virtual registers of each class each function names, once computed.
+    nvregs: FxHashMap<u32, (u32, u32)>,
     res_area: Word,
     hung: bool,
     /// The pending exception, if any (Lean's `LMachine.exn`).
@@ -56,9 +67,11 @@ pub(super) fn run(m: Machine<'_>, f: u32, args: &[Value], fuel: u64) -> String {
         m,
         x: [Word::Bits(0); 31],
         sp: Word::Bits(0),
+        d: [0; 32],
         nzcv: 0,
         frames: Vec::new(),
         vregs: Vec::new(),
+        fvregs: Vec::new(),
         nvregs: FxHashMap::default(),
         res_area: Word::Bits(0),
         hung: false,
@@ -177,12 +190,84 @@ fn int_offset(n: Int<'_>) -> i128 {
     }
 }
 
-/// The callee-saved registers: `x19`…`x29`, then `sp` (Lean's `calleeSaved`).
+/// The callee-saved registers: `x19`…`x29`, `sp`, then `d8`…`d15` (Lean's `calleeSaved`).
 fn callee_saved(i: usize) -> Reg {
-    if i < 11 {
-        Reg::x(19 + i as u32)
+    match i {
+        0..11 => Reg::x(19 + i as u32),
+        11 => Reg::SP,
+        _ => Reg::d(i as u32 - 4),
+    }
+}
+
+/// The registers an instruction names that must be of one class: general-purpose (`false`) or
+/// FP (`true`) (Lean's `regClasses`).
+fn reg_classes(k: OpKind, out: &mut Vec<(Reg, bool)>) {
+    out.clear();
+    match k {
+        OpKind::A64Alu { d, n, m, .. } | OpKind::A64Csel { d, n, m, .. } => {
+            out.extend([(d, false), (n, false), (m, false)])
+        }
+        OpKind::A64AluImm { d, n, .. }
+        | OpKind::A64ShiftImm { d, n, .. }
+        | OpKind::A64Ext { d, n, .. }
+        | OpKind::A64Mov { d, n, .. } => out.extend([(d, false), (n, false)]),
+        OpKind::A64MovWide { d, .. }
+        | OpKind::A64Adrl { d, .. }
+        | OpKind::A64AdrlFunc { d, .. }
+        | OpKind::A64ExnTake { d } => out.push((d, false)),
+        OpKind::A64Ldr { base, .. }
+        | OpKind::A64Str { base, .. }
+        | OpKind::A64Blr { n: base, .. }
+        | OpKind::A64ExnSet { n: base } => out.push((base, false)),
+        OpKind::A64Falu { d, n, m, .. }
+        | OpKind::A64Fmadd { d, n, m, .. }
+        | OpKind::A64Fcsel { d, n, m, .. } => out.extend([(d, true), (n, true), (m, true)]),
+        OpKind::A64Funary { op, d, n, .. } => {
+            if op != FUnaryOp::Fmov {
+                out.extend([(d, true), (n, true)]);
+            }
+        }
+        OpKind::A64FmovImm { d, .. } => out.push((d, true)),
+        OpKind::A64Fcmp { n, m, .. } => out.extend([(n, true), (m, true)]),
+        OpKind::A64Fcvt { d, n, .. } => out.extend([(d, true), (n, true)]),
+        OpKind::A64Cvtf { d, n, .. } => out.extend([(d, true), (n, false)]),
+        OpKind::A64Fcvtz { d, n, .. } => out.extend([(d, false), (n, true)]),
+        _ => {}
+    }
+}
+
+/// The low `fs` bits of a register, zero-extended.
+fn low(fs: FSize, b: u64) -> u64 {
+    b & mask(fs.bits())
+}
+
+/// ASL's `VFPExpandImm` (Lean's `vfpExpandImm`): the float an 8-bit `fmov` immediate encodes.
+pub fn vfp_expand_imm(fs: FSize, imm8: u32) -> u64 {
+    let (e, m) = match fs {
+        FSize::S => (8, 23),
+        FSize::D => (11, 52),
+    };
+    let imm8 = u64::from(imm8);
+    let b6 = (imm8 >> 6) & 1;
+    let ones = if b6 == 1 {
+        ((1u64 << (e - 3)) - 1) << 2
     } else {
-        Reg::SP
+        0
+    };
+    let exp = ((1 - b6) << (e - 1)) | ones | ((imm8 >> 4) & 3);
+    ((imm8 >> 7) << (e + m)) | (exp << m) | ((imm8 & 15) << (m - 4))
+}
+
+/// ASL's `FPCompare` flags (Lean's `fpCompare`).
+fn fp_compare(f: FloatTy, a: u64, b: u64) -> u8 {
+    if crate::float::is_nan(f, a) || crate::float::is_nan(f, b) {
+        nzcv(false, false, true, true)
+    } else if crate::float::cmp(f, FPred::Oeq, a, b) {
+        nzcv(false, true, true, false)
+    } else if crate::float::cmp(f, FPred::Olt, a, b) {
+        nzcv(true, false, false, false)
+    } else {
+        nzcv(false, false, true, false)
     }
 }
 
@@ -193,11 +278,13 @@ impl<'m> Lfir<'m> {
 
     // Registers
 
+    /// A general-purpose register.
     fn read(&self, loc: Option<Loc>, r: Reg) -> R<Word> {
         match r {
             Reg::XZR => Ok(Word::Bits(0)),
             Reg::SP => Ok(self.sp),
             r if r.is_gpr() => Ok(self.x[r.0 as usize]),
+            r if r.is_fp() => stuck(loc, format!("{r} is not a general-purpose register")),
             r => {
                 let Some(f) = self.frames.last() else {
                     return stuck(loc, "no running function");
@@ -211,11 +298,13 @@ impl<'m> Lfir<'m> {
         }
     }
 
+    /// Write a general-purpose register (`exec` checks the class first).
     fn write(&mut self, r: Reg, w: Word) {
         match r {
             Reg::XZR => {}
             Reg::SP => self.sp = w,
             r if r.is_gpr() => self.x[r.0 as usize] = w,
+            r if r.is_fp() => {}
             r => {
                 if let Some(f) = self.frames.last() {
                     let i = (f.vbase + r.virt_index()) as usize;
@@ -226,6 +315,64 @@ impl<'m> Lfir<'m> {
                 }
             }
         }
+    }
+
+    /// An FP register's 64 bits (Lean's `readF`).
+    fn read_f(&self, loc: Option<Loc>, r: Reg) -> R<u64> {
+        if r.is_fpr() {
+            return Ok(self.d[r.fpr_index() as usize]);
+        }
+        if !(r.is_fp() && r.is_virtual()) {
+            return stuck(loc, format!("{r} is not an FP register"));
+        }
+        let Some(f) = self.frames.last() else {
+            return stuck(loc, "no running function");
+        };
+        let i = (f.fvbase + r.virt_index()) as usize;
+        match self.fvregs.get(i).copied().flatten() {
+            Some(b) => Ok(b),
+            None => stuck(loc, format!("{r} is read before it is written")),
+        }
+    }
+
+    fn write_f(&mut self, r: Reg, b: u64) {
+        if r.is_fpr() {
+            self.d[r.fpr_index() as usize] = b;
+        } else if r.is_fp()
+            && r.is_virtual()
+            && let Some(f) = self.frames.last()
+        {
+            let i = (f.fvbase + r.virt_index()) as usize;
+            if i >= self.fvregs.len() {
+                self.fvregs.resize(i + 1, None);
+            }
+            self.fvregs[i] = Some(b);
+        }
+    }
+
+    /// The low bits of an FP register, as a float of the format (Lean's `readFs`).
+    fn read_fs(&self, loc: Option<Loc>, fs: FSize, r: Reg) -> R<u64> {
+        Ok(low(fs, self.read_f(loc, r)?))
+    }
+
+    /// A register of either class, as a word (Lean's `readAny`).
+    fn read_any(&self, loc: Option<Loc>, r: Reg) -> R<Word> {
+        if r.is_fp() {
+            Ok(Word::Bits(self.read_f(loc, r)?))
+        } else {
+            self.read(loc, r)
+        }
+    }
+
+    /// Lean's `writeAny`.
+    fn write_any(&mut self, loc: Option<Loc>, r: Reg, w: Word) -> R<()> {
+        if r.is_fp() {
+            let b = self.word_bits(loc, w)?;
+            self.write_f(r, b);
+        } else {
+            self.write(r, w);
+        }
+        Ok(())
     }
 
     fn word_bits(&mut self, loc: Option<Loc>, w: Word) -> R<u64> {
@@ -388,8 +535,15 @@ impl<'m> Lfir<'m> {
                 self.m.byte_vals.extend_from_slice(&bs[..(n / 8) as usize]);
                 Ok(Value::Bytes { start, len: n / 8 })
             }
+            Ty::Float(f) => {
+                let b = self.word_bits(loc, w)?;
+                Ok(Value::Float {
+                    f,
+                    bits: b & mask(f.width()),
+                })
+            }
             Ty::Int(_) | Ty::Byte(_) => stuck(loc, format!("{t} is wider than a register")),
-            Ty::Agg(_) | Ty::Slice | Ty::Float(_) => stuck(loc, "not a value type"),
+            Ty::Agg(_) | Ty::Slice => stuck(loc, "not a value type"),
         }
     }
 
@@ -410,9 +564,8 @@ impl<'m> Lfir<'m> {
                 self.word_of_bytes(loc, &bs)?
             }
             Value::Agg { .. } => return stuck(loc, "an aggregate is not a register value"),
-            Value::Float { .. } | Value::FloatPoison(_) => {
-                return stuck(loc, "a float is not in a general-purpose register");
-            }
+            Value::Float { bits, .. } => Word::Bits(bits),
+            Value::FloatPoison(_) => Word::Bits(0),
             Value::Unset => return stuck(loc, "no value"),
         })
     }
@@ -420,12 +573,13 @@ impl<'m> Lfir<'m> {
     /// Lean's `argVals`.
     fn arg_vals(&mut self, loc: Option<Loc>, ps: &[Ty]) -> R<Vec<Value>> {
         let mut out = Vec::with_capacity(ps.len());
-        for (i, &t) in ps.iter().enumerate() {
-            let w = if i < 8 {
-                self.x[i]
-            } else {
-                let a = self.offset_word(loc, self.sp, 8 * (i as i128 - 8))?;
-                self.load(loc, 8, a)?
+        for (&t, l) in ps.iter().zip(abi::arg_locs(ps)) {
+            let w = match l {
+                ArgLoc::Reg(r) => self.read_any(loc, r)?,
+                ArgLoc::Stack(off) => {
+                    let a = self.offset_word(loc, self.sp, i128::from(off))?;
+                    self.load(loc, 8, a)?
+                }
             };
             out.push(self.val_of_word(loc, t, w)?);
         }
@@ -433,38 +587,50 @@ impl<'m> Lfir<'m> {
     }
 
     /// Lean's `setResults`.
-    fn set_results(&mut self, loc: Option<Loc>, nrets: usize, vs: &[Value]) -> R<()> {
-        if nrets <= 2 {
-            for (i, &v) in vs.iter().enumerate() {
-                self.x[i] = self.word_of_val(loc, v)?;
+    fn set_results(&mut self, loc: Option<Loc>, rets: &[Ty], vs: &[Value]) -> R<()> {
+        match abi::res_regs(rets) {
+            Some(rs) => {
+                for (&v, r) in vs.iter().zip(rs) {
+                    let w = self.word_of_val(loc, v)?;
+                    self.write_any(loc, r, w)?;
+                }
             }
-        } else {
-            let area = self.x[8];
-            for (i, &v) in vs.iter().enumerate() {
-                let a = self.offset_word(loc, area, 8 * i as i128)?;
-                let w = self.word_of_val(loc, v)?;
-                self.store(loc, 8, a, w)?;
+            None => {
+                let area = self.x[8];
+                for (i, &v) in vs.iter().enumerate() {
+                    let a = self.offset_word(loc, area, 8 * i as i128)?;
+                    let w = self.word_of_val(loc, v)?;
+                    self.store(loc, 8, a, w)?;
+                }
             }
         }
         Ok(())
     }
 
     /// Lean's `clobber`: the oracle's choice, 0.
-    fn clobber(&mut self, keep: usize) {
-        for i in keep..19 {
-            self.x[i] = Word::Bits(0);
+    fn clobber(&mut self, keep: &[Reg]) {
+        for i in 0..19 {
+            if !keep.contains(&Reg::x(i)) {
+                self.x[i as usize] = Word::Bits(0);
+            }
         }
         self.x[30] = Word::Bits(0);
+        for i in abi::FP_CALLER_SAVED {
+            if !keep.contains(&Reg::d(i)) {
+                self.d[i as usize] = 0;
+            }
+        }
         self.nzcv = 0;
     }
 
     // Calls and returns
 
-    fn saved_words(&self) -> [Word; 12] {
-        let mut out = [Word::Bits(0); 12];
+    fn saved_words(&self) -> [Word; NSAVED] {
+        let mut out = [Word::Bits(0); NSAVED];
         for (i, w) in out.iter_mut().enumerate() {
             *w = match callee_saved(i) {
                 Reg::SP => self.sp,
+                r if r.is_fpr() => Word::Bits(self.d[r.fpr_index() as usize]),
                 r => self.x[r.0 as usize],
             };
         }
@@ -491,13 +657,18 @@ impl<'m> Lfir<'m> {
         }
         let rets = self.rets(f);
         let mut ws = Vec::with_capacity(rets.len());
-        for i in 0..rets.len() {
-            ws.push(if rets.len() <= 2 {
-                self.x[i]
-            } else {
-                let a = self.offset_word(loc, self.res_area, 8 * i as i128)?;
-                self.load(loc, 8, a)?
-            });
+        match abi::res_regs(rets) {
+            Some(rs) => {
+                for r in rs {
+                    ws.push(self.read_any(loc, r)?);
+                }
+            }
+            None => {
+                for i in 0..rets.len() {
+                    let a = self.offset_word(loc, self.res_area, 8 * i as i128)?;
+                    ws.push(self.load(loc, 8, a)?);
+                }
+            }
         }
         let mut out = String::new();
         for (i, (&t, &w)) in rets.iter().zip(&ws).enumerate() {
@@ -515,13 +686,13 @@ impl<'m> Lfir<'m> {
         }))
     }
 
-    /// How many virtual registers function `f` names.
-    fn vreg_count(&mut self, f: u32) -> u32 {
+    /// How many virtual registers of each class (`vN`, `fvN`) function `f` names.
+    fn vreg_count(&mut self, f: u32) -> (u32, u32) {
         if let Some(&n) = self.nvregs.get(&f) {
             return n;
         }
         let body = &self.m.module.funcs[f as usize].body;
-        let mut n = 0;
+        let (mut n, mut nf) = (0, 0);
         let mut stack = vec![body.entry()];
         while let Some(r) = stack.pop() {
             for op in body.ops(r) {
@@ -530,14 +701,15 @@ impl<'m> Lfir<'m> {
                     if let Some(Imm::Reg(r)) = k.imm(i)
                         && r.is_virtual()
                     {
-                        n = n.max(r.virt_index() + 1);
+                        let c = if r.is_fp() { &mut nf } else { &mut n };
+                        *c = (*c).max(r.virt_index() + 1);
                     }
                 }
                 stack.extend_from_slice(body.regions(op));
             }
         }
-        self.nvregs.insert(f, n);
-        n
+        self.nvregs.insert(f, (n, nf));
+        (n, nf)
     }
 
     /// Lean's `enter`.
@@ -555,14 +727,17 @@ impl<'m> Lfir<'m> {
         match (body.kind(op), body.regions(op)) {
             (OpKind::A64Code, &[entry, ..]) => {
                 let saved = self.saved_words();
-                let n = self.vreg_count(f);
+                let (n, nf) = self.vreg_count(f);
                 let vbase = self.vregs.len() as u32;
                 self.vregs.resize(self.vregs.len() + n as usize, None);
+                let fvbase = self.fvregs.len() as u32;
+                self.fvregs.resize(self.fvregs.len() + nf as usize, None);
                 self.frames.push(LFrame {
                     func: f,
                     code: op,
                     next: body.ops(entry).next(),
                     vbase,
+                    fvbase,
                     saved,
                 });
                 self.m.func = f;
@@ -587,7 +762,7 @@ impl<'m> Lfir<'m> {
                         }
                     }
                 }
-                self.set_results(rloc, func.rets.len(), &outs)
+                self.set_results(rloc, &func.rets, &outs)
             }
             _ => stuck(
                 loc,
@@ -640,12 +815,8 @@ impl<'m> Lfir<'m> {
         }
         trace.push_str("; ");
         self.m.trace = trace;
-        self.set_results(loc, ext.rets.len(), &rs)?;
-        self.clobber(if ext.rets.len() <= 2 {
-            ext.rets.len()
-        } else {
-            0
-        });
+        self.set_results(loc, &ext.rets, &rs)?;
+        self.clobber(&abi::res_regs(&ext.rets).unwrap_or_default());
         Ok(())
     }
 
@@ -705,6 +876,7 @@ impl<'m> Lfir<'m> {
         }
         let f = self.frames.pop().unwrap();
         self.vregs.truncate(f.vbase as usize);
+        self.fvregs.truncate(f.fvbase as usize);
         match self.frames.last() {
             Some(below) => {
                 self.m.func = below.func;
@@ -790,10 +962,38 @@ impl<'m> Lfir<'m> {
 
     // Instructions
 
+    /// Lean's `fmov`: between registers of any classes but two general-purpose ones.
+    fn fmov(&mut self, loc: Option<Loc>, fs: FSize, d: Reg, n: Reg) -> R<()> {
+        match (d.is_fp(), n.is_fp()) {
+            (true, true) => {
+                let b = self.read_fs(loc, fs, n)?;
+                self.write_f(d, b);
+            }
+            (true, false) => {
+                let b = self.read_bits(loc, n)?;
+                self.write_f(d, low(fs, b));
+            }
+            (false, true) => {
+                let b = self.read_fs(loc, fs, n)?;
+                self.write(d, Word::Bits(b));
+            }
+            (false, false) => return stuck(loc, "fmov needs an FP register"),
+        }
+        Ok(())
+    }
+
     /// Lean's `exec`.
     fn exec(&mut self, op: OpId) -> R<()> {
         let body = self.body();
         let loc = body.loc(op);
+        let mut classes = Vec::new();
+        reg_classes(body.kind(op), &mut classes);
+        for (r, fp) in classes {
+            if r.is_fp() != fp {
+                let class = if fp { "an FP" } else { "a general-purpose" };
+                return stuck(loc, format!("{r} is not {class} register"));
+            }
+        }
         match body.kind(op) {
             OpKind::A64Alu { op, sf, d, n, m } => {
                 let (a, b) = (self.read(loc, n)?, self.read(loc, m)?);
@@ -911,13 +1111,88 @@ impl<'m> Lfir<'m> {
                 let b = self.read(loc, base)?;
                 let a = self.offset_word(loc, b, int_offset(body.int(off)))?;
                 let w = self.load(loc, size.bytes().into(), a)?;
-                self.write(d, w);
+                self.write_any(loc, d, w)?;
             }
             OpKind::A64Str { size, s, base, off } => {
                 let b = self.read(loc, base)?;
                 let a = self.offset_word(loc, b, int_offset(body.int(off)))?;
-                let v = self.read(loc, s)?;
+                let v = self.read_any(loc, s)?;
                 self.store(loc, size.bytes().into(), a, v)?;
+            }
+            OpKind::A64Falu { op, fs, d, n, m } => {
+                let (a, b) = (self.read_fs(loc, fs, n)?, self.read_fs(loc, fs, m)?);
+                let op = match op {
+                    FAluOp::Fadd => FBinOp::Add,
+                    FAluOp::Fsub => FBinOp::Sub,
+                    FAluOp::Fmul => FBinOp::Mul,
+                    FAluOp::Fdiv => FBinOp::Div,
+                };
+                self.write_f(d, crate::float::bin_with(NanRule::Arm, fs.fty(), op, a, b));
+            }
+            OpKind::A64Funary { op, fs, d, n } => {
+                let op = match op {
+                    FUnaryOp::Fmov => return self.fmov(loc, fs, d, n),
+                    FUnaryOp::Fabs => FUnOp::Abs,
+                    FUnaryOp::Fneg => FUnOp::Neg,
+                    FUnaryOp::Fsqrt => FUnOp::Sqrt,
+                };
+                let a = self.read_fs(loc, fs, n)?;
+                self.write_f(d, crate::float::un_with(NanRule::Arm, fs.fty(), op, a));
+            }
+            OpKind::A64Fmadd { fs, d, n, m } => {
+                let a = self.read_fs(loc, fs, d)?;
+                let (x, y) = (self.read_fs(loc, fs, n)?, self.read_fs(loc, fs, m)?);
+                self.write_f(d, crate::float::fma_with(NanRule::Arm, fs.fty(), x, y, a));
+            }
+            OpKind::A64FmovImm { fs, d, imm } => {
+                if imm >= 256 {
+                    return stuck(loc, format!("{imm} is not an 8-bit immediate"));
+                }
+                self.write_f(d, vfp_expand_imm(fs, imm));
+            }
+            OpKind::A64Fcmp { fs, n, m } => {
+                let (a, b) = (self.read_fs(loc, fs, n)?, self.read_fs(loc, fs, m)?);
+                self.nzcv = fp_compare(fs.fty(), a, b);
+            }
+            OpKind::A64Fcsel { c, fs, d, n, m } => {
+                let r = if c.holds(self.nzcv) { n } else { m };
+                let b = self.read_fs(loc, fs, r)?;
+                self.write_f(d, b);
+            }
+            OpKind::A64Fcvt { dst, src, d, n } => {
+                if dst == src {
+                    return stuck(loc, "fcvt converts between s and d");
+                }
+                let a = self.read_fs(loc, src, n)?;
+                self.write_f(
+                    d,
+                    crate::float::cvt_with(NanRule::Arm, src.fty(), dst.fty(), a),
+                );
+            }
+            OpKind::A64Cvtf {
+                signed,
+                fs,
+                sf,
+                d,
+                n,
+            } => {
+                let x = self.read_bits(loc, n)? & mask(sf.bits());
+                let b = crate::float::from_int(fs.fty(), signed, sf.bits(), &Bits::Small(x));
+                self.write_f(d, b);
+            }
+            OpKind::A64Fcvtz {
+                signed,
+                sf,
+                fs,
+                d,
+                n,
+            } => {
+                let a = self.read_fs(loc, fs, n)?;
+                let r = match crate::float::to_int(fs.fty(), signed, CvtEdge::Sat, sf.bits(), a) {
+                    Out::Val(Some(Bits::Small(b))) => b,
+                    _ => 0,
+                };
+                self.write(d, Word::Bits(r & mask(sf.bits())));
             }
             OpKind::A64Adrl { d, global } => {
                 let name = body.str(global);
@@ -971,12 +1246,12 @@ impl<'m> Lfir<'m> {
                 let fam = self.m.family(body.str(family));
                 let p = self.m.new_alloc(loc, size, align, Kind::Heap(fam));
                 self.x[0] = Word::Ptr(p);
-                self.clobber(1);
+                self.clobber(&[Reg::x(0)]);
             }
             OpKind::A64BlFree { family } => {
                 let p = self.ptr_of_word(self.x[0]);
                 self.m.free(loc, body.str(family), Some(p))?;
-                self.clobber(0);
+                self.clobber(&[]);
             }
             k => return stuck(loc, format!("{} can't run in LFIR", k.mnemonic())),
         }
@@ -1013,16 +1288,26 @@ impl<'m> Lfir<'m> {
             self.res_area = self.sp;
             self.x[8] = self.sp;
         }
-        if args.len() > 8 {
-            down(self, 8 * (args.len() - 8))?;
-            for (i, &v) in args[8..].iter().enumerate() {
-                let a = self.offset_word(None, self.sp, 8 * i as i128)?;
-                let w = self.word_of_val(None, v)?;
-                self.store(None, 8, a, w)?;
+        let module: &'m Module = self.m.module;
+        let body = &module.funcs[f as usize].body;
+        let ps: Vec<Ty> = body.params(body.entry()).map(|v| body.ty(v)).collect();
+        let locs = abi::arg_locs(&ps);
+        let slots = abi::stack_slots(&ps);
+        if slots > 0 {
+            down(self, 8 * slots as usize)?;
+            for (&v, &l) in args.iter().zip(&locs) {
+                if let ArgLoc::Stack(off) = l {
+                    let a = self.offset_word(None, self.sp, i128::from(off))?;
+                    let w = self.word_of_val(None, v)?;
+                    self.store(None, 8, a, w)?;
+                }
             }
         }
-        for (i, &v) in args.iter().take(8).enumerate() {
-            self.x[i] = self.word_of_val(None, v)?;
+        for (&v, &l) in args.iter().zip(&locs) {
+            if let ArgLoc::Reg(r) = l {
+                let w = self.word_of_val(None, v)?;
+                self.write_any(None, r, w)?;
+            }
         }
         self.enter(None, f)?;
         if self.frames.is_empty() {

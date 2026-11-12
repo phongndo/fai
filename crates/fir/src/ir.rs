@@ -8,7 +8,7 @@
 use std::fmt;
 
 pub use crate::backend::aarch64::syntax::{
-    AluImmOp, AluOp, Cond, CselOp, MemSize, MovOp, Reg, Sf, ShiftImmOp,
+    AluImmOp, AluOp, Cond, CselOp, FAluOp, FSize, FUnaryOp, MemSize, MovOp, Reg, Sf, ShiftImmOp,
 };
 use crate::body::IntId;
 pub use crate::globals::{Globals, Init};

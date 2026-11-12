@@ -1071,7 +1071,7 @@ impl<'m> FuncBuilder<'m> {
     /// A register immediate: `x0`…`x30`, `sp`, `xzr`, or a virtual register (what the text can
     /// name).
     pub(crate) fn reg(&self, r: Reg) -> Result<Reg, BuildError> {
-        if r.is_gpr() || r == Reg::SP || r == Reg::XZR || (r.is_virtual() && r.0 != u32::MAX) {
+        if r.is_valid() {
             Ok(r)
         } else {
             err(format!("{} is not a register", r.0))

@@ -73,10 +73,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use fir::{
     AllocFail, AluImmOp, AluOp, ArithOp, BitOp, BuildError, Cond, CselOp, CvtEdge, DivOp, Edge,
-    ExtEffect, FBinOp, FPred, FUnOp, FactArg, FloatTy, FuncBuilder, FuncRef, GlobalRef, Init,
-    IntImm, MemClass, MemSize, ModuleBuilder, MovOp, OpId, Operand, Ovf, Policy, Pred, RegionId,
-    Sf, ShiftEdge, ShiftImmOp, ShiftOp, SpaceCfg, SwitchCase, Target, TrapReason, TruncMode, Trust,
-    Ty, TyId, ValueDef,
+    ExtEffect, FAluOp, FBinOp, FPred, FSize, FUnOp, FUnaryOp, FactArg, FloatTy, FuncBuilder,
+    FuncRef, GlobalRef, Init, IntImm, MemClass, MemSize, ModuleBuilder, MovOp, OpId, Operand, Ovf,
+    Policy, Pred, RegionId, Sf, ShiftEdge, ShiftImmOp, ShiftOp, SpaceCfg, SwitchCase, Target,
+    TrapReason, TruncMode, Trust, Ty, TyId, ValueDef,
 };
 
 #[path = "generated/ops.rs"]
@@ -340,12 +340,17 @@ pub const FIR_FACT_ALIGN: FirFactKind = 3;
 pub const FIR_FACT_NOALIAS: FirFactKind = 4;
 pub const FIR_FACT_READONLY: FirFactKind = 5;
 
-/// A register of an `aarch64.*` op: `x0`…`x30` are 0…30, then `FIR_REG_SP` and `FIR_REG_XZR`;
-/// the virtual register `vN` is `FIR_REG_V0 + N`.
+/// A register of an `aarch64.*` op. General-purpose: `x0`…`x30` are 0…30, then `FIR_REG_SP` and
+/// `FIR_REG_XZR`, and the virtual register `vN` is `FIR_REG_V0 + N`. FP/SIMD, with the top bit
+/// set: `dN` (`sN` at 32 bits) is `FIR_REG_D0 + N` for N up to 31, and the virtual register `fvN`
+/// is `FIR_REG_FV0 + N`. A module's virtual registers of the two classes are numbered apart (no
+/// `vN` with an `fvN`) for `fir_module_compile`'s allocator; the interpreters don't mind.
 pub type FirReg = u32;
 pub const FIR_REG_SP: FirReg = 31;
 pub const FIR_REG_XZR: FirReg = 32;
 pub const FIR_REG_V0: FirReg = 64;
+pub const FIR_REG_D0: FirReg = 0x8000_0000;
+pub const FIR_REG_FV0: FirReg = 0x8000_0040;
 
 /// The operation size of an `aarch64.*` op (`Sf`): 32 or 64 bits.
 pub type FirSf = u32;
@@ -425,6 +430,26 @@ pub const FIR_MEM_SIZE_B: FirMemSize = 0;
 pub const FIR_MEM_SIZE_H: FirMemSize = 1;
 pub const FIR_MEM_SIZE_W: FirMemSize = 2;
 pub const FIR_MEM_SIZE_X: FirMemSize = 3;
+
+/// The format of a scalar FP `aarch64.*` op (`FSize`): `s` (`f32`) or `d` (`f64`).
+pub type FirFSize = u32;
+pub const FIR_FSIZE_S: FirFSize = 0;
+pub const FIR_FSIZE_D: FirFSize = 1;
+
+/// `aarch64.fadd`, `aarch64.fsub`, … on two FP registers (`FAluOp`).
+pub type FirFAluOp = u32;
+pub const FIR_FALU_OP_FADD: FirFAluOp = 0;
+pub const FIR_FALU_OP_FSUB: FirFAluOp = 1;
+pub const FIR_FALU_OP_FMUL: FirFAluOp = 2;
+pub const FIR_FALU_OP_FDIV: FirFAluOp = 3;
+
+/// `aarch64.fmov`, `aarch64.fabs`, `aarch64.fneg`, `aarch64.fsqrt` on one FP register
+/// (`FUnaryOp`); `fmov` also moves bits to or from a general-purpose register.
+pub type FirFUnaryOp = u32;
+pub const FIR_FUNARY_OP_FMOV: FirFUnaryOp = 0;
+pub const FIR_FUNARY_OP_FABS: FirFUnaryOp = 1;
+pub const FIR_FUNARY_OP_FNEG: FirFUnaryOp = 2;
+pub const FIR_FUNARY_OP_FSQRT: FirFUnaryOp = 3;
 
 /// Why `cf.check` and `aarch64.trap` trap (`TrapReason`).
 pub type FirTrapReason = u32;
@@ -517,6 +542,13 @@ c_enum!(CselOp, "FirCselOp":
 c_enum!(MemSize, "FirMemSize":
     FIR_MEM_SIZE_B => MemSize::B, FIR_MEM_SIZE_H => MemSize::H, FIR_MEM_SIZE_W => MemSize::W,
     FIR_MEM_SIZE_X => MemSize::X);
+c_enum!(FSize, "FirFSize": FIR_FSIZE_S => FSize::S, FIR_FSIZE_D => FSize::D);
+c_enum!(FAluOp, "FirFAluOp":
+    FIR_FALU_OP_FADD => FAluOp::Fadd, FIR_FALU_OP_FSUB => FAluOp::Fsub,
+    FIR_FALU_OP_FMUL => FAluOp::Fmul, FIR_FALU_OP_FDIV => FAluOp::Fdiv);
+c_enum!(FUnaryOp, "FirFUnaryOp":
+    FIR_FUNARY_OP_FMOV => FUnaryOp::Fmov, FIR_FUNARY_OP_FABS => FUnaryOp::Fabs,
+    FIR_FUNARY_OP_FNEG => FUnaryOp::Fneg, FIR_FUNARY_OP_FSQRT => FUnaryOp::Fsqrt);
 c_enum!(TrapReason, "FirTrapReason":
     FIR_TRAP_REASON_DIV0 => TrapReason::Div0, FIR_TRAP_REASON_OVERFLOW => TrapReason::Overflow,
     FIR_TRAP_REASON_SHIFT => TrapReason::Shift, FIR_TRAP_REASON_OOM => TrapReason::Oom,

@@ -10,6 +10,7 @@
 //! `fir-ref run` execute. The calling convention is AAPCS64 for integers and pointers: see the
 //! decision log (LFIR for AArch64) and [`machine`]'s twin in Lean, `Fir.AArch64Machine`.
 
+pub mod abi;
 pub mod emit;
 pub mod isel;
 pub mod lfir;

@@ -8,9 +8,10 @@
 //! nearest, ties to even, exactly as Lean's one rounding function does; `sqrt` follows Lean's
 //! integer square root and `round` on big integers, comparisons compare bits as integers. Every
 //! NaN an arithmetic op produces is replaced by the canonical NaN, the choice of the oracle that
-//! always answers 0 (`Float.nanResult`, `Oracle.zero`). The ops that only copy bits (`neg`, `abs`, `copysign`)
-//! keep payloads. Conversions from integers wider than 128 bits, and the reading and writing of
-//! decimals, follow Lean's `round` and `shortest` on big integers.
+//! always answers 0 (`Float.nanResult`, `Oracle.zero`), or by Arm's choice under
+//! [`NanRule::Arm`]. The ops that only copy bits (`neg`, `abs`, `copysign`) keep payloads.
+//! Conversions from integers wider than 128 bits, and the reading and writing of decimals, follow
+//! Lean's `round` and `shortest` on big integers.
 
 use num_bigint::{BigInt, BigUint, Sign};
 use rustc_apfloat::ieee::{Double, Single};
@@ -140,6 +141,95 @@ fn bin_sw<T: Float>(f: FloatTy, op: FBinOp, a: u64, b: u64) -> u64 {
         FBinOp::Copysign => unreachable!(),
     };
     of_sw(f, r.value)
+}
+
+/// How NaN results are picked: the oracle's NaN choice (Lean's `Oracle.nan`, decision: NaN
+/// choice), for the two oracles the tools use.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum NanRule {
+    /// The canonical NaN, always: the oracle that answers 0 (`fir run`, `fir-ref run`).
+    #[default]
+    Canonical,
+    /// AArch64's rule with default-NaN mode off (`AArch64.processNaNs`): the first signaling NaN
+    /// operand, else the first quiet one, made quiet, in the order the instruction that
+    /// implements the op takes them; the canonical NaN for an invalid operation. Under this
+    /// oracle a program's NaNs are those of its compiled code.
+    Arm,
+}
+
+/// A NaN of format `f` as a quiet NaN of format `g` (Lean's `quietAs`).
+pub fn quiet_as(f: FloatTy, g: FloatTy, x: u64) -> u64 {
+    let (s, t) = (fmt(f), fmt(g));
+    let man = if t.m >= s.m {
+        s.man(x) << (t.m - s.m)
+    } else {
+        s.man(x) >> (s.m - t.m)
+    };
+    t.pack(s.sign(x), t.special(), man | t.quiet_bit())
+}
+
+fn is_snan(s: Fmt, x: u64) -> bool {
+    s.is_nan(x) && s.man(x) & s.quiet_bit() == 0
+}
+
+/// Arm's `FPProcessNaNs` (Lean's `AArch64.processNaNs`): the first signaling NaN operand, else
+/// the first quiet one, made quiet; `None` if no operand is a NaN.
+pub fn process_nans(f: FloatTy, ops: &[u64]) -> Option<u64> {
+    let s = fmt(f);
+    ops.iter()
+        .find(|&&x| is_snan(s, x))
+        .or_else(|| ops.iter().find(|&&x| s.is_nan(x)))
+        .map(|&x| quiet_as(f, f, x))
+}
+
+/// [`bin`] with NaN results picked by `rule`. Under Arm's rule the operands are in the order of
+/// `fadd`, `fsub`, `fmul`, `fdiv`.
+pub fn bin_with(rule: NanRule, f: FloatTy, op: FBinOp, a: u64, b: u64) -> u64 {
+    if rule == NanRule::Arm
+        && op != FBinOp::Copysign
+        && let Some(r) = process_nans(f, &[a, b])
+    {
+        return r;
+    }
+    bin(f, op, a, b)
+}
+
+/// [`un`] with NaN results picked by `rule`.
+pub fn un_with(rule: NanRule, f: FloatTy, op: FUnOp, a: u64) -> u64 {
+    if rule == NanRule::Arm
+        && op == FUnOp::Sqrt
+        && let Some(r) = process_nans(f, &[a])
+    {
+        return r;
+    }
+    un(f, op, a)
+}
+
+/// [`fma`] (`a * b + c`) with NaN results picked by `rule`. Under Arm's rule it is `fmadd`
+/// with addend `c` (Lean's `AArch64.fpMulAdd c a b`): a quiet NaN addend with an infinite times
+/// zero product gives the canonical NaN, and NaN operands are taken in the order `c`, `a`, `b`.
+pub fn fma_with(rule: NanRule, f: FloatTy, a: u64, b: u64, c: u64) -> u64 {
+    if rule == NanRule::Arm {
+        let s = fmt(f);
+        let inf = |x: u64| s.exp(x) == s.special() && s.man(x) == 0;
+        let zero = |x: u64| s.exp(x) == 0 && s.man(x) == 0;
+        if s.is_nan(c) && !is_snan(s, c) && ((inf(a) && zero(b)) || (zero(a) && inf(b))) {
+            return s.canon_nan();
+        }
+        if let Some(r) = process_nans(f, &[c, a, b]) {
+            return r;
+        }
+    }
+    fma(f, a, b, c)
+}
+
+/// [`cvt`] with NaN results picked by `rule`: under Arm's rule (`fcvt`), a NaN made quiet in the
+/// new format.
+pub fn cvt_with(rule: NanRule, f: FloatTy, g: FloatTy, a: u64) -> u64 {
+    if rule == NanRule::Arm && fmt(f).is_nan(a) {
+        return quiet_as(f, g, a);
+    }
+    cvt(f, g, a)
 }
 
 /// `float.add` and friends on defined bits.

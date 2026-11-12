@@ -150,8 +150,11 @@ typedef uint32_t FirAluOp;
 // The operation size of an `aarch64.*` op (`Sf`): 32 or 64 bits.
 typedef uint32_t FirSf;
 
-// A register of an `aarch64.*` op: `x0`…`x30` are 0…30, then `FIR_REG_SP` and `FIR_REG_XZR`;
-// the virtual register `vN` is `FIR_REG_V0 + N`.
+// A register of an `aarch64.*` op. General-purpose: `x0`…`x30` are 0…30, then `FIR_REG_SP` and
+// `FIR_REG_XZR`, and the virtual register `vN` is `FIR_REG_V0 + N`. FP/SIMD, with the top bit
+// set: `dN` (`sN` at 32 bits) is `FIR_REG_D0 + N` for N up to 31, and the virtual register `fvN`
+// is `FIR_REG_FV0 + N`. A module's virtual registers of the two classes are numbered apart (no
+// `vN` with an `fvN`) for `fir_module_compile`'s allocator; the interpreters don't mind.
 typedef uint32_t FirReg;
 
 // `aarch64.add.imm`, … with an immediate (`AluImmOp`).
@@ -171,6 +174,16 @@ typedef uint32_t FirCond;
 
 // The access size of `aarch64.ldr` and `aarch64.str`: 1, 2, 4, or 8 bytes (`MemSize`).
 typedef uint32_t FirMemSize;
+
+// `aarch64.fadd`, `aarch64.fsub`, … on two FP registers (`FAluOp`).
+typedef uint32_t FirFAluOp;
+
+// The format of a scalar FP `aarch64.*` op (`FSize`): `s` (`f32`) or `d` (`f64`).
+typedef uint32_t FirFSize;
+
+// `aarch64.fmov`, `aarch64.fabs`, `aarch64.fneg`, `aarch64.fsqrt` on one FP register
+// (`FUnaryOp`); `fmov` also moves bits to or from a general-purpose register.
+typedef uint32_t FirFUnaryOp;
 
 #define FIR_OK 0
 
@@ -412,6 +425,10 @@ typedef uint32_t FirMemSize;
 
 #define FIR_REG_V0 64
 
+#define FIR_REG_D0 2147483648
+
+#define FIR_REG_FV0 2147483712
+
 #define FIR_SF_W 0
 
 #define FIR_SF_X 1
@@ -521,6 +538,26 @@ typedef uint32_t FirMemSize;
 #define FIR_MEM_SIZE_W 2
 
 #define FIR_MEM_SIZE_X 3
+
+#define FIR_FSIZE_S 0
+
+#define FIR_FSIZE_D 1
+
+#define FIR_FALU_OP_FADD 0
+
+#define FIR_FALU_OP_FSUB 1
+
+#define FIR_FALU_OP_FMUL 2
+
+#define FIR_FALU_OP_FDIV 3
+
+#define FIR_FUNARY_OP_FMOV 0
+
+#define FIR_FUNARY_OP_FABS 1
+
+#define FIR_FUNARY_OP_FNEG 2
+
+#define FIR_FUNARY_OP_FSQRT 3
 
 #define FIR_TRAP_REASON_DIV0 0
 
@@ -1182,11 +1219,69 @@ FirOp fir_aarch64_csel(struct FirBuilder *fb,
                        FirReg n,
                        FirReg m);
 
-// `aarch64.ldr.w x0, x1, 8`: load 1, 2, 4, or 8 bytes from `x1 + 8`, zero-extended.
+// `aarch64.ldr.w x0, x1, 8`: load 1, 2, 4, or 8 bytes from `x1 + 8`, zero-extended. Into an
+// FP register (`aarch64.ldr.w d0, x1, 8`) it is Arm's `ldr s0, [x1, #8]`.
 FirOp fir_aarch64_ldr(struct FirBuilder *fb, FirMemSize size, FirReg d, FirReg base, int64_t off);
 
-// `aarch64.str.w x0, x1, 8`: store the low 1, 2, 4, or 8 bytes of `x0` at `x1 + 8`.
+// `aarch64.str.w x0, x1, 8`: store the low 1, 2, 4, or 8 bytes of `x0` at `x1 + 8`, an FP
+// register's too (`aarch64.str.x d0, x1, 8` is `str d0, [x1, #8]`).
 FirOp fir_aarch64_str(struct FirBuilder *fb, FirMemSize size, FirReg s, FirReg base, int64_t off);
+
+// `aarch64.fadd.d d0, d1, d2` and friends: scalar FP arithmetic in the format; see
+// `FAluOp`. A NaN result is Arm's (`AArch64.fpProcessNaNs`, default-NaN mode off).
+FirOp fir_aarch64_falu(struct FirBuilder *fb,
+                       FirFAluOp op,
+                       FirFSize fs,
+                       FirReg d,
+                       FirReg n,
+                       FirReg m);
+
+// `aarch64.fsqrt.d d0, d1` and friends: scalar FP operations on one register; see
+// `FUnaryOp`. `fmov` also moves bits between a general-purpose register and an FP one
+// (`aarch64.fmov.d d0, x1`, `aarch64.fmov.s x1, d0`).
+FirOp fir_aarch64_funary(struct FirBuilder *fb, FirFUnaryOp op, FirFSize fs, FirReg d, FirReg n);
+
+// `aarch64.fmadd.d d0, d1, d2`: `d0 := d1 * d2 + d0`, rounded once: Arm's `fmadd d0, d1, d2,
+// d0`, with the destination as the addend (four registers don't fit an op's immediates).
+FirOp fir_aarch64_fmadd(struct FirBuilder *fb, FirFSize fs, FirReg d, FirReg n, FirReg m);
+
+// `aarch64.fmov.imm.d d0, 112`: the float Arm's 8-bit immediate encodes (`VFPExpandImm`:
+// 112 is 1.0, `fmov d0, #1.0`).
+FirOp fir_aarch64_fmov_imm(struct FirBuilder *fb, FirFSize fs, FirReg d, uint32_t imm);
+
+// `aarch64.fcmp.d d0, d1`: compare, setting the flags (`0011` when unordered, `0110` when
+// equal, `1000` when less, `0010` when greater).
+FirOp fir_aarch64_fcmp(struct FirBuilder *fb, FirFSize fs, FirReg n, FirReg m);
+
+// `aarch64.fcsel.eq.d d0, d1, d2`: `d1` if the condition holds, else `d2`.
+FirOp fir_aarch64_fcsel(struct FirBuilder *fb,
+                        FirCond c,
+                        FirFSize fs,
+                        FirReg d,
+                        FirReg n,
+                        FirReg m);
+
+// `aarch64.fcvt.d.s d0, d1`: convert between the formats (to `d` from `s` here; exact one
+// way, rounded the other).
+FirOp fir_aarch64_fcvt(struct FirBuilder *fb, FirFSize dst, FirFSize src, FirReg d, FirReg n);
+
+// `aarch64.scvtf.d.x d0, x1`: an integer of the size, signed (`scvtf`) or unsigned
+// (`ucvtf`), to the format, rounded.
+FirOp fir_aarch64_cvtf(struct FirBuilder *fb,
+                       bool signed_,
+                       FirFSize fs,
+                       FirSf sf,
+                       FirReg d,
+                       FirReg n);
+
+// `aarch64.fcvtzs.x.d x0, d1`: a float to an integer of the size, signed (`fcvtzs`) or
+// unsigned (`fcvtzu`), toward zero, saturating at the bounds, NaN giving 0.
+FirOp fir_aarch64_fcvtz(struct FirBuilder *fb,
+                        bool signed_,
+                        FirSf sf,
+                        FirFSize fs,
+                        FirReg d,
+                        FirReg n);
 
 // `aarch64.adrl x0, @g`: the address of a global (`adrp` and `add`).
 FirOp fir_aarch64_adrl(struct FirBuilder *fb, FirReg d, FirGlobal global);

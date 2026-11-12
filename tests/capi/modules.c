@@ -576,6 +576,8 @@ static void lfir(void) {
   FirFunc five = ID(fir_func_declare(m, "five", NULL, 0, &i64, 1));
   FirFunc calc = ID(fir_func_declare(m, "calc", two, 2, &i64, 1));
   FirFunc heap = ID(fir_func_declare(m, "heap", NULL, 0, &i64, 1));
+  FirType f64 = FIR_TYPE_F64, fargs[2] = {FIR_TYPE_F64, i64};
+  FirFunc fp = ID(fir_func_declare(m, "fp", fargs, 2, &f64, 1));
 
   FirBuilder *b = fir_func_begin(m, five);
   FirOp code = ID(fir_aarch64_code_begin(b));
@@ -644,6 +646,28 @@ static void lfir(void) {
   OK(fir_blocks_end(b, code));
   OK(fir_func_end(b));
 
+  /* FP registers: d0..d31 (FIR_REG_D0 + n) and virtual fvN (FIR_REG_FV0 + n). */
+  b = fir_func_begin(m, fp);
+  code = ID(fir_aarch64_code_begin(b));
+  OK(fir_position_at_end(b, ID(fir_block_new(b, code, "entry", NULL, 0))));
+  const FirReg d0 = FIR_REG_D0, d1 = FIR_REG_D0 + 1, fv0 = FIR_REG_FV0, fv1 = FIR_REG_FV0 + 1;
+  ID(fir_aarch64_cvtf(b, true, FIR_FSIZE_D, FIR_SF_X, fv0, x0));          /* fv0 = (double)x0 */
+  ID(fir_aarch64_falu(b, FIR_FALU_OP_FMUL, FIR_FSIZE_D, fv1, d0, fv0));   /* fv1 = d0 * fv0 */
+  ID(fir_aarch64_fmov_imm(b, FIR_FSIZE_D, d1, 0x70));                      /* d1 = 1.0 */
+  ID(fir_aarch64_fmadd(b, FIR_FSIZE_D, d1, d0, d0));                       /* d1 += d0 * d0 */
+  ID(fir_aarch64_funary(b, FIR_FUNARY_OP_FSQRT, FIR_FSIZE_D, d1, d1));
+  ID(fir_aarch64_fcvt(b, FIR_FSIZE_S, FIR_FSIZE_D, fv0, d1));
+  ID(fir_aarch64_fcvt(b, FIR_FSIZE_D, FIR_FSIZE_S, d1, fv0));
+  ID(fir_aarch64_fcmp(b, FIR_FSIZE_D, fv1, d1));
+  ID(fir_aarch64_fcsel(b, FIR_COND_GT, FIR_FSIZE_D, d0, fv1, d1));         /* the larger */
+  ID(fir_aarch64_fcvtz(b, true, FIR_SF_X, FIR_FSIZE_D, x1, d0));
+  ID(fir_aarch64_funary(b, FIR_FUNARY_OP_FMOV, FIR_FSIZE_D, x1, d0));
+  ID(fir_aarch64_ret(b));
+  CHECK(fir_aarch64_falu(b, FIR_FALU_OP_FADD, FIR_FSIZE_D, FIR_REG_D0 + 32, d0, d0) == FIR_INVALID);
+  expect_error("2147483680 is not a register", __LINE__);
+  OK(fir_blocks_end(b, code));
+  OK(fir_func_end(b));
+
   OK(fir_module_verify(m));
   expect_text(m, true,
               "layer lfir aarch64\n"
@@ -700,7 +724,28 @@ static void lfir(void) {
               "  ^oom:\n"
               "    aarch64.trap.oom @7:9\n"
               "  }\n"
+              "}\n"
+              "\n"
+              "func @fp(%0: f64, %1: i64) -> f64 {\n"
+              "  aarch64.code {\n"
+              "  ^entry:\n"
+              "    aarch64.scvtf.d.x fv0, x0\n"
+              "    aarch64.fmul.d fv1, d0, fv0\n"
+              "    aarch64.fmov.imm.d d1, 112\n"
+              "    aarch64.fmadd.d d1, d0, d0\n"
+              "    aarch64.fsqrt.d d1, d1\n"
+              "    aarch64.fcvt.s.d fv0, d1\n"
+              "    aarch64.fcvt.d.s d1, fv0\n"
+              "    aarch64.fcmp.d fv1, d1\n"
+              "    aarch64.fcsel.gt.d d0, fv1, d1\n"
+              "    aarch64.fcvtzs.x.d x1, d0\n"
+              "    aarch64.fmov.d x1, d0\n"
+              "    aarch64.ret\n"
+              "  }\n"
               "}\n");
+  const char *fp_big[] = {"3.0", "2"}, *fp_small[] = {"0.5", "1"};
+  expect_run(m, "fp", fp_big, 2, "returned f64 6.0");
+  expect_run(m, "fp", fp_small, 2, "returned f64 1.1180340051651");
   const char *small_args[] = {"-10", "2"}, *big_args[] = {"1", "2"};
   expect_run(m, "calc", small_args, 2, "returned i64 3");
   expect_run(m, "calc", big_args, 2, "returned i64 21");

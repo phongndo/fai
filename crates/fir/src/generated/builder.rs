@@ -887,7 +887,8 @@ impl FuncBuilder<'_> {
         self.simple(kind, Res::None)
     }
 
-    /// `aarch64.ldr.w x0, x1, 8`: load 1, 2, 4, or 8 bytes from `x1 + 8`, zero-extended.
+    /// `aarch64.ldr.w x0, x1, 8`: load 1, 2, 4, or 8 bytes from `x1 + 8`, zero-extended. Into an
+    /// FP register (`aarch64.ldr.w d0, x1, 8`) it is Arm's `ldr s0, [x1, #8]`.
     pub fn aarch64_ldr(&mut self, size: MemSize, d: Reg, base: Reg, off: impl Into<IntImm>) -> Result<OpId, BuildError> {
         self.begin_op();
         let d_r = self.reg(d)?;
@@ -897,13 +898,106 @@ impl FuncBuilder<'_> {
         self.simple(kind, Res::None)
     }
 
-    /// `aarch64.str.w x0, x1, 8`: store the low 1, 2, 4, or 8 bytes of `x0` at `x1 + 8`.
+    /// `aarch64.str.w x0, x1, 8`: store the low 1, 2, 4, or 8 bytes of `x0` at `x1 + 8`, an FP
+    /// register's too (`aarch64.str.x d0, x1, 8` is `str d0, [x1, #8]`).
     pub fn aarch64_str(&mut self, size: MemSize, s: Reg, base: Reg, off: impl Into<IntImm>) -> Result<OpId, BuildError> {
         self.begin_op();
         let s_r = self.reg(s)?;
         let base_r = self.reg(base)?;
         let off_id = self.int_imm(off.into());
         let kind = OpKind::A64Str { size, s: s_r, base: base_r, off: off_id };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.fadd.d d0, d1, d2` and friends: scalar FP arithmetic in the format; see
+    /// `FAluOp`. A NaN result is Arm's (`AArch64.fpProcessNaNs`, default-NaN mode off).
+    pub fn aarch64_falu(&mut self, op: FAluOp, fs: FSize, d: Reg, n: Reg, m: Reg) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let d_r = self.reg(d)?;
+        let n_r = self.reg(n)?;
+        let m_r = self.reg(m)?;
+        let kind = OpKind::A64Falu { op, fs, d: d_r, n: n_r, m: m_r };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.fsqrt.d d0, d1` and friends: scalar FP operations on one register; see
+    /// `FUnaryOp`. `fmov` also moves bits between a general-purpose register and an FP one
+    /// (`aarch64.fmov.d d0, x1`, `aarch64.fmov.s x1, d0`).
+    pub fn aarch64_funary(&mut self, op: FUnaryOp, fs: FSize, d: Reg, n: Reg) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let d_r = self.reg(d)?;
+        let n_r = self.reg(n)?;
+        let kind = OpKind::A64Funary { op, fs, d: d_r, n: n_r };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.fmadd.d d0, d1, d2`: `d0 := d1 * d2 + d0`, rounded once: Arm's `fmadd d0, d1, d2,
+    /// d0`, with the destination as the addend (four registers don't fit an op's immediates).
+    pub fn aarch64_fmadd(&mut self, fs: FSize, d: Reg, n: Reg, m: Reg) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let d_r = self.reg(d)?;
+        let n_r = self.reg(n)?;
+        let m_r = self.reg(m)?;
+        let kind = OpKind::A64Fmadd { fs, d: d_r, n: n_r, m: m_r };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.fmov.imm.d d0, 112`: the float Arm's 8-bit immediate encodes (`VFPExpandImm`:
+    /// 112 is 1.0, `fmov d0, #1.0`).
+    pub fn aarch64_fmov_imm(&mut self, fs: FSize, d: Reg, imm: u32) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let d_r = self.reg(d)?;
+        let kind = OpKind::A64FmovImm { fs, d: d_r, imm };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.fcmp.d d0, d1`: compare, setting the flags (`0011` when unordered, `0110` when
+    /// equal, `1000` when less, `0010` when greater).
+    pub fn aarch64_fcmp(&mut self, fs: FSize, n: Reg, m: Reg) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let n_r = self.reg(n)?;
+        let m_r = self.reg(m)?;
+        let kind = OpKind::A64Fcmp { fs, n: n_r, m: m_r };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.fcsel.eq.d d0, d1, d2`: `d1` if the condition holds, else `d2`.
+    pub fn aarch64_fcsel(&mut self, c: Cond, fs: FSize, d: Reg, n: Reg, m: Reg) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let d_r = self.reg(d)?;
+        let n_r = self.reg(n)?;
+        let m_r = self.reg(m)?;
+        let kind = OpKind::A64Fcsel { c, fs, d: d_r, n: n_r, m: m_r };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.fcvt.d.s d0, d1`: convert between the formats (to `d` from `s` here; exact one
+    /// way, rounded the other).
+    pub fn aarch64_fcvt(&mut self, dst: FSize, src: FSize, d: Reg, n: Reg) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let d_r = self.reg(d)?;
+        let n_r = self.reg(n)?;
+        let kind = OpKind::A64Fcvt { dst, src, d: d_r, n: n_r };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.scvtf.d.x d0, x1`: an integer of the size, signed (`scvtf`) or unsigned
+    /// (`ucvtf`), to the format, rounded.
+    pub fn aarch64_cvtf(&mut self, signed: bool, fs: FSize, sf: Sf, d: Reg, n: Reg) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let d_r = self.reg(d)?;
+        let n_r = self.reg(n)?;
+        let kind = OpKind::A64Cvtf { signed, fs, sf, d: d_r, n: n_r };
+        self.simple(kind, Res::None)
+    }
+
+    /// `aarch64.fcvtzs.x.d x0, d1`: a float to an integer of the size, signed (`fcvtzs`) or
+    /// unsigned (`fcvtzu`), toward zero, saturating at the bounds, NaN giving 0.
+    pub fn aarch64_fcvtz(&mut self, signed: bool, sf: Sf, fs: FSize, d: Reg, n: Reg) -> Result<OpId, BuildError> {
+        self.begin_op();
+        let d_r = self.reg(d)?;
+        let n_r = self.reg(n)?;
+        let kind = OpKind::A64Fcvtz { signed, sf, fs, d: d_r, n: n_r };
         self.simple(kind, Res::None)
     }
 

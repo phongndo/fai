@@ -37,6 +37,7 @@ use num_bigint::{BigInt, BigUint};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::body::{Body, Int, OpId, Operand, OperandKind, RegionId, Succ, ValueId};
+pub use crate::float::NanRule;
 use crate::ir::*;
 use crate::sem::{self, Bits, Out};
 pub use crate::sem::{TrapReason, UbKind};
@@ -429,6 +430,20 @@ pub fn run_detail(
     fuel: u64,
     lower_rets: bool,
 ) -> Result<RunOutput, String> {
+    run_detail_with(m, name, args, fuel, lower_rets, NanRule::Canonical)
+}
+
+/// [`run_detail`] for the oracle whose NaN choice is `nan` (and that answers 0 otherwise):
+/// `NanRule::Arm` gives the NaNs compiled code gives. An LFIR module runs on the AArch64 machine,
+/// whose NaNs are Arm's whatever `nan` says.
+pub fn run_detail_with(
+    m: &Module,
+    name: &str,
+    args: &[&str],
+    fuel: u64,
+    lower_rets: bool,
+    nan: NanRule,
+) -> Result<RunOutput, String> {
     if m.space.addr_bits > 64 {
         return Err(format!(
             "the interpreter supports address sizes up to 64 bits, not {}",
@@ -461,6 +476,7 @@ pub fn run_detail(
         });
     }
     mach.lower_rets = lower_rets;
+    mach.nan = nan;
     Ok(match mach.init(fi as u32, &vals) {
         Err(h) => RunOutput {
             line: h.render(),
@@ -512,6 +528,8 @@ struct Machine<'m> {
     base: u32,
     /// Show returned values as the lowering returns them (`run_detail`).
     lower_rets: bool,
+    /// How NaN results are picked (`run_detail_with`).
+    nan: NanRule,
     /// Reused buffers.
     scratch: Vec<Value>,
     bytes_buf: Vec<Byte>,
@@ -565,6 +583,7 @@ impl<'m> Machine<'m> {
             func: 0,
             base: 0,
             lower_rets: false,
+            nan: NanRule::Canonical,
             scratch: Vec::new(),
             bytes_buf: Vec::new(),
         };
@@ -1993,7 +2012,7 @@ impl<'m> Machine<'m> {
                 });
                 self.int_value(rw, r)
             }
-            // Floats (Lean's `evalFloat`), for the oracle that answers 0: NaN results are canonical.
+            // Floats (Lean's `evalFloat`): NaN results as `self.nan` picks them.
             (OpKind::FloatConst { value }, []) => match rty {
                 Some(Ty::Float(f)) => Value::Float { f, bits: value },
                 _ => return stuck(loc, "float.const of a non-float"),
@@ -2001,11 +2020,15 @@ impl<'m> Machine<'m> {
             (OpKind::FloatBin(op), &[a @ (Value::Float { f, .. } | Value::FloatPoison(f)), b]) => {
                 let a = self.float_of(loc, f, a)?;
                 let b = self.float_of(loc, f, b)?;
-                Self::float_value(f, a.zip(b).map(|(a, b)| crate::float::bin(f, op, a, b)))
+                Self::float_value(
+                    f,
+                    a.zip(b)
+                        .map(|(a, b)| crate::float::bin_with(self.nan, f, op, a, b)),
+                )
             }
             (OpKind::FloatUn(op), &[a @ (Value::Float { f, .. } | Value::FloatPoison(f))]) => {
                 let a = self.float_of(loc, f, a)?;
-                Self::float_value(f, a.map(|a| crate::float::un(f, op, a)))
+                Self::float_value(f, a.map(|a| crate::float::un_with(self.nan, f, op, a)))
             }
             (OpKind::FloatFma, &[a @ (Value::Float { f, .. } | Value::FloatPoison(f)), b, c]) => {
                 let a = self.float_of(loc, f, a)?;
@@ -2015,7 +2038,7 @@ impl<'m> Machine<'m> {
                     f,
                     a.zip(b)
                         .zip(c)
-                        .map(|((a, b), c)| crate::float::fma(f, a, b, c)),
+                        .map(|((a, b), c)| crate::float::fma_with(self.nan, f, a, b, c)),
                 )
             }
             (OpKind::FloatCmp(p), &[a @ (Value::Float { f, .. } | Value::FloatPoison(f)), b]) => {
@@ -2037,7 +2060,7 @@ impl<'m> Machine<'m> {
                     return stuck(loc, "expected a float result");
                 };
                 let a = self.float_of(loc, f, vs[0])?;
-                Self::float_value(g, a.map(|a| crate::float::cvt(f, g, a)))
+                Self::float_value(g, a.map(|a| crate::float::cvt_with(self.nan, f, g, a)))
             }
             (
                 OpKind::FloatToInt { signed, edge },
