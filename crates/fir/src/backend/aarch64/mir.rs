@@ -129,7 +129,7 @@ impl Inst {
     }
 
     /// The registers the instruction writes and reads, apart from what a call does under the
-    /// calling convention (see [`MFunc::call_regs`]).
+    /// calling convention (its argument registers and [`CALLER_SAVED`]; see `regalloc`).
     pub fn regs(self, defs: &mut Vec<Reg>, uses: &mut Vec<Reg>) {
         defs.clear();
         uses.clear();

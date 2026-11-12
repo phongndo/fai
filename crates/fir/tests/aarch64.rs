@@ -16,6 +16,8 @@
 //! The comparison also runs each program's LFIR in the interpreter, before and after register
 //! allocation, and expects what the source run gives (with the same normalization): this checks
 //! instruction selection and register allocation against the LFIR semantics without hardware.
+//! For the fixtures and the first `FIR_FUZZ_LEAN` (default 100) random programs, the Lean
+//! reference tool runs the LFIR text too, and must print exactly what `fir run` prints.
 //!
 //! `FIR_FUZZ=N` sets the number of random programs (default 100), `FIR_FUZZ_SEED` the seed;
 //! `FIR_SHOW_ADDRESS_DIFFS=1` prints the runs that differ only where addresses are observed.
@@ -407,9 +409,10 @@ fn normalize(reference: &str) -> Result<(String, bool), String> {
 fn observes_addresses(m: &Module) -> bool {
     use fir::OpKind as K;
     let mut int_loads = false;
-    let mut ptr_bytes = (0..m.globals.len()).any(|g| m.globals.ty(g) != Ty::Ptr && false)
-        || (0..m.globals.len())
-            .any(|g| matches!(m.globals.init(g), fir::Init::Sym(_) | fir::Init::List(_)));
+    // A global initialized with addresses, or (below) a pointer store or copy, puts pointer
+    // bytes in memory.
+    let mut ptr_bytes = (0..m.globals.len())
+        .any(|g| matches!(m.globals.init(g), fir::Init::Sym(_) | fir::Init::List(_)));
     for f in &m.funcs {
         let b = &f.body;
         let mut stack = vec![b.entry()];
@@ -470,7 +473,8 @@ fn matches(want: &str, got: &str) -> bool {
 }
 
 /// What the LFIR of a module gives for a run, before and after register allocation.
-fn lfir_runs(m: &Module, name: &str, args: &[&str], fuel: u64) -> Result<[String; 2], String> {
+/// The LFIR of a module, before and after register allocation, verified.
+fn lfir_modules(m: &Module) -> Result<[Module; 2], String> {
     let mut mm = a64::select(m)?;
     let before = a64::lfir::to_module(m, &mm);
     fir::verify_module(&before)
@@ -478,12 +482,12 @@ fn lfir_runs(m: &Module, name: &str, args: &[&str], fuel: u64) -> Result<[String
     a64::allocate(m, &mut mm);
     let after = a64::lfir::to_module(m, &mm);
     fir::verify_module(&after).map_err(|e| format!("LFIR after allocation doesn't verify: {e}"))?;
-    // The machine code takes more steps than the source: give it plenty.
-    let fuel = fuel.saturating_mul(64);
-    Ok([
-        fir::interp::run(&before, name, args, fuel)?,
-        fir::interp::run(&after, name, args, fuel)?,
-    ])
+    Ok([before, after])
+}
+
+/// The machine code takes more steps than the source: give it plenty.
+fn lfir_fuel(fuel: u64) -> u64 {
+    fuel.saturating_mul(64)
 }
 
 #[derive(Default)]
@@ -501,6 +505,7 @@ impl Tally {
 /// Check one module's runs: `(function, args, fuel)`.
 fn check_module(
     tc: Option<&Toolchain>,
+    lean: Option<&Path>,
     m: &Module,
     runs: &[(String, Vec<String>, u64)],
     dir: &Path,
@@ -541,11 +546,61 @@ fn check_module(
             true
         }
     };
-    // The LFIR in the interpreter.
+    // The LFIR in the interpreter, and in the Lean reference tool when there is one.
+    let modules = match lfir_modules(m) {
+        Ok(ms) => ms,
+        Err(e) => {
+            tally.lock().unwrap().count(format!(
+                "not compiled: {}",
+                e.rsplit(':').next().unwrap_or(&e).trim()
+            ));
+            return true;
+        }
+    };
+    let files: Vec<PathBuf> = match lean {
+        Some(_) => ["vregs", "allocated"]
+            .iter()
+            .zip(&modules)
+            .map(|(stage, lm)| {
+                let p = dir.join(format!("{name}.{stage}.fir"));
+                std::fs::write(&p, lm.render(true)).unwrap();
+                p
+            })
+            .collect(),
+        None => Vec::new(),
+    };
     for (f, args, fuel, want) in &comparable {
         let a: Vec<&str> = args.iter().map(String::as_str).collect();
-        match lfir_runs(m, f, &a, *fuel) {
+        let run = |lm: &Module| fir::interp::run(lm, f, &a, lfir_fuel(*fuel));
+        match modules
+            .iter()
+            .map(run)
+            .collect::<Result<Vec<String>, String>>()
+        {
             Ok(got) => {
+                if let Some(tool) = lean {
+                    for (file, g) in files.iter().zip(&got) {
+                        let out = Command::new(tool)
+                            .arg("run")
+                            .arg(file)
+                            .arg(format!("@{f}"))
+                            .args(args)
+                            .args(["--fuel", &lfir_fuel(*fuel).to_string()])
+                            .output()
+                            .unwrap();
+                        let r = String::from_utf8_lossy(&out.stdout).trim_end().to_owned();
+                        if &r == g {
+                            tally.lock().unwrap().count("LFIR: fir-ref run agrees");
+                        } else {
+                            ok = false;
+                            tally.lock().unwrap().fails.push(format!(
+                                "{}: @{f}({}): fir-ref run {r:?}, fir run {g:?}",
+                                file.display(),
+                                args.join(", ")
+                            ));
+                        }
+                    }
+                }
                 for (stage, g) in ["vregs", "allocated"].iter().zip(&got) {
                     let g = normalize(g).map(|x| x.0).unwrap_or_else(|_| g.clone());
                     if matches(want, &g) {
@@ -563,12 +618,18 @@ fn check_module(
                 }
             }
             Err(e) => {
-                tally.lock().unwrap().count(format!(
-                    "not compiled: {}",
-                    e.rsplit(':').next().unwrap_or(&e).trim()
-                ));
-                return true;
+                ok = false;
+                tally
+                    .lock()
+                    .unwrap()
+                    .fails
+                    .push(format!("{name} @{f}: {e}"));
             }
+        }
+    }
+    if ok {
+        for file in &files {
+            let _ = std::fs::remove_file(file);
         }
     }
     let Some(tc) = tc else { return ok };
@@ -642,6 +703,7 @@ fn fixtures_run_natively() {
         .map_err(|e| eprintln!("native runs skipped: {e}"))
         .ok();
     let tally = Mutex::new(Tally::default());
+    let lean = common::reference();
     let mut modules = 0;
     for file in common::fir_files() {
         let text = std::fs::read_to_string(&file).unwrap();
@@ -674,7 +736,7 @@ fn fixtures_run_natively() {
             .map(|(f, a)| (f, a, fir::interp::DEFAULT_FUEL))
             .collect();
         let stem = name.replace(['/', '.'], "_");
-        check_module(tc.as_ref(), &m, &runs, &dir, &stem, &tally);
+        check_module(tc.as_ref(), lean.as_deref(), &m, &runs, &dir, &stem, &tally);
     }
     eprintln!("{modules} fixture modules compiled");
     report("fixtures", tally.into_inner().unwrap());
@@ -695,6 +757,8 @@ fn random_programs_run_natively() {
         .ok();
     let count = env_u64("FIR_FUZZ", 100);
     let seed = env_u64("FIR_FUZZ_SEED", 1);
+    let lean = common::reference();
+    let lean_count = env_u64("FIR_FUZZ_LEAN", 100);
     let tally = Mutex::new(Tally::default());
     let next = Mutex::new(0u64);
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
@@ -722,7 +786,9 @@ fn random_programs_run_natively() {
                         .map(|(a, fuel)| ("f0".to_owned(), a.clone(), *fuel))
                         .collect();
                     tally.lock().unwrap().count("(programs)");
-                    if !check_module(tc.as_ref(), &m, &runs, &dir, &name, &tally) {
+                    // The Lean reference tool runs the LFIR of the first programs.
+                    let lean = lean.as_deref().filter(|_| k < lean_count);
+                    if !check_module(tc.as_ref(), lean, &m, &runs, &dir, &name, &tally) {
                         std::fs::write(dir.join(format!("{name}.fir")), &prog.text).unwrap();
                     } else {
                         for ext in ["", ".s", ".c"] {

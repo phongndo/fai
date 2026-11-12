@@ -926,7 +926,7 @@ impl Sel<'_, '_> {
         }
         match kind {
             OpKind::Const(n) => {
-                let w = body.ty(body.results(op).next().unwrap()).width_bits();
+                let w = width_bits(body.ty(body.results(op).next().unwrap()));
                 let bits = int_low_bits(body.int(n));
                 let d = self.result(op, 0);
                 self.mov_int(d, w, bits);
@@ -1783,16 +1783,11 @@ fn int_low_bits(n: crate::body::Int<'_>) -> u64 {
     }
 }
 
-trait WidthBits {
-    fn width_bits(self) -> u32;
-}
-
-impl WidthBits for Ty {
-    fn width_bits(self) -> u32 {
-        match self {
-            Ty::Int(w) | Ty::Byte(w) => w,
-            _ => 64,
-        }
+/// An integer or byte type's width (64 for a pointer).
+fn width_bits(t: Ty) -> u32 {
+    match t {
+        Ty::Int(w) | Ty::Byte(w) => w,
+        _ => 64,
     }
 }
 
