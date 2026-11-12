@@ -80,7 +80,8 @@ M and F run in parallel; then N; then V and A one after the other (both change t
 ## Varargs and aggregates by value (tracks V and A)
 
 Designed when their tracks start, against AAPCS64 (Linux first; macOS's variant, where variadic
-arguments all go on the stack, stays open). Track V's design is in its Progress entry. Constraints: a variadic call names its fixed and
+arguments all go on the stack, stays open). Tracks V's and A's designs are in their Progress
+entries. Constraints: a variadic call names its fixed and
 variadic argument types; `va.start`, `va.arg T`, `va.copy`, `va.end` work on a `va_list` the
 target lays out (AAPCS64's five-field structure on Linux), so FIR can pass one to `vprintf`; by-value
 aggregates in signatures follow AAPCS64's classification and lower to scalars, registers, and
@@ -434,6 +435,78 @@ va_list (track V) unchanged.
   FIR's semantics reads as `poison`. Open item 4 will need a way to pass a `va_list` by value.
 - **Not yet:** external globals (`stdout`, `stderr`, `errno`); structs and unions by value,
   variadic ones included (track A); `long double`.
+
+### Track A: Aggregates by value (done)
+
+Decisions: C ABI for aggregates (new), and Calling convention, Aggregates, Aggregate values,
+External functions, External call semantics, Varargs, HFIR lowering, Lowering proofs, Layers,
+Instruction selection, Backend testing, Builder API, API.
+
+- **Where the ABI is applied:** calls pass structs and arrays whole. Outside HFIR a value may be
+  a composite (a struct or array of scalars and composites), made by `agg.make`, taken apart by
+  `agg.extract`/`agg.insert` (now MFIR ops too), copied, and passed as a parameter, call
+  argument or result, `va.arg` result, or a function's only result; MFIR memory stays scalar.
+  The lowering keeps composites whole exactly there (`agg.make` where one is passed,
+  `agg.extract`s where it arrives) and scalarizes the rest as before, so MFIR names only the
+  ABI's unit and the backend classifies. HFIR's semantics of aggregate calls is unchanged, and
+  MFIR's composites are the same tuples of leaves.
+- **AAPCS64** (`spec/Fir/AArch64Abi.lean`, twin `abi.rs`): empty composites take nothing; HFAs
+  (one to four floats of one format, no padding, no zero-length array: GCC's rule) take FP
+  registers or, closing them, the stack; up to 16 bytes take one or two `x` registers (even
+  first if 16-byte aligned) or, closing them, the stack; larger ones are a pointer to a copy in
+  the caller's frame; results go where the first argument would, or at `x8`. Variadic composites
+  go as named ones and `va.arg` follows AAPCS64's algorithm (general-purpose or FP save area,
+  stack, by reference). `--os darwin` rejects composites passed on the stack.
+- **Proofs:** every proof builds, with no `sorry` and no warnings; `#print axioms` of the main
+  theorems shows only `propext`, `Classical.choice`, and `Quot.sound`. `Fir.AArch64Abi` proves
+  that a composite's register pieces are its bytes (`pieces_flatten`), that a defined piece put in
+  a register and stored back is itself, a pointer's eight fragments that pointer
+  (`Word.bytes_ofBytes`), and so that registers carry a composite's defined bytes exactly
+  (`roundTrip`). `lowerFunc_refines` covers what it covered (functions with no aggregate
+  values; one that passes a struct has one).
+- **Semantics (Lean, both interpreters):** external functions take and give structs and arrays
+  (a struct result only alone); their events show them as values, pointers in their leaves are
+  argument pointers for reach and `read(args)`, and the world's composite results are checked
+  leaf by leaf. Variadic composites are C's (`struct<C>` and arrays, whose layout a value's
+  shape gives), a slot each of their size rounded to 8; `va.arg T` of one needs its type up to
+  an array being the struct of its elements, else UB `va-arg`. Both LFIR machines read an
+  external callee's composite arguments and place its composite results by the ABI.
+- **Backend:** a composite value is its leaves' registers; isel packs them into words (a
+  pointer that fills a word moves as it is, keeping its provenance) or FP registers, stores
+  them to the stack, a frame copy, or `x8`'s memory, and unpacks them where they arrive;
+  `va.arg` of a composite, and variadic functions' save areas counted with composites. The
+  allocator's call shapes come from the ABI (blr's precomputed per signature).
+- **Text:** an op with no operands and no location no longer swallows the next line's result
+  (`agg.make` of an empty composite, which the lowering emits): a `%name` followed by `:`
+  starts the next op, in both parsers.
+- **Tests:** `tests/abi/` (every class as parameter and result, 1 to 16 bytes with padding,
+  floats mixed with integers, a 16-byte aligned struct, packed fields across words, large
+  structs written by the callee, pointers dereferenced after crossing, empty, `auto`, and packed
+  structs, stack placement after a class's registers close, nested and indirect calls, external
+  calls, and variadic composites of every class, after the registers fill, read back as arrays,
+  and UB for a wrong type: 22 run lines); `fir-ref test`, `fir run`, the lowering, and native
+  runs under qemu (with and without `-O`, and the LFIR before and after allocation in both
+  machines) agree. `crates/fir/tests/abi.rs` is the ABI torture test: random signatures (up to
+  12 arguments, structs of `i8`…`i64`, `f32`, `f64`, `ptr`, arrays, nested, packed, and 16-byte
+  aligned structs, HFAs of 1 to 4 members) compiled by the cross GCC and FIR, each side calling
+  the other directly and through `...`, every leaf reported and compared; 20 seeds of 1,000
+  signatures each (about 14,000 leaves per seed in each of four directions) pass. It found GCC's
+  HFA rule: a struct of floats with a zero-length array (even of floats) isn't one.
+  `tests/capi/e2e.c` builds a module through the C API that C calls with every class (a large
+  struct whose copy the callee keeps to itself), that calls C with them directly and through
+  `...`, and reads C's composite variadic arguments, natively with and without `-O`, and checks
+  the macOS rejection. The fuzzer gives external functions composite parameters and results and
+  passes composites as variadic arguments (not the entry's, whose run lines can't write them);
+  `FIR_FUZZ=3000` on seeds 67 and 71 for `fuzz.rs`, `opt.rs`, `builder.rs`, and `aarch64.rs`:
+  no differences. Per seed 480 to 500 modules pass composites to or from external functions,
+  150 to 170 pass them through `...`, 45 to 48 read them with `va.arg`, and 790 to 850 native
+  runs (each with and without `-O`) pass structs by value. The native harness declares C structs of each
+  composite's layout and class and prints them as `fir run` renders them.
+- **API:** version 1.5 (no new functions; external and MFIR functions take composites).
+- **Not yet:** `fai-cc`'s structs by value (track F2); macOS's stack packing (composites on the
+  stack are a compile error there); integer leaves wider than 64 bits in a passed composite
+  (`__int128` fields: the backend rejects them); composites in MFIR region state and memory
+  accesses (the lowering never makes them; isel rejects them); other targets' classifications.
 
 ## Not in this round
 
