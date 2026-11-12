@@ -33,6 +33,10 @@
 //   AArch64 Linux the struct `__va_list`) is FIR's `va_list` memory type, passed to functions as
 //   the address of a copy (AAPCS64's by-reference composite); `va_start`, `va_arg`, and `va_end`
 //   are `va.start`, `va.arg`, and `va.end`, and `va_copy` is `mem.copy va_list`.
+// * Structs and unions by value (parameters, results, variadic arguments, `va_arg`) are FIR
+//   composite values, loaded from the C object where they are sent and stored into one where
+//   they arrive (a call's or `va_arg`'s temporary is made at the function's entry), of an ABI
+//   type chosen so that FIR's AAPCS64 classification is GCC's (`abi`).
 //
 // What isn't supported yet is reported with its source location and nothing is emitted.
 
@@ -43,6 +47,7 @@
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
+#include "clang/AST/ExprCXX.h"
 #include "clang/AST/RecordLayout.h"
 #include "clang/AST/Stmt.h"
 #include "clang/Basic/Builtins.h"
@@ -162,6 +167,7 @@ private:
   bool term = false;              // the region (or block) already ended
   llvm::DenseMap<const Decl *, FirValue> slots;
   llvm::DenseMap<const CompoundLiteralExpr *, FirValue> litSlots;
+  llvm::DenseMap<const Expr *, FirValue> tempSlots; // struct-valued calls and `va_arg`s
   llvm::DenseMap<const LabelDecl *, FirRegion> labels;
   llvm::DenseMap<const SwitchCase *, FirRegion> caseBlocks;
   std::vector<Jump> jumps;
@@ -357,8 +363,6 @@ private:
     info.isUnion = def->isUnion();
     info.size = (uint64_t)L.getSize().getQuantity();
     info.align = (unsigned)L.getAlignment().getQuantity();
-    if (info.size == 0)
-      unsupported(def->getLocation(), "empty structs and unions");
     if (info.align > 16)
       unsupported(def->getLocation(), "alignments above 16");
     unsigned firAlign = 1;
@@ -439,6 +443,270 @@ private:
     throw Abort{};
   }
 
+  // Structs and unions by value (decision: C frontend). A call passes, a function returns, and
+  // `va.arg` reads a record as a FIR composite value, loaded from the C object where it is sent
+  // and stored into one where it arrives. The value's type (its *ABI type*) is chosen so that
+  // FIR's AAPCS64 classification (decision: C ABI for aggregates) is GCC's for the C type:
+  //
+  // * an HFA by GCC's rule (`hfaCount`: one to four `float`s or `double`s through members,
+  //   arrays, and unions, no padding, no zero-length array, zero-width bitfields ignored) is
+  //   `struct<C>{f32 × n}` or `struct<C>{f64 × n}`, read from the object's bytes;
+  // * any other record of at most 16 bytes is its leaves at their offsets, a union or a
+  //   bitfield's storage as bytes (`array<k x i8>`), with a leading `array<0 x i128>` exactly
+  //   when GCC aligns the argument to 16: GCC's argument alignment is the largest of the
+  //   fields' (an `aligned` attribute on the struct itself doesn't count), unlike the record's
+  //   memory alignment, which a FIR memory type carries; an empty struct is `struct<C>{}`,
+  //   which takes no register or stack (and is left out of variadic calls, as GCC does);
+  // * a larger one, passed by reference, is its memory type, or its bytes when that type holds
+  //   something a C composite can't (a zero-length array, an empty struct). One holding a
+  //   `va_list` is rejected: its bytes would lose the cursor, which only `va.arg` reads.
+  struct AbiInfo {
+    FirType ty = FIR_INVALID;
+    bool vararg = false;     // a C composite, so FIR passes and reads it through `...`
+    std::string unsupported; // why it can't be passed at all, if it can't
+    std::string noVararg;    // why it can't be a variadic argument, if it can't
+  };
+  std::map<const RecordDecl *, AbiInfo> abis;
+
+  // GCC's `aapcs_vfp_sub_candidate` for `float` and `double`: the number of floats of width
+  // `fbits` making up `t`, -1 if it isn't made of them only, without padding.
+  int hfaCount(QualType t, unsigned &fbits) {
+    QualType c = t.getCanonicalType();
+    if (const auto *bt = c->getAs<BuiltinType>()) {
+      if (bt->getKind() != BuiltinType::Float && bt->getKind() != BuiltinType::Double)
+        return -1;
+      unsigned w = bits(c);
+      if (fbits && fbits != w)
+        return -1;
+      fbits = w;
+      return 1;
+    }
+    if (const auto *a = ctx.getAsConstantArrayType(c)) {
+      uint64_t n = a->getSize().getZExtValue();
+      int k = hfaCount(a->getElementType(), fbits);
+      if (n == 0 || k < 0 || k * n > 4 || ctx.getTypeSize(c) != k * n * fbits)
+        return -1;
+      return (int)(k * n);
+    }
+    const RecordDecl *rd = c->getAsRecordDecl();
+    if (!rd || !rd->getDefinition())
+      return -1;
+    int count = 0;
+    for (const FieldDecl *fd : rd->getDefinition()->fields()) {
+      if (fd->isBitField() && fd->getBitWidthValue() == 0)
+        continue; // GCC's C frontend drops zero-width bitfields from the type
+      if (fd->isBitField())
+        return -1;
+      int k = hfaCount(fd->getType(), fbits);
+      if (k < 0)
+        return -1;
+      count = rd->isUnion() ? std::max(count, k) : count + k;
+    }
+    if (count > 4 || ctx.getTypeSize(c) != (uint64_t)count * fbits)
+      return -1;
+    return count;
+  }
+
+  // GCC's `aarch64_function_arg_alignment` of a record, in bytes: its fields' largest.
+  unsigned argAlign(const RecordDecl *def) {
+    unsigned a = 1;
+    for (const FieldDecl *fd : def->fields()) {
+      if (fd->isBitField() && fd->getBitWidthValue() == 0)
+        continue;
+      a = std::max(a, (unsigned)ctx.getDeclAlign(fd).getQuantity());
+      if (fd->isBitField())
+        a = std::max(a, alignOf(fd->getType()));
+    }
+    return a;
+  }
+
+  // The scalar and byte leaves of an object of type `t` at `off`, in order; `zeroLen` is set
+  // if it has a zero-length or flexible array.
+  void abiLeaves(QualType t, uint64_t off, std::vector<std::pair<uint64_t, FirType>> &out,
+                 bool &zeroLen, SourceLocation loc) {
+    QualType c = t.getCanonicalType();
+    if (isScalar(c)) {
+      out.push_back({off, scalarTy(c, loc)});
+      return;
+    }
+    if (const auto *a = ctx.getAsConstantArrayType(c)) {
+      uint64_t n = a->getSize().getZExtValue();
+      uint64_t stride = ctx.getTypeSizeInChars(a->getElementType()).getQuantity();
+      zeroLen |= n == 0;
+      for (uint64_t i = 0; i < n; i++)
+        abiLeaves(a->getElementType(), off + i * stride, out, zeroLen, loc);
+      return;
+    }
+    if (ctx.getAsIncompleteArrayType(c)) {
+      zeroLen = true;
+      return;
+    }
+    if (const RecordDecl *rd = c->getAsRecordDecl(); rd && !isVaList(c)) {
+      RecordInfo &info = record(rd, loc);
+      if (info.isUnion) {
+        if (info.size > 0)
+          out.push_back({off, ck(fir_type_array(m, info.size, fir_type_int(8)), "fir_type_array")});
+        return;
+      }
+      for (const Slot &s : info.slots) {
+        if (s.kind == Slot::Member)
+          abiLeaves(s.field->getType(), off + s.offset, out, zeroLen, loc);
+        else if (s.kind == Slot::Pad && s.len > 0)
+          out.push_back({off + s.offset, s.ty});
+      }
+      return;
+    }
+    unsupported(loc, "values of type '" + t.getAsString() + "' in a struct passed by value");
+  }
+
+  // Whether a record's memory type is a C composite: no `va_list`, no zero-length array, no
+  // empty struct.
+  bool cComposite(QualType t, SourceLocation loc) {
+    QualType c = t.getCanonicalType();
+    if (isVaList(c))
+      return false;
+    if (isScalar(c))
+      return true;
+    if (const auto *a = ctx.getAsConstantArrayType(c))
+      return a->getSize().getZExtValue() > 0 && cComposite(a->getElementType(), loc);
+    if (const RecordDecl *rd = c->getAsRecordDecl()) {
+      RecordInfo &info = record(rd, loc);
+      if (info.size == 0)
+        return false;
+      for (const Slot &s : info.slots) {
+        if (s.kind == Slot::Align || (s.kind == Slot::Pad && s.len == 0))
+          return false;
+        if (s.kind == Slot::Member && !cComposite(s.field->getType(), loc))
+          return false;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  bool hasVaList(QualType t) {
+    QualType c = t.getCanonicalType();
+    if (isVaList(c))
+      return true;
+    if (const auto *a = ctx.getAsArrayType(c))
+      return hasVaList(a->getElementType());
+    if (const RecordDecl *rd = c->getAsRecordDecl(); rd && rd->getDefinition())
+      for (const FieldDecl *fd : rd->getDefinition()->fields())
+        if (hasVaList(fd->getType()))
+          return true;
+    return false;
+  }
+
+  AbiInfo &abi(QualType t, SourceLocation loc) {
+    const RecordDecl *def = t.getCanonicalType()->getAsRecordDecl()->getDefinition();
+    RecordInfo &info = record(def, loc);
+    auto found = abis.find(def);
+    if (found != abis.end())
+      return found->second;
+    AbiInfo ai;
+    unsigned fbits = 0;
+    int n = hfaCount(t, fbits);
+    bool align16 = argAlign(def) >= 16;
+    auto structOf = [&](const std::vector<FirType> &tys) {
+      return ck(fir_type_struct(m, FIR_POLICY_C, tys.data(), tys.size()), "fir_type_struct");
+    };
+    if (n >= 1 && n <= 4) {
+      ai.ty = structOf(std::vector<FirType>(n, fbits == 32 ? FIR_TYPE_F32 : FIR_TYPE_F64));
+      ai.vararg = true;
+      // GCC puts such an HFA on the stack 16-byte aligned; FIR's HFAs have their floats'.
+      if (align16)
+        ai.unsupported = "16-byte aligned homogeneous float aggregates by value (FIR's HFA of "
+                         "the same floats has their alignment on the stack)";
+    } else if (info.size <= 16) {
+      std::vector<std::pair<uint64_t, FirType>> leaves;
+      bool zeroLen = false;
+      abiLeaves(t, 0, leaves, zeroLen, loc);
+      std::vector<FirType> tys;
+      std::vector<uint64_t> offs;
+      uint64_t cur = 0;
+      unsigned firAlign = 1;
+      bool allFloat = !leaves.empty();
+      if (align16) {
+        tys.push_back(ck(fir_type_array(m, 0, fir_type_int(128)), "fir_type_array"));
+        offs.push_back(0);
+        firAlign = 16;
+      }
+      for (auto [off, ty] : leaves) {
+        uint64_t size;
+        uint32_t align;
+        layoutOf(ty, size, align);
+        if (off < cur || off % align != 0)
+          layoutMismatch(def, "a leaf of its value");
+        if (alignUp(cur, align) != off) {
+          offs.push_back(cur);
+          tys.push_back(ck(fir_type_array(m, off - cur, fir_type_int(8)), "fir_type_array"));
+        }
+        offs.push_back(off);
+        tys.push_back(ty);
+        cur = off + size;
+        firAlign = std::max(firAlign, (unsigned)align);
+        allFloat &= ty == FIR_TYPE_F32 || ty == FIR_TYPE_F64;
+      }
+      if (alignUp(cur, firAlign) != info.size) {
+        offs.push_back(cur);
+        tys.push_back(ck(fir_type_array(m, info.size - cur, fir_type_int(8)), "fir_type_array"));
+      }
+      // Floats beside a zero-length array aren't an HFA for GCC; a zero-length array keeps
+      // FIR from taking them as one too.
+      bool floatsBesideZeroLen = zeroLen && allFloat;
+      if (floatsBesideZeroLen) {
+        offs.push_back(info.size);
+        tys.push_back(ck(fir_type_array(m, 0, fir_type_int(8)), "fir_type_array"));
+      }
+      ai.ty = structOf(tys);
+      ai.vararg = !align16 && !floatsBesideZeroLen;
+      if (align16)
+        ai.noVararg = "16-byte aligned structs and unions as variadic arguments (FIR's variadic "
+                      "composites can't carry the alignment)";
+      else if (floatsBesideZeroLen)
+        ai.noVararg = "structs of floats with a zero-length array as variadic arguments (FIR's "
+                      "variadic composites have no zero-length arrays)";
+      for (uint32_t i = 0; i < offs.size(); i++) {
+        uint64_t off;
+        ok(fir_type_field_offset(m, ai.ty, i, &off), "fir_type_field_offset");
+        if (off != offs[i])
+          layoutMismatch(def, "field " + std::to_string(i) + " of its value");
+      }
+    } else if (hasVaList(t)) {
+      // Its bytes would lose the cursor, which only `va.arg` reads.
+      ai.unsupported = "structs and unions holding a 'va_list' by value";
+    } else if (cComposite(t, loc)) {
+      ai.ty = info.ty;
+      ai.vararg = true;
+    } else {
+      ai.ty = structOf({ck(fir_type_array(m, info.size, fir_type_int(8)), "fir_type_array")});
+      ai.vararg = true;
+    }
+    if (ai.ty != FIR_INVALID) {
+      uint64_t size;
+      uint32_t align;
+      layoutOf(ai.ty, size, align);
+      if (size != info.size)
+        layoutMismatch(def, "the size of its value");
+    }
+    return abis.emplace(def, std::move(ai)).first->second;
+  }
+
+  // An empty struct or union (a GNU extension): no bytes, and no argument.
+  bool isEmptyRecord(QualType t, SourceLocation loc) {
+    return record(t.getCanonicalType()->getAsRecordDecl(), loc).size == 0;
+  }
+
+  // A record's ABI type, diagnosing one that can't be passed (`vararg`: through `...`).
+  FirType abiTy(QualType t, SourceLocation loc, bool vararg = false) {
+    AbiInfo &ai = abi(t, loc);
+    if (!ai.unsupported.empty())
+      unsupported(loc, ai.unsupported);
+    if (vararg && !ai.vararg)
+      unsupported(loc, ai.noVararg);
+    return ai.ty;
+  }
+
   // Signatures.
 
   struct Sig {
@@ -449,13 +717,15 @@ private:
   // A function type's FIR signature. One without a prototype (`int f();`) takes no
   // parameters: calls with arguments to it are rejected (C23's meaning). A `va_list`
   // parameter is a `ptr`: AAPCS64 passes a composite larger than 16 bytes as the address of
-  // the caller's copy, which the callee owns.
+  // the caller's copy, which the callee owns. Structs and unions are their ABI types.
   Sig sigOf(const FunctionType *ft, SourceLocation loc) {
     Sig s;
     QualType ret = ft->getReturnType();
+    if (isVaList(ret))
+      unsupported(loc, "returning a 'va_list'");
     if (ret->isRecordType())
-      unsupported(loc, "structs and unions returned by value (track A)");
-    if (!ret->isVoidType())
+      s.rets.push_back(abiTy(ret, loc));
+    else if (!ret->isVoidType())
       s.rets.push_back(scalarTy(ret, loc));
     if (const auto *p = dyn_cast<FunctionProtoType>(ft)) {
       s.variadic = p->isVariadic();
@@ -465,9 +735,7 @@ private:
           s.params.push_back(FIR_TYPE_PTR);
           continue;
         }
-        if (pt->isRecordType())
-          unsupported(loc, "structs and unions passed by value (track A)");
-        s.params.push_back(scalarTy(pt, loc));
+        s.params.push_back(pt->isRecordType() ? abiTy(pt, loc) : scalarTy(pt, loc));
       }
     }
     return s;
@@ -938,6 +1206,16 @@ private:
   void store(QualType t, FirValue v, FirValue addr, SourceLocation loc) {
     ck(fir_mem_store(b, scalarTy(t, loc), v, addr, alignOf(t)), "mem.store");
   }
+  // A struct or union object's value as its ABI type (its leaves, loaded one by one), and
+  // such a value stored into an object.
+  FirValue loadValue(QualType t, FirValue addr, SourceLocation loc, bool vararg = false) {
+    if (t.isVolatileQualified())
+      unsupported(loc, "'volatile'");
+    return ck(fir_mem_load(b, abiTy(t, loc, vararg), addr, alignOf(t)), "mem.load");
+  }
+  void storeValue(QualType t, FirValue v, FirValue addr, SourceLocation loc) {
+    ck(fir_mem_store(b, abiTy(t, loc), v, addr, alignOf(t)), "mem.store");
+  }
 
   FirValue offsetPtr(FirValue p, uint64_t off) {
     if (off == 0)
@@ -1068,6 +1346,8 @@ private:
     e = e->IgnoreParens();
     if (const auto *ce = dyn_cast<ConstantExpr>(e))
       return rvalue(ce->getSubExpr());
+    if (const auto *ew = dyn_cast<ExprWithCleanups>(e))
+      return rvalue(ew->getSubExpr());
     if (const auto *c = dyn_cast<CastExpr>(e))
       return castExpr(c);
     if (const auto *u = dyn_cast<UnaryOperator>(e))
@@ -1465,6 +1745,8 @@ private:
     if (foldInt(e, k))
       return i1(k != 0);
     e = e->IgnoreParens();
+    if (const auto *ew = dyn_cast<ExprWithCleanups>(e))
+      return cond(ew->getSubExpr());
     if (const auto *u = dyn_cast<UnaryOperator>(e); u && u->getOpcode() == UO_LNot)
       return ck(fir_int_bit(b, FIR_BIT_OP_XOR, cond(u->getSubExpr()), i1(true)), "xor");
     if (const auto *bo = dyn_cast<BinaryOperator>(e)) {
@@ -1703,8 +1985,10 @@ private:
   FirValue vaArg(const VAArgExpr *va) {
     SourceLocation loc = va->getExprLoc();
     QualType t = va->getType();
+    if (isVaList(t))
+      unsupported(loc, "'va_arg' of a 'va_list'");
     if (t->isRecordType())
-      unsupported(loc, "'va_arg' of structs and unions (track A)");
+      unsupported(loc, "this 'va_arg'"); // aggAddr reads structs and unions
     FirType ty = scalarTy(t, loc);
     FirValue ap = lvalue(va->getSubExpr());
     LocScope ls(*this, loc);
@@ -1722,11 +2006,11 @@ private:
     return tmp;
   }
 
+  // A call: its scalar result, or, for a struct or union result, the address of the call's
+  // temporary object holding it.
   FirValue callExpr(const CallExpr *ce) {
     SourceLocation loc = ce->getExprLoc();
     QualType rt = ce->getType();
-    if (rt->isRecordType())
-      unsupported(loc, "structs and unions returned by value (track A)");
     const FunctionDecl *fd = ce->getDirectCallee();
     if (fd) {
       if (unsigned id = fd->getBuiltinID()) {
@@ -1770,14 +2054,20 @@ private:
     std::vector<FirValue> args;
     for (unsigned i = 0; i < ce->getNumArgs(); i++) {
       const Expr *a = ce->getArg(i);
-      if (i >= nfixed && a->getType()->isRecordType())
-        unsupported(a->getExprLoc(), "structs and unions as variadic arguments (track A)");
       if (isVaList(a->getType())) {
         args.push_back(vaListArg(a));
         continue;
       }
-      if (a->getType()->isRecordType())
-        unsupported(a->getExprLoc(), "structs and unions passed by value (track A)");
+      if (a->getType()->isRecordType()) {
+        FirValue addr = aggAddr(a);
+        // An empty struct through `...` is nothing (GCC's C on AArch64; FIR's variadic
+        // composites are nonempty).
+        if (i >= nfixed && isEmptyRecord(a->getType(), a->getExprLoc()))
+          continue;
+        LocScope al(*this, a->getExprLoc());
+        args.push_back(loadValue(a->getType(), addr, a->getExprLoc(), i >= nfixed));
+        continue;
+      }
       args.push_back(rvalue(a));
     }
     LocScope ls(*this, loc);
@@ -1791,7 +2081,36 @@ private:
     }
     if (rt->isVoidType())
       return FIR_INVALID;
-    return ck(fir_op_result(b, op, 0), "result");
+    FirValue r = ck(fir_op_result(b, op, 0), "result");
+    if (!rt->isRecordType())
+      return r;
+    FirValue tmp = tempSlot(ce);
+    storeValue(rt, r, tmp, loc);
+    return tmp;
+  }
+
+  // The temporary object of a call or `va_arg` of a struct or union, made at the function's
+  // entry (an object in the region where the call is would end with it, and `?:` yields the
+  // address out of its arms).
+  FirValue tempSlot(const Expr *e) {
+    auto it = tempSlots.find(e);
+    if (it == tempSlots.end())
+      unsupported(e->getExprLoc(), "a struct or union value here");
+    return it->second;
+  }
+
+  // `va_arg(ap, T)` of a struct or union: `va.arg` of its ABI type, into a temporary.
+  FirValue vaArgRecord(const VAArgExpr *va) {
+    SourceLocation loc = va->getExprLoc();
+    QualType t = va->getType();
+    FirValue ap = lvalue(va->getSubExpr());
+    LocScope ls(*this, loc);
+    FirValue tmp = tempSlot(va);
+    if (isEmptyRecord(t, loc))
+      return tmp; // passed as nothing, so read as nothing
+    FirValue v = ck(fir_va_arg(b, abiTy(t, loc, true), ap), "va.arg");
+    storeValue(t, v, tmp, loc);
+    return tmp;
   }
 
   // Lvalues: addresses.
@@ -1867,6 +2186,8 @@ private:
       return lvalueFull(g->getResultExpr());
     if (const auto *ch = dyn_cast<ChooseExpr>(e))
       return lvalueFull(ch->getChosenSubExpr());
+    if (const auto *ew = dyn_cast<ExprWithCleanups>(e))
+      return lvalueFull(ew->getSubExpr());
     if (e->getType()->isRecordType() || e->getType()->isArrayType())
       return {aggAddr(e)};
     unsupported(loc, std::string("this lvalue ('") + e->getStmtClassName() + "')");
@@ -1906,10 +2227,20 @@ private:
       if (ce->getCastKind() == CK_LValueToRValue || ce->getCastKind() == CK_NoOp)
         return aggAddr(ce->getSubExpr());
     }
-    if (isa<CallExpr>(e))
-      unsupported(loc, "structs and unions returned by value (track A)");
-    if (isa<VAArgExpr>(e))
-      unsupported(loc, "'va_arg' of structs and unions (track A)");
+    if (const auto *call = dyn_cast<CallExpr>(e)) {
+      if (!call->getType()->isRecordType())
+        unsupported(loc, "this aggregate expression");
+      return callExpr(call);
+    }
+    if (const auto *va = dyn_cast<VAArgExpr>(e)) {
+      if (!va->getType()->isRecordType() || isVaList(va->getType()))
+        unsupported(loc, "'va_arg' of a 'va_list'");
+      return vaArgRecord(va);
+    }
+    if (const auto *mt = dyn_cast<MaterializeTemporaryExpr>(e))
+      return aggAddr(mt->getSubExpr());
+    if (const auto *ew = dyn_cast<ExprWithCleanups>(e))
+      return aggAddr(ew->getSubExpr());
     if (isa<StmtExpr>(e))
       unsupported(loc, "statement expressions");
     if (isa<DeclRefExpr, MemberExpr, ArraySubscriptExpr, UnaryOperator, StringLiteral,
@@ -2100,6 +2431,12 @@ private:
     QualType rt = curFn->getReturnType();
     if (rt->isVoidType()) {
       ck(fir_func_ret(b, nullptr, 0), "func.ret");
+    } else if (rt->isRecordType()) {
+      // No value: the leaves of a fresh object, which are `poison`.
+      SourceLocation loc = curFn->getLocation();
+      FirValue tmp = ck(fir_mem_stack_of(b, memTy(rt, loc), alignOf(rt)), "mem.stack.of");
+      FirValue v = loadValue(rt, tmp, loc);
+      ck(fir_func_ret(b, &v, 1), "func.ret");
     } else {
       FirType t = scalarTy(rt, curFn->getLocation());
       FirValue v = curFn->isMain() ? cint(t, 0) : ck(fir_poison(b, t), "poison");
@@ -2135,9 +2472,10 @@ private:
       return;
     case Stmt::ReturnStmtClass: {
       const Expr *e = cast<ReturnStmt>(s)->getRetValue();
-      if (e && e->getType()->isRecordType())
-        unsupported(loc, "structs and unions returned by value (track A)");
-      if (e && !curFn->getReturnType()->isVoidType()) {
+      if (e && curFn->getReturnType()->isRecordType()) {
+        FirValue v = loadValue(curFn->getReturnType(), aggAddr(e), loc);
+        ck(fir_func_ret(b, &v, 1), "func.ret");
+      } else if (e && !curFn->getReturnType()->isVoidType()) {
         FirValue v = rvalue(e);
         ck(fir_func_ret(b, &v, 1), "func.ret");
       } else {
@@ -2514,6 +2852,13 @@ private:
         slots[vd] = slot;
       }
     }
+    if (isa<CallExpr, VAArgExpr>(s) && cast<Expr>(s)->getType()->isRecordType() &&
+        !isVaList(cast<Expr>(s)->getType())) {
+      QualType t = cast<Expr>(s)->getType();
+      LocScope ls(*this, s->getBeginLoc());
+      tempSlots[cast<Expr>(s)] =
+          ck(fir_mem_stack_of(b, memTy(t, s->getBeginLoc()), alignOf(t)), "mem.stack.of");
+    }
     if (const auto *cle = dyn_cast<CompoundLiteralExpr>(s); cle && !cle->isFileScope()) {
       LocScope ls(*this, cle->getBeginLoc());
       litSlots[cle] = ck(
@@ -2539,6 +2884,7 @@ private:
     curFn = fd;
     slots.clear();
     litSlots.clear();
+    tempSlots.clear();
     labels.clear();
     caseBlocks.clear();
     jumps.clear();
@@ -2580,7 +2926,10 @@ private:
                                             (uint32_t)ctx.getDeclAlign(pd).getQuantity()),
                            "mem.stack.of");
         nameValue(slot, (pd->getName() + ".addr").str());
-        store(pd->getType(), v, slot, pd->getLocation());
+        if (pd->getType()->isRecordType())
+          storeValue(pd->getType(), v, slot, pd->getLocation());
+        else
+          store(pd->getType(), v, slot, pd->getLocation());
         slots[pd] = slot;
       }
       const Stmt *body = fd->getBody();
