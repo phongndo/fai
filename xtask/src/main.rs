@@ -671,8 +671,22 @@ fn check_evidence(
         Some(1),
     );
     need(&mut bad, "contracts", "kinds", None);
-    // The C ABI against the C compiler: the default number of random signatures, all agreeing.
+    // The C ABI against the C compiler: the default number of random signatures, all agreeing,
+    // with each register class exhausted, scalars after a composite on the stack, reordered
+    // HFAs, non-C composites through `...` as twins, split pointers refused, and the interpreter
+    // runs of MFIR and LFIR agreeing.
     need(&mut bad, "abi_torture", "signatures", Some(240));
+    for key in [
+        "gp_exhausted",
+        "fp_exhausted",
+        "scalar_after_stack_composite",
+        "reordered_hfa",
+        "variadic_twins",
+        "refused_split_pointer",
+        "interpreter_runs",
+    ] {
+        need(&mut bad, "abi_torture", key, None);
+    }
     need(
         &mut bad,
         "dce_check",
