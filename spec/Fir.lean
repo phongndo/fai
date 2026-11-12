@@ -14,3 +14,4 @@ import Fir.Rules
 import Fir.Sim
 import Fir.CodeRel
 import Fir.Dse
+import Fir.Space
