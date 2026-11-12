@@ -45,6 +45,8 @@ struct Lfir<'m> {
     nvregs: FxHashMap<u32, u32>,
     res_area: Word,
     hung: bool,
+    /// The pending exception, if any (Lean's `LMachine.exn`).
+    exn: Option<Word>,
 }
 
 /// Run function `f` of an LFIR module with `args`, and describe the outcome as `fir-ref run`
@@ -60,6 +62,7 @@ pub(super) fn run(m: Machine<'_>, f: u32, args: &[Value], fuel: u64) -> String {
         nvregs: FxHashMap::default(),
         res_area: Word::Bits(0),
         hung: false,
+        exn: None,
     };
     match l.start(f, args) {
         Err(h) => h.render(),
@@ -470,8 +473,19 @@ impl<'m> Lfir<'m> {
         &module.funcs[f as usize].rets
     }
 
-    /// Lean's `finish`: the outermost call's results and the leaks.
+    /// Lean's `finish`: the outermost call's results (or the exception it threw) and the leaks.
     fn finish(&mut self, loc: Option<Loc>, f: u32) -> R<()> {
+        if let Some(w) = self.exn {
+            let v = self.val_of_word(loc, Ty::Ptr, w)?;
+            let mut out = String::new();
+            self.m.render_value(v, &mut out);
+            return Err(Box::new(Halt {
+                behavior: Behavior::Threw(out),
+                loc,
+                note: String::new(),
+                leaks: self.m.leaks(),
+            }));
+        }
         let rets = self.rets(f);
         let mut ws = Vec::with_capacity(rets.len());
         for i in 0..rets.len() {
@@ -925,6 +939,17 @@ impl<'m> Lfir<'m> {
                 self.jump(loc, body.succ(s).label)?;
             }
             OpKind::A64Ret => self.ret(loc)?,
+            OpKind::A64ExnSet { n } => self.exn = Some(self.read(loc, n)?),
+            OpKind::A64ExnTake { d } => {
+                let Some(w) = self.exn.take() else {
+                    return stuck(loc, "no exception is pending");
+                };
+                self.write(d, w);
+            }
+            OpKind::A64BExn { t, f } => {
+                let s = if self.exn.is_some() { t } else { f };
+                self.jump(loc, body.succ(s).label)?;
+            }
             OpKind::A64Trap(r) => return halt(Behavior::Trap(r), loc, ""),
             OpKind::A64Bl { callee } => {
                 let name = body.str(callee);

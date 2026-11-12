@@ -32,6 +32,11 @@ stack of call frames, each with its own virtual registers. The instructions' bit
   whatever `x30` holds: return addresses aren't modeled.
 * **Runtime calls**: `aarch64.bl.alloc` and `aarch64.bl.free` allocate and free like `mem.alloc`
   and `mem.free`, without an event; `aarch64.trap.R` traps with reason `R`.
+* **Exceptions** (decision: Exceptions at run time): the machine has one exception slot, the
+  pending exception or none (`__fir_exn` in native code), outside FIR's memory, which no program
+  can reach. `aarch64.exn.set` sets it, `aarch64.exn.take` takes it, and `aarch64.b.exn` branches
+  on it. A throwing function sets it and returns; its callers check it after each call. The
+  outermost call returning with an exception pending ends the run with `threw`.
 
 A function whose body is a plain `func.ret` of its parameters also runs: it returns those
 values where the calling convention puts results.
@@ -65,6 +70,8 @@ structure LMachine where
   resArea : Word := .bits 0
   /-- An external call didn't return: the machine runs on without doing anything. -/
   hung : Bool := false
+  /-- The pending exception, if any. -/
+  exn : Option Word := none
 
 abbrev LM := StateT LMachine (Except Halt)
 
@@ -243,8 +250,11 @@ def calleeSaved : List Reg := (List.range 11).map (fun i => .x (19 + i)) ++ [.sp
 
 def savedWords : LM (List Word) := calleeSaved.mapM (readReg none)
 
-/-- End the outermost call: its results, by its signature, and the leaks. -/
+/-- End the outermost call: its results, by its signature (or the exception it threw), and the
+leaks. -/
 def finish (loc : Option Loc) (f : Func) : LM Unit := do
+  if let some w := (← get).exn then
+    throw { outcome := .threw (← valOfWord loc .ptr w), loc, leaks := leaks (← get).core }
   let ws ← if f.rets.length ≤ 2 then (List.range f.rets.length).mapM fun i => readReg loc (.x i)
     else (List.range f.rets.length).mapM fun i => do
       loadWord loc 8 (← offsetWord loc (← get).resArea (8 * i : Nat))
@@ -429,6 +439,16 @@ def exec (op : Op) : LM Unit := do
   | .a64B dest => jump loc dest.label
   | .a64BCond c t f => jump loc (if conditionHolds c (← get).nzcv then t.label else f.label)
   | .a64Ret => ret loc
+  | .a64ExnSet n => do
+    let w ← readReg loc n
+    modify fun m => { m with exn := some w }
+  | .a64ExnTake d =>
+    match (← get).exn with
+    | some w =>
+      modify fun m => { m with exn := none }
+      writeReg d w
+    | none => stuckL loc "no exception is pending"
+  | .a64BExn t f => jump loc (if (← get).exn.isSome then t.label else f.label)
   | .a64Trap r => halt (.trap r) loc
   | .a64Bl callee => callNamed loc callee
   | .a64Blr _ n => callNamed loc (← funcAt loc (← readReg loc n))

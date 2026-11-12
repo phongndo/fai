@@ -154,6 +154,13 @@ fn func(m: &Module, mm: &MModule, f: &MFunc) -> Func {
                 Inst::BlFree { family } => OpKind::A64BlFree {
                     family: body.add_str(&mm.families[family as usize]),
                 },
+                Inst::ExnSet { n } => OpKind::A64ExnSet { n },
+                Inst::ExnTake { d } => OpKind::A64ExnTake { d },
+                Inst::BExn { t, f: e } => {
+                    let t = succ(&mut body, t);
+                    let e = succ(&mut body, e);
+                    OpKind::A64BExn { t, f: e }
+                }
             };
             body.append_op(region, kind, [], [], [], f.locs[i]);
         }

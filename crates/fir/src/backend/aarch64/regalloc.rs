@@ -125,7 +125,7 @@ fn successors(f: &MFunc) -> Vec<Vec<u32>> {
             let r = f.block_range(b);
             match f.insts[r.end - 1] {
                 Inst::B { t } => vec![t],
-                Inst::BCond { t, f, .. } => vec![t, f],
+                Inst::BCond { t, f, .. } | Inst::BExn { t, f } => vec![t, f],
                 _ => vec![],
             }
         })

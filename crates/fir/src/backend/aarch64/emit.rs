@@ -4,11 +4,21 @@
 //! `aarch64.adrl` (`adrp` and `add`, or a GOT load for an external function's address),
 //! `aarch64.trap.R` (the reason and location in `w0`…`w2`, then `bl __fir_trap`),
 //! `aarch64.bl.alloc` (`bl malloc`, or `aligned_alloc` for alignments above 16), and
-//! `aarch64.bl.free` (`bl free`). A branch to the next block is left out. Every output defines a
-//! weak `__fir_trap` that executes `brk #1000`; a program (or the test harness) can define its
-//! own to report traps, which it receives as `__fir_trap(reason, line, col)` with reason codes
-//! `div0` 0, `overflow` 1, `shift` 2, `oom` 3, `bounds` 4, `tag` 5, and line and column
-//! `0xffffffff` for no location.
+//! `aarch64.bl.free` (`bl free`), and the exception ops, which address the exception slot
+//! `__fir_exn` through `x16` (decision: Exceptions at run time). A branch to the next block is
+//! left out. Every output defines a weak `__fir_trap` that executes `brk #1000`; a program (or
+//! the test harness) can define its own to report traps, which it receives as
+//! `__fir_trap(reason, line, col)` with reason codes `div0` 0, `overflow` 1, `shift` 2, `oom` 3,
+//! `bounds` 4, `tag` 5, and line and column `0xffffffff` for no location.
+//!
+//! **The exception slot.** `__fir_exn` is two 8-byte words, `{ flag, value }`, zero while no
+//! exception is pending: in C, `struct { void *flag; void *value; } __fir_exn`. A pending
+//! exception has a nonzero flag (the slot's own address) and its value in `value`.
+//! `aarch64.exn.set xN` is `adrp`/`add x16` of the slot, `str xN, [x16, #8]`,
+//! `str x16, [x16]`; `aarch64.exn.take xD` loads `value` into `xD` and stores `xzr` to the flag;
+//! `aarch64.b.exn` loads the flag into `x16` and branches with `cbnz`. An output whose code uses
+//! the slot defines it weakly, zeroed; a C program that calls FIR functions that may throw
+//! defines or declares it, and after each call checks `flag` (and clears it to catch).
 
 use std::fmt::Write;
 
@@ -424,6 +434,41 @@ impl Emitter<'_> {
                 let s = self.sym("free", false);
                 self.linef(format_args!("bl {s}"));
             }
+            Inst::ExnSet { n } => {
+                debug_assert!(n != Reg::x(16), "x16 addresses the exception slot");
+                let s = self.sym("__fir_exn", false);
+                self.adrl(Reg::x(16), &s, false);
+                self.linef(format_args!("str {}, [x16, #8]", x(n)));
+                self.line("str x16, [x16]");
+            }
+            Inst::ExnTake { d } => {
+                debug_assert!(d != Reg::x(16), "x16 addresses the exception slot");
+                let s = self.sym("__fir_exn", false);
+                self.adrl(Reg::x(16), &s, false);
+                self.linef(format_args!("ldr {}, [x16, #8]", x(d)));
+                self.line("str xzr, [x16]");
+            }
+            Inst::BExn { t, f: e } => {
+                let s = self.sym("__fir_exn", false);
+                match self.o.os {
+                    Os::Linux => {
+                        self.linef(format_args!("adrp x16, {s}"));
+                        self.linef(format_args!("ldr x16, [x16, :lo12:{s}]"));
+                    }
+                    Os::Darwin => {
+                        self.linef(format_args!("adrp x16, {s}@PAGE"));
+                        self.linef(format_args!("ldr x16, [x16, {s}@PAGEOFF]"));
+                    }
+                }
+                if Some(t) == next {
+                    self.linef(format_args!("cbz x16, {}", self.label(fi, e)));
+                } else {
+                    self.linef(format_args!("cbnz x16, {}", self.label(fi, t)));
+                    if Some(e) != next {
+                        self.linef(format_args!("b {}", self.label(fi, e)));
+                    }
+                }
+            }
         }
     }
 
@@ -604,6 +649,36 @@ pub fn emit(m: &Module, mm: &MModule, o: &Options) -> String {
     }
     let _ = writeln!(e.out, "{t}:");
     e.line("brk #1000");
+    // The exception slot, if the code uses it.
+    let uses_exn = mm.funcs.iter().any(|f| {
+        f.insts.iter().any(|i| {
+            matches!(
+                i,
+                Inst::ExnSet { .. } | Inst::ExnTake { .. } | Inst::BExn { .. }
+            )
+        })
+    });
+    if uses_exn {
+        let s = e.sym("__fir_exn", false);
+        e.out.push('\n');
+        match o.os {
+            Os::Linux => {
+                e.line(".data");
+                e.line(&format!(".weak {s}"));
+                e.line(".p2align 3");
+                e.line(&format!(".type {s}, %object"));
+                e.line(&format!(".size {s}, 16"));
+            }
+            Os::Darwin => {
+                e.line(".data");
+                e.line(&format!(".globl {s}"));
+                e.line(&format!(".weak_definition {s}"));
+                e.line(".p2align 3");
+            }
+        }
+        let _ = writeln!(e.out, "{s}:");
+        e.line(".quad 0, 0");
+    }
     e.globals();
     if o.os == Os::Linux {
         e.out

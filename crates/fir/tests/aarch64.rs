@@ -11,6 +11,8 @@
 //!   and counted, and the rest of its file still runs.
 //! * External functions are stubs that print the event and return zeros, as `fir run`'s world
 //!   does. Traps reach the test runtime's `__fir_trap`, which prints the reason and location.
+//!   An exception that leaves the called function is pending in the runtime's `__fir_exn` when
+//!   it returns, and `main` prints it as `threw ptr …`.
 //! * Runs that end in UB, get stuck, reach a hole, are ambiguous, or run out of fuel are not
 //!   comparable (UB allows anything) and are only counted.
 //! * Where a module observes addresses (the interpreter's and the hardware's differ), a run
@@ -73,6 +75,10 @@ const RUNTIME: &str = r#"
 #include <stdlib.h>
 
 static const char *reasons[] = {"div0", "overflow", "shift", "oom", "bounds", "tag"};
+
+/* The exception slot (decision: Exceptions at run time): a nonzero flag while an exception is
+   pending, and its value. The compiled code defines it weakly; this definition wins. */
+struct fir_exn { void *flag; void *value; } __fir_exn;
 
 void __fir_trap(uint32_t reason, uint32_t line, uint32_t col) {
     printf("trap %s", reason < 6 ? reasons[reason] : "?");
@@ -176,7 +182,8 @@ fn harness(m: &Module, runs: &[(String, Vec<String>)], darwin: bool) -> String {
     let us = if darwin { "_" } else { "" };
     let mut c = String::from(
         "#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n\
-         void fir_print(char kind, unsigned w, uint64_t v);\n",
+         void fir_print(char kind, unsigned w, uint64_t v);\n\
+         extern struct fir_exn { void *flag; void *value; } __fir_exn;\n",
     );
     let mut sizes: Vec<usize> = m.externs.iter().map(|x| x.rets.len()).collect();
     sizes.extend(m.funcs.iter().map(|f| f.rets.len()));
@@ -255,21 +262,28 @@ fn harness(m: &Module, runs: &[(String, Vec<String>)], darwin: bool) -> String {
         let args: Vec<String> = tys.iter().zip(args).map(|(&t, a)| c_arg(t, a)).collect();
         let call = format!("fn{i}({})", args.join(", "));
         writeln!(c, "  case {k}: {{").unwrap();
+        // An exception that leaves the function is pending in `__fir_exn` when it returns.
+        let threw = "if (__fir_exn.flag) {\n      printf(\"threw \");\n      fir_print('p', 64, (uint64_t)(uintptr_t)__fir_exn.value);\n    } else ";
         match f.rets.len() {
-            0 => writeln!(c, "    {call};\n    printf(\"returned\");").unwrap(),
+            0 => writeln!(c, "    {call};\n    {threw}printf(\"returned\");").unwrap(),
             1 => {
                 let (kd, w) = kind(f.rets[0]);
-                writeln!(c, "    uint64_t r = {call};\n    printf(\"returned \");\n    fir_print('{kd}', {w}, r);").unwrap();
+                writeln!(c, "    uint64_t r = {call};\n    {threw}{{\n      printf(\"returned \");\n      fir_print('{kd}', {w}, r);\n    }}").unwrap();
             }
             n => {
-                writeln!(c, "    struct r{n} r = {call};\n    printf(\"returned \");").unwrap();
+                writeln!(
+                    c,
+                    "    struct r{n} r = {call};\n    {threw}{{\n      printf(\"returned \");"
+                )
+                .unwrap();
                 for (k, &t) in f.rets.iter().enumerate() {
                     let (kd, w) = kind(t);
                     if k > 0 {
-                        c.push_str("    printf(\", \");\n");
+                        c.push_str("      printf(\", \");\n");
                     }
-                    writeln!(c, "    fir_print('{kd}', {w}, r.r[{k}]);").unwrap();
+                    writeln!(c, "      fir_print('{kd}', {w}, r.r[{k}]);").unwrap();
                 }
+                c.push_str("    }\n");
             }
         }
         c.push_str("    printf(\"\\n\");\n    break;\n  }\n");
@@ -548,6 +562,7 @@ fn blocks_used(m: &Module) -> Vec<&'static str> {
         let mut stack = vec![b.entry()];
         while let Some(r) = stack.pop() {
             for op in b.ops(r) {
+                stack.extend_from_slice(b.regions(op));
                 out.push(match b.kind(op) {
                     K::AggMake | K::AggExtract { .. } | K::AggInsert { .. } => "agg.*",
                     K::Overflow { .. } => "int.*.overflow.*",
@@ -555,6 +570,9 @@ fn blocks_used(m: &Module) -> Vec<&'static str> {
                     K::SliceMake | K::SlicePtr | K::SliceLen => "slice.make/ptr/len",
                     K::SliceGet { .. } | K::SliceSet { .. } => "slice.get/set",
                     K::Check(_) => "cf.check",
+                    K::Try => "cf.try",
+                    K::Throw => "exn.throw",
+                    K::Invoke { .. } | K::InvokeIndirect { .. } => "func.invoke",
                     K::Load { .. } | K::Store { .. } => {
                         let t = match b.kind(op) {
                             K::Store { ty, .. } => ty,
@@ -567,7 +585,6 @@ fn blocks_used(m: &Module) -> Vec<&'static str> {
                     }
                     _ => continue,
                 });
-                stack.extend_from_slice(b.regions(op));
             }
         }
     }
@@ -772,6 +789,15 @@ fn check_module(
                 t.count(format!("{what} matches"));
                 if !blocks.is_empty() {
                     t.count(format!("{what} matches (building blocks)"));
+                }
+                if blocks
+                    .iter()
+                    .any(|b| ["cf.try", "exn.throw", "func.invoke"].contains(b))
+                {
+                    t.count(format!("{what} matches (exceptions)"));
+                }
+                if want.contains("threw ") {
+                    t.count(format!("{what} matches (threw)"));
                 }
             } else if differs(want, &got, what) {
                 ok = false;

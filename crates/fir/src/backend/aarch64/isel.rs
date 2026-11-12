@@ -32,6 +32,12 @@
 //! stores of odd sizes split into 4-, 2-, and 1-byte accesses; `mem.copy` copies up to 64 bytes
 //! through registers and larger sizes in a loop whose direction depends on the addresses, so
 //! overlap is fine. **Calls** follow AAPCS64 (see `super::abi`).
+//!
+//! **Exceptions** use an error-return convention (decision: Exceptions at run time):
+//! `exn.throw` makes its value the pending exception (`aarch64.exn.set`) and returns through
+//! the epilogue; after each call that may throw ([`may_throw`]), `aarch64.b.exn` tests for a
+//! pending exception: a plain call then returns at once, leaving it pending for its own caller,
+//! and a `func.invoke` takes it (`aarch64.exn.take`) and jumps to its handler block with it.
 
 use rustc_hash::FxHashMap;
 
@@ -70,6 +76,58 @@ pub struct ModuleCx<'a> {
     /// Functions, then external functions, by name: the callee indices of `bl`.
     pub funcs: FxHashMap<&'a str, u32>,
     pub globals: FxHashMap<&'a str, u32>,
+    /// Which of the module's functions may return with an exception pending
+    /// ([`may_throw`]); external functions never do.
+    pub throws: Vec<bool>,
+}
+
+/// Which functions of a module may throw out of themselves: those with an `exn.throw`, a plain
+/// call to one that may, or an indirect call when any function may (a `func.invoke` catches
+/// what its callee throws). The least fixed point, so code without throws gets no checks.
+pub fn may_throw(m: &Module) -> Vec<bool> {
+    let names: FxHashMap<&str, usize> = m
+        .funcs
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name.as_str(), i))
+        .collect();
+    // Each function's own throws, direct callees (plain calls), and whether it calls indirectly.
+    let mut own = vec![false; m.funcs.len()];
+    let mut callees: Vec<Vec<usize>> = vec![Vec::new(); m.funcs.len()];
+    let mut indirect = vec![false; m.funcs.len()];
+    for (i, f) in m.funcs.iter().enumerate() {
+        let b = &f.body;
+        let mut stack = vec![b.entry()];
+        while let Some(r) = stack.pop() {
+            for op in b.ops(r) {
+                match b.kind(op) {
+                    OpKind::Throw => own[i] = true,
+                    OpKind::Call { callee } => {
+                        if let Some(&g) = names.get(b.str(callee)) {
+                            callees[i].push(g);
+                        }
+                    }
+                    OpKind::CallIndirect(_) => indirect[i] = true,
+                    _ => {}
+                }
+                stack.extend_from_slice(b.regions(op));
+            }
+        }
+    }
+    let mut throws = own;
+    loop {
+        let any = throws.iter().any(|&t| t);
+        let mut changed = false;
+        for i in 0..throws.len() {
+            if !throws[i] && ((indirect[i] && any) || callees[i].iter().any(|&g| throws[g])) {
+                throws[i] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            return throws;
+        }
+    }
 }
 
 impl<'a> ModuleCx<'a> {
@@ -84,7 +142,12 @@ impl<'a> ModuleCx<'a> {
         let globals = (0..m.globals.len())
             .map(|g| (m.globals.name(g), g as u32))
             .collect();
-        ModuleCx { m, funcs, globals }
+        ModuleCx {
+            m,
+            funcs,
+            globals,
+            throws: may_throw(m),
+        }
     }
 
     /// The parameter and result types of callee `f`.
@@ -701,9 +764,15 @@ impl Sel<'_, '_> {
         while let Some(r) = stack.pop() {
             for op in body.ops(r) {
                 match body.kind(op) {
-                    OpKind::Call { .. } | OpKind::CallIndirect(_) => {
+                    OpKind::Call { .. }
+                    | OpKind::CallIndirect(_)
+                    | OpKind::Invoke { .. }
+                    | OpKind::InvokeIndirect { .. } => {
                         let n = body.operands(op).len()
-                            - usize::from(matches!(body.kind(op), OpKind::CallIndirect(_)));
+                            - usize::from(matches!(
+                                body.kind(op),
+                                OpKind::CallIndirect(_) | OpKind::InvokeIndirect { .. }
+                            ));
                         outgoing = outgoing.max(8 * n.saturating_sub(8) as u64);
                     }
                     OpKind::MemStack { align: a, .. } => align = align.max(u64::from(a)),
@@ -850,6 +919,10 @@ impl Sel<'_, '_> {
                     },
                     Inst::BCond { c, t, f } => Inst::BCond {
                         c,
+                        t: new_index[t as usize],
+                        f: new_index[f as usize],
+                    },
+                    Inst::BExn { t, f } => Inst::BExn {
                         t: new_index[t as usize],
                         f: new_index[f as usize],
                     },
@@ -1183,15 +1256,17 @@ impl Sel<'_, '_> {
                 let d = self.result(op, 0);
                 self.emit(Inst::AdrlFunc { d, func });
             }
-            OpKind::Call { callee } => {
+            OpKind::Call { callee } | OpKind::Invoke { callee, .. } => {
                 let func = self.cx.funcs[body.str(callee)];
                 let args = self.operands(op)?;
                 let (_, rs) = self.cx.sig(func);
                 self.call(op, &args, rs.len(), |s| {
                     s.emit(Inst::Bl { func });
                 });
+                let throws = self.cx.throws.get(func as usize).copied().unwrap_or(false);
+                self.after_call(kind, throws);
             }
-            OpKind::CallIndirect(sig) => {
+            OpKind::CallIndirect(sig) | OpKind::InvokeIndirect { sig, .. } => {
                 let args = self.operands(op)?;
                 let Some(Shape::Func(ps, rs)) = body.types().shape_of(sig) else {
                     return Err(format!("{}not a function type", at(self.loc)));
@@ -1204,6 +1279,15 @@ impl Sel<'_, '_> {
                 self.call(op, &args[1..], nr, |s| {
                     s.emit(Inst::Blr { n: target, sig });
                 });
+                let throws = self.cx.throws.iter().any(|&t| t);
+                self.after_call(kind, throws);
+            }
+            OpKind::Throw => {
+                // Make it the pending exception and return through the epilogue (decision:
+                // Exceptions at run time).
+                let v = self.operand(op, 0)?;
+                self.emit(Inst::ExnSet { n: v });
+                self.emit(Inst::B { t: self.exit });
             }
             OpKind::If => {
                 let c = self.operand(op, 0)?;
@@ -1405,6 +1489,32 @@ impl Sel<'_, '_> {
                 }
             }
         }
+    }
+
+    /// After a call that may throw: if an exception is pending, a plain call returns at once
+    /// (through the epilogue, leaving it pending for its caller), and a `func.invoke` takes it
+    /// and jumps to its handler block with it.
+    fn after_call(&mut self, kind: OpKind, throws: bool) {
+        if !throws {
+            return;
+        }
+        let cont = self.new_block(false);
+        match kind {
+            OpKind::Invoke { unwind, .. } | OpKind::InvokeIndirect { unwind, .. } => {
+                let land = self.new_block(true);
+                self.emit(Inst::BExn { t: land, f: cont });
+                self.switch_to(land);
+                let e = self.fresh();
+                self.emit(Inst::ExnTake { d: e });
+                let label = self.body.str(self.body.succ(unwind).label).to_owned();
+                self.jump(&label, &[e]);
+            }
+            _ => self.emit(Inst::BExn {
+                t: self.exit,
+                f: cont,
+            }),
+        }
+        self.switch_to(cont);
     }
 
     /// Compare `v` (zero-extended) against sorted keys, branching to each case or the default.

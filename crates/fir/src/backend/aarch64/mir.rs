@@ -109,6 +109,19 @@ pub enum Inst {
     BlFree {
         family: u32,
     },
+    /// `aarch64.exn.set`: `n` becomes the pending exception.
+    ExnSet {
+        n: Reg,
+    },
+    /// `aarch64.exn.take`: `d` gets the pending exception, which stops being pending.
+    ExnTake {
+        d: Reg,
+    },
+    /// `aarch64.b.exn`: to `t` if an exception is pending, else to `f`.
+    BExn {
+        t: u32,
+        f: u32,
+    },
 }
 
 impl Inst {
@@ -116,7 +129,7 @@ impl Inst {
     pub fn is_terminator(self) -> bool {
         matches!(
             self,
-            Inst::B { .. } | Inst::BCond { .. } | Inst::Ret | Inst::Trap(_)
+            Inst::B { .. } | Inst::BCond { .. } | Inst::Ret | Inst::Trap(_) | Inst::BExn { .. }
         )
     }
 
@@ -157,8 +170,10 @@ impl Inst {
             }
             Inst::Str { s, base, .. } => uses.extend([s, base]),
             Inst::Adrl { d, .. } | Inst::AdrlFunc { d, .. } => defs.push(d),
-            Inst::Blr { n, .. } => uses.push(n),
+            Inst::Blr { n, .. } | Inst::ExnSet { n } => uses.push(n),
+            Inst::ExnTake { d } => defs.push(d),
             Inst::B { .. }
+            | Inst::BExn { .. }
             | Inst::BCond { .. }
             | Inst::Ret
             | Inst::Trap(_)
@@ -256,6 +271,8 @@ impl Inst {
                 n: f(n, false),
                 sig,
             },
+            Inst::ExnSet { n } => Inst::ExnSet { n: f(n, false) },
+            Inst::ExnTake { d } => Inst::ExnTake { d: f(d, true) },
             i => i,
         }
     }
