@@ -48,6 +48,8 @@
 //! # Ok::<(), fir::BuildError>(())
 //! ```
 
+#![forbid(unsafe_code)]
+
 pub mod backend;
 mod body;
 pub mod builder;

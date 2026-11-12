@@ -349,6 +349,27 @@ def generateRust : String := Id.run do
   out := out.pop.push "}"
   return "\n".intercalate out.toList ++ "\n"
 
+/-- The `# Safety` section of an op's C function: what each pointer it takes must be. Values,
+ids, and enums need nothing: bad ones are reported, not trusted. -/
+def safetyLines (ps : List Param) : List String := Id.run do
+  let mut out := ["* `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,",
+    "  of a module that hasn't been freed, used by no other thread during the call."]
+  for p in ps do
+    match p.c with
+    | [(n, "*const c_char")] =>
+      out := out ++ [s!"* `{n}` is null or points to a NUL-terminated string."]
+    | [(n, "FirTarget")] =>
+      out := out ++ [s!"* `{n}.args` points to `{n}.nargs` readable `FirValue`s, or `{n}.nargs` is 0."]
+    | [(n, "*const FirCase"), (nn, _)] =>
+      out := out ++ [s!"* `{n}` points to `{nn}` readable `FirCase`s, or `{nn}` is 0; each case's",
+        "  `target.args` points to `target.nargs` readable `FirValue`s, or `target.nargs` is 0."]
+    | [(n, t), (nn, "usize")] =>
+      let elem := (t.drop 7).toString
+      out := out ++ [s!"* `{n}` points to `{nn}` readable `{elem}`s, or `{nn}` is 0."]
+    | _ => pure ()
+  out := out ++ ["", "Each is read only during the call."]
+  return out
+
 /-- The C function for one op (the `_begin` form for ops with regions). -/
 def capiOp (d : OpDecl) (i : Nat) : List String := Id.run do
   let name := methodName d i
@@ -365,8 +386,12 @@ def capiOp (d : OpDecl) (i : Nat) : List String := Id.run do
     out := out ++ ["///", "/// Makes the op with empty regions: fill them with `fir_position_at_end`."]
   let cps := ps.flatMap (·.c)
   let sig := ", ".intercalate ("fb: *mut FirBuilder" :: cps.map fun (n, t) => s!"{n}: {t}")
+  out := out ++ ["///", "/// # Safety", "///"] ++
+    (safetyLines ps).map fun l => if l.isEmpty then "///" else s!"/// {l}"
   out := out ++ ["#[unsafe(no_mangle)]",
     s!"pub unsafe extern \"C\" fn fir_{method}({sig}) -> {cRet} \{",
+    "    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the",
+    "    // `# Safety` section only during this call, which that section requires to be valid.",
     "    unsafe {",
     "        with_builder(fb, FIR_INVALID, |builder| {"]
   for p in ps do

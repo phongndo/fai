@@ -67,8 +67,6 @@
 //! changed bumps the major version. Op functions follow the op table, which is versioned the
 //! same way.
 
-#![allow(clippy::missing_safety_doc)]
-
 use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -647,12 +645,19 @@ fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
 
 /// Run `f` on a module, catching panics. On failure, the module keeps the message and the call
 /// returns `invalid`, or the failure's status when `status` is set.
+///
+/// # Safety
+///
+/// `m` is null or a module of this library that hasn't been freed, which nothing else uses
+/// during the call. (Every export's contract says so of the module it is given.)
 unsafe fn with_module<T>(
     m: *mut FirModule,
     invalid: T,
     status: impl FnOnce(FirStatus) -> Option<T>,
     f: impl FnOnce(&mut FirModule) -> Result<T, Fail>,
 ) -> T {
+    // SAFETY: `m` is null or a live module no one else uses during the call (this function's `#
+    // Safety`).
     let Some(m) = (unsafe { m.as_mut() }) else {
         return status(FIR_ERR_INVALID).unwrap_or(invalid);
     };
@@ -670,31 +675,50 @@ unsafe fn with_module<T>(
 }
 
 /// [`with_module`] for a call returning an id or a pointer (`invalid` on failure).
+///
+/// # Safety
+///
+/// As [`with_module`].
 unsafe fn module_id<T>(
     m: *mut FirModule,
     invalid: T,
     f: impl FnOnce(&mut FirModule) -> Result<T, Fail>,
 ) -> T {
+    // SAFETY: passed on: `with_module` needs what this function's caller guarantees.
     unsafe { with_module(m, invalid, |_| None, f) }
 }
 
 /// [`with_module`] for a call returning a status.
+///
+/// # Safety
+///
+/// As [`with_module`].
 unsafe fn module_status(
     m: *mut FirModule,
     f: impl FnOnce(&mut FirModule) -> Result<(), Fail>,
 ) -> FirStatus {
+    // SAFETY: passed on: `with_module` needs what this function's caller guarantees.
     unsafe { with_module(m, FIR_OK, Some, |m| f(m).map(|()| FIR_OK)) }
 }
 
 /// Run `f` on the function a builder builds; see [`with_module`].
+///
+/// # Safety
+///
+/// `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned, whose
+/// module hasn't been freed, and which nothing else uses during the call.
 pub(crate) unsafe fn with_builder<T>(
     fb: *mut FirBuilder,
     invalid: T,
     f: impl FnOnce(&mut FuncBuilder<'_>) -> Result<T, BuildError>,
 ) -> T {
+    // SAFETY: `fb` is null or a live builder of a live module (this function's `# Safety`), so its
+    // `module` is too.
     let Some(b) = (unsafe { fb.as_ref() }) else {
         return invalid;
     };
+    // SAFETY: `fb` is null or a live builder of a live module (this function's `# Safety`), so its
+    // `module` is too.
     unsafe {
         module_id(b.module, invalid, |m| match m.mb.current() {
             Some(mut fb) => Ok(f(&mut fb)?),
@@ -703,13 +727,22 @@ pub(crate) unsafe fn with_builder<T>(
     }
 }
 
+/// [`with_builder`] for a call returning a status.
+///
+/// # Safety
+///
+/// As [`with_builder`].
 unsafe fn builder_status(
     fb: *mut FirBuilder,
     f: impl FnOnce(&mut FuncBuilder<'_>) -> Result<(), BuildError>,
 ) -> FirStatus {
+    // SAFETY: `fb` is null or a live builder of a live module (this function's `# Safety`), so its
+    // `module` is too.
     let Some(b) = (unsafe { fb.as_ref() }) else {
         return FIR_ERR_INVALID;
     };
+    // SAFETY: `fb` is null or a live builder of a live module (this function's `# Safety`), so its
+    // `module` is too.
     unsafe {
         module_status(b.module, |m| match m.mb.current() {
             Some(mut fb) => Ok(f(&mut fb)?),
@@ -721,18 +754,31 @@ unsafe fn builder_status(
 // Conversions for the generated functions.
 
 /// A list passed from C; empty when the length is 0, whatever the pointer.
+///
+/// # Safety
+///
+/// When `n` isn't 0 and `p` isn't null, `p` points to `n` readable, initialized, aligned `T`s
+/// that stay unchanged for `'a` (in practice, the call).
 pub(crate) unsafe fn list<'a, T>(p: *const T, n: usize) -> &'a [T] {
     if n == 0 || p.is_null() {
         &[]
     } else {
+        // SAFETY: `p` points to `n` readable `T`s that outlive `'a` (this function's `# Safety`),
+        // and isn't null.
         unsafe { std::slice::from_raw_parts(p, n) }
     }
 }
 
 /// Operands passed from C: a `FirValue` is an operand's 32 bits.
+///
+/// # Safety
+///
+/// As [`list`], for `FirValue`s.
 pub(crate) unsafe fn values<'a>(p: *const FirValue, n: usize) -> &'a [Operand] {
     // `Operand` is `repr(transparent)` over `u32`, and every `u32` is an operand (one that names
     // nothing is rejected when used).
+    // SAFETY: `Operand` is `repr(transparent)` over `u32`, so `n` readable `FirValue`s are `n`
+    // readable operands.
     unsafe { list(p.cast::<Operand>(), n) }
 }
 
@@ -764,14 +810,27 @@ fn ty_to_c(t: Ty) -> FirType {
     }
 }
 
+/// Types passed from C, each checked.
+///
+/// # Safety
+///
+/// As [`list`], for `FirType`s.
 pub(crate) unsafe fn tys(p: *const FirType, n: usize) -> Result<Vec<Ty>, BuildError> {
+    // SAFETY: passed on: `p` points to `n` readable `FirType`s (this function's `# Safety`).
     unsafe { list(p, n) }.iter().map(|&t| ty(t)).collect()
 }
 
+/// A string passed from C; an error if it is null or not UTF-8.
+///
+/// # Safety
+///
+/// `p` is null or points to a NUL-terminated string that stays unchanged for `'a`.
 pub(crate) unsafe fn cstr<'a>(p: *const c_char) -> Result<&'a str, BuildError> {
     if p.is_null() {
         return Err(BuildError::new("a name is missing"));
     }
+    // SAFETY: `p` isn't null, and points to a NUL-terminated string that outlives `'a` (this
+    // function's `# Safety`).
     unsafe { CStr::from_ptr(p) }
         .to_str()
         .map_err(|_| BuildError::new("a name is not UTF-8"))
@@ -781,11 +840,21 @@ pub(crate) fn target(t: FirTarget, args: &[Operand]) -> Target<'_> {
     Target::new(RegionId::from_raw(t.block), args)
 }
 
+/// `cf.switch`'s cases passed from C.
+///
+/// # Safety
+///
+/// As [`list`], for `FirCase`s, each of whose targets' `args` is as [`values`] needs for
+/// `nargs`.
 pub(crate) unsafe fn switch_cases<'a>(p: *const FirCase, n: usize) -> Vec<SwitchCase<'a>> {
+    // SAFETY: `p` points to `n` readable cases whose targets' `args` point to `nargs` values (this
+    // function's `# Safety`).
     unsafe { list(p, n) }
         .iter()
         .map(|c| SwitchCase {
             key: c.key.into(),
+            // SAFETY: `p` points to `n` readable cases whose targets' `args` point to `nargs`
+            // values (this function's `# Safety`).
             target: target(c.target, unsafe { values(c.target.args, c.target.nargs) }),
         })
         .collect()
@@ -794,14 +863,34 @@ pub(crate) unsafe fn switch_cases<'a>(p: *const FirCase, n: usize) -> Vec<Switch
 // Float constants from C values.
 
 /// `float.const` of type `f32` with the bits of a C `float` (NaN payloads included).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+///   abandoned, of a module that hasn't been freed, used by no other thread during the
+///   call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_float_const_f32(fb: *mut FirBuilder, value: f32) -> FirValue {
+    // SAFETY: `fb` are as this function's `# Safety` section requires; they are
+    // used only during the call.
     unsafe { fir_float_const(fb, FIR_TYPE_F32, u64::from(value.to_bits())) }
 }
 
 /// `float.const` of type `f64` with the bits of a C `double` (NaN payloads included).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+///   abandoned, of a module that hasn't been freed, used by no other thread during the
+///   call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_float_const_f64(fb: *mut FirBuilder, value: f64) -> FirValue {
+    // SAFETY: `fb` are as this function's `# Safety` section requires; they are
+    // used only during the call.
     unsafe { fir_float_const(fb, FIR_TYPE_F64, value.to_bits()) }
 }
 
@@ -825,6 +914,14 @@ pub extern "C" fn fir_module_new() -> *mut FirModule {
 
 /// Parse FIR text into a new module (`*out`), to verify, print, run, or add to. On failure,
 /// `*error` gets the message, which the caller frees with `fir_string_free`.
+///
+/// # Safety
+///
+/// * `text` is null or points to a NUL-terminated string.
+/// * `out` is null or points to a writable `*mut FirModule`.
+/// * `error` is null or points to a writable `*mut c_char`.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_module_parse(
     text: *const c_char,
@@ -832,6 +929,8 @@ pub unsafe extern "C" fn fir_module_parse(
     error: *mut *mut c_char,
 ) -> FirStatus {
     let r = catch_unwind(|| -> Result<ModuleBuilder, (FirStatus, String)> {
+        // SAFETY: `text`, `out`, `error` are as this function's `# Safety` section requires; they
+        // are used only during the call.
         let text = unsafe { cstr(text) }.map_err(|e| (FIR_ERR_INVALID, e.to_string()))?;
         let m = fir::parse_module(text).map_err(|e| (FIR_ERR_PARSE, e))?;
         ModuleBuilder::from_module(m).map_err(|e| (FIR_ERR_INVALID, e.to_string()))
@@ -839,6 +938,8 @@ pub unsafe extern "C" fn fir_module_parse(
     .unwrap_or_else(|p| Err((FIR_ERR_INTERNAL, panic_message(&*p))));
     match r {
         Ok(mb) => {
+            // SAFETY: `text`, `out`, `error` are as this function's `# Safety` section requires;
+            // they are used only during the call.
             if let Some(out) = unsafe { out.as_mut() } {
                 *out = Box::into_raw(Box::new(FirModule {
                     mb,
@@ -849,6 +950,8 @@ pub unsafe extern "C" fn fir_module_parse(
             FIR_OK
         }
         Err((status, msg)) => {
+            // SAFETY: `text`, `out`, `error` are as this function's `# Safety` section requires;
+            // they are used only during the call.
             if let Some(error) = unsafe { error.as_mut() } {
                 *error = c_string(msg).into_raw();
             }
@@ -858,17 +961,32 @@ pub unsafe extern "C" fn fir_module_parse(
 }
 
 /// Free a module and everything in it. A builder of it can't be used afterwards.
+///
+/// # Safety
+///
+/// * `m` is null or a module from `fir_module_new` or `fir_module_parse` (or a module
+///   out-parameter of this library) that hasn't been freed. It is freed: `m`, and any
+///   builder of it, dangle afterwards.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_module_free(m: *mut FirModule) {
     if !m.is_null() {
+        // SAFETY: `m` are as this function's `# Safety` section requires; they are used only during
+        // the call.
         drop(unsafe { Box::from_raw(m) });
     }
 }
 
 /// The message of the module's last failed call (empty if none failed). It belongs to the
 /// module, and lasts until its next failed call.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed. The string returned lasts until
+///   the module's next failed call or until it is freed, whichever is first.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_module_error(m: *const FirModule) -> *const c_char {
+    // SAFETY: `m` are as this function's `# Safety` section requires; they are used only during the
+    // call.
     match unsafe { m.as_ref() } {
         Some(m) => m.error.as_ptr(),
         None => c"no module".as_ptr(),
@@ -876,9 +994,16 @@ pub unsafe extern "C" fn fir_module_error(m: *const FirModule) -> *const c_char 
 }
 
 /// Free a string FIR returned.
+///
+/// # Safety
+///
+/// * `s` is null or a string this library returned (from an out-parameter or a
+///   function's result) that hasn't been freed. It is freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_string_free(s: *mut c_char) {
     if !s.is_null() {
+        // SAFETY: `s` are as this function's `# Safety` section requires; they are used only during
+        // the call.
         drop(unsafe { CString::from_raw(s) });
     }
 }
@@ -886,6 +1011,14 @@ pub unsafe extern "C" fn fir_string_free(s: *mut c_char) {
 /// Set the default memory space's data layout: pointer and address sizes in bits, the pointer
 /// alignment in bytes (0: the natural one), and the integer alignments by increasing width (none:
 /// the default ones). Set it before building functions.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `ints` points to `nints` readable `FirIntAlign`s, or `nints` is 0.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_module_set_space(
     m: *mut FirModule,
@@ -895,6 +1028,8 @@ pub unsafe extern "C" fn fir_module_set_space(
     ints: *const FirIntAlign,
     nints: usize,
 ) -> FirStatus {
+    // SAFETY: `m`, `ints` are as this function's `# Safety` section requires; they are used only
+    // during the call.
     unsafe {
         module_status(m, |m| {
             let mut sp = SpaceCfg {
@@ -921,12 +1056,21 @@ pub unsafe extern "C" fn fir_module_set_space(
 
 /// Set the size and alignment in bytes of the module's `va_list` (its memory space's `valist`;
 /// 32 and 8 by default). Set it before building functions.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_module_set_va_list(
     m: *mut FirModule,
     size: u32,
     align: u32,
 ) -> FirStatus {
+    // SAFETY: `m` are as this function's `# Safety` section requires; they are
+    // used only during the call.
     unsafe {
         module_status(m, |m| {
             let sp = SpaceCfg {
@@ -943,12 +1087,22 @@ pub unsafe extern "C" fn fir_module_set_va_list(
 /// Set the module's layer: HFIR (the default), MFIR, or LFIR for the target `target` (such as
 /// `"aarch64"`; ignored for the other layers). Set it before building functions: each op is
 /// checked against it as it is built.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `target` is null or points to a NUL-terminated string.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_module_set_layer(
     m: *mut FirModule,
     layer: FirLayer,
     target: *const c_char,
 ) -> FirStatus {
+    // SAFETY: `m`, `target` are as this function's `# Safety` section requires; they are used only
+    // during the call.
     unsafe {
         module_status(m, |m| {
             let layer = match layer {
@@ -971,8 +1125,17 @@ pub unsafe extern "C" fn fir_module_set_layer(
 
 /// Check the module (its finished functions) as `fir check` does. On failure the message is the
 /// verifier's.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_module_verify(m: *mut FirModule) -> FirStatus {
+    // SAFETY: `m` are as this function's `# Safety` section requires; they are used only during the
+    // call.
     unsafe {
         module_status(m, |m| match fir::verify_module(m.mb.module()) {
             Ok(_) => Ok(()),
@@ -983,8 +1146,17 @@ pub unsafe extern "C" fn fir_module_verify(m: *mut FirModule) -> FirStatus {
 
 /// The module (its finished functions) in canonical text, with locations or without. Free it with
 /// `fir_string_free`.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_module_print(m: *mut FirModule, show_locs: bool) -> *mut c_char {
+    // SAFETY: `m` are as this function's `# Safety` section requires; they are used only during the
+    // call.
     unsafe {
         module_id(m, std::ptr::null_mut(), |m| {
             Ok(c_string(m.mb.module().render(show_locs)).into_raw())
@@ -995,6 +1167,17 @@ pub unsafe extern "C" fn fir_module_print(m: *mut FirModule, show_locs: bool) ->
 /// Verify the module, then run `@name` with arguments written as text (integers, `null`,
 /// `poison`) for at most `fuel` steps. `*out` gets the outcome in one line, as `fir run` prints
 /// it (`returned i32 3`, `ub div0 @4:3`, …); free it with `fir_string_free`.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `name` is null or points to a NUL-terminated string.
+/// * `args` points to `nargs` readable pointers, or `nargs` is 0; each is null or
+///   points to a NUL-terminated string.
+/// * `out` is null or points to a writable `*mut c_char`.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_module_run(
     m: *mut FirModule,
@@ -1004,6 +1187,8 @@ pub unsafe extern "C" fn fir_module_run(
     fuel: u64,
     out: *mut *mut c_char,
 ) -> FirStatus {
+    // SAFETY: `m`, `name`, `args`, `out` are as this function's `# Safety` section requires; they
+    // are used only during the call.
     unsafe {
         module_status(m, |m| {
             let name = cstr(name)?;
@@ -1029,11 +1214,16 @@ pub unsafe extern "C" fn fir_module_run(
 }
 
 /// A new module, `*out`, from a verified copy of `m` (its finished functions). `m` is unchanged.
+///
+/// # Safety
+///
+/// `m` as [`with_module`]; `out` is null or points to a writable `*mut FirModule`.
 unsafe fn derive(
     m: *mut FirModule,
     out: *mut *mut FirModule,
     f: impl FnOnce(&fir::Module) -> Result<fir::Module, Fail>,
 ) -> FirStatus {
+    // SAFETY: passed on: `m` and `out` are as this function's caller guarantees.
     unsafe {
         module_status(m, |m| {
             let module = m.mb.module();
@@ -1059,11 +1249,21 @@ unsafe fn derive(
 /// core ops, and aggregate, union, and slice values their scalars, so the lowered functions take
 /// and return those scalars. `FIR_ERR_VERIFY` if `m` doesn't verify, `FIR_ERR_COMPILE` if it
 /// can't be lowered (such as a field offset the address size can't hold).
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `out` is null or points to a writable `*mut FirModule`.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_module_lower(
     m: *mut FirModule,
     out: *mut *mut FirModule,
 ) -> FirStatus {
+    // SAFETY: `m`, `out` are as this function's `# Safety` section requires; they are used only
+    // during the call.
     unsafe {
         derive(m, out, |module| {
             if module.layer != fir::Layer::Hfir {
@@ -1076,11 +1276,21 @@ pub unsafe extern "C" fn fir_module_lower(
 
 /// Verify a module and run the default pass pipeline on a copy, as `fir opt -O` does: `*out`
 /// gets the optimized module, verified (free it with `fir_module_free`), and `m` is unchanged.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `out` is null or points to a writable `*mut FirModule`.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_module_optimize(
     m: *mut FirModule,
     out: *mut *mut FirModule,
 ) -> FirStatus {
+    // SAFETY: `m`, `out` are as this function's `# Safety` section requires; they are used only
+    // during the call.
     unsafe {
         derive(m, out, |module| {
             let mut new = module.clone();
@@ -1106,6 +1316,15 @@ pub unsafe extern "C" fn fir_module_optimize(
 /// Exceptions use an error-return convention: an exception that escapes a compiled function is
 /// pending in `struct { void *flag; void *value; } __fir_exn` (nonzero `flag`) when it returns;
 /// a C caller checks `flag` after the call, and clears it to catch.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `target` is null or points to a NUL-terminated string.
+/// * `out` is null or points to a writable `*mut c_char`.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_module_compile(
     m: *mut FirModule,
@@ -1115,6 +1334,8 @@ pub unsafe extern "C" fn fir_module_compile(
     out: *mut *mut c_char,
 ) -> FirStatus {
     use fir::backend::aarch64 as a64;
+    // SAFETY: `m`, `target`, `out` are as this function's `# Safety` section requires; they are
+    // used only during the call.
     unsafe {
         module_status(m, |m| {
             let target = cstr(target)?;
@@ -1168,6 +1389,14 @@ pub extern "C" fn fir_type_byte(width: u32) -> FirType {
 }
 
 /// `struct<policy>{fields}`
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `fields` points to `nfields` readable `FirType`s, or `nfields` is 0.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_type_struct(
     m: *mut FirModule,
@@ -1175,6 +1404,8 @@ pub unsafe extern "C" fn fir_type_struct(
     fields: *const FirType,
     nfields: usize,
 ) -> FirType {
+    // SAFETY: `m`, `fields` are as this function's `# Safety` section requires; they are used only
+    // during the call.
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             let fields = tys(fields, nfields)?;
@@ -1184,8 +1415,17 @@ pub unsafe extern "C" fn fir_type_struct(
 }
 
 /// `array<n x elem>`
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_type_array(m: *mut FirModule, n: u64, elem: FirType) -> FirType {
+    // SAFETY: `m` are as this function's `# Safety` section requires; they are used only during the
+    // call.
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             Ok(ty_to_c(m.mb.array_ty(n, ty(elem)?)?))
@@ -1194,12 +1434,22 @@ pub unsafe extern "C" fn fir_type_array(m: *mut FirModule, n: u64, elem: FirType
 }
 
 /// `union<variants>` (HFIR): one of the variants, value types, and an `i32` tag naming it.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `variants` points to `nvariants` readable `FirType`s, or `nvariants` is 0.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_type_union(
     m: *mut FirModule,
     variants: *const FirType,
     nvariants: usize,
 ) -> FirType {
+    // SAFETY: `m`, `variants` are as this function's `# Safety` section requires; they are used
+    // only during the call.
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             let vs = tys(variants, nvariants)?;
@@ -1209,6 +1459,15 @@ pub unsafe extern "C" fn fir_type_union(
 }
 
 /// `func<(params) -> rets>`, the signature of `func.call.indirect`.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `params` points to `nparams` readable `FirType`s, or `nparams` is 0.
+/// * `rets` points to `nrets` readable `FirType`s, or `nrets` is 0.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_type_func(
     m: *mut FirModule,
@@ -1217,11 +1476,22 @@ pub unsafe extern "C" fn fir_type_func(
     rets: *const FirType,
     nrets: usize,
 ) -> FirType {
+    // SAFETY: `m`, `params`, `rets` are as this function's `# Safety` section requires; they are
+    // used only during the call.
     unsafe { fir_type_func_va(m, params, nparams, rets, nrets, false) }
 }
 
 /// `func<(params, ...) -> rets>` if `variadic`, else `func<(params) -> rets>`: the signature of
 /// an indirect call of a variadic function, which passes variadic arguments after `params`.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `params` points to `nparams` readable `FirType`s, or `nparams` is 0.
+/// * `rets` points to `nrets` readable `FirType`s, or `nrets` is 0.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_type_func_va(
     m: *mut FirModule,
@@ -1231,6 +1501,8 @@ pub unsafe extern "C" fn fir_type_func_va(
     nrets: usize,
     variadic: bool,
 ) -> FirType {
+    // SAFETY: `m`, `params`, `rets` are as this function's `# Safety` section requires; they are
+    // used only during the call.
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             let (ps, rs) = (tys(params, nparams)?, tys(rets, nrets)?);
@@ -1263,6 +1535,15 @@ fn layout_ty(m: &FirModule, t: FirType) -> Result<Ty, Fail> {
 /// A type's size and alignment in bytes, in the module's memory space (its data layout), as
 /// `ty.size` and `ty.align` give them: what a frontend checks its own layout against. Scalars,
 /// structs, and arrays have a layout; function and union types don't.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `size` is null or points to a writable `u64`.
+/// * `align` is null or points to a writable `u32`.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_type_layout(
     m: *mut FirModule,
@@ -1270,6 +1551,8 @@ pub unsafe extern "C" fn fir_type_layout(
     size: *mut u64,
     align: *mut u32,
 ) -> FirStatus {
+    // SAFETY: `m`, `size`, `align` are as this function's `# Safety` section requires; they are
+    // used only during the call.
     unsafe {
         module_status(m, |m| {
             let t = layout_ty(m, t)?;
@@ -1292,6 +1575,14 @@ pub unsafe extern "C" fn fir_type_layout(
 }
 
 /// The offset in bytes of field `index` of the struct type `t`, as `ty.offset` gives it.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `offset` is null or points to a writable `u64`.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_type_field_offset(
     m: *mut FirModule,
@@ -1299,6 +1590,8 @@ pub unsafe extern "C" fn fir_type_field_offset(
     index: u32,
     offset: *mut u64,
 ) -> FirStatus {
+    // SAFETY: `m`, `offset` are as this function's `# Safety` section requires; they are
+    // used only during the call.
     unsafe {
         module_status(m, |m| {
             let t = layout_ty(m, t)?;
@@ -1327,6 +1620,16 @@ pub unsafe extern "C" fn fir_type_field_offset(
 
 /// Declare a function `@name(params) -> rets`, to call it or take its address, and define it
 /// with `fir_func_begin`.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `name` is null or points to a NUL-terminated string.
+/// * `params` points to `nparams` readable `FirType`s, or `nparams` is 0.
+/// * `rets` points to `nrets` readable `FirType`s, or `nrets` is 0.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_func_declare(
     m: *mut FirModule,
@@ -1336,6 +1639,8 @@ pub unsafe extern "C" fn fir_func_declare(
     rets: *const FirType,
     nrets: usize,
 ) -> FirFunc {
+    // SAFETY: `m`, `name`, `params`, `rets` are as this function's `# Safety` section requires;
+    // they are used only during the call.
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             let (ps, rs) = (tys(params, nparams)?, tys(rets, nrets)?);
@@ -1347,6 +1652,16 @@ pub unsafe extern "C" fn fir_func_declare(
 /// `fir_func_declare` of a function that takes variadic arguments after `params` if
 /// `variadic` (`func @name(%a: T, ...)`): its body reads them with `fir_va_start` and
 /// `fir_va_arg`, and a call (`fir_func_call`) passes them after the fixed arguments.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `name` is null or points to a NUL-terminated string.
+/// * `params` points to `nparams` readable `FirType`s, or `nparams` is 0.
+/// * `rets` points to `nrets` readable `FirType`s, or `nrets` is 0.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_func_declare_va(
     m: *mut FirModule,
@@ -1357,6 +1672,8 @@ pub unsafe extern "C" fn fir_func_declare_va(
     nrets: usize,
     variadic: bool,
 ) -> FirFunc {
+    // SAFETY: `m`, `name`, `params`, `rets` are as this function's `# Safety` section requires; they are
+    // used only during the call.
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             let (ps, rs) = (tys(params, nparams)?, tys(rets, nrets)?);
@@ -1366,8 +1683,18 @@ pub unsafe extern "C" fn fir_func_declare_va(
 }
 
 /// The function or external function named `name`.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `name` is null or points to a NUL-terminated string.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_func_find(m: *mut FirModule, name: *const c_char) -> FirFunc {
+    // SAFETY: `m`, `name` are as this function's `# Safety` section requires; they are used only
+    // during the call.
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             let name = cstr(name)?;
@@ -1381,6 +1708,17 @@ pub unsafe extern "C" fn fir_func_find(m: *mut FirModule, name: *const c_char) -
 
 /// `extern func @name(params) -> rets effects[…] trust`: a function outside the module, with the
 /// `FIR_EFFECT_*` it may have.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `name` is null or points to a NUL-terminated string.
+/// * `params` points to `nparams` readable `FirType`s, or `nparams` is 0.
+/// * `rets` points to `nrets` readable `FirType`s, or `nrets` is 0.
+/// * `effects` points to `neffects` readable `FirEffect`s, or `neffects` is 0.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_extern_declare(
     m: *mut FirModule,
@@ -1393,6 +1731,8 @@ pub unsafe extern "C" fn fir_extern_declare(
     neffects: usize,
     trust: FirTrust,
 ) -> FirFunc {
+    // SAFETY: `m`, `name`, `params`, `rets`, `effects` are as this function's `# Safety` section
+    // requires; they are used only during the call.
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             let (ps, rs) = (tys(params, nparams)?, tys(rets, nrets)?);
@@ -1409,6 +1749,17 @@ pub unsafe extern "C" fn fir_extern_declare(
 
 /// `fir_extern_declare` of a function that takes variadic arguments after `params` if
 /// `variadic` (`extern func @printf(ptr, ...) -> i32 …`).
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `name` is null or points to a NUL-terminated string.
+/// * `params` points to `nparams` readable `FirType`s, or `nparams` is 0.
+/// * `rets` points to `nrets` readable `FirType`s, or `nrets` is 0.
+/// * `effects` points to `neffects` readable `FirEffect`s, or `neffects` is 0.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_extern_declare_va(
     m: *mut FirModule,
@@ -1422,6 +1773,8 @@ pub unsafe extern "C" fn fir_extern_declare_va(
     neffects: usize,
     trust: FirTrust,
 ) -> FirFunc {
+    // SAFETY: `m`, `name`, `params`, `rets`, `effects` are as this function's `# Safety` section requires; they are
+    // used only during the call.
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             let (ps, rs) = (tys(params, nparams)?, tys(rets, nrets)?);
@@ -1439,6 +1792,14 @@ pub unsafe extern "C" fn fir_extern_declare_va(
 
 /// `global [const] @name: ty [align align] = init`. An initializer that takes the address of a
 /// global declared later is set afterwards with `fir_global_set_init`.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `name` is null or points to a NUL-terminated string.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_global_declare(
     m: *mut FirModule,
@@ -1448,6 +1809,8 @@ pub unsafe extern "C" fn fir_global_declare(
     align: u32,
     init: FirInit,
 ) -> FirGlobal {
+    // SAFETY: `m`, `name` are as this function's `# Safety` section requires; they are used only
+    // during the call.
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             let init = m.init(init)?;
@@ -1458,12 +1821,21 @@ pub unsafe extern "C" fn fir_global_declare(
 }
 
 /// Replace a global's initializer.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_global_set_init(
     m: *mut FirModule,
     g: FirGlobal,
     init: FirInit,
 ) -> FirStatus {
+    // SAFETY: `m` are as this function's `# Safety` section requires; they are used only during the
+    // call.
     unsafe {
         module_status(m, |m| {
             let init = m.init(init)?;
@@ -1487,20 +1859,47 @@ impl FirModule {
 }
 
 /// `zero`: every byte zero.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_init_zero(m: *mut FirModule) -> FirInit {
+    // SAFETY: `m` are as this function's `# Safety` section requires; they are used only during the
+    // call.
     unsafe { module_id(m, FIR_INVALID, |m| Ok(m.add_init(Init::Zero))) }
 }
 
 /// `null`
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_init_null(m: *mut FirModule) -> FirInit {
+    // SAFETY: `m` are as this function's `# Safety` section requires; they are used only during the
+    // call.
     unsafe { module_id(m, FIR_INVALID, |m| Ok(m.add_init(Init::Null))) }
 }
 
 /// An integer, for an `iN` or `bN`.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_init_int(m: *mut FirModule, n: i64) -> FirInit {
+    // SAFETY: `m` are as this function's `# Safety` section requires; they are used only during the
+    // call.
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             let init = m.mb.init_int(n);
@@ -1510,8 +1909,18 @@ pub unsafe extern "C" fn fir_init_int(m: *mut FirModule, n: i64) -> FirInit {
 }
 
 /// `bytes "…"`: the whole object's bytes.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `bytes` points to `n` readable `u8`s, or `n` is 0.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_init_bytes(m: *mut FirModule, bytes: *const u8, n: usize) -> FirInit {
+    // SAFETY: `m`, `bytes` are as this function's `# Safety` section requires; they are used only
+    // during the call.
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             let init = m.mb.init_bytes(list(bytes, n));
@@ -1521,8 +1930,17 @@ pub unsafe extern "C" fn fir_init_bytes(m: *mut FirModule, bytes: *const u8, n: 
 }
 
 /// An `f32`, for a global of that type.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_init_f32(m: *mut FirModule, x: f32) -> FirInit {
+    // SAFETY: `m` are as this function's `# Safety` section requires; they are
+    // used only during the call.
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             let init = m.mb.init_f32(x);
@@ -1532,8 +1950,17 @@ pub unsafe extern "C" fn fir_init_f32(m: *mut FirModule, x: f32) -> FirInit {
 }
 
 /// An `f64`, for a global of that type.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_init_f64(m: *mut FirModule, x: f64) -> FirInit {
+    // SAFETY: `m` are as this function's `# Safety` section requires; they are
+    // used only during the call.
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             let init = m.mb.init_f64(x);
@@ -1543,8 +1970,17 @@ pub unsafe extern "C" fn fir_init_f64(m: *mut FirModule, x: f64) -> FirInit {
 }
 
 /// `@f`: a function's address.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_init_func(m: *mut FirModule, f: FirFunc) -> FirInit {
+    // SAFETY: `m` are as this function's `# Safety` section requires; they are used only during the
+    // call.
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             let init = m.mb.init_func(FuncRef::from_raw(f))?;
@@ -1554,8 +1990,17 @@ pub unsafe extern "C" fn fir_init_func(m: *mut FirModule, f: FirFunc) -> FirInit
 }
 
 /// `@g`: a global's address.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_init_global(m: *mut FirModule, g: FirGlobal) -> FirInit {
+    // SAFETY: `m` are as this function's `# Safety` section requires; they are used only during the
+    // call.
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             let init = m.mb.init_global(GlobalRef::from_raw(g))?;
@@ -1565,12 +2010,22 @@ pub unsafe extern "C" fn fir_init_global(m: *mut FirModule, g: FirGlobal) -> Fir
 }
 
 /// `{…}`: one initializer per struct field or array element.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `items` points to `n` readable `FirInit`s, or `n` is 0.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_init_list(
     m: *mut FirModule,
     items: *const FirInit,
     n: usize,
 ) -> FirInit {
+    // SAFETY: `m`, `items` are as this function's `# Safety` section requires; they are used only
+    // during the call.
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             let items = list(items, n)
@@ -1587,8 +2042,17 @@ pub unsafe extern "C" fn fir_init_list(
 
 /// Start building a declared function, at the end of its entry region. Finish with
 /// `fir_func_end` (or drop it with `fir_func_abandon`), which frees the builder. Null on failure.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_func_begin(m: *mut FirModule, f: FirFunc) -> *mut FirBuilder {
+    // SAFETY: `m` are as this function's `# Safety` section requires; they are used only during the
+    // call.
     unsafe {
         module_id(m, std::ptr::null_mut(), |mm| {
             mm.mb.define(FuncRef::from_raw(f))?;
@@ -1598,12 +2062,21 @@ pub unsafe extern "C" fn fir_func_begin(m: *mut FirModule, f: FirFunc) -> *mut F
 }
 
 /// Finish the function and add it to the module; free the builder, whatever the outcome.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed. The builder is freed: `fb` dangles afterwards.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_func_end(fb: *mut FirBuilder) -> FirStatus {
     if fb.is_null() {
         return FIR_ERR_INVALID;
     }
+    // SAFETY: `fb` are as this function's `# Safety` section requires; they are used only during
+    // the call.
     let b = unsafe { Box::from_raw(fb) };
+    // SAFETY: `fb` are as this function's `# Safety` section requires; they are used only during
+    // the call.
     unsafe {
         module_status(b.module, |m| match m.mb.current() {
             Some(f) => Ok(f.finish().map(drop)?),
@@ -1613,12 +2086,21 @@ pub unsafe extern "C" fn fir_func_end(fb: *mut FirBuilder) -> FirStatus {
 }
 
 /// Drop the function being built (it stays declared) and free the builder.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed. The builder is freed: `fb` dangles afterwards.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_func_abandon(fb: *mut FirBuilder) {
     if fb.is_null() {
         return;
     }
+    // SAFETY: `fb` are as this function's `# Safety` section requires; they are used only during
+    // the call.
     let b = unsafe { Box::from_raw(fb) };
+    // SAFETY: `fb` are as this function's `# Safety` section requires; they are used only during
+    // the call.
     unsafe {
         module_status(b.module, |m| {
             m.mb.abandon_func();
@@ -1628,8 +2110,18 @@ pub unsafe extern "C" fn fir_func_abandon(fb: *mut FirBuilder) {
 }
 
 /// Parameter `i` of the function.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+///   abandoned, of a module that hasn't been freed, used by no other thread during the
+///   call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_builder_param(fb: *mut FirBuilder, i: u32) -> FirValue {
+    // SAFETY: `fb` are as this function's `# Safety` section requires; they are used only during
+    // the call.
     unsafe {
         with_builder(fb, FIR_INVALID, |f| {
             let ps = f.params();
@@ -1645,14 +2137,34 @@ pub unsafe extern "C" fn fir_builder_param(fb: *mut FirBuilder, i: u32) -> FirVa
 }
 
 /// The function's entry region.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+///   abandoned, of a module that hasn't been freed, used by no other thread during the
+///   call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_builder_entry(fb: *mut FirBuilder) -> FirRegion {
+    // SAFETY: `fb` are as this function's `# Safety` section requires; they are used only during
+    // the call.
     unsafe { with_builder(fb, FIR_INVALID, |f| Ok(f.entry().raw())) }
 }
 
 /// Result `i` of an op.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+///   abandoned, of a module that hasn't been freed, used by no other thread during the
+///   call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_op_result(fb: *mut FirBuilder, op: FirOp, i: u32) -> FirValue {
+    // SAFETY: `fb` are as this function's `# Safety` section requires; they are used only during
+    // the call.
     unsafe {
         with_builder(fb, FIR_INVALID, |f| {
             let rs = f.results(OpId::from_raw(op))?;
@@ -1666,8 +2178,18 @@ pub unsafe extern "C" fn fir_op_result(fb: *mut FirBuilder, op: FirOp, i: u32) -
 }
 
 /// The op whose result `v` is.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+///   abandoned, of a module that hasn't been freed, used by no other thread during the
+///   call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_value_op(fb: *mut FirBuilder, v: FirValue) -> FirOp {
+    // SAFETY: `fb` are as this function's `# Safety` section requires; they are used only during
+    // the call.
     unsafe {
         with_builder(fb, FIR_INVALID, |f| {
             let v = fir::ValueId::from_raw(v);
@@ -1683,8 +2205,18 @@ pub unsafe extern "C" fn fir_value_op(fb: *mut FirBuilder, v: FirValue) -> FirOp
 }
 
 /// Region `i` of an op.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+///   abandoned, of a module that hasn't been freed, used by no other thread during the
+///   call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_op_region(fb: *mut FirBuilder, op: FirOp, i: u32) -> FirRegion {
+    // SAFETY: `fb` are as this function's `# Safety` section requires; they are used only during
+    // the call.
     unsafe {
         with_builder(fb, FIR_INVALID, |f| {
             Ok(f.region(OpId::from_raw(op), i as usize)?.raw())
@@ -1693,8 +2225,18 @@ pub unsafe extern "C" fn fir_op_region(fb: *mut FirBuilder, op: FirOp, i: u32) -
 }
 
 /// Parameter `i` of a region or block.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+///   abandoned, of a module that hasn't been freed, used by no other thread during the
+///   call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_region_param(fb: *mut FirBuilder, r: FirRegion, i: u32) -> FirValue {
+    // SAFETY: `fb` are as this function's `# Safety` section requires; they are used only during
+    // the call.
     unsafe {
         with_builder(fb, FIR_INVALID, |f| {
             let ps = f.region_params(RegionId::from_raw(r))?;
@@ -1708,20 +2250,50 @@ pub unsafe extern "C" fn fir_region_param(fb: *mut FirBuilder, r: FirRegion, i: 
 }
 
 /// Put the next ops at the end of a region or block.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+///   abandoned, of a module that hasn't been freed, used by no other thread during the
+///   call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_position_at_end(fb: *mut FirBuilder, r: FirRegion) -> FirStatus {
+    // SAFETY: `fb` are as this function's `# Safety` section requires; they are used only during
+    // the call.
     unsafe { builder_status(fb, |f| f.position_at_end(RegionId::from_raw(r))) }
 }
 
 /// Put the next ops right before an op.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+///   abandoned, of a module that hasn't been freed, used by no other thread during the
+///   call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_position_before(fb: *mut FirBuilder, op: FirOp) -> FirStatus {
+    // SAFETY: `fb` are as this function's `# Safety` section requires; they are used only during
+    // the call.
     unsafe { builder_status(fb, |f| f.position_before(OpId::from_raw(op))) }
 }
 
 /// A new block of the `cf.blocks` (or `aarch64.code`) op `op`, labeled `label` (null or empty:
 /// its id) and with these parameter types. The first block made is the entry, without parameters. Blocks are
 /// given to the op in the order made, by `fir_blocks_end` or when the function ends.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+///   abandoned, of a module that hasn't been freed, used by no other thread during the
+///   call.
+/// * `label` is null or points to a NUL-terminated string.
+/// * `params` points to `nparams` readable `FirType`s, or `nparams` is 0.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_block_new(
     fb: *mut FirBuilder,
@@ -1730,6 +2302,8 @@ pub unsafe extern "C" fn fir_block_new(
     params: *const FirType,
     nparams: usize,
 ) -> FirRegion {
+    // SAFETY: `fb`, `label`, `params` are as this function's `# Safety` section requires; they are
+    // used only during the call.
     unsafe {
         with_builder(fb, FIR_INVALID, |f| {
             let label = if label.is_null() { "" } else { cstr(label)? };
@@ -1740,14 +2314,34 @@ pub unsafe extern "C" fn fir_block_new(
 }
 
 /// Give a `cf.blocks` (or `aarch64.code`) op the blocks made for it; no more can be added.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+///   abandoned, of a module that hasn't been freed, used by no other thread during the
+///   call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_blocks_end(fb: *mut FirBuilder, op: FirOp) -> FirStatus {
+    // SAFETY: `fb` are as this function's `# Safety` section requires; they are used only during
+    // the call.
     unsafe { builder_status(fb, |f| f.end_blocks(OpId::from_raw(op))) }
 }
 
 /// The source location the next ops get, `@line:col`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+///   abandoned, of a module that hasn't been freed, used by no other thread during the
+///   call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_set_loc(fb: *mut FirBuilder, line: u32, col: u32) -> FirStatus {
+    // SAFETY: `fb` are as this function's `# Safety` section requires; they are used only during
+    // the call.
     unsafe {
         builder_status(fb, |f| {
             f.set_loc(Some(fir::Loc { line, col }));
@@ -1757,8 +2351,18 @@ pub unsafe extern "C" fn fir_set_loc(fb: *mut FirBuilder, line: u32, col: u32) -
 }
 
 /// The next ops get no location.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+///   abandoned, of a module that hasn't been freed, used by no other thread during the
+///   call.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_clear_loc(fb: *mut FirBuilder) -> FirStatus {
+    // SAFETY: `fb` are as this function's `# Safety` section requires; they are used only during
+    // the call.
     unsafe {
         builder_status(fb, |f| {
             f.set_loc(None);
@@ -1768,8 +2372,19 @@ pub unsafe extern "C" fn fir_clear_loc(fb: *mut FirBuilder) -> FirStatus {
 }
 
 /// The source file of the function's locations (`loc "main.c"`); null for none.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+///   abandoned, of a module that hasn't been freed, used by no other thread during the
+///   call.
+/// * `file` is null or points to a NUL-terminated string.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_set_file(fb: *mut FirBuilder, file: *const c_char) -> FirStatus {
+    // SAFETY: `fb`, `file` are as this function's `# Safety` section requires; they are used only
+    // during the call.
     unsafe {
         builder_status(fb, |f| {
             let file = if file.is_null() {
@@ -1784,16 +2399,36 @@ pub unsafe extern "C" fn fir_set_file(fb: *mut FirBuilder, file: *const c_char) 
 }
 
 /// Name a value, as `%name` in text. Unnamed values are named after their ids.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+///   abandoned, of a module that hasn't been freed, used by no other thread during the
+///   call.
+/// * `name` is null or points to a NUL-terminated string.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_value_set_name(
     fb: *mut FirBuilder,
     v: FirValue,
     name: *const c_char,
 ) -> FirStatus {
+    // SAFETY: `fb`, `name` are as this function's `# Safety` section requires; they are used only
+    // during the call.
     unsafe { builder_status(fb, |f| f.name(fir::ValueId::from_raw(v), cstr(name)?)) }
 }
 
 /// Put these facts on a value, replacing any it has.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+///   abandoned, of a module that hasn't been freed, used by no other thread during the
+///   call.
+/// * `facts` points to `nfacts` readable `FirFact`s, or `nfacts` is 0.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_value_set_facts(
     fb: *mut FirBuilder,
@@ -1801,6 +2436,8 @@ pub unsafe extern "C" fn fir_value_set_facts(
     facts: *const FirFact,
     nfacts: usize,
 ) -> FirStatus {
+    // SAFETY: `fb`, `facts` are as this function's `# Safety` section requires; they are used only
+    // during the call.
     unsafe {
         builder_status(fb, |f| {
             let mut fs = Vec::new();
@@ -1822,12 +2459,23 @@ pub unsafe extern "C" fn fir_value_set_facts(
 }
 
 /// A hole `?name: ty`, usable as an operand.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+///   abandoned, of a module that hasn't been freed, used by no other thread during the
+///   call.
+/// * `name` is null or points to a NUL-terminated string.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_hole(
     fb: *mut FirBuilder,
     name: *const c_char,
     ty_: FirType,
 ) -> FirValue {
+    // SAFETY: `fb`, `name` are as this function's `# Safety` section requires; they are used only
+    // during the call.
     unsafe {
         with_builder(fb, FIR_INVALID, |f| {
             Ok(f.hole(cstr(name)?, ty(ty_)?)?.raw())
@@ -1836,12 +2484,23 @@ pub unsafe extern "C" fn fir_hole(
 }
 
 /// `int.const` with the constant in decimal, for constants wider than 64 bits.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+///   abandoned, of a module that hasn't been freed, used by no other thread during the
+///   call.
+/// * `digits` is null or points to a NUL-terminated string.
+///
+/// Each is used only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_int_const_dec(
     fb: *mut FirBuilder,
     result: FirType,
     digits: *const c_char,
 ) -> FirValue {
+    // SAFETY: `fb`, `digits` are as this function's `# Safety` section requires; they are used only
+    // during the call.
     unsafe {
         with_builder(fb, FIR_INVALID, |f| {
             let s = cstr(digits)?;

@@ -5,3 +5,14 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
+
+# Lints every crate inherits (`[lints] workspace = true`), checked by `cargo xtask verify` with
+# `-D warnings`. The C API is the only crate with `unsafe` (`fir` forbids it): each unsafe block
+# says why it is sound, each unsafe function says what its caller must guarantee.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+not_unsafe_ptr_arg_deref = "deny"

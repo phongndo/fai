@@ -12,8 +12,17 @@ use fir::{FuncRef, GlobalRef, Operand, Reg};
 use crate::*;
 
 /// `int.const n`
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_int_const(fb: *mut FirBuilder, result: FirType, n: i64) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.int_const(crate::ty(result)?, n).map(|v| v.raw())
@@ -23,8 +32,17 @@ pub unsafe extern "C" fn fir_int_const(fb: *mut FirBuilder, result: FirType, n: 
 
 /// `poison`: a `poison` value of a scalar type (`iN`, `ptr`, `bN` (whose bytes are all
 /// `poison`), or a float).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_poison(fb: *mut FirBuilder, result: FirType) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.poison(crate::ty(result)?).map(|v| v.raw())
@@ -33,8 +51,17 @@ pub unsafe extern "C" fn fir_poison(fb: *mut FirBuilder, result: FirType) -> Fir
 }
 
 /// `freeze %x`: `%x`, or an arbitrary value if it is `poison`; an integer or a float.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_freeze(fb: *mut FirBuilder, t: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.freeze(Operand::from_raw(t)).map(|v| v.raw())
@@ -44,8 +71,17 @@ pub unsafe extern "C" fn fir_freeze(fb: *mut FirBuilder, t: FirValue) -> FirValu
 
 /// `copy %x`: the same value, of any type. Rewrites produce it (store-to-load forwarding
 /// turns a load into a copy of the stored value), and copy propagation removes it.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_copy(fb: *mut FirBuilder, t: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.copy(Operand::from_raw(t)).map(|v| v.raw())
@@ -54,8 +90,17 @@ pub unsafe extern "C" fn fir_copy(fb: *mut FirBuilder, t: FirValue) -> FirValue 
 }
 
 /// `select %c, %a, %b`
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_select(fb: *mut FirBuilder, c: FirValue, a: FirValue, b: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.select(Operand::from_raw(c), Operand::from_raw(a), Operand::from_raw(b)).map(|v| v.raw())
@@ -65,8 +110,17 @@ pub unsafe extern "C" fn fir_select(fb: *mut FirBuilder, c: FirValue, a: FirValu
 
 /// `int.add.nsw %a, %b` and friends: `int.add`, `int.sub`, `int.mul` with an overflow
 /// modifier.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_int_arith(fb: *mut FirBuilder, op: FirArithOp, ovf: FirOvf, a: FirValue, b: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.int_arith(ArithOp::from_c(op)?, Ovf::from_c(ovf)?, Operand::from_raw(a), Operand::from_raw(b)).map(|v| v.raw())
@@ -75,8 +129,17 @@ pub unsafe extern "C" fn fir_int_arith(fb: *mut FirBuilder, op: FirArithOp, ovf:
 }
 
 /// `int.and`, `int.or`, `int.xor`
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_int_bit(fb: *mut FirBuilder, op: FirBitOp, a: FirValue, b: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.int_bit(BitOp::from_c(op)?, Operand::from_raw(a), Operand::from_raw(b)).map(|v| v.raw())
@@ -85,8 +148,17 @@ pub unsafe extern "C" fn fir_int_bit(fb: *mut FirBuilder, op: FirBitOp, a: FirVa
 }
 
 /// `int.div.s.ub %a, %b` and friends; see `Edge`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_int_div(fb: *mut FirBuilder, op: FirDivOp, zero: FirEdge, ovf: FirEdge, a: FirValue, b: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.int_div(DivOp::from_c(op)?, Edge::from_c(zero)?, Edge::from_c(ovf)?, Operand::from_raw(a), Operand::from_raw(b)).map(|v| v.raw())
@@ -95,8 +167,17 @@ pub unsafe extern "C" fn fir_int_div(fb: *mut FirBuilder, op: FirDivOp, zero: Fi
 }
 
 /// `int.shl.mask %a, %b`, `int.shr.u`, `int.shr.s`; see `ShiftEdge`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_int_shift(fb: *mut FirBuilder, op: FirShiftOp, edge: FirShiftEdge, a: FirValue, b: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.int_shift(ShiftOp::from_c(op)?, ShiftEdge::from_c(edge)?, Operand::from_raw(a), Operand::from_raw(b)).map(|v| v.raw())
@@ -105,8 +186,17 @@ pub unsafe extern "C" fn fir_int_shift(fb: *mut FirBuilder, op: FirShiftOp, edge
 }
 
 /// `int.cmp.slt %a, %b` and friends.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_int_cmp(fb: *mut FirBuilder, p: FirPred, a: FirValue, b: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.int_cmp(Pred::from_c(p)?, Operand::from_raw(a), Operand::from_raw(b)).map(|v| v.raw())
@@ -115,8 +205,17 @@ pub unsafe extern "C" fn fir_int_cmp(fb: *mut FirBuilder, p: FirPred, a: FirValu
 }
 
 /// `int.zext %a`: the result type is the wider type.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_int_zext(fb: *mut FirBuilder, result: FirType, a: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.int_zext(crate::ty(result)?, Operand::from_raw(a)).map(|v| v.raw())
@@ -125,8 +224,17 @@ pub unsafe extern "C" fn fir_int_zext(fb: *mut FirBuilder, result: FirType, a: F
 }
 
 /// `int.sext %a`
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_int_sext(fb: *mut FirBuilder, result: FirType, a: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.int_sext(crate::ty(result)?, Operand::from_raw(a)).map(|v| v.raw())
@@ -135,8 +243,17 @@ pub unsafe extern "C" fn fir_int_sext(fb: *mut FirBuilder, result: FirType, a: F
 }
 
 /// `int.trunc.nsw %a`; see `TruncMode`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_int_trunc(fb: *mut FirBuilder, result: FirType, mode: FirTruncMode, a: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.int_trunc(crate::ty(result)?, TruncMode::from_c(mode)?, Operand::from_raw(a)).map(|v| v.raw())
@@ -145,8 +262,17 @@ pub unsafe extern "C" fn fir_int_trunc(fb: *mut FirBuilder, result: FirType, mod
 }
 
 /// `mem.stack 16, align 4`: stack memory, freed when its region ends.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_mem_stack(fb: *mut FirBuilder, size: u64, align: u32) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.mem_stack(size, align).map(|v| v.raw())
@@ -155,8 +281,18 @@ pub unsafe extern "C" fn fir_mem_stack(fb: *mut FirBuilder, size: u64, align: u3
 }
 
 /// `mem.alloc.null c.malloc %n, align 16`: heap memory from an allocator family.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `family` is null or points to a NUL-terminated string.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_mem_alloc(fb: *mut FirBuilder, fail: FirAllocFail, family: *const c_char, n: FirValue, align: u32) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.mem_alloc(AllocFail::from_c(fail)?, crate::cstr(family)?, Operand::from_raw(n), align).map(|v| v.raw())
@@ -165,8 +301,18 @@ pub unsafe extern "C" fn fir_mem_alloc(fb: *mut FirBuilder, fail: FirAllocFail, 
 }
 
 /// `mem.free c.malloc %p`
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `family` is null or points to a NUL-terminated string.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_mem_free(fb: *mut FirBuilder, family: *const c_char, p: FirValue) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.mem_free(crate::cstr(family)?, Operand::from_raw(p)).map(|op| op.raw())
@@ -175,8 +321,17 @@ pub unsafe extern "C" fn fir_mem_free(fb: *mut FirBuilder, family: *const c_char
 }
 
 /// `mem.load %p, align 4`: the result type is the accessed type.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_mem_load(fb: *mut FirBuilder, result: FirType, p: FirValue, align: u32) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.mem_load(crate::ty(result)?, Operand::from_raw(p), align).map(|v| v.raw())
@@ -185,8 +340,17 @@ pub unsafe extern "C" fn fir_mem_load(fb: *mut FirBuilder, result: FirType, p: F
 }
 
 /// `mem.store i32 %v, %p, align 4`
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_mem_store(fb: *mut FirBuilder, ty: FirType, value: FirValue, p: FirValue, align: u32) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.mem_store(crate::ty(ty)?, Operand::from_raw(value), Operand::from_raw(p), align).map(|op| op.raw())
@@ -195,8 +359,17 @@ pub unsafe extern "C" fn fir_mem_store(fb: *mut FirBuilder, ty: FirType, value: 
 }
 
 /// `ptr.offset.inbounds %p, %n` (poison if it leaves the allocation) or `ptr.offset.wrap`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_ptr_offset(fb: *mut FirBuilder, inbounds: bool, p: FirValue, n: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.ptr_offset(inbounds, Operand::from_raw(p), Operand::from_raw(n)).map(|v| v.raw())
@@ -205,8 +378,17 @@ pub unsafe extern "C" fn fir_ptr_offset(fb: *mut FirBuilder, inbounds: bool, p: 
 }
 
 /// `ptr.addr %p`: the address, without exposing the allocation.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_ptr_addr(fb: *mut FirBuilder, p: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.ptr_addr(Operand::from_raw(p)).map(|v| v.raw())
@@ -215,8 +397,17 @@ pub unsafe extern "C" fn fir_ptr_addr(fb: *mut FirBuilder, p: FirValue) -> FirVa
 }
 
 /// `ptr.expose %p`: the address, and `ptr.from_exposed` may reach the allocation from now on.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_ptr_expose(fb: *mut FirBuilder, p: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.ptr_expose(Operand::from_raw(p)).map(|v| v.raw())
@@ -225,8 +416,17 @@ pub unsafe extern "C" fn fir_ptr_expose(fb: *mut FirBuilder, p: FirValue) -> Fir
 }
 
 /// `ptr.from_exposed %a`: a pointer to an exposed allocation at that address.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_ptr_from_exposed(fb: *mut FirBuilder, n: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.ptr_from_exposed(Operand::from_raw(n)).map(|v| v.raw())
@@ -235,8 +435,17 @@ pub unsafe extern "C" fn fir_ptr_from_exposed(fb: *mut FirBuilder, n: FirValue) 
 }
 
 /// `ptr.with_addr %p, %a`: a new address in `%p`'s allocation.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_ptr_with_addr(fb: *mut FirBuilder, p: FirValue, n: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.ptr_with_addr(Operand::from_raw(p), Operand::from_raw(n)).map(|v| v.raw())
@@ -245,8 +454,17 @@ pub unsafe extern "C" fn fir_ptr_with_addr(fb: *mut FirBuilder, p: FirValue, n: 
 }
 
 /// `ptr.null`
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_ptr_null(fb: *mut FirBuilder) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.ptr_null().map(|v| v.raw())
@@ -255,8 +473,17 @@ pub unsafe extern "C" fn fir_ptr_null(fb: *mut FirBuilder) -> FirValue {
 }
 
 /// `ptr.cmp.eq` and friends; ordered comparisons are unsigned.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_ptr_cmp(fb: *mut FirBuilder, p: FirPred, a: FirValue, b: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.ptr_cmp(Pred::from_c(p)?, Operand::from_raw(a), Operand::from_raw(b)).map(|v| v.raw())
@@ -265,8 +492,18 @@ pub unsafe extern "C" fn fir_ptr_cmp(fb: *mut FirBuilder, p: FirPred, a: FirValu
 }
 
 /// `func.call @f(%a, %b)`
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `args` points to `nargs` readable `FirValue`s, or `nargs` is 0.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_func_call(fb: *mut FirBuilder, callee: FirFunc, args: *const FirValue, nargs: usize) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.func_call(FuncRef::from_raw(callee), crate::values(args, nargs)).map(|r| r.op.raw())
@@ -277,8 +514,18 @@ pub unsafe extern "C" fn fir_func_call(fb: *mut FirBuilder, callee: FirFunc, arg
 /// `cf.if %c { … } else { … }`: two regions.
 ///
 /// Makes the op with empty regions: fill them with `fir_position_at_end`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `results` points to `nresults` readable `FirType`s, or `nresults` is 0.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_cf_if_begin(fb: *mut FirBuilder, results: *const FirType, nresults: usize, cond: FirValue) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             let results = crate::tys(results, nresults)?;
@@ -290,8 +537,19 @@ pub unsafe extern "C" fn fir_cf_if_begin(fb: *mut FirBuilder, results: *const Fi
 /// `cf.loop [progress] [iter(…)] { … }`: one region whose parameters are the loop state.
 ///
 /// Makes the op with empty regions: fill them with `fir_position_at_end`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `results` points to `nresults` readable `FirType`s, or `nresults` is 0.
+/// * `inits` points to `ninits` readable `FirValue`s, or `ninits` is 0.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_cf_loop_begin(fb: *mut FirBuilder, results: *const FirType, nresults: usize, progress: bool, inits: *const FirValue, ninits: usize) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             let results = crate::tys(results, nresults)?;
@@ -301,8 +559,18 @@ pub unsafe extern "C" fn fir_cf_loop_begin(fb: *mut FirBuilder, results: *const 
 }
 
 /// `cf.yield`: ends a `cf.if` region with the `cf.if`'s results.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `args` points to `nargs` readable `FirValue`s, or `nargs` is 0.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_cf_yield(fb: *mut FirBuilder, args: *const FirValue, nargs: usize) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.cf_yield(crate::values(args, nargs)).map(|op| op.raw())
@@ -311,8 +579,18 @@ pub unsafe extern "C" fn fir_cf_yield(fb: *mut FirBuilder, args: *const FirValue
 }
 
 /// `cf.break`: leaves the nearest loop with the loop's results.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `args` points to `nargs` readable `FirValue`s, or `nargs` is 0.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_cf_break(fb: *mut FirBuilder, args: *const FirValue, nargs: usize) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.cf_break(crate::values(args, nargs)).map(|op| op.raw())
@@ -321,8 +599,18 @@ pub unsafe extern "C" fn fir_cf_break(fb: *mut FirBuilder, args: *const FirValue
 }
 
 /// `cf.continue`: starts the next iteration with new loop state.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `args` points to `nargs` readable `FirValue`s, or `nargs` is 0.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_cf_continue(fb: *mut FirBuilder, args: *const FirValue, nargs: usize) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.cf_continue(crate::values(args, nargs)).map(|op| op.raw())
@@ -331,8 +619,18 @@ pub unsafe extern "C" fn fir_cf_continue(fb: *mut FirBuilder, args: *const FirVa
 }
 
 /// `func.ret`
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `args` points to `nargs` readable `FirValue`s, or `nargs` is 0.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_func_ret(fb: *mut FirBuilder, args: *const FirValue, nargs: usize) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.func_ret(crate::values(args, nargs)).map(|op| op.raw())
@@ -346,8 +644,18 @@ pub unsafe extern "C" fn fir_func_ret(fb: *mut FirBuilder, args: *const FirValue
 /// `progress`, control may be assumed to leave the op (as for `cf.loop progress`).
 ///
 /// Makes the op with empty regions: fill them with `fir_position_at_end`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `results` points to `nresults` readable `FirType`s, or `nresults` is 0.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_cf_blocks_begin(fb: *mut FirBuilder, results: *const FirType, nresults: usize, progress: bool) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             let results = crate::tys(results, nresults)?;
@@ -357,8 +665,18 @@ pub unsafe extern "C" fn fir_cf_blocks_begin(fb: *mut FirBuilder, results: *cons
 }
 
 /// `cf.br ^b(%x, …)`: jump to a block of the nearest enclosing `cf.blocks`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `dest.args` points to `dest.nargs` readable `FirValue`s, or `dest.nargs` is 0.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_cf_br(fb: *mut FirBuilder, dest: FirTarget) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             let dest_args = crate::values(dest.args, dest.nargs);
@@ -369,8 +687,19 @@ pub unsafe extern "C" fn fir_cf_br(fb: *mut FirBuilder, dest: FirTarget) -> FirO
 
 /// `cf.cond_br %c, ^t(…), ^f(…)`: jump to `^t` if `%c` is 1, otherwise to `^f`. Branching on
 /// `poison` is UB.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `t.args` points to `t.nargs` readable `FirValue`s, or `t.nargs` is 0.
+/// * `f.args` points to `f.nargs` readable `FirValue`s, or `f.nargs` is 0.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_cf_cond_br(fb: *mut FirBuilder, cond: FirValue, t: FirTarget, f: FirTarget) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             let t_args = crate::values(t.args, t.nargs);
@@ -382,8 +711,20 @@ pub unsafe extern "C" fn fir_cf_cond_br(fb: *mut FirBuilder, cond: FirValue, t: 
 
 /// `cf.switch %v, default ^d(…), [k: ^b(…), …]`: jump to the case whose key is `%v` (keys are
 /// taken modulo `2^N`), or to the default. Branching on `poison` is UB.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `dflt.args` points to `dflt.nargs` readable `FirValue`s, or `dflt.nargs` is 0.
+/// * `cases` points to `ncases` readable `FirCase`s, or `ncases` is 0; each case's
+///   `target.args` points to `target.nargs` readable `FirValue`s, or `target.nargs` is 0.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_cf_switch(fb: *mut FirBuilder, x: FirValue, dflt: FirTarget, cases: *const FirCase, ncases: usize) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             let dflt_args = crate::values(dflt.args, dflt.nargs);
@@ -394,8 +735,17 @@ pub unsafe extern "C" fn fir_cf_switch(fb: *mut FirBuilder, x: FirValue, dflt: F
 }
 
 /// `ty.size T`: how many bytes a `T` takes, in the memory space's data layout.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_ty_size(fb: *mut FirBuilder, ty: FirType) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.ty_size(crate::ty(ty)?).map(|v| v.raw())
@@ -404,8 +754,17 @@ pub unsafe extern "C" fn fir_ty_size(fb: *mut FirBuilder, ty: FirType) -> FirVal
 }
 
 /// `ty.align T`: a `T`'s alignment in bytes.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_ty_align(fb: *mut FirBuilder, ty: FirType) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.ty_align(crate::ty(ty)?).map(|v| v.raw())
@@ -414,8 +773,17 @@ pub unsafe extern "C" fn fir_ty_align(fb: *mut FirBuilder, ty: FirType) -> FirVa
 }
 
 /// `ty.offset T, i`: the offset of field `i` in the struct `T`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_ty_offset(fb: *mut FirBuilder, ty: FirType, index: u32) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.ty_offset(crate::ty(ty)?, index).map(|v| v.raw())
@@ -425,8 +793,17 @@ pub unsafe extern "C" fn fir_ty_offset(fb: *mut FirBuilder, ty: FirType, index: 
 
 /// `ptr.field.inbounds T %p, i`: field `i` of the struct `T` at `%p`, as `ptr.offset` by the
 /// field's offset (`.inbounds` or `.wrap`).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_ptr_field(fb: *mut FirBuilder, inbounds: bool, ty: FirType, p: FirValue, index: u32) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.ptr_field(inbounds, crate::ty(ty)?, Operand::from_raw(p), index).map(|v| v.raw())
@@ -437,8 +814,17 @@ pub unsafe extern "C" fn fir_ptr_field(fb: *mut FirBuilder, inbounds: bool, ty: 
 /// `ptr.index.inbounds T %p, %i`: element `%i` (signed) of an array of `T` at `%p`. The
 /// in-bounds form also gives `poison` when `%i` times `T`'s stride overflows a signed address;
 /// the `.wrap` form wraps it.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_ptr_index(fb: *mut FirBuilder, inbounds: bool, ty: FirType, p: FirValue, n: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.ptr_index(inbounds, crate::ty(ty)?, Operand::from_raw(p), Operand::from_raw(n)).map(|v| v.raw())
@@ -448,8 +834,17 @@ pub unsafe extern "C" fn fir_ptr_index(fb: *mut FirBuilder, inbounds: bool, ty: 
 
 /// `mem.stack.of T, align 1`: stack memory for a `T`, aligned to `align` or `T`'s alignment,
 /// whichever is larger; freed when its region ends.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_mem_stack_of(fb: *mut FirBuilder, ty: FirType, align: u32) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.mem_stack_of(crate::ty(ty)?, align).map(|v| v.raw())
@@ -459,8 +854,17 @@ pub unsafe extern "C" fn fir_mem_stack_of(fb: *mut FirBuilder, ty: FirType, alig
 
 /// `mem.copy T %dst, %src, align 4`: copy a `T`'s bytes exactly, as loading and storing them
 /// as one byte value would: padding and pointers included, overlap allowed.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_mem_copy(fb: *mut FirBuilder, ty: FirType, a: FirValue, b: FirValue, align: u32) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.mem_copy(crate::ty(ty)?, Operand::from_raw(a), Operand::from_raw(b), align).map(|op| op.raw())
@@ -469,8 +873,17 @@ pub unsafe extern "C" fn fir_mem_copy(fb: *mut FirBuilder, ty: FirType, a: FirVa
 }
 
 /// `mem.global @g`: a pointer to the global `@g`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_mem_global(fb: *mut FirBuilder, global: FirGlobal) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.mem_global(GlobalRef::from_raw(global)).map(|v| v.raw())
@@ -479,8 +892,17 @@ pub unsafe extern "C" fn fir_mem_global(fb: *mut FirBuilder, global: FirGlobal) 
 }
 
 /// `func.addr @f`: a pointer to the function `@f`, which only calls may use.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_func_addr(fb: *mut FirBuilder, callee: FirFunc) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.func_addr(FuncRef::from_raw(callee)).map(|v| v.raw())
@@ -490,8 +912,18 @@ pub unsafe extern "C" fn fir_func_addr(fb: *mut FirBuilder, callee: FirFunc) -> 
 
 /// `func.call.indirect func<(i32) -> i32> %p(%a)`: a call through a pointer, which must point
 /// at a function of this signature.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `args` points to `nargs` readable `FirValue`s, or `nargs` is 0.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_func_call_indirect(fb: *mut FirBuilder, sig: FirType, p: FirValue, args: *const FirValue, nargs: usize) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.func_call_indirect(crate::ty(sig)?, Operand::from_raw(p), crate::values(args, nargs)).map(|r| r.op.raw())
@@ -501,8 +933,17 @@ pub unsafe extern "C" fn fir_func_call_indirect(fb: *mut FirBuilder, sig: FirTyp
 
 /// `va.start %ap`: start a cursor over the running call's variadic arguments in the
 /// `va_list` at `%ap`, at the first. Only in a variadic function.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_va_start(fb: *mut FirBuilder, p: FirValue) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.va_start(Operand::from_raw(p)).map(|op| op.raw())
@@ -513,8 +954,17 @@ pub unsafe extern "C" fn fir_va_start(fb: *mut FirBuilder, p: FirValue) -> FirOp
 /// `va.arg %ap`: the next variadic argument of the cursor in the `va_list` at `%ap`, read as
 /// the result type, which must be of the argument's class (integer and pointer, or float); the
 /// cursor moves past it. Its bytes are read as a load of the result type reads the argument's.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_va_arg(fb: *mut FirBuilder, result: FirType, p: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.va_arg(crate::ty(result)?, Operand::from_raw(p)).map(|v| v.raw())
@@ -523,8 +973,17 @@ pub unsafe extern "C" fn fir_va_arg(fb: *mut FirBuilder, result: FirType, p: Fir
 }
 
 /// `va.end %ap`: end the cursor in the `va_list` at `%ap`; its bytes become `poison`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_va_end(fb: *mut FirBuilder, p: FirValue) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.va_end(Operand::from_raw(p)).map(|op| op.raw())
@@ -534,8 +993,17 @@ pub unsafe extern "C" fn fir_va_end(fb: *mut FirBuilder, p: FirValue) -> FirOp {
 
 /// `float.const 1.5`: the result type's float with these bits, written as the shortest
 /// decimal that reads back to them, `inf`, `-inf`, `nan`, or `nan(0x…)` (see `Fir.FloatText`).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_float_const(fb: *mut FirBuilder, result: FirType, value: u64) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.float_const(crate::ty(result)?, value).map(|v| v.raw())
@@ -545,8 +1013,17 @@ pub unsafe extern "C" fn fir_float_const(fb: *mut FirBuilder, result: FirType, v
 
 /// `float.add %a, %b`, `float.sub`, `float.mul`, `float.div`: the exact result, rounded to
 /// nearest (ties to even); `float.copysign %a, %b`: `%a`'s magnitude with `%b`'s sign.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_float_bin(fb: *mut FirBuilder, op: FirFBinOp, a: FirValue, b: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.float_bin(FBinOp::from_c(op)?, Operand::from_raw(a), Operand::from_raw(b)).map(|v| v.raw())
@@ -556,8 +1033,17 @@ pub unsafe extern "C" fn fir_float_bin(fb: *mut FirBuilder, op: FirFBinOp, a: Fi
 
 /// `float.neg %a`, `float.abs %a` (the sign bit flipped or cleared), `float.sqrt %a`
 /// (rounded).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_float_un(fb: *mut FirBuilder, op: FirFUnOp, a: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.float_un(FUnOp::from_c(op)?, Operand::from_raw(a)).map(|v| v.raw())
@@ -566,8 +1052,17 @@ pub unsafe extern "C" fn fir_float_un(fb: *mut FirBuilder, op: FirFUnOp, a: FirV
 }
 
 /// `float.fma %a, %b, %c`: `%a * %b + %c`, rounded once.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_float_fma(fb: *mut FirBuilder, a: FirValue, b: FirValue, c: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.float_fma(Operand::from_raw(a), Operand::from_raw(b), Operand::from_raw(c)).map(|v| v.raw())
@@ -576,8 +1071,17 @@ pub unsafe extern "C" fn fir_float_fma(fb: *mut FirBuilder, a: FirValue, b: FirV
 }
 
 /// `float.cmp.olt %a, %b` and friends; see `FPred`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_float_cmp(fb: *mut FirBuilder, p: FirFPred, a: FirValue, b: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.float_cmp(FPred::from_c(p)?, Operand::from_raw(a), Operand::from_raw(b)).map(|v| v.raw())
@@ -586,8 +1090,17 @@ pub unsafe extern "C" fn fir_float_cmp(fb: *mut FirBuilder, p: FirFPred, a: FirV
 }
 
 /// `float.ext %a`: a float in a wider format, exactly.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_float_ext(fb: *mut FirBuilder, result: FirType, a: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.float_ext(crate::ty(result)?, Operand::from_raw(a)).map(|v| v.raw())
@@ -596,8 +1109,17 @@ pub unsafe extern "C" fn fir_float_ext(fb: *mut FirBuilder, result: FirType, a: 
 }
 
 /// `float.trunc %a`: a float in a narrower format, rounded.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_float_trunc(fb: *mut FirBuilder, result: FirType, a: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.float_trunc(crate::ty(result)?, Operand::from_raw(a)).map(|v| v.raw())
@@ -609,8 +1131,17 @@ pub unsafe extern "C" fn fir_float_trunc(fb: *mut FirBuilder, result: FirType, a
 /// type; a NaN or an integer part out of range is UB (`.ub`), the nearest bound (`.sat`, NaN
 /// gives 0), or a trap with reason `convert` (`.trap`). A `poison` input is UB for `.ub` and
 /// `.trap`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_float_to_int(fb: *mut FirBuilder, result: FirType, signed: bool, edge: FirCvtEdge, a: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.float_to_int(crate::ty(result)?, signed, CvtEdge::from_c(edge)?, Operand::from_raw(a)).map(|v| v.raw())
@@ -619,8 +1150,17 @@ pub unsafe extern "C" fn fir_float_to_int(fb: *mut FirBuilder, result: FirType, 
 }
 
 /// `int.to_float.s %a`: the integer, signed or unsigned, as the result type's float, rounded.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_int_to_float(fb: *mut FirBuilder, result: FirType, signed: bool, a: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.int_to_float(crate::ty(result)?, signed, Operand::from_raw(a)).map(|v| v.raw())
@@ -629,8 +1169,17 @@ pub unsafe extern "C" fn fir_int_to_float(fb: *mut FirBuilder, result: FirType, 
 }
 
 /// `float.from_bits %a`: the float with an integer's bits (the same width).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_float_from_bits(fb: *mut FirBuilder, result: FirType, a: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.float_from_bits(crate::ty(result)?, Operand::from_raw(a)).map(|v| v.raw())
@@ -639,8 +1188,17 @@ pub unsafe extern "C" fn fir_float_from_bits(fb: *mut FirBuilder, result: FirTyp
 }
 
 /// `float.to_bits %a`: a float's bits, as an integer of the same width.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_float_to_bits(fb: *mut FirBuilder, result: FirType, a: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.float_to_bits(crate::ty(result)?, Operand::from_raw(a)).map(|v| v.raw())
@@ -650,8 +1208,18 @@ pub unsafe extern "C" fn fir_float_to_bits(fb: *mut FirBuilder, result: FirType,
 
 /// `agg.make %a, %b`: a struct value from its fields, or an array value from its elements;
 /// the result type says which.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `args` points to `nargs` readable `FirValue`s, or `nargs` is 0.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_agg_make(fb: *mut FirBuilder, result: FirType, args: *const FirValue, nargs: usize) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.agg_make(crate::ty(result)?, crate::values(args, nargs)).map(|v| v.raw())
@@ -660,8 +1228,17 @@ pub unsafe extern "C" fn fir_agg_make(fb: *mut FirBuilder, result: FirType, args
 }
 
 /// `agg.extract %s, 1`: field `1` of a struct value, or element `1` of an array value.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_agg_extract(fb: *mut FirBuilder, result: FirType, a: FirValue, index: u32) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.agg_extract(crate::ty(result)?, Operand::from_raw(a), index).map(|v| v.raw())
@@ -670,8 +1247,17 @@ pub unsafe extern "C" fn fir_agg_extract(fb: *mut FirBuilder, result: FirType, a
 }
 
 /// `agg.insert %s, %v, 1`: `%s` with field or element `1` replaced by `%v`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_agg_insert(fb: *mut FirBuilder, a: FirValue, v: FirValue, index: u32) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.agg_insert(Operand::from_raw(a), Operand::from_raw(v), index).map(|v| v.raw())
@@ -682,8 +1268,17 @@ pub unsafe extern "C" fn fir_agg_insert(fb: *mut FirBuilder, a: FirValue, v: Fir
 /// `int.add.overflow.s %a, %b`: the wrapped result and whether the operation overflowed
 /// (signed, or unsigned with `.u`), as `int.add.s.trap` would trap; `int.sub` and `int.mul` too.
 /// `poison` in, `poison` out (both results).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_int_overflow(fb: *mut FirBuilder, op: FirArithOp, signed: bool, a: FirValue, b: FirValue) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.int_overflow(ArithOp::from_c(op)?, signed, Operand::from_raw(a), Operand::from_raw(b)).map(|r| r.op.raw())
@@ -692,8 +1287,17 @@ pub unsafe extern "C" fn fir_int_overflow(fb: *mut FirBuilder, op: FirArithOp, s
 }
 
 /// `union.make %v, 1`: the union (the result type) holding variant `1`, `%v`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_union_make(fb: *mut FirBuilder, result: FirType, v: FirValue, index: u32) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.union_make(crate::ty(result)?, Operand::from_raw(v), index).map(|v| v.raw())
@@ -702,8 +1306,17 @@ pub unsafe extern "C" fn fir_union_make(fb: *mut FirBuilder, result: FirType, v:
 }
 
 /// `union.tag %u`: which variant `%u` holds, as an `i32`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_union_tag(fb: *mut FirBuilder, u: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.union_tag(Operand::from_raw(u)).map(|v| v.raw())
@@ -713,8 +1326,17 @@ pub unsafe extern "C" fn fir_union_tag(fb: *mut FirBuilder, u: FirValue) -> FirV
 
 /// `union.get.trap %u, 1`: the payload of variant `1`; if `%u` holds another variant, UB
 /// (`.ub`) or a trap with reason `tag` (`.trap`).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_union_get(fb: *mut FirBuilder, result: FirType, trap: bool, u: FirValue, index: u32) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.union_get(crate::ty(result)?, trap, Operand::from_raw(u), index).map(|v| v.raw())
@@ -723,8 +1345,17 @@ pub unsafe extern "C" fn fir_union_get(fb: *mut FirBuilder, result: FirType, tra
 }
 
 /// `slice.make %p, %n`: the slice of `%n` elements at `%p`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_slice_make(fb: *mut FirBuilder, p: FirValue, n: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.slice_make(Operand::from_raw(p), Operand::from_raw(n)).map(|v| v.raw())
@@ -733,8 +1364,17 @@ pub unsafe extern "C" fn fir_slice_make(fb: *mut FirBuilder, p: FirValue, n: Fir
 }
 
 /// `slice.ptr %s`
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_slice_ptr(fb: *mut FirBuilder, s: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.slice_ptr(Operand::from_raw(s)).map(|v| v.raw())
@@ -743,8 +1383,17 @@ pub unsafe extern "C" fn fir_slice_ptr(fb: *mut FirBuilder, s: FirValue) -> FirV
 }
 
 /// `slice.len %s`
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_slice_len(fb: *mut FirBuilder, s: FirValue) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.slice_len(Operand::from_raw(s)).map(|v| v.raw())
@@ -756,8 +1405,17 @@ pub unsafe extern "C" fn fir_slice_len(fb: *mut FirBuilder, s: FirValue) -> FirV
 /// type. An index not below the length is UB (`.ub`) or traps with reason `bounds` (`.trap`); a
 /// `poison` index or length is UB. The element is at `ptr.offset.inbounds` by `%i` times the
 /// stride, wrapped.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_slice_get(fb: *mut FirBuilder, result: FirType, trap: bool, s: FirValue, n: FirValue, align: u32) -> FirValue {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.slice_get(crate::ty(result)?, trap, Operand::from_raw(s), Operand::from_raw(n), align).map(|v| v.raw())
@@ -767,8 +1425,17 @@ pub unsafe extern "C" fn fir_slice_get(fb: *mut FirBuilder, result: FirType, tra
 
 /// `slice.set.trap i32 %v, %s, %i, align 4`: store element `%i` of the slice, checked like
 /// `slice.get`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_slice_set(fb: *mut FirBuilder, trap: bool, ty: FirType, value: FirValue, s: FirValue, n: FirValue, align: u32) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.slice_set(trap, crate::ty(ty)?, Operand::from_raw(value), Operand::from_raw(s), Operand::from_raw(n), align).map(|op| op.raw())
@@ -778,8 +1445,17 @@ pub unsafe extern "C" fn fir_slice_set(fb: *mut FirBuilder, trap: bool, ty: FirT
 
 /// `cf.check.bounds %ok`: nothing if `%ok` is 1; a trap with that reason if it is 0; UB if it
 /// is `poison`. The lowered form of HFIR's checks.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_cf_check(fb: *mut FirBuilder, reason: FirTrapReason, x: FirValue) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.cf_check(TrapReason::from_c(reason)?, Operand::from_raw(x)).map(|op| op.raw())
@@ -793,8 +1469,18 @@ pub unsafe extern "C" fn fir_cf_check(fb: *mut FirBuilder, reason: FirTrapReason
 /// gives the op's results. Jumps can't leave either region.
 ///
 /// Makes the op with empty regions: fill them with `fir_position_at_end`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `results` points to `nresults` readable `FirType`s, or `nresults` is 0.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_cf_try_begin(fb: *mut FirBuilder, results: *const FirType, nresults: usize) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             let results = crate::tys(results, nresults)?;
@@ -807,8 +1493,17 @@ pub unsafe extern "C" fn fir_cf_try_begin(fb: *mut FirBuilder, results: *const F
 /// and a call's `noalias` scopes) up to the nearest `cf.try` region or `func.invoke` handler, in
 /// this function or a calling one; an exception that leaves the function the run started in is
 /// the run's outcome, `threw`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_exn_throw(fb: *mut FirBuilder, p: FirValue) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.exn_throw(Operand::from_raw(p)).map(|op| op.raw())
@@ -819,8 +1514,19 @@ pub unsafe extern "C" fn fir_exn_throw(fb: *mut FirBuilder, p: FirValue) -> FirO
 /// `func.invoke @f(%a) unwind ^h`: `func.call`, except that an exception the callee throws
 /// jumps to block `^h` of the nearest `cf.blocks`, whose one parameter takes it, instead of going
 /// on to the caller (a plain `func.call` passes it on).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `args` points to `nargs` readable `FirValue`s, or `nargs` is 0.
+/// * `unwind.args` points to `unwind.nargs` readable `FirValue`s, or `unwind.nargs` is 0.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_func_invoke(fb: *mut FirBuilder, callee: FirFunc, args: *const FirValue, nargs: usize, unwind: FirTarget) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             let unwind_args = crate::values(unwind.args, unwind.nargs);
@@ -831,8 +1537,19 @@ pub unsafe extern "C" fn fir_func_invoke(fb: *mut FirBuilder, callee: FirFunc, a
 
 /// `func.invoke.indirect func<(i32) -> i32> %p(%a) unwind ^h`: `func.call.indirect` with a
 /// handler, as `func.invoke`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `args` points to `nargs` readable `FirValue`s, or `nargs` is 0.
+/// * `unwind.args` points to `unwind.nargs` readable `FirValue`s, or `unwind.nargs` is 0.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_func_invoke_indirect(fb: *mut FirBuilder, sig: FirType, p: FirValue, args: *const FirValue, nargs: usize, unwind: FirTarget) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             let unwind_args = crate::values(unwind.args, unwind.nargs);
@@ -846,8 +1563,17 @@ pub unsafe extern "C" fn fir_func_invoke_indirect(fb: *mut FirBuilder, sig: FirT
 /// body of an LFIR function, which finds its arguments where the calling convention puts them.
 ///
 /// Makes the op with empty regions: fill them with `fir_position_at_end`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_code_begin(fb: *mut FirBuilder) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_code_begin().map(|op| op.raw())
@@ -856,8 +1582,17 @@ pub unsafe extern "C" fn fir_aarch64_code_begin(fb: *mut FirBuilder) -> FirOp {
 }
 
 /// `aarch64.add.x x0, x1, x2` and friends: three-register data processing; see `AluOp`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_alu(fb: *mut FirBuilder, op: FirAluOp, sf: FirSf, d: FirReg, n: FirReg, m: FirReg) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_alu(AluOp::from_c(op)?, Sf::from_c(sf)?, Reg(d), Reg(n), Reg(m)).map(|op| op.raw())
@@ -866,8 +1601,17 @@ pub unsafe extern "C" fn fir_aarch64_alu(fb: *mut FirBuilder, op: FirAluOp, sf: 
 }
 
 /// `aarch64.add.imm.x x0, x1, 16`: data processing with an immediate; see `AluImmOp`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_alu_imm(fb: *mut FirBuilder, op: FirAluImmOp, sf: FirSf, d: FirReg, n: FirReg, imm: i64) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_alu_imm(AluImmOp::from_c(op)?, Sf::from_c(sf)?, Reg(d), Reg(n), imm).map(|op| op.raw())
@@ -876,8 +1620,17 @@ pub unsafe extern "C" fn fir_aarch64_alu_imm(fb: *mut FirBuilder, op: FirAluImmO
 }
 
 /// `aarch64.lsl.imm.x x0, x1, 3`: a shift by an immediate below the size.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_shift_imm(fb: *mut FirBuilder, op: FirShiftImmOp, sf: FirSf, d: FirReg, n: FirReg, amount: u32) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_shift_imm(ShiftImmOp::from_c(op)?, Sf::from_c(sf)?, Reg(d), Reg(n), amount).map(|op| op.raw())
@@ -887,8 +1640,17 @@ pub unsafe extern "C" fn fir_aarch64_shift_imm(fb: *mut FirBuilder, op: FirShift
 
 /// `aarch64.sbfx.x x0, x1, 8`: the low `width` bits (1 to the size), sign-extended (`sbfx`) or
 /// zero-extended (`ubfx`).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_ext(fb: *mut FirBuilder, signed: bool, sf: FirSf, d: FirReg, n: FirReg, width: u32) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_ext(signed, Sf::from_c(sf)?, Reg(d), Reg(n), width).map(|op| op.raw())
@@ -897,8 +1659,17 @@ pub unsafe extern "C" fn fir_aarch64_ext(fb: *mut FirBuilder, signed: bool, sf: 
 }
 
 /// `aarch64.mov.x x0, x1`: copy a register (`sp` included).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_mov(fb: *mut FirBuilder, sf: FirSf, d: FirReg, n: FirReg) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_mov(Sf::from_c(sf)?, Reg(d), Reg(n)).map(|op| op.raw())
@@ -908,8 +1679,17 @@ pub unsafe extern "C" fn fir_aarch64_mov(fb: *mut FirBuilder, sf: FirSf, d: FirR
 
 /// `aarch64.movz.x x0, 4660, 16`: a 16-bit immediate shifted left by `hw` (0, 16, 32, or 48):
 /// zero elsewhere (`movz`), inverted (`movn`), or inserted into the register (`movk`).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_mov_wide(fb: *mut FirBuilder, op: FirMovOp, sf: FirSf, d: FirReg, imm: u32, hw: u32) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_mov_wide(MovOp::from_c(op)?, Sf::from_c(sf)?, Reg(d), imm, hw).map(|op| op.raw())
@@ -919,8 +1699,17 @@ pub unsafe extern "C" fn fir_aarch64_mov_wide(fb: *mut FirBuilder, op: FirMovOp,
 
 /// `aarch64.csel.eq.x x0, x1, x2`: `x1` if the condition holds, else `x2` (incremented,
 /// inverted, or negated for `csinc`, `csinv`, `csneg`).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_csel(fb: *mut FirBuilder, op: FirCselOp, c: FirCond, sf: FirSf, d: FirReg, n: FirReg, m: FirReg) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_csel(CselOp::from_c(op)?, Cond::from_c(c)?, Sf::from_c(sf)?, Reg(d), Reg(n), Reg(m)).map(|op| op.raw())
@@ -930,8 +1719,17 @@ pub unsafe extern "C" fn fir_aarch64_csel(fb: *mut FirBuilder, op: FirCselOp, c:
 
 /// `aarch64.ldr.w x0, x1, 8`: load 1, 2, 4, or 8 bytes from `x1 + 8`, zero-extended. Into an
 /// FP register (`aarch64.ldr.w d0, x1, 8`) it is Arm's `ldr s0, [x1, #8]`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_ldr(fb: *mut FirBuilder, size: FirMemSize, d: FirReg, base: FirReg, off: i64) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_ldr(MemSize::from_c(size)?, Reg(d), Reg(base), off).map(|op| op.raw())
@@ -941,8 +1739,17 @@ pub unsafe extern "C" fn fir_aarch64_ldr(fb: *mut FirBuilder, size: FirMemSize, 
 
 /// `aarch64.str.w x0, x1, 8`: store the low 1, 2, 4, or 8 bytes of `x0` at `x1 + 8`, an FP
 /// register's too (`aarch64.str.x d0, x1, 8` is `str d0, [x1, #8]`).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_str(fb: *mut FirBuilder, size: FirMemSize, s: FirReg, base: FirReg, off: i64) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_str(MemSize::from_c(size)?, Reg(s), Reg(base), off).map(|op| op.raw())
@@ -952,8 +1759,17 @@ pub unsafe extern "C" fn fir_aarch64_str(fb: *mut FirBuilder, size: FirMemSize, 
 
 /// `aarch64.fadd.d d0, d1, d2` and friends: scalar FP arithmetic in the format; see
 /// `FAluOp`. A NaN result is Arm's (`AArch64.fpProcessNaNs`, default-NaN mode off).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_falu(fb: *mut FirBuilder, op: FirFAluOp, fs: FirFSize, d: FirReg, n: FirReg, m: FirReg) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_falu(FAluOp::from_c(op)?, FSize::from_c(fs)?, Reg(d), Reg(n), Reg(m)).map(|op| op.raw())
@@ -964,8 +1780,17 @@ pub unsafe extern "C" fn fir_aarch64_falu(fb: *mut FirBuilder, op: FirFAluOp, fs
 /// `aarch64.fsqrt.d d0, d1` and friends: scalar FP operations on one register; see
 /// `FUnaryOp`. `fmov` also moves bits between a general-purpose register and an FP one
 /// (`aarch64.fmov.d d0, x1`, `aarch64.fmov.s x1, d0`).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_funary(fb: *mut FirBuilder, op: FirFUnaryOp, fs: FirFSize, d: FirReg, n: FirReg) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_funary(FUnaryOp::from_c(op)?, FSize::from_c(fs)?, Reg(d), Reg(n)).map(|op| op.raw())
@@ -975,8 +1800,17 @@ pub unsafe extern "C" fn fir_aarch64_funary(fb: *mut FirBuilder, op: FirFUnaryOp
 
 /// `aarch64.fmadd.d d0, d1, d2`: `d0 := d1 * d2 + d0`, rounded once: Arm's `fmadd d0, d1, d2,
 /// d0`, with the destination as the addend (four registers don't fit an op's immediates).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_fmadd(fb: *mut FirBuilder, fs: FirFSize, d: FirReg, n: FirReg, m: FirReg) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_fmadd(FSize::from_c(fs)?, Reg(d), Reg(n), Reg(m)).map(|op| op.raw())
@@ -986,8 +1820,17 @@ pub unsafe extern "C" fn fir_aarch64_fmadd(fb: *mut FirBuilder, fs: FirFSize, d:
 
 /// `aarch64.fmov.imm.d d0, 112`: the float Arm's 8-bit immediate encodes (`VFPExpandImm`:
 /// 112 is 1.0, `fmov d0, #1.0`).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_fmov_imm(fb: *mut FirBuilder, fs: FirFSize, d: FirReg, imm: u32) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_fmov_imm(FSize::from_c(fs)?, Reg(d), imm).map(|op| op.raw())
@@ -997,8 +1840,17 @@ pub unsafe extern "C" fn fir_aarch64_fmov_imm(fb: *mut FirBuilder, fs: FirFSize,
 
 /// `aarch64.fcmp.d d0, d1`: compare, setting the flags (`0011` when unordered, `0110` when
 /// equal, `1000` when less, `0010` when greater).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_fcmp(fb: *mut FirBuilder, fs: FirFSize, n: FirReg, m: FirReg) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_fcmp(FSize::from_c(fs)?, Reg(n), Reg(m)).map(|op| op.raw())
@@ -1007,8 +1859,17 @@ pub unsafe extern "C" fn fir_aarch64_fcmp(fb: *mut FirBuilder, fs: FirFSize, n: 
 }
 
 /// `aarch64.fcsel.eq.d d0, d1, d2`: `d1` if the condition holds, else `d2`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_fcsel(fb: *mut FirBuilder, c: FirCond, fs: FirFSize, d: FirReg, n: FirReg, m: FirReg) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_fcsel(Cond::from_c(c)?, FSize::from_c(fs)?, Reg(d), Reg(n), Reg(m)).map(|op| op.raw())
@@ -1018,8 +1879,17 @@ pub unsafe extern "C" fn fir_aarch64_fcsel(fb: *mut FirBuilder, c: FirCond, fs: 
 
 /// `aarch64.fcvt.d.s d0, d1`: convert between the formats (to `d` from `s` here; exact one
 /// way, rounded the other).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_fcvt(fb: *mut FirBuilder, dst: FirFSize, src: FirFSize, d: FirReg, n: FirReg) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_fcvt(FSize::from_c(dst)?, FSize::from_c(src)?, Reg(d), Reg(n)).map(|op| op.raw())
@@ -1029,8 +1899,17 @@ pub unsafe extern "C" fn fir_aarch64_fcvt(fb: *mut FirBuilder, dst: FirFSize, sr
 
 /// `aarch64.scvtf.d.x d0, x1`: an integer of the size, signed (`scvtf`) or unsigned
 /// (`ucvtf`), to the format, rounded.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_cvtf(fb: *mut FirBuilder, signed: bool, fs: FirFSize, sf: FirSf, d: FirReg, n: FirReg) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_cvtf(signed, FSize::from_c(fs)?, Sf::from_c(sf)?, Reg(d), Reg(n)).map(|op| op.raw())
@@ -1040,8 +1919,17 @@ pub unsafe extern "C" fn fir_aarch64_cvtf(fb: *mut FirBuilder, signed: bool, fs:
 
 /// `aarch64.fcvtzs.x.d x0, d1`: a float to an integer of the size, signed (`fcvtzs`) or
 /// unsigned (`fcvtzu`), toward zero, saturating at the bounds, NaN giving 0.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_fcvtz(fb: *mut FirBuilder, signed: bool, sf: FirSf, fs: FirFSize, d: FirReg, n: FirReg) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_fcvtz(signed, Sf::from_c(sf)?, FSize::from_c(fs)?, Reg(d), Reg(n)).map(|op| op.raw())
@@ -1050,8 +1938,17 @@ pub unsafe extern "C" fn fir_aarch64_fcvtz(fb: *mut FirBuilder, signed: bool, sf
 }
 
 /// `aarch64.adrl x0, @g`: the address of a global (`adrp` and `add`).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_adrl(fb: *mut FirBuilder, d: FirReg, global: FirGlobal) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_adrl(Reg(d), GlobalRef::from_raw(global)).map(|op| op.raw())
@@ -1061,8 +1958,17 @@ pub unsafe extern "C" fn fir_aarch64_adrl(fb: *mut FirBuilder, d: FirReg, global
 
 /// `aarch64.adrl.func x0, @f`: the address of a function (`adrp` and `add`, or a GOT load for
 /// an external one).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_adrl_func(fb: *mut FirBuilder, d: FirReg, callee: FirFunc) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_adrl_func(Reg(d), FuncRef::from_raw(callee)).map(|op| op.raw())
@@ -1071,8 +1977,18 @@ pub unsafe extern "C" fn fir_aarch64_adrl_func(fb: *mut FirBuilder, d: FirReg, c
 }
 
 /// `aarch64.b ^b`: jump to a block of the enclosing `aarch64.code`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `dest.args` points to `dest.nargs` readable `FirValue`s, or `dest.nargs` is 0.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_b(fb: *mut FirBuilder, dest: FirTarget) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             let dest_args = crate::values(dest.args, dest.nargs);
@@ -1082,8 +1998,19 @@ pub unsafe extern "C" fn fir_aarch64_b(fb: *mut FirBuilder, dest: FirTarget) -> 
 }
 
 /// `aarch64.b.eq ^t, ^f`: jump to `^t` if the condition holds, otherwise to `^f`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `t.args` points to `t.nargs` readable `FirValue`s, or `t.nargs` is 0.
+/// * `f.args` points to `f.nargs` readable `FirValue`s, or `f.nargs` is 0.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_b_cond(fb: *mut FirBuilder, c: FirCond, t: FirTarget, f: FirTarget) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             let t_args = crate::values(t.args, t.nargs);
@@ -1095,8 +2022,17 @@ pub unsafe extern "C" fn fir_aarch64_b_cond(fb: *mut FirBuilder, c: FirCond, t: 
 
 /// `aarch64.ret`: return to the caller, with the results where the calling convention puts
 /// them.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_ret(fb: *mut FirBuilder) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_ret().map(|op| op.raw())
@@ -1106,8 +2042,17 @@ pub unsafe extern "C" fn fir_aarch64_ret(fb: *mut FirBuilder) -> FirOp {
 
 /// `aarch64.trap.div0`: trap with a reason (a call to `__fir_trap` with the reason and the
 /// op's location).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_trap(fb: *mut FirBuilder, reason: FirTrapReason) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_trap(TrapReason::from_c(reason)?).map(|op| op.raw())
@@ -1118,8 +2063,17 @@ pub unsafe extern "C" fn fir_aarch64_trap(fb: *mut FirBuilder, reason: FirTrapRe
 /// `aarch64.bl @f`: call a function; the arguments and results are where the calling
 /// convention puts them for `@f`'s signature, and the call clobbers the caller-saved
 /// registers.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_bl(fb: *mut FirBuilder, callee: FirFunc) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_bl(FuncRef::from_raw(callee)).map(|op| op.raw())
@@ -1131,8 +2085,17 @@ pub unsafe extern "C" fn fir_aarch64_bl(fb: *mut FirBuilder, callee: FirFunc) ->
 /// of the signature's parameter types: its own, or, for a variadic function, every argument's
 /// at this call (`func<(ptr, i32, f64) -> i32>` for `printf` with an `i32` and an `f64`;
 /// decision: Varargs).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_blr(fb: *mut FirBuilder, sig: FirType, n: FirReg) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_blr(crate::ty(sig)?, Reg(n)).map(|op| op.raw())
@@ -1142,8 +2105,18 @@ pub unsafe extern "C" fn fir_aarch64_blr(fb: *mut FirBuilder, sig: FirType, n: F
 
 /// `aarch64.bl.alloc c.malloc, align 16`: allocate `x0` bytes from the family's allocator;
 /// `x0` is the memory, or null if allocation failed (a call to `malloc` or `aligned_alloc`).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `family` is null or points to a NUL-terminated string.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_bl_alloc(fb: *mut FirBuilder, family: *const c_char, align: u32) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_bl_alloc(crate::cstr(family)?, align).map(|op| op.raw())
@@ -1154,8 +2127,17 @@ pub unsafe extern "C" fn fir_aarch64_bl_alloc(fb: *mut FirBuilder, family: *cons
 /// `aarch64.exn.set x0`: make `x0` the pending exception (decision: Exceptions at run time):
 /// store it in the thread's exception slot, `__fir_exn`. A function that throws sets it, then
 /// returns.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_exn_set(fb: *mut FirBuilder, n: FirReg) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_exn_set(Reg(n)).map(|op| op.raw())
@@ -1164,8 +2146,17 @@ pub unsafe extern "C" fn fir_aarch64_exn_set(fb: *mut FirBuilder, n: FirReg) -> 
 }
 
 /// `aarch64.exn.take x0`: `x0` gets the pending exception, which is no longer pending.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_exn_take(fb: *mut FirBuilder, d: FirReg) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_exn_take(Reg(d)).map(|op| op.raw())
@@ -1174,8 +2165,19 @@ pub unsafe extern "C" fn fir_aarch64_exn_take(fb: *mut FirBuilder, d: FirReg) ->
 }
 
 /// `aarch64.b.exn ^t, ^f`: jump to `^t` if an exception is pending, otherwise to `^f`.
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `t.args` points to `t.nargs` readable `FirValue`s, or `t.nargs` is 0.
+/// * `f.args` points to `f.nargs` readable `FirValue`s, or `f.nargs` is 0.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_b_exn(fb: *mut FirBuilder, t: FirTarget, f: FirTarget) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             let t_args = crate::values(t.args, t.nargs);
@@ -1186,8 +2188,18 @@ pub unsafe extern "C" fn fir_aarch64_b_exn(fb: *mut FirBuilder, t: FirTarget, f:
 }
 
 /// `aarch64.bl.free c.malloc`: free `x0` (a call to `free`).
+///
+/// # Safety
+///
+/// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+///   of a module that hasn't been freed, used by no other thread during the call.
+/// * `family` is null or points to a NUL-terminated string.
+///
+/// Each is read only during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fir_aarch64_bl_free(fb: *mut FirBuilder, family: *const c_char) -> FirOp {
+    // SAFETY: `with_builder` and the conversions read `fb` and the pointers listed in the
+    // `# Safety` section only during this call, which that section requires to be valid.
     unsafe {
         with_builder(fb, FIR_INVALID, |builder| {
             builder.aarch64_bl_free(crate::cstr(family)?).map(|op| op.raw())

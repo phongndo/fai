@@ -22,11 +22,15 @@ mod env {
 
     pub fn get() -> Word {
         let mut x: Word = 0;
+        // SAFETY: `stmxcsr` writes the 4-byte MXCSR to `x`, a live local `u32`, and nothing else.
         unsafe { asm!("stmxcsr [{}]", in(reg) &mut x, options(nostack)) };
         x
     }
 
     pub fn set(x: Word) {
+        // SAFETY: `ldmxcsr` reads 4 bytes from `x`. Its values come from `get`, possibly changed
+        // by `hostile`, which sets only rounding, FTZ, and DAZ bits, never a reserved one; MXCSR
+        // affects only this thread's floating point, which the test restores.
         unsafe { asm!("ldmxcsr [{}]", in(reg) &x, options(nostack)) };
     }
 
@@ -44,11 +48,15 @@ mod env {
 
     pub fn get() -> Word {
         let x: Word;
+        // SAFETY: reading FPCR into a register has no other effect.
         unsafe { asm!("mrs {}, fpcr", out(reg) x, options(nostack)) };
         x
     }
 
     pub fn set(x: Word) {
+        // SAFETY: the value comes from `get`, possibly changed by `hostile`, which sets only the
+        // rounding mode and FZ; FPCR affects only this thread's floating point, which the test
+        // restores.
         unsafe { asm!("msr fpcr, {}", in(reg) x, options(nostack)) };
     }
 

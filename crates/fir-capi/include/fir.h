@@ -586,9 +586,25 @@ extern "C" {
 #endif // __cplusplus
 
 // `float.const` of type `f32` with the bits of a C `float` (NaN payloads included).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+//   abandoned, of a module that hasn't been freed, used by no other thread during the
+//   call.
+//
+// Each is used only during the call.
 FirValue fir_float_const_f32(struct FirBuilder *fb, float value);
 
 // `float.const` of type `f64` with the bits of a C `double` (NaN payloads included).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+//   abandoned, of a module that hasn't been freed, used by no other thread during the
+//   call.
+//
+// Each is used only during the call.
 FirValue fir_float_const_f64(struct FirBuilder *fb, double value);
 
 // The API version the library was built with: `FIR_API_VERSION`.
@@ -599,21 +615,53 @@ struct FirModule *fir_module_new(void);
 
 // Parse FIR text into a new module (`*out`), to verify, print, run, or add to. On failure,
 // `*error` gets the message, which the caller frees with `fir_string_free`.
+//
+// # Safety
+//
+// * `text` is null or points to a NUL-terminated string.
+// * `out` is null or points to a writable `*mut FirModule`.
+// * `error` is null or points to a writable `*mut c_char`.
+//
+// Each is used only during the call.
 FirStatus fir_module_parse(const char *text, struct FirModule **out, char **error);
 
 // Free a module and everything in it. A builder of it can't be used afterwards.
+//
+// # Safety
+//
+// * `m` is null or a module from `fir_module_new` or `fir_module_parse` (or a module
+//   out-parameter of this library) that hasn't been freed. It is freed: `m`, and any
+//   builder of it, dangle afterwards.
 void fir_module_free(struct FirModule *m);
 
 // The message of the module's last failed call (empty if none failed). It belongs to the
 // module, and lasts until its next failed call.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed. The string returned lasts until
+//   the module's next failed call or until it is freed, whichever is first.
 const char *fir_module_error(const struct FirModule *m);
 
 // Free a string FIR returned.
+//
+// # Safety
+//
+// * `s` is null or a string this library returned (from an out-parameter or a
+//   function's result) that hasn't been freed. It is freed.
 void fir_string_free(char *s);
 
 // Set the default memory space's data layout: pointer and address sizes in bits, the pointer
 // alignment in bytes (0: the natural one), and the integer alignments by increasing width (none:
 // the default ones). Set it before building functions.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `ints` points to `nints` readable `FirIntAlign`s, or `nints` is 0.
+//
+// Each is used only during the call.
 FirStatus fir_module_set_space(struct FirModule *m,
                                uint32_t ptr_bits,
                                uint32_t addr_bits,
@@ -623,24 +671,64 @@ FirStatus fir_module_set_space(struct FirModule *m,
 
 // Set the size and alignment in bytes of the module's `va_list` (its memory space's `valist`;
 // 32 and 8 by default). Set it before building functions.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+//
+// Each is used only during the call.
 FirStatus fir_module_set_va_list(struct FirModule *m, uint32_t size, uint32_t align);
 
 // Set the module's layer: HFIR (the default), MFIR, or LFIR for the target `target` (such as
 // `"aarch64"`; ignored for the other layers). Set it before building functions: each op is
 // checked against it as it is built.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `target` is null or points to a NUL-terminated string.
+//
+// Each is used only during the call.
 FirStatus fir_module_set_layer(struct FirModule *m, FirLayer layer, const char *target);
 
 // Check the module (its finished functions) as `fir check` does. On failure the message is the
 // verifier's.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+//
+// Each is used only during the call.
 FirStatus fir_module_verify(struct FirModule *m);
 
 // The module (its finished functions) in canonical text, with locations or without. Free it with
 // `fir_string_free`.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+//
+// Each is used only during the call.
 char *fir_module_print(struct FirModule *m, bool show_locs);
 
 // Verify the module, then run `@name` with arguments written as text (integers, `null`,
 // `poison`) for at most `fuel` steps. `*out` gets the outcome in one line, as `fir run` prints
 // it (`returned i32 3`, `ub div0 @4:3`, …); free it with `fir_string_free`.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `name` is null or points to a NUL-terminated string.
+// * `args` points to `nargs` readable pointers, or `nargs` is 0; each is null or
+//   points to a NUL-terminated string.
+// * `out` is null or points to a writable `*mut c_char`.
+//
+// Each is used only during the call.
 FirStatus fir_module_run(struct FirModule *m,
                          const char *name,
                          const char *const *args,
@@ -653,10 +741,26 @@ FirStatus fir_module_run(struct FirModule *m,
 // core ops, and aggregate, union, and slice values their scalars, so the lowered functions take
 // and return those scalars. `FIR_ERR_VERIFY` if `m` doesn't verify, `FIR_ERR_COMPILE` if it
 // can't be lowered (such as a field offset the address size can't hold).
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `out` is null or points to a writable `*mut FirModule`.
+//
+// Each is used only during the call.
 FirStatus fir_module_lower(struct FirModule *m, struct FirModule **out);
 
 // Verify a module and run the default pass pipeline on a copy, as `fir opt -O` does: `*out`
 // gets the optimized module, verified (free it with `fir_module_free`), and `m` is unchanged.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `out` is null or points to a writable `*mut FirModule`.
+//
+// Each is used only during the call.
 FirStatus fir_module_optimize(struct FirModule *m, struct FirModule **out);
 
 // Verify a module and compile it for `target` (`"aarch64"`, the only one so far) to GNU
@@ -667,6 +771,15 @@ FirStatus fir_module_optimize(struct FirModule *m, struct FirModule **out);
 // Exceptions use an error-return convention: an exception that escapes a compiled function is
 // pending in `struct { void *flag; void *value; } __fir_exn` (nonzero `flag`) when it returns;
 // a C caller checks `flag` after the call, and clears it to catch.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `target` is null or points to a NUL-terminated string.
+// * `out` is null or points to a writable `*mut c_char`.
+//
+// Each is used only during the call.
 FirStatus fir_module_compile(struct FirModule *m,
                              const char *target,
                              bool optimize,
@@ -680,18 +793,50 @@ FirType fir_type_int(uint32_t width);
 FirType fir_type_byte(uint32_t width);
 
 // `struct<policy>{fields}`
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `fields` points to `nfields` readable `FirType`s, or `nfields` is 0.
+//
+// Each is used only during the call.
 FirType fir_type_struct(struct FirModule *m,
                         FirPolicy policy,
                         const FirType *fields,
                         size_t nfields);
 
 // `array<n x elem>`
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+//
+// Each is used only during the call.
 FirType fir_type_array(struct FirModule *m, uint64_t n, FirType elem);
 
 // `union<variants>` (HFIR): one of the variants, value types, and an `i32` tag naming it.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `variants` points to `nvariants` readable `FirType`s, or `nvariants` is 0.
+//
+// Each is used only during the call.
 FirType fir_type_union(struct FirModule *m, const FirType *variants, size_t nvariants);
 
 // `func<(params) -> rets>`, the signature of `func.call.indirect`.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `params` points to `nparams` readable `FirType`s, or `nparams` is 0.
+// * `rets` points to `nrets` readable `FirType`s, or `nrets` is 0.
+//
+// Each is used only during the call.
 FirType fir_type_func(struct FirModule *m,
                       const FirType *params,
                       size_t nparams,
@@ -700,6 +845,15 @@ FirType fir_type_func(struct FirModule *m,
 
 // `func<(params, ...) -> rets>` if `variadic`, else `func<(params) -> rets>`: the signature of
 // an indirect call of a variadic function, which passes variadic arguments after `params`.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `params` points to `nparams` readable `FirType`s, or `nparams` is 0.
+// * `rets` points to `nrets` readable `FirType`s, or `nrets` is 0.
+//
+// Each is used only during the call.
 FirType fir_type_func_va(struct FirModule *m,
                          const FirType *params,
                          size_t nparams,
@@ -710,13 +864,40 @@ FirType fir_type_func_va(struct FirModule *m,
 // A type's size and alignment in bytes, in the module's memory space (its data layout), as
 // `ty.size` and `ty.align` give them: what a frontend checks its own layout against. Scalars,
 // structs, and arrays have a layout; function and union types don't.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `size` is null or points to a writable `u64`.
+// * `align` is null or points to a writable `u32`.
+//
+// Each is used only during the call.
 FirStatus fir_type_layout(struct FirModule *m, FirType t, uint64_t *size, uint32_t *align);
 
 // The offset in bytes of field `index` of the struct type `t`, as `ty.offset` gives it.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `offset` is null or points to a writable `u64`.
+//
+// Each is used only during the call.
 FirStatus fir_type_field_offset(struct FirModule *m, FirType t, uint32_t index, uint64_t *offset);
 
 // Declare a function `@name(params) -> rets`, to call it or take its address, and define it
 // with `fir_func_begin`.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `name` is null or points to a NUL-terminated string.
+// * `params` points to `nparams` readable `FirType`s, or `nparams` is 0.
+// * `rets` points to `nrets` readable `FirType`s, or `nrets` is 0.
+//
+// Each is used only during the call.
 FirFunc fir_func_declare(struct FirModule *m,
                          const char *name,
                          const FirType *params,
@@ -727,6 +908,16 @@ FirFunc fir_func_declare(struct FirModule *m,
 // `fir_func_declare` of a function that takes variadic arguments after `params` if
 // `variadic` (`func @name(%a: T, ...)`): its body reads them with `fir_va_start` and
 // `fir_va_arg`, and a call (`fir_func_call`) passes them after the fixed arguments.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `name` is null or points to a NUL-terminated string.
+// * `params` points to `nparams` readable `FirType`s, or `nparams` is 0.
+// * `rets` points to `nrets` readable `FirType`s, or `nrets` is 0.
+//
+// Each is used only during the call.
 FirFunc fir_func_declare_va(struct FirModule *m,
                             const char *name,
                             const FirType *params,
@@ -736,10 +927,29 @@ FirFunc fir_func_declare_va(struct FirModule *m,
                             bool variadic);
 
 // The function or external function named `name`.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `name` is null or points to a NUL-terminated string.
+//
+// Each is used only during the call.
 FirFunc fir_func_find(struct FirModule *m, const char *name);
 
 // `extern func @name(params) -> rets effects[…] trust`: a function outside the module, with the
 // `FIR_EFFECT_*` it may have.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `name` is null or points to a NUL-terminated string.
+// * `params` points to `nparams` readable `FirType`s, or `nparams` is 0.
+// * `rets` points to `nrets` readable `FirType`s, or `nrets` is 0.
+// * `effects` points to `neffects` readable `FirEffect`s, or `neffects` is 0.
+//
+// Each is used only during the call.
 FirFunc fir_extern_declare(struct FirModule *m,
                            const char *name,
                            const FirType *params,
@@ -752,6 +962,17 @@ FirFunc fir_extern_declare(struct FirModule *m,
 
 // `fir_extern_declare` of a function that takes variadic arguments after `params` if
 // `variadic` (`extern func @printf(ptr, ...) -> i32 …`).
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `name` is null or points to a NUL-terminated string.
+// * `params` points to `nparams` readable `FirType`s, or `nparams` is 0.
+// * `rets` points to `nrets` readable `FirType`s, or `nrets` is 0.
+// * `effects` points to `neffects` readable `FirEffect`s, or `neffects` is 0.
+//
+// Each is used only during the call.
 FirFunc fir_extern_declare_va(struct FirModule *m,
                               const char *name,
                               const FirType *params,
@@ -765,6 +986,14 @@ FirFunc fir_extern_declare_va(struct FirModule *m,
 
 // `global [const] @name: ty [align align] = init`. An initializer that takes the address of a
 // global declared later is set afterwards with `fir_global_set_init`.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `name` is null or points to a NUL-terminated string.
+//
+// Each is used only during the call.
 FirGlobal fir_global_declare(struct FirModule *m,
                              const char *name,
                              FirType ty_,
@@ -773,72 +1002,235 @@ FirGlobal fir_global_declare(struct FirModule *m,
                              FirInit init);
 
 // Replace a global's initializer.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+//
+// Each is used only during the call.
 FirStatus fir_global_set_init(struct FirModule *m, FirGlobal g, FirInit init);
 
 // `zero`: every byte zero.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+//
+// Each is used only during the call.
 FirInit fir_init_zero(struct FirModule *m);
 
 // `null`
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+//
+// Each is used only during the call.
 FirInit fir_init_null(struct FirModule *m);
 
 // An integer, for an `iN` or `bN`.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+//
+// Each is used only during the call.
 FirInit fir_init_int(struct FirModule *m, int64_t n);
 
 // `bytes "…"`: the whole object's bytes.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `bytes` points to `n` readable `u8`s, or `n` is 0.
+//
+// Each is used only during the call.
 FirInit fir_init_bytes(struct FirModule *m, const uint8_t *bytes, size_t n);
 
 // An `f32`, for a global of that type.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+//
+// Each is used only during the call.
 FirInit fir_init_f32(struct FirModule *m, float x);
 
 // An `f64`, for a global of that type.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+//
+// Each is used only during the call.
 FirInit fir_init_f64(struct FirModule *m, double x);
 
 // `@f`: a function's address.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+//
+// Each is used only during the call.
 FirInit fir_init_func(struct FirModule *m, FirFunc f);
 
 // `@g`: a global's address.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+//
+// Each is used only during the call.
 FirInit fir_init_global(struct FirModule *m, FirGlobal g);
 
 // `{…}`: one initializer per struct field or array element.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `items` points to `n` readable `FirInit`s, or `n` is 0.
+//
+// Each is used only during the call.
 FirInit fir_init_list(struct FirModule *m, const FirInit *items, size_t n);
 
 // Start building a declared function, at the end of its entry region. Finish with
 // `fir_func_end` (or drop it with `fir_func_abandon`), which frees the builder. Null on failure.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+//
+// Each is used only during the call.
 struct FirBuilder *fir_func_begin(struct FirModule *m, FirFunc f);
 
 // Finish the function and add it to the module; free the builder, whatever the outcome.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed. The builder is freed: `fb` dangles afterwards.
 FirStatus fir_func_end(struct FirBuilder *fb);
 
 // Drop the function being built (it stays declared) and free the builder.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed. The builder is freed: `fb` dangles afterwards.
 void fir_func_abandon(struct FirBuilder *fb);
 
 // Parameter `i` of the function.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+//   abandoned, of a module that hasn't been freed, used by no other thread during the
+//   call.
+//
+// Each is used only during the call.
 FirValue fir_builder_param(struct FirBuilder *fb, uint32_t i);
 
 // The function's entry region.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+//   abandoned, of a module that hasn't been freed, used by no other thread during the
+//   call.
+//
+// Each is used only during the call.
 FirRegion fir_builder_entry(struct FirBuilder *fb);
 
 // Result `i` of an op.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+//   abandoned, of a module that hasn't been freed, used by no other thread during the
+//   call.
+//
+// Each is used only during the call.
 FirValue fir_op_result(struct FirBuilder *fb, FirOp op, uint32_t i);
 
 // The op whose result `v` is.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+//   abandoned, of a module that hasn't been freed, used by no other thread during the
+//   call.
+//
+// Each is used only during the call.
 FirOp fir_value_op(struct FirBuilder *fb, FirValue v);
 
 // Region `i` of an op.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+//   abandoned, of a module that hasn't been freed, used by no other thread during the
+//   call.
+//
+// Each is used only during the call.
 FirRegion fir_op_region(struct FirBuilder *fb, FirOp op, uint32_t i);
 
 // Parameter `i` of a region or block.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+//   abandoned, of a module that hasn't been freed, used by no other thread during the
+//   call.
+//
+// Each is used only during the call.
 FirValue fir_region_param(struct FirBuilder *fb, FirRegion r, uint32_t i);
 
 // Put the next ops at the end of a region or block.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+//   abandoned, of a module that hasn't been freed, used by no other thread during the
+//   call.
+//
+// Each is used only during the call.
 FirStatus fir_position_at_end(struct FirBuilder *fb, FirRegion r);
 
 // Put the next ops right before an op.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+//   abandoned, of a module that hasn't been freed, used by no other thread during the
+//   call.
+//
+// Each is used only during the call.
 FirStatus fir_position_before(struct FirBuilder *fb, FirOp op);
 
 // A new block of the `cf.blocks` (or `aarch64.code`) op `op`, labeled `label` (null or empty:
 // its id) and with these parameter types. The first block made is the entry, without parameters. Blocks are
 // given to the op in the order made, by `fir_blocks_end` or when the function ends.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+//   abandoned, of a module that hasn't been freed, used by no other thread during the
+//   call.
+// * `label` is null or points to a NUL-terminated string.
+// * `params` points to `nparams` readable `FirType`s, or `nparams` is 0.
+//
+// Each is used only during the call.
 FirRegion fir_block_new(struct FirBuilder *fb,
                         FirOp op,
                         const char *label,
@@ -846,57 +1238,182 @@ FirRegion fir_block_new(struct FirBuilder *fb,
                         size_t nparams);
 
 // Give a `cf.blocks` (or `aarch64.code`) op the blocks made for it; no more can be added.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+//   abandoned, of a module that hasn't been freed, used by no other thread during the
+//   call.
+//
+// Each is used only during the call.
 FirStatus fir_blocks_end(struct FirBuilder *fb, FirOp op);
 
 // The source location the next ops get, `@line:col`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+//   abandoned, of a module that hasn't been freed, used by no other thread during the
+//   call.
+//
+// Each is used only during the call.
 FirStatus fir_set_loc(struct FirBuilder *fb, uint32_t line, uint32_t col);
 
 // The next ops get no location.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+//   abandoned, of a module that hasn't been freed, used by no other thread during the
+//   call.
+//
+// Each is used only during the call.
 FirStatus fir_clear_loc(struct FirBuilder *fb);
 
 // The source file of the function's locations (`loc "main.c"`); null for none.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+//   abandoned, of a module that hasn't been freed, used by no other thread during the
+//   call.
+// * `file` is null or points to a NUL-terminated string.
+//
+// Each is used only during the call.
 FirStatus fir_set_file(struct FirBuilder *fb, const char *file);
 
 // Name a value, as `%name` in text. Unnamed values are named after their ids.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+//   abandoned, of a module that hasn't been freed, used by no other thread during the
+//   call.
+// * `name` is null or points to a NUL-terminated string.
+//
+// Each is used only during the call.
 FirStatus fir_value_set_name(struct FirBuilder *fb, FirValue v, const char *name);
 
 // Put these facts on a value, replacing any it has.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+//   abandoned, of a module that hasn't been freed, used by no other thread during the
+//   call.
+// * `facts` points to `nfacts` readable `FirFact`s, or `nfacts` is 0.
+//
+// Each is used only during the call.
 FirStatus fir_value_set_facts(struct FirBuilder *fb,
                               FirValue v,
                               const struct FirFact *facts,
                               size_t nfacts);
 
 // A hole `?name: ty`, usable as an operand.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+//   abandoned, of a module that hasn't been freed, used by no other thread during the
+//   call.
+// * `name` is null or points to a NUL-terminated string.
+//
+// Each is used only during the call.
 FirValue fir_hole(struct FirBuilder *fb, const char *name, FirType ty_);
 
 // `int.const` with the constant in decimal, for constants wider than 64 bits.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or
+//   abandoned, of a module that hasn't been freed, used by no other thread during the
+//   call.
+// * `digits` is null or points to a NUL-terminated string.
+//
+// Each is used only during the call.
 FirValue fir_int_const_dec(struct FirBuilder *fb, FirType result, const char *digits);
 
 // `int.const n`
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_int_const(struct FirBuilder *fb, FirType result, int64_t n);
 
 // `poison`: a `poison` value of a scalar type (`iN`, `ptr`, `bN` (whose bytes are all
 // `poison`), or a float).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_poison(struct FirBuilder *fb, FirType result);
 
 // `freeze %x`: `%x`, or an arbitrary value if it is `poison`; an integer or a float.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_freeze(struct FirBuilder *fb, FirValue t);
 
 // `copy %x`: the same value, of any type. Rewrites produce it (store-to-load forwarding
 // turns a load into a copy of the stored value), and copy propagation removes it.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_copy(struct FirBuilder *fb, FirValue t);
 
 // `select %c, %a, %b`
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_select(struct FirBuilder *fb, FirValue c, FirValue a, FirValue b);
 
 // `int.add.nsw %a, %b` and friends: `int.add`, `int.sub`, `int.mul` with an overflow
 // modifier.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_int_arith(struct FirBuilder *fb, FirArithOp op, FirOvf ovf, FirValue a, FirValue b);
 
 // `int.and`, `int.or`, `int.xor`
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_int_bit(struct FirBuilder *fb, FirBitOp op, FirValue a, FirValue b);
 
 // `int.div.s.ub %a, %b` and friends; see `Edge`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_int_div(struct FirBuilder *fb,
                      FirDivOp op,
                      FirEdge zero,
@@ -905,6 +1422,13 @@ FirValue fir_int_div(struct FirBuilder *fb,
                      FirValue b);
 
 // `int.shl.mask %a, %b`, `int.shr.u`, `int.shr.s`; see `ShiftEdge`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_int_shift(struct FirBuilder *fb,
                        FirShiftOp op,
                        FirShiftEdge edge,
@@ -912,21 +1436,64 @@ FirValue fir_int_shift(struct FirBuilder *fb,
                        FirValue b);
 
 // `int.cmp.slt %a, %b` and friends.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_int_cmp(struct FirBuilder *fb, FirPred p, FirValue a, FirValue b);
 
 // `int.zext %a`: the result type is the wider type.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_int_zext(struct FirBuilder *fb, FirType result, FirValue a);
 
 // `int.sext %a`
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_int_sext(struct FirBuilder *fb, FirType result, FirValue a);
 
 // `int.trunc.nsw %a`; see `TruncMode`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_int_trunc(struct FirBuilder *fb, FirType result, FirTruncMode mode, FirValue a);
 
 // `mem.stack 16, align 4`: stack memory, freed when its region ends.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_mem_stack(struct FirBuilder *fb, uint64_t size, uint32_t align);
 
 // `mem.alloc.null c.malloc %n, align 16`: heap memory from an allocator family.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `family` is null or points to a NUL-terminated string.
+//
+// Each is read only during the call.
 FirValue fir_mem_alloc(struct FirBuilder *fb,
                        FirAllocFail fail,
                        const char *family,
@@ -934,41 +1501,128 @@ FirValue fir_mem_alloc(struct FirBuilder *fb,
                        uint32_t align);
 
 // `mem.free c.malloc %p`
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `family` is null or points to a NUL-terminated string.
+//
+// Each is read only during the call.
 FirOp fir_mem_free(struct FirBuilder *fb, const char *family, FirValue p);
 
 // `mem.load %p, align 4`: the result type is the accessed type.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_mem_load(struct FirBuilder *fb, FirType result, FirValue p, uint32_t align);
 
 // `mem.store i32 %v, %p, align 4`
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_mem_store(struct FirBuilder *fb, FirType ty, FirValue value, FirValue p, uint32_t align);
 
 // `ptr.offset.inbounds %p, %n` (poison if it leaves the allocation) or `ptr.offset.wrap`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_ptr_offset(struct FirBuilder *fb, bool inbounds, FirValue p, FirValue n);
 
 // `ptr.addr %p`: the address, without exposing the allocation.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_ptr_addr(struct FirBuilder *fb, FirValue p);
 
 // `ptr.expose %p`: the address, and `ptr.from_exposed` may reach the allocation from now on.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_ptr_expose(struct FirBuilder *fb, FirValue p);
 
 // `ptr.from_exposed %a`: a pointer to an exposed allocation at that address.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_ptr_from_exposed(struct FirBuilder *fb, FirValue n);
 
 // `ptr.with_addr %p, %a`: a new address in `%p`'s allocation.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_ptr_with_addr(struct FirBuilder *fb, FirValue p, FirValue n);
 
 // `ptr.null`
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_ptr_null(struct FirBuilder *fb);
 
 // `ptr.cmp.eq` and friends; ordered comparisons are unsigned.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_ptr_cmp(struct FirBuilder *fb, FirPred p, FirValue a, FirValue b);
 
 // `func.call @f(%a, %b)`
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `args` points to `nargs` readable `FirValue`s, or `nargs` is 0.
+//
+// Each is read only during the call.
 FirOp fir_func_call(struct FirBuilder *fb, FirFunc callee, const FirValue *args, size_t nargs);
 
 // `cf.if %c { … } else { … }`: two regions.
 //
 // Makes the op with empty regions: fill them with `fir_position_at_end`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `results` points to `nresults` readable `FirType`s, or `nresults` is 0.
+//
+// Each is read only during the call.
 FirOp fir_cf_if_begin(struct FirBuilder *fb,
                       const FirType *results,
                       size_t nresults,
@@ -977,6 +1631,15 @@ FirOp fir_cf_if_begin(struct FirBuilder *fb,
 // `cf.loop [progress] [iter(…)] { … }`: one region whose parameters are the loop state.
 //
 // Makes the op with empty regions: fill them with `fir_position_at_end`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `results` points to `nresults` readable `FirType`s, or `nresults` is 0.
+// * `inits` points to `ninits` readable `FirValue`s, or `ninits` is 0.
+//
+// Each is read only during the call.
 FirOp fir_cf_loop_begin(struct FirBuilder *fb,
                         const FirType *results,
                         size_t nresults,
@@ -985,15 +1648,47 @@ FirOp fir_cf_loop_begin(struct FirBuilder *fb,
                         size_t ninits);
 
 // `cf.yield`: ends a `cf.if` region with the `cf.if`'s results.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `args` points to `nargs` readable `FirValue`s, or `nargs` is 0.
+//
+// Each is read only during the call.
 FirOp fir_cf_yield(struct FirBuilder *fb, const FirValue *args, size_t nargs);
 
 // `cf.break`: leaves the nearest loop with the loop's results.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `args` points to `nargs` readable `FirValue`s, or `nargs` is 0.
+//
+// Each is read only during the call.
 FirOp fir_cf_break(struct FirBuilder *fb, const FirValue *args, size_t nargs);
 
 // `cf.continue`: starts the next iteration with new loop state.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `args` points to `nargs` readable `FirValue`s, or `nargs` is 0.
+//
+// Each is read only during the call.
 FirOp fir_cf_continue(struct FirBuilder *fb, const FirValue *args, size_t nargs);
 
 // `func.ret`
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `args` points to `nargs` readable `FirValue`s, or `nargs` is 0.
+//
+// Each is read only during the call.
 FirOp fir_func_ret(struct FirBuilder *fb, const FirValue *args, size_t nargs);
 
 // `cf.blocks [progress] { ^entry: … ^b(%x: i32): … }`: labeled blocks, entered at the first
@@ -1002,20 +1697,55 @@ FirOp fir_func_ret(struct FirBuilder *fb, const FirValue *args, size_t nargs);
 // `progress`, control may be assumed to leave the op (as for `cf.loop progress`).
 //
 // Makes the op with empty regions: fill them with `fir_position_at_end`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `results` points to `nresults` readable `FirType`s, or `nresults` is 0.
+//
+// Each is read only during the call.
 FirOp fir_cf_blocks_begin(struct FirBuilder *fb,
                           const FirType *results,
                           size_t nresults,
                           bool progress);
 
 // `cf.br ^b(%x, …)`: jump to a block of the nearest enclosing `cf.blocks`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `dest.args` points to `dest.nargs` readable `FirValue`s, or `dest.nargs` is 0.
+//
+// Each is read only during the call.
 FirOp fir_cf_br(struct FirBuilder *fb, struct FirTarget dest);
 
 // `cf.cond_br %c, ^t(…), ^f(…)`: jump to `^t` if `%c` is 1, otherwise to `^f`. Branching on
 // `poison` is UB.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `t.args` points to `t.nargs` readable `FirValue`s, or `t.nargs` is 0.
+// * `f.args` points to `f.nargs` readable `FirValue`s, or `f.nargs` is 0.
+//
+// Each is read only during the call.
 FirOp fir_cf_cond_br(struct FirBuilder *fb, FirValue cond, struct FirTarget t, struct FirTarget f);
 
 // `cf.switch %v, default ^d(…), [k: ^b(…), …]`: jump to the case whose key is `%v` (keys are
 // taken modulo `2^N`), or to the default. Branching on `poison` is UB.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `dflt.args` points to `dflt.nargs` readable `FirValue`s, or `dflt.nargs` is 0.
+// * `cases` points to `ncases` readable `FirCase`s, or `ncases` is 0; each case's
+//   `target.args` points to `target.nargs` readable `FirValue`s, or `target.nargs` is 0.
+//
+// Each is read only during the call.
 FirOp fir_cf_switch(struct FirBuilder *fb,
                     FirValue x,
                     struct FirTarget dflt,
@@ -1023,16 +1753,44 @@ FirOp fir_cf_switch(struct FirBuilder *fb,
                     size_t ncases);
 
 // `ty.size T`: how many bytes a `T` takes, in the memory space's data layout.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_ty_size(struct FirBuilder *fb, FirType ty);
 
 // `ty.align T`: a `T`'s alignment in bytes.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_ty_align(struct FirBuilder *fb, FirType ty);
 
 // `ty.offset T, i`: the offset of field `i` in the struct `T`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_ty_offset(struct FirBuilder *fb, FirType ty, uint32_t index);
 
 // `ptr.field.inbounds T %p, i`: field `i` of the struct `T` at `%p`, as `ptr.offset` by the
 // field's offset (`.inbounds` or `.wrap`).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_ptr_field(struct FirBuilder *fb,
                        bool inbounds,
                        FirType ty,
@@ -1042,24 +1800,67 @@ FirValue fir_ptr_field(struct FirBuilder *fb,
 // `ptr.index.inbounds T %p, %i`: element `%i` (signed) of an array of `T` at `%p`. The
 // in-bounds form also gives `poison` when `%i` times `T`'s stride overflows a signed address;
 // the `.wrap` form wraps it.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_ptr_index(struct FirBuilder *fb, bool inbounds, FirType ty, FirValue p, FirValue n);
 
 // `mem.stack.of T, align 1`: stack memory for a `T`, aligned to `align` or `T`'s alignment,
 // whichever is larger; freed when its region ends.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_mem_stack_of(struct FirBuilder *fb, FirType ty, uint32_t align);
 
 // `mem.copy T %dst, %src, align 4`: copy a `T`'s bytes exactly, as loading and storing them
 // as one byte value would: padding and pointers included, overlap allowed.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_mem_copy(struct FirBuilder *fb, FirType ty, FirValue a, FirValue b, uint32_t align);
 
 // `mem.global @g`: a pointer to the global `@g`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_mem_global(struct FirBuilder *fb, FirGlobal global);
 
 // `func.addr @f`: a pointer to the function `@f`, which only calls may use.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_func_addr(struct FirBuilder *fb, FirFunc callee);
 
 // `func.call.indirect func<(i32) -> i32> %p(%a)`: a call through a pointer, which must point
 // at a function of this signature.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `args` points to `nargs` readable `FirValue`s, or `nargs` is 0.
+//
+// Each is read only during the call.
 FirOp fir_func_call_indirect(struct FirBuilder *fb,
                              FirType sig,
                              FirValue p,
@@ -1068,44 +1869,121 @@ FirOp fir_func_call_indirect(struct FirBuilder *fb,
 
 // `va.start %ap`: start a cursor over the running call's variadic arguments in the
 // `va_list` at `%ap`, at the first. Only in a variadic function.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_va_start(struct FirBuilder *fb, FirValue p);
 
 // `va.arg %ap`: the next variadic argument of the cursor in the `va_list` at `%ap`, read as
 // the result type, which must be of the argument's class (integer and pointer, or float); the
 // cursor moves past it. Its bytes are read as a load of the result type reads the argument's.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_va_arg(struct FirBuilder *fb, FirType result, FirValue p);
 
 // `va.end %ap`: end the cursor in the `va_list` at `%ap`; its bytes become `poison`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_va_end(struct FirBuilder *fb, FirValue p);
 
 // `float.const 1.5`: the result type's float with these bits, written as the shortest
 // decimal that reads back to them, `inf`, `-inf`, `nan`, or `nan(0x…)` (see `Fir.FloatText`).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_float_const(struct FirBuilder *fb, FirType result, uint64_t value);
 
 // `float.add %a, %b`, `float.sub`, `float.mul`, `float.div`: the exact result, rounded to
 // nearest (ties to even); `float.copysign %a, %b`: `%a`'s magnitude with `%b`'s sign.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_float_bin(struct FirBuilder *fb, FirFBinOp op, FirValue a, FirValue b);
 
 // `float.neg %a`, `float.abs %a` (the sign bit flipped or cleared), `float.sqrt %a`
 // (rounded).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_float_un(struct FirBuilder *fb, FirFUnOp op, FirValue a);
 
 // `float.fma %a, %b, %c`: `%a * %b + %c`, rounded once.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_float_fma(struct FirBuilder *fb, FirValue a, FirValue b, FirValue c);
 
 // `float.cmp.olt %a, %b` and friends; see `FPred`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_float_cmp(struct FirBuilder *fb, FirFPred p, FirValue a, FirValue b);
 
 // `float.ext %a`: a float in a wider format, exactly.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_float_ext(struct FirBuilder *fb, FirType result, FirValue a);
 
 // `float.trunc %a`: a float in a narrower format, rounded.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_float_trunc(struct FirBuilder *fb, FirType result, FirValue a);
 
 // `float.to_int.s.sat %a`: the integer part (toward zero), signed or unsigned, of the result
 // type; a NaN or an integer part out of range is UB (`.ub`), the nearest bound (`.sat`, NaN
 // gives 0), or a trap with reason `convert` (`.trap`). A `poison` input is UB for `.ub` and
 // `.trap`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_float_to_int(struct FirBuilder *fb,
                           FirType result,
                           bool signed_,
@@ -1113,37 +1991,108 @@ FirValue fir_float_to_int(struct FirBuilder *fb,
                           FirValue a);
 
 // `int.to_float.s %a`: the integer, signed or unsigned, as the result type's float, rounded.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_int_to_float(struct FirBuilder *fb, FirType result, bool signed_, FirValue a);
 
 // `float.from_bits %a`: the float with an integer's bits (the same width).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_float_from_bits(struct FirBuilder *fb, FirType result, FirValue a);
 
 // `float.to_bits %a`: a float's bits, as an integer of the same width.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_float_to_bits(struct FirBuilder *fb, FirType result, FirValue a);
 
 // `agg.make %a, %b`: a struct value from its fields, or an array value from its elements;
 // the result type says which.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `args` points to `nargs` readable `FirValue`s, or `nargs` is 0.
+//
+// Each is read only during the call.
 FirValue fir_agg_make(struct FirBuilder *fb, FirType result, const FirValue *args, size_t nargs);
 
 // `agg.extract %s, 1`: field `1` of a struct value, or element `1` of an array value.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_agg_extract(struct FirBuilder *fb, FirType result, FirValue a, uint32_t index);
 
 // `agg.insert %s, %v, 1`: `%s` with field or element `1` replaced by `%v`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_agg_insert(struct FirBuilder *fb, FirValue a, FirValue v, uint32_t index);
 
 // `int.add.overflow.s %a, %b`: the wrapped result and whether the operation overflowed
 // (signed, or unsigned with `.u`), as `int.add.s.trap` would trap; `int.sub` and `int.mul` too.
 // `poison` in, `poison` out (both results).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_int_overflow(struct FirBuilder *fb, FirArithOp op, bool signed_, FirValue a, FirValue b);
 
 // `union.make %v, 1`: the union (the result type) holding variant `1`, `%v`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_union_make(struct FirBuilder *fb, FirType result, FirValue v, uint32_t index);
 
 // `union.tag %u`: which variant `%u` holds, as an `i32`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_union_tag(struct FirBuilder *fb, FirValue u);
 
 // `union.get.trap %u, 1`: the payload of variant `1`; if `%u` holds another variant, UB
 // (`.ub`) or a trap with reason `tag` (`.trap`).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_union_get(struct FirBuilder *fb,
                        FirType result,
                        bool trap,
@@ -1151,18 +2100,46 @@ FirValue fir_union_get(struct FirBuilder *fb,
                        uint32_t index);
 
 // `slice.make %p, %n`: the slice of `%n` elements at `%p`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_slice_make(struct FirBuilder *fb, FirValue p, FirValue n);
 
 // `slice.ptr %s`
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_slice_ptr(struct FirBuilder *fb, FirValue s);
 
 // `slice.len %s`
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_slice_len(struct FirBuilder *fb, FirValue s);
 
 // `slice.get.trap %s, %i, align 4`: load element `%i` (unsigned) of the slice, of the result
 // type. An index not below the length is UB (`.ub`) or traps with reason `bounds` (`.trap`); a
 // `poison` index or length is UB. The element is at `ptr.offset.inbounds` by `%i` times the
 // stride, wrapped.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirValue fir_slice_get(struct FirBuilder *fb,
                        FirType result,
                        bool trap,
@@ -1172,6 +2149,13 @@ FirValue fir_slice_get(struct FirBuilder *fb,
 
 // `slice.set.trap i32 %v, %s, %i, align 4`: store element `%i` of the slice, checked like
 // `slice.get`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_slice_set(struct FirBuilder *fb,
                     bool trap,
                     FirType ty,
@@ -1182,6 +2166,13 @@ FirOp fir_slice_set(struct FirBuilder *fb,
 
 // `cf.check.bounds %ok`: nothing if `%ok` is 1; a trap with that reason if it is 0; UB if it
 // is `poison`. The lowered form of HFIR's checks.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_cf_check(struct FirBuilder *fb, FirTrapReason reason, FirValue x);
 
 // `cf.try { … } catch(%e: ptr) { … }`: run the first region; an exception thrown in it (by
@@ -1190,17 +2181,41 @@ FirOp fir_cf_check(struct FirBuilder *fb, FirTrapReason reason, FirValue x);
 // gives the op's results. Jumps can't leave either region.
 //
 // Makes the op with empty regions: fill them with `fir_position_at_end`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `results` points to `nresults` readable `FirType`s, or `nresults` is 0.
+//
+// Each is read only during the call.
 FirOp fir_cf_try_begin(struct FirBuilder *fb, const FirType *results, size_t nresults);
 
 // `exn.throw %e`: throw the exception `%e`. Unwinding pops frames (ending their stack memory,
 // and a call's `noalias` scopes) up to the nearest `cf.try` region or `func.invoke` handler, in
 // this function or a calling one; an exception that leaves the function the run started in is
 // the run's outcome, `threw`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_exn_throw(struct FirBuilder *fb, FirValue p);
 
 // `func.invoke @f(%a) unwind ^h`: `func.call`, except that an exception the callee throws
 // jumps to block `^h` of the nearest `cf.blocks`, whose one parameter takes it, instead of going
 // on to the caller (a plain `func.call` passes it on).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `args` points to `nargs` readable `FirValue`s, or `nargs` is 0.
+// * `unwind.args` points to `unwind.nargs` readable `FirValue`s, or `unwind.nargs` is 0.
+//
+// Each is read only during the call.
 FirOp fir_func_invoke(struct FirBuilder *fb,
                       FirFunc callee,
                       const FirValue *args,
@@ -1209,6 +2224,15 @@ FirOp fir_func_invoke(struct FirBuilder *fb,
 
 // `func.invoke.indirect func<(i32) -> i32> %p(%a) unwind ^h`: `func.call.indirect` with a
 // handler, as `func.invoke`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `args` points to `nargs` readable `FirValue`s, or `nargs` is 0.
+// * `unwind.args` points to `unwind.nargs` readable `FirValue`s, or `unwind.nargs` is 0.
+//
+// Each is read only during the call.
 FirOp fir_func_invoke_indirect(struct FirBuilder *fb,
                                FirType sig,
                                FirValue p,
@@ -1221,12 +2245,33 @@ FirOp fir_func_invoke_indirect(struct FirBuilder *fb,
 // body of an LFIR function, which finds its arguments where the calling convention puts them.
 //
 // Makes the op with empty regions: fill them with `fir_position_at_end`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_code_begin(struct FirBuilder *fb);
 
 // `aarch64.add.x x0, x1, x2` and friends: three-register data processing; see `AluOp`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_alu(struct FirBuilder *fb, FirAluOp op, FirSf sf, FirReg d, FirReg n, FirReg m);
 
 // `aarch64.add.imm.x x0, x1, 16`: data processing with an immediate; see `AluImmOp`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_alu_imm(struct FirBuilder *fb,
                           FirAluImmOp op,
                           FirSf sf,
@@ -1235,6 +2280,13 @@ FirOp fir_aarch64_alu_imm(struct FirBuilder *fb,
                           int64_t imm);
 
 // `aarch64.lsl.imm.x x0, x1, 3`: a shift by an immediate below the size.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_shift_imm(struct FirBuilder *fb,
                             FirShiftImmOp op,
                             FirSf sf,
@@ -1244,6 +2296,13 @@ FirOp fir_aarch64_shift_imm(struct FirBuilder *fb,
 
 // `aarch64.sbfx.x x0, x1, 8`: the low `width` bits (1 to the size), sign-extended (`sbfx`) or
 // zero-extended (`ubfx`).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_ext(struct FirBuilder *fb,
                       bool signed_,
                       FirSf sf,
@@ -1252,10 +2311,24 @@ FirOp fir_aarch64_ext(struct FirBuilder *fb,
                       uint32_t width);
 
 // `aarch64.mov.x x0, x1`: copy a register (`sp` included).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_mov(struct FirBuilder *fb, FirSf sf, FirReg d, FirReg n);
 
 // `aarch64.movz.x x0, 4660, 16`: a 16-bit immediate shifted left by `hw` (0, 16, 32, or 48):
 // zero elsewhere (`movz`), inverted (`movn`), or inserted into the register (`movk`).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_mov_wide(struct FirBuilder *fb,
                            FirMovOp op,
                            FirSf sf,
@@ -1265,6 +2338,13 @@ FirOp fir_aarch64_mov_wide(struct FirBuilder *fb,
 
 // `aarch64.csel.eq.x x0, x1, x2`: `x1` if the condition holds, else `x2` (incremented,
 // inverted, or negated for `csinc`, `csinv`, `csneg`).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_csel(struct FirBuilder *fb,
                        FirCselOp op,
                        FirCond c,
@@ -1275,14 +2355,35 @@ FirOp fir_aarch64_csel(struct FirBuilder *fb,
 
 // `aarch64.ldr.w x0, x1, 8`: load 1, 2, 4, or 8 bytes from `x1 + 8`, zero-extended. Into an
 // FP register (`aarch64.ldr.w d0, x1, 8`) it is Arm's `ldr s0, [x1, #8]`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_ldr(struct FirBuilder *fb, FirMemSize size, FirReg d, FirReg base, int64_t off);
 
 // `aarch64.str.w x0, x1, 8`: store the low 1, 2, 4, or 8 bytes of `x0` at `x1 + 8`, an FP
 // register's too (`aarch64.str.x d0, x1, 8` is `str d0, [x1, #8]`).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_str(struct FirBuilder *fb, FirMemSize size, FirReg s, FirReg base, int64_t off);
 
 // `aarch64.fadd.d d0, d1, d2` and friends: scalar FP arithmetic in the format; see
 // `FAluOp`. A NaN result is Arm's (`AArch64.fpProcessNaNs`, default-NaN mode off).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_falu(struct FirBuilder *fb,
                        FirFAluOp op,
                        FirFSize fs,
@@ -1293,21 +2394,56 @@ FirOp fir_aarch64_falu(struct FirBuilder *fb,
 // `aarch64.fsqrt.d d0, d1` and friends: scalar FP operations on one register; see
 // `FUnaryOp`. `fmov` also moves bits between a general-purpose register and an FP one
 // (`aarch64.fmov.d d0, x1`, `aarch64.fmov.s x1, d0`).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_funary(struct FirBuilder *fb, FirFUnaryOp op, FirFSize fs, FirReg d, FirReg n);
 
 // `aarch64.fmadd.d d0, d1, d2`: `d0 := d1 * d2 + d0`, rounded once: Arm's `fmadd d0, d1, d2,
 // d0`, with the destination as the addend (four registers don't fit an op's immediates).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_fmadd(struct FirBuilder *fb, FirFSize fs, FirReg d, FirReg n, FirReg m);
 
 // `aarch64.fmov.imm.d d0, 112`: the float Arm's 8-bit immediate encodes (`VFPExpandImm`:
 // 112 is 1.0, `fmov d0, #1.0`).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_fmov_imm(struct FirBuilder *fb, FirFSize fs, FirReg d, uint32_t imm);
 
 // `aarch64.fcmp.d d0, d1`: compare, setting the flags (`0011` when unordered, `0110` when
 // equal, `1000` when less, `0010` when greater).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_fcmp(struct FirBuilder *fb, FirFSize fs, FirReg n, FirReg m);
 
 // `aarch64.fcsel.eq.d d0, d1, d2`: `d1` if the condition holds, else `d2`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_fcsel(struct FirBuilder *fb,
                         FirCond c,
                         FirFSize fs,
@@ -1317,10 +2453,24 @@ FirOp fir_aarch64_fcsel(struct FirBuilder *fb,
 
 // `aarch64.fcvt.d.s d0, d1`: convert between the formats (to `d` from `s` here; exact one
 // way, rounded the other).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_fcvt(struct FirBuilder *fb, FirFSize dst, FirFSize src, FirReg d, FirReg n);
 
 // `aarch64.scvtf.d.x d0, x1`: an integer of the size, signed (`scvtf`) or unsigned
 // (`ucvtf`), to the format, rounded.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_cvtf(struct FirBuilder *fb,
                        bool signed_,
                        FirFSize fs,
@@ -1330,6 +2480,13 @@ FirOp fir_aarch64_cvtf(struct FirBuilder *fb,
 
 // `aarch64.fcvtzs.x.d x0, d1`: a float to an integer of the size, signed (`fcvtzs`) or
 // unsigned (`fcvtzu`), toward zero, saturating at the bounds, NaN giving 0.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_fcvtz(struct FirBuilder *fb,
                         bool signed_,
                         FirSf sf,
@@ -1338,53 +2495,151 @@ FirOp fir_aarch64_fcvtz(struct FirBuilder *fb,
                         FirReg n);
 
 // `aarch64.adrl x0, @g`: the address of a global (`adrp` and `add`).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_adrl(struct FirBuilder *fb, FirReg d, FirGlobal global);
 
 // `aarch64.adrl.func x0, @f`: the address of a function (`adrp` and `add`, or a GOT load for
 // an external one).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_adrl_func(struct FirBuilder *fb, FirReg d, FirFunc callee);
 
 // `aarch64.b ^b`: jump to a block of the enclosing `aarch64.code`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `dest.args` points to `dest.nargs` readable `FirValue`s, or `dest.nargs` is 0.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_b(struct FirBuilder *fb, struct FirTarget dest);
 
 // `aarch64.b.eq ^t, ^f`: jump to `^t` if the condition holds, otherwise to `^f`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `t.args` points to `t.nargs` readable `FirValue`s, or `t.nargs` is 0.
+// * `f.args` points to `f.nargs` readable `FirValue`s, or `f.nargs` is 0.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_b_cond(struct FirBuilder *fb, FirCond c, struct FirTarget t, struct FirTarget f);
 
 // `aarch64.ret`: return to the caller, with the results where the calling convention puts
 // them.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_ret(struct FirBuilder *fb);
 
 // `aarch64.trap.div0`: trap with a reason (a call to `__fir_trap` with the reason and the
 // op's location).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_trap(struct FirBuilder *fb, FirTrapReason reason);
 
 // `aarch64.bl @f`: call a function; the arguments and results are where the calling
 // convention puts them for `@f`'s signature, and the call clobbers the caller-saved
 // registers.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_bl(struct FirBuilder *fb, FirFunc callee);
 
 // `aarch64.blr func<(i32) -> i32> x9`: call the function `x9` points to, with arguments
 // of the signature's parameter types: its own, or, for a variadic function, every argument's
 // at this call (`func<(ptr, i32, f64) -> i32>` for `printf` with an `i32` and an `f64`;
 // decision: Varargs).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_blr(struct FirBuilder *fb, FirType sig, FirReg n);
 
 // `aarch64.bl.alloc c.malloc, align 16`: allocate `x0` bytes from the family's allocator;
 // `x0` is the memory, or null if allocation failed (a call to `malloc` or `aligned_alloc`).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `family` is null or points to a NUL-terminated string.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_bl_alloc(struct FirBuilder *fb, const char *family, uint32_t align);
 
 // `aarch64.exn.set x0`: make `x0` the pending exception (decision: Exceptions at run time):
 // store it in the thread's exception slot, `__fir_exn`. A function that throws sets it, then
 // returns.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_exn_set(struct FirBuilder *fb, FirReg n);
 
 // `aarch64.exn.take x0`: `x0` gets the pending exception, which is no longer pending.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_exn_take(struct FirBuilder *fb, FirReg d);
 
 // `aarch64.b.exn ^t, ^f`: jump to `^t` if an exception is pending, otherwise to `^f`.
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `t.args` points to `t.nargs` readable `FirValue`s, or `t.nargs` is 0.
+// * `f.args` points to `f.nargs` readable `FirValue`s, or `f.nargs` is 0.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_b_exn(struct FirBuilder *fb, struct FirTarget t, struct FirTarget f);
 
 // `aarch64.bl.free c.malloc`: free `x0` (a call to `free`).
+//
+// # Safety
+//
+// * `fb` is null or a builder from `fir_func_begin` that hasn't been ended or abandoned,
+//   of a module that hasn't been freed, used by no other thread during the call.
+// * `family` is null or points to a NUL-terminated string.
+//
+// Each is read only during the call.
 FirOp fir_aarch64_bl_free(struct FirBuilder *fb, const char *family);
 
 #ifdef __cplusplus

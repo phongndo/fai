@@ -11,3 +11,6 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 fir = { path = "../fir" }
+
+[lints]
+workspace = true
