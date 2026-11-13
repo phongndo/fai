@@ -53,7 +53,7 @@
 pub mod backend;
 pub mod codegen;
 mod driver;
-pub mod interp;
+pub use fai_interp as interp;
 mod lower;
 pub mod passes;
 

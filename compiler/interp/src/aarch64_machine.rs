@@ -5,16 +5,16 @@
 //! is a child of `interp`, so it uses the [`Machine`]'s private parts): registers `x0`…`x30` and
 //! `sp` hold words (64 bits, or a pointer with its provenance), `d0`…`d31` the low 64 bits of the
 //! FP/SIMD registers, NZCV the flags, and each call has a frame with its own virtual registers
-//! of both classes. FP results follow Arm's NaN rules (`crate::float::NanRule::Arm`). Memory is
+//! of both classes. FP results follow Arm's NaN rules (`fai_ir::float::NanRule::Arm`). Memory is
 //! flat: an integer address reaches whichever live allocation holds those bytes. Calls follow
 //! AAPCS64 (`super::abi`); external calls are events, answered with zeros, and leave the
 //! caller-saved registers zero (the oracle's choice).
 
 use super::*;
-use crate::body::StrId;
-use crate::decl::Imm;
-use crate::dialect::aarch64::abi::{self, ArgLoc, PassKind};
-use crate::float::NanRule;
+use fai_ir::body::StrId;
+use fai_ir::decl::Imm;
+use fai_ir::dialect::aarch64::abi::{self, ArgLoc, PassKind};
+use fai_ir::float::NanRule;
 
 /// The callee-saved registers, as Lean's `calleeSaved` lists them.
 const NSAVED: usize = 20;
@@ -248,7 +248,7 @@ fn low(fs: FSize, b: u64) -> u64 {
 }
 
 /// ASL's `VFPExpandImm` (Lean's `vfpExpandImm`): the float an 8-bit `fmov` immediate encodes.
-pub(crate) fn vfp_expand_imm(fs: FSize, imm8: u32) -> u64 {
+pub fn vfp_expand_imm(fs: FSize, imm8: u32) -> u64 {
     let (e, m) = match fs {
         FSize::S => (8, 23),
         FSize::D => (11, 52),
@@ -266,11 +266,11 @@ pub(crate) fn vfp_expand_imm(fs: FSize, imm8: u32) -> u64 {
 
 /// ASL's `FPCompare` flags (Lean's `fpCompare`).
 fn fp_compare(f: FloatTy, a: u64, b: u64) -> u8 {
-    if crate::float::is_nan(f, a) || crate::float::is_nan(f, b) {
+    if fai_ir::float::is_nan(f, a) || fai_ir::float::is_nan(f, b) {
         nzcv(false, false, true, true)
-    } else if crate::float::cmp(f, FPred::Oeq, a, b) {
+    } else if fai_ir::float::cmp(f, FPred::Oeq, a, b) {
         nzcv(false, true, true, false)
-    } else if crate::float::cmp(f, FPred::Olt, a, b) {
+    } else if fai_ir::float::cmp(f, FPred::Olt, a, b) {
         nzcv(true, false, false, false)
     } else {
         nzcv(false, false, true, false)
@@ -1305,7 +1305,7 @@ impl<'m> Lfir<'m> {
                     FAluOp::Fmul => FBinOp::Mul,
                     FAluOp::Fdiv => FBinOp::Div,
                 };
-                self.write_f(d, crate::float::bin_with(NanRule::Arm, fs.fty(), op, a, b));
+                self.write_f(d, fai_ir::float::bin_with(NanRule::Arm, fs.fty(), op, a, b));
             }
             OpKind::A64Funary { op, fs, d, n } => {
                 let op = match op {
@@ -1315,12 +1315,12 @@ impl<'m> Lfir<'m> {
                     FUnaryOp::Fsqrt => FUnOp::Sqrt,
                 };
                 let a = self.read_fs(loc, fs, n)?;
-                self.write_f(d, crate::float::un_with(NanRule::Arm, fs.fty(), op, a));
+                self.write_f(d, fai_ir::float::un_with(NanRule::Arm, fs.fty(), op, a));
             }
             OpKind::A64Fmadd { fs, d, n, m } => {
                 let a = self.read_fs(loc, fs, d)?;
                 let (x, y) = (self.read_fs(loc, fs, n)?, self.read_fs(loc, fs, m)?);
-                self.write_f(d, crate::float::fma_with(NanRule::Arm, fs.fty(), x, y, a));
+                self.write_f(d, fai_ir::float::fma_with(NanRule::Arm, fs.fty(), x, y, a));
             }
             OpKind::A64FmovImm { fs, d, imm } => {
                 if imm >= 256 {
@@ -1344,7 +1344,7 @@ impl<'m> Lfir<'m> {
                 let a = self.read_fs(loc, src, n)?;
                 self.write_f(
                     d,
-                    crate::float::cvt_with(NanRule::Arm, src.fty(), dst.fty(), a),
+                    fai_ir::float::cvt_with(NanRule::Arm, src.fty(), dst.fty(), a),
                 );
             }
             OpKind::A64Cvtf {
@@ -1355,7 +1355,7 @@ impl<'m> Lfir<'m> {
                 n,
             } => {
                 let x = self.read_bits(loc, n)? & mask(sf.bits());
-                let b = crate::float::from_int(fs.fty(), signed, sf.bits(), &Bits::Small(x));
+                let b = fai_ir::float::from_int(fs.fty(), signed, sf.bits(), &Bits::Small(x));
                 self.write_f(d, b);
             }
             OpKind::A64Fcvtz {
@@ -1366,7 +1366,7 @@ impl<'m> Lfir<'m> {
                 n,
             } => {
                 let a = self.read_fs(loc, fs, n)?;
-                let r = match crate::float::to_int(fs.fty(), signed, CvtEdge::Sat, sf.bits(), a) {
+                let r = match fai_ir::float::to_int(fs.fty(), signed, CvtEdge::Sat, sf.bits(), a) {
                     Out::Val(Some(Bits::Small(b))) => b,
                     _ => 0,
                 };

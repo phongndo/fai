@@ -1,0 +1,19 @@
+[package]
+name = "fai-interp"
+version = "0.1.0"
+description = "FIR's reference interpreter: HFIR and MFIR, and LFIR on the AArch64 machine model"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fai-ir = { path = "../ir" }
+num-bigint = "0.4"
+rustc-hash = "2"
+
+# The examples in the docs are written against the supported interface, the `fir` crate.
+[dev-dependencies]
+fir = { path = "../../crates/fir" }
+
+[lints]
+workspace = true

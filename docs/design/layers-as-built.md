@@ -46,7 +46,7 @@ run of it ends `ambiguous`.
 | Modules | Machine | Behaviors and refinement defined in Lean |
 |---|---|---|
 | HFIR and MFIR | `Fir.Interp` (Rust: `interp.rs`). It never reads the module's layer: an op means the same in both. | Yes: `Behaves`, `Func.Refines`, `Func.Decided` |
-| LFIR for AArch64 | `Fir.AArch64Machine` (Rust: `backend/aarch64/machine.rs`): registers and flags over `Fir.Interp`'s core (memory, allocations, events, oracle), ending in the same `Outcome` | No: the machine has `step` and `run` (a printed outcome), and no `Behaves` or refinement against a source |
+| LFIR for AArch64 | `Fir.AArch64Machine` (Rust: `compiler/interp/src/aarch64_machine.rs`): registers and flags over `Fir.Interp`'s core (memory, allocations, events, oracle), ending in the same `Outcome` | No: the machine has `step` and `run` (a printed outcome), and no `Behaves` or refinement against a source |
 
 **The rest of the meaning:**
 

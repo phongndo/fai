@@ -10,7 +10,7 @@
 //! unwinds in one step, as Lean's `throwExn` does (`Machine::throw_exn`), and one that leaves the
 //! outermost call ends the run with `threw`.
 //!
-//! The machine follows the crate's data-oriented rules (see [`crate::Body`]):
+//! The machine follows the crate's data-oriented rules (see [`fai_ir::Body`]):
 //!
 //! * **Values** are small `Copy` enums (`Value`). Integers up to 64 bits are inline; wider ones,
 //!   pointers, and byte strings are ids into append-only tables (`wides`, `ptrs`, `byte_vals`).
@@ -31,22 +31,24 @@
 //! offsets, which Lean leaves unbounded, are 128-bit, which a run can't overflow without more
 //! than `2^63` steps.
 
+#![forbid(unsafe_code)]
+
 use std::fmt::Write;
 
 use num_bigint::{BigInt, BigUint};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::body::{Body, Int, OpId, Operand, OperandKind, RegionId, Succ, ValueId};
-pub use crate::float::NanRule;
-use crate::ir::*;
-use crate::sem::{self, Bits, Out};
-pub use crate::sem::{TrapReason, UbKind};
-use crate::types::{Policy, Shape};
+use fai_ir::body::{Body, Int, OpId, Operand, OperandKind, RegionId, Succ, ValueId};
+pub use fai_ir::float::NanRule;
+use fai_ir::ir::*;
+use fai_ir::sem::{self, Bits, Out};
+pub use fai_ir::sem::{TrapReason, UbKind};
+use fai_ir::types::{Policy, Shape};
 
 // The machine that runs LFIR modules for AArch64; a child module, so it shares the memory model.
-#[path = "backend/aarch64/machine.rs"]
+#[path = "aarch64_machine.rs"]
 mod lfir;
-pub(crate) use lfir::vfp_expand_imm;
+pub use lfir::vfp_expand_imm;
 
 /// The alignment a leaf at offset `off` of an access aligned to `align` keeps (Lean's
 /// `Nat.gcd align off`).
@@ -403,11 +405,11 @@ pub fn parse_int(s: &str) -> Option<BigInt> {
     }
 }
 
-/// What the interpreter does with ops of a kind ([`crate::contract`]): it runs every op of every
-/// layer, LFIR's `aarch64.*` ops on the machine model (`backend/aarch64/machine.rs`). The
+/// What the interpreter does with ops of a kind ([`fai_ir::contract`]): it runs every op of every
+/// layer, LFIR's `aarch64.*` ops on the machine model (`aarch64_machine.rs`). The
 /// differential tests against `fir-ref run` are what check that it runs them as Lean does.
 #[deny(clippy::wildcard_enum_match_arm)]
-pub fn support(k: OpKind) -> crate::contract::Support {
+pub fn support(k: OpKind) -> fai_ir::contract::Support {
     match k {
         OpKind::Const(_)
         | OpKind::Poison
@@ -517,7 +519,7 @@ pub fn support(k: OpKind) -> crate::contract::Support {
         | OpKind::VaStart
         | OpKind::VaArg
         | OpKind::VaEnd
-        | OpKind::A64BlFree { .. } => crate::contract::Support::Yes,
+        | OpKind::A64BlFree { .. } => fai_ir::contract::Support::Yes,
     }
 }
 
@@ -561,12 +563,12 @@ impl ExecutionProfile {
             .iter()
             .enumerate()
             .filter(|&(_, &n)| n > 0)
-            .map(|(i, &n)| (crate::contract::CONTRACTS[i].name, n))
+            .map(|(i, &n)| (fai_ir::contract::CONTRACTS[i].name, n))
     }
 
     fn record(&mut self, kind: OpKind) {
         if self.counts.is_empty() {
-            self.counts = vec![0; crate::contract::CONTRACTS.len()];
+            self.counts = vec![0; fai_ir::contract::CONTRACTS.len()];
         }
         self.counts[kind.contract().index as usize] += 1;
     }
@@ -718,7 +720,7 @@ fn run_full(
         }
         vals.push(mach.parse_arg(ty, v)?);
     }
-    if let crate::Layer::Lfir(_) = m.layer {
+    if let fai_ir::Layer::Lfir(_) = m.layer {
         return Ok(lfir::run(mach, fi as u32, &vals, fuel));
     }
     mach.lower_rets = lower_rets;
@@ -1220,7 +1222,7 @@ impl<'m> Machine<'m> {
             }
             Value::PtrPoison => out.push_str("ptr poison"),
             Value::Float { f, bits } => {
-                write!(out, "{} {}", f.name(), crate::float::render(f, bits)).unwrap()
+                write!(out, "{} {}", f.name(), fai_ir::float::render(f, bits)).unwrap()
             }
             Value::FloatPoison(f) => write!(out, "{} poison", f.name()).unwrap(),
             Value::Bytes { start, len } => {
@@ -1273,7 +1275,7 @@ impl<'m> Machine<'m> {
             (Ty::Ptr, "null") => Ok(Value::Ptr(NULL)),
             (Ty::Ptr, "poison") => Ok(Value::PtrPoison),
             (Ty::Float(f), "poison") => Ok(Value::FloatPoison(f)),
-            (Ty::Float(f), _) => match crate::float::parse_lit(s).and_then(|l| l.to_bits(f)) {
+            (Ty::Float(f), _) => match fai_ir::float::parse_lit(s).and_then(|l| l.to_bits(f)) {
                 Some(bits) => Ok(Value::Float { f, bits }),
                 None => Err(format!(
                     "bad argument '{s}': expected a float like 1.5, inf, nan, or poison"
@@ -2331,12 +2333,12 @@ impl<'m> Machine<'m> {
                 Self::float_value(
                     f,
                     a.zip(b)
-                        .map(|(a, b)| crate::float::bin_with(self.nan, f, op, a, b)),
+                        .map(|(a, b)| fai_ir::float::bin_with(self.nan, f, op, a, b)),
                 )
             }
             (OpKind::FloatUn(op), &[a @ (Value::Float { f, .. } | Value::FloatPoison(f))]) => {
                 let a = self.float_of(loc, f, a)?;
-                Self::float_value(f, a.map(|a| crate::float::un_with(self.nan, f, op, a)))
+                Self::float_value(f, a.map(|a| fai_ir::float::un_with(self.nan, f, op, a)))
             }
             (OpKind::FloatFma, &[a @ (Value::Float { f, .. } | Value::FloatPoison(f)), b, c]) => {
                 let a = self.float_of(loc, f, a)?;
@@ -2346,7 +2348,7 @@ impl<'m> Machine<'m> {
                     f,
                     a.zip(b)
                         .zip(c)
-                        .map(|((a, b), c)| crate::float::fma_with(self.nan, f, a, b, c)),
+                        .map(|((a, b), c)| fai_ir::float::fma_with(self.nan, f, a, b, c)),
                 )
             }
             (OpKind::FloatCmp(p), &[a @ (Value::Float { f, .. } | Value::FloatPoison(f)), b]) => {
@@ -2355,7 +2357,7 @@ impl<'m> Machine<'m> {
                 match a.zip(b) {
                     Some((a, b)) => Value::Int {
                         w: 1,
-                        bits: u64::from(crate::float::cmp(f, p, a, b)),
+                        bits: u64::from(fai_ir::float::cmp(f, p, a, b)),
                     },
                     None => Value::Poison { w: 1 },
                 }
@@ -2368,14 +2370,14 @@ impl<'m> Machine<'m> {
                     return stuck(loc, "expected a float result");
                 };
                 let a = self.float_of(loc, f, vs[0])?;
-                Self::float_value(g, a.map(|a| crate::float::cvt_with(self.nan, f, g, a)))
+                Self::float_value(g, a.map(|a| fai_ir::float::cvt_with(self.nan, f, g, a)))
             }
             (
                 OpKind::FloatToInt { signed, edge },
                 &[a @ (Value::Float { f, .. } | Value::FloatPoison(f))],
             ) => {
                 let o = match self.float_of(loc, f, a)? {
-                    Some(a) => crate::float::to_int(f, signed, edge, rw, a),
+                    Some(a) => fai_ir::float::to_int(f, signed, edge, rw, a),
                     None if edge == CvtEdge::Sat => Out::Val(None),
                     None => Out::Ub(UbKind::Poison),
                 };
@@ -2387,7 +2389,7 @@ impl<'m> Machine<'m> {
                 };
                 let w = Self::width(a);
                 let a = self.bits(loc, a)?;
-                Self::float_value(g, a.map(|a| crate::float::from_int(g, signed, w, &a)))
+                Self::float_value(g, a.map(|a| fai_ir::float::from_int(g, signed, w, &a)))
             }
             (OpKind::FloatFromBits, &[a]) => {
                 let Some(Ty::Float(g)) = rty else {
@@ -3127,7 +3129,7 @@ impl<'m> Machine<'m> {
                 t.push_str(if params.is_empty() { "..." } else { ", ..." });
             }
             t.push(')');
-            crate::types::write_rets(&mut t, rets, |out, &r| ctypes.write(out, r));
+            fai_ir::types::write_rets(&mut t, rets, |out, &r| ctypes.write(out, r));
             t.push('>');
             return ub(UbKind::BadCall, loc, format!("@{name} has type {t}"));
         }
