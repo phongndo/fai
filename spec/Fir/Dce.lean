@@ -172,7 +172,7 @@ The float ops are pure but for `float.to_int.*.trap`, which may trap: `evalFloat
 core, since a NaN result is the oracle's choice from the op and its operands (`Oracle.nan`;
 decision: NaN choice). More: every float op, `.trap` included, is a function of the oracle alone
 (`evalFloat_oracle`), so within a run two evaluations of an op on the same operands agree. The
-pass reads its list of pure kinds off this (`crates/fir/src/passes/dce.rs`). -/
+pass reads its list of pure kinds off this (`compiler/transforms/src/dce.rs`). -/
 
 /-- The float ops dead code elimination deletes: all but `float.to_int` with `.trap`. -/
 def floatPure : OpKind → Bool

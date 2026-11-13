@@ -14,7 +14,7 @@
 //! the Lean parser are in the trusted base, and the match checks that they agree on these
 //! modules. This is what `tests/dce_check.rs` does in the tests, here available for any input:
 //! `fir opt --check-dce FIR-REF`, `fir compile -O --check-dce FIR-REF`, `fcc -O --check-dce
-//! FIR-REF`, and any optimized compilation through [`crate::backend::optimize`] (the C API
+//! FIR-REF`, and any optimized compilation through `fir::backend::optimize` (the C API
 //! included) when [`ENV`] names a `fir-ref`. It validates each DCE step of this run; it says
 //! nothing about the other passes, about composing per-function refinements across a module's
 //! calls, or about steps of other runs.
@@ -25,10 +25,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::{Observer, Pass};
-use crate::ir::Module;
+use fai_ir::ir::Module;
 
 /// The environment variable that turns the checker on for every optimized compilation
-/// ([`crate::backend::optimize`]): the path of the `fir-ref` to run.
+/// (`fir::backend::optimize`): the path of the `fir-ref` to run.
 pub const ENV: &str = "FIR_CHECK_DCE";
 
 /// Validates every `dce` step of a pipeline run with `fir-ref check-dce`.

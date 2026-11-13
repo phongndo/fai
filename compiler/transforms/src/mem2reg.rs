@@ -55,10 +55,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::body::{
+use fai_ir::body::{
     Body, OpId, Operand, OperandKind, RegionId, StrId, Succ, ValueDef, ValueId, ValueSpec,
 };
-use crate::ir::{OpKind, SpaceCfg, Ty};
+use fai_ir::ir::{OpKind, SpaceCfg, Ty};
 
 use super::{Remarks, at};
 
@@ -390,7 +390,7 @@ impl Liveness {
             live: vec![0; ops.len() * words],
         };
         // Each op's successors, and the slot it reads (`true`) or writes.
-        let slot = |o: crate::body::Operand| match o.get() {
+        let slot = |o: fai_ir::body::Operand| match o.get() {
             OperandKind::Value(v) => slot_of.get(v.index()).copied().flatten(),
             OperandKind::Hole(_) => None,
         };
@@ -881,7 +881,7 @@ impl Promoter<'_> {
                     .cases(cases)
                     .iter()
                     .zip(&widened[1..])
-                    .map(|(c, &succ)| crate::body::Case { key: c.key, succ })
+                    .map(|(c, &succ)| fai_ir::body::Case { key: c.key, succ })
                     .collect();
                 OpKind::Switch {
                     dflt: b.add_succ(widened[0]),

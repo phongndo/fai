@@ -58,6 +58,8 @@
 //! stops at every call and `func.invoke`; `dce` never deletes a call, a throw, or an op with
 //! regions. The handler block a `func.invoke` names is reached only by unwinding, and stays.
 
+#![forbid(unsafe_code)]
+
 pub mod copyprop;
 pub mod dce;
 pub mod dse;
@@ -69,10 +71,10 @@ pub mod stackdce;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use crate::body::{Body, OpId, Ops};
-pub use crate::contract::Policy;
-use crate::ir::{Loc, Module};
-use crate::verify::render_loc;
+use fai_ir::body::{Body, OpId, Ops};
+pub use fai_ir::contract::Policy;
+use fai_ir::ir::{Loc, Module};
+use fai_ir::verify::render_loc;
 
 /// What a pass runs over. A pass returns how many changes it made, or why its own checker
 /// refused its candidate (the code is then unchanged; see [`dce`]). It gets the policy that says
@@ -574,7 +576,7 @@ fn check(m: &Module, pass: &'static str, round: u32, time: &mut Duration) -> Res
             .check_invariants()
             .map_err(|e| fail(format!("@{}: {e}", f.name)))?;
     }
-    crate::verify::verify_module(m).map_err(fail)?;
+    fai_ir::verify::verify_module(m).map_err(fail)?;
     *time += start.elapsed();
     Ok(())
 }
@@ -600,7 +602,7 @@ pub(crate) fn walk(body: &Body, out: &mut Vec<OpId>) {
 
 #[cfg(test)]
 pub(crate) mod test_util {
-    use crate::ir::Module;
+    use fai_ir::ir::Module;
 
     use super::Remarks;
 
@@ -608,14 +610,14 @@ pub(crate) mod test_util {
     /// change count, the text without locations, and the remarks.
     pub fn apply(
         text: &str,
-        f: impl FnOnce(&mut crate::Body, &mut Remarks) -> u32,
+        f: impl FnOnce(&mut fai_ir::Body, &mut Remarks) -> u32,
     ) -> (u32, String, Vec<String>) {
-        let mut m: Module = crate::parse_module(text).unwrap();
-        crate::verify_module(&m).unwrap();
+        let mut m: Module = fai_ir::parse_module(text).unwrap();
+        fai_ir::verify_module(&m).unwrap();
         let mut remarks = Remarks::new(true);
         let n = f(&mut m.funcs[0].body, &mut remarks);
         m.funcs[0].body.check_invariants().unwrap();
-        crate::verify_module(&m).unwrap_or_else(|e| panic!("{e}\n{}", m.render(true)));
+        fai_ir::verify_module(&m).unwrap_or_else(|e| panic!("{e}\n{}", m.render(true)));
         let out = m.render(false);
         let remarks = remarks.list().iter().map(|r| r.to_string()).collect();
         (n, out, remarks)
@@ -623,7 +625,7 @@ pub(crate) mod test_util {
 
     /// The function bodies of `text` without locations, for comparing with [`apply`]'s.
     pub fn canon(text: &str) -> String {
-        crate::parse_module(text).unwrap().render(false)
+        fai_ir::parse_module(text).unwrap().render(false)
     }
 }
 
@@ -643,7 +645,7 @@ mod tests {
 
     #[test]
     fn default_pipeline_reaches_a_fixed_point() {
-        let mut m = crate::parse_module(SRC).unwrap();
+        let mut m = fai_ir::parse_module(SRC).unwrap();
         let mut remarks = Remarks::new(true);
         let mut p = Pipeline::default_opt();
         p.verify_each = true;
@@ -731,7 +733,7 @@ mod tests {
 
     #[test]
     fn observers_see_every_run_and_can_reject_a_step() {
-        let mut m = crate::parse_module(SRC).unwrap();
+        let mut m = fai_ir::parse_module(SRC).unwrap();
         let mut seen = Seen {
             log: Vec::new(),
             objects_to: "",
@@ -743,7 +745,7 @@ mod tests {
         assert_eq!(seen.log.len(), 4);
         assert!(seen.log[0].starts_with("before dse 1"), "{:?}", seen.log);
         assert!(seen.log[3].starts_with("after dce 1"), "{:?}", seen.log);
-        let mut m = crate::parse_module(SRC).unwrap();
+        let mut m = fai_ir::parse_module(SRC).unwrap();
         let mut seen = Seen {
             log: Vec::new(),
             objects_to: "dse",
@@ -761,7 +763,7 @@ mod tests {
 
     #[test]
     fn names_the_pass_that_broke_the_module() {
-        let mut m = crate::parse_module(SRC).unwrap();
+        let mut m = fai_ir::parse_module(SRC).unwrap();
         let mut p = Pipeline::parse("dse").unwrap();
         p.passes.push(&BROKEN);
         p.verify_each = true;

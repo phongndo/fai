@@ -54,7 +54,7 @@ pub mod backend;
 pub mod codegen;
 mod driver;
 pub use fai_interp as interp;
-pub mod passes;
+pub use fai_transforms as passes;
 
 pub use fai_ir::{builder, dialect, float};
 
@@ -67,7 +67,7 @@ pub mod contract {
 }
 
 // The IR's modules, under the names this crate's own modules use.
-use fai_ir::{body, ir, sem, types, verify};
+use fai_ir::{body, ir, sem, types};
 
 pub use fai_ir::body::{
     Body, Case, CasesId, HoleId, Int, IntId, OpId, Operand, OperandKind, Ops, RegionId, StrId,

@@ -20,8 +20,8 @@
 //! write only their leaves and leave padding as it was, so a later aggregate store doesn't hide
 //! all of an earlier store's bytes (decision: Aggregate values).
 
-use crate::body::{Body, OperandKind};
-use crate::ir::{OpKind, Ty};
+use fai_ir::body::{Body, OperandKind};
+use fai_ir::ir::{OpKind, Ty};
 
 use super::{Remarks, at, walk};
 

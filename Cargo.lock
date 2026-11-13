@@ -43,12 +43,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fai-transforms"
+version = "0.1.0"
+dependencies = [
+ "fai-ir",
+ "fir",
+]
+
+[[package]]
 name = "fir"
 version = "0.1.0"
 dependencies = [
  "fai-interp",
  "fai-ir",
  "fai-lowering",
+ "fai-transforms",
  "num-bigint",
  "rustc-hash",
  "rustc_apfloat",

@@ -329,7 +329,7 @@ right about.
 
 ## Files
 
-- `crates/fir/src/passes/mod.rs`: `Assurance`, `Observer`, `run_observed`,
+- `compiler/transforms/src/lib.rs`: `Assurance`, `Observer`, `run_observed`,
   `parse_experimental`; `passes/reference.rs`: `CheckDce`.
 - `crates/fir/src/bin/fir.rs`: `fir opt` observation flags, `--list-passes`, `--check-dce`,
   `fir compile -g`, `-` for standard input.

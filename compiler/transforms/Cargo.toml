@@ -1,0 +1,17 @@
+[package]
+name = "fai-transforms"
+version = "0.1.0"
+description = "FIR's pass manager and passes: the proved -O pipeline, and experimental passes behind an opt-in"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fai-ir = { path = "../ir" }
+
+# The examples in the docs are written against the supported interface, the `fir` crate.
+[dev-dependencies]
+fir = { path = "../../crates/fir" }
+
+[lints]
+workspace = true

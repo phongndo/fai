@@ -19,8 +19,8 @@
 //! Skipped: a pointer operand that is a hole (Lean compares holes by name; holes here are
 //! separate operands, and a program with holes can't be compiled anyway).
 
-use crate::body::{Body, OperandKind};
-use crate::ir::{OpKind, Ty};
+use fai_ir::body::{Body, OperandKind};
+use fai_ir::ir::{OpKind, Ty};
 
 use super::{Remarks, at, walk};
 

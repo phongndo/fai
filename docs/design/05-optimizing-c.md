@@ -52,7 +52,7 @@ passes are refused without `--experimental`, and print a warning with it. `fcc
 
 ## What was built
 
-**`mem2reg`** (`crates/fir/src/passes/mem2reg.rs`, a module pass: field sizes need the data
+**`mem2reg`** (`compiler/transforms/src/mem2reg.rs`, a module pass: field sizes need the data
 layout's pointer size).
 
 - *Candidates.* A `mem.stack` or `mem.stack.of`, in any region, whose pointer is used only as the

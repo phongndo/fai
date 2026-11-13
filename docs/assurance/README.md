@@ -130,7 +130,7 @@ and the checkers are for.
   proves that `freeze`, whose declaration lists no effects, changes the core: an empty effects
   list is not evidence of purity (`ptr.addr`, `ptr.with_addr`, and `func.addr` are in the same
   position).
-* The pass never edits a body directly (`crates/fir/src/passes/dce.rs`): `plan(&Body)` proposes a
+* The pass never edits a body directly (`compiler/transforms/src/dce.rs`): `plan(&Body)` proposes a
   `Candidate` (ops to delete); `check(&mut Body, Candidate)` independently recounts reads and refuses
   any op the contract keeps under the policy, any op with regions or holes, duplicates, ops not
   in the body, and any deletion whose result a remaining op reads; only the `Accepted` value it

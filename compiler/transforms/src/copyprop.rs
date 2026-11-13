@@ -24,8 +24,8 @@
 //! (the region, cut at each op with regions or a call) in one walk, and a use is rewritten when
 //! its op is in the copy's segment.
 
-use crate::body::{Body, OpId, OperandKind, Ops};
-use crate::ir::OpKind;
+use fai_ir::body::{Body, OpId, OperandKind, Ops};
+use fai_ir::ir::OpKind;
 
 use super::{Remarks, at};
 
@@ -128,11 +128,11 @@ func @f(%x: i32, %c: i1) -> i32 {
   func.ret %v
 }
 ";
-        let mut m = crate::parse_module(src).unwrap();
-        crate::verify_module(&m).unwrap();
+        let mut m = fai_ir::parse_module(src).unwrap();
+        fai_ir::verify_module(&m).unwrap();
         let mut remarks = Remarks::new(true);
         let n = run(&mut m.funcs[1].body, &mut remarks);
-        crate::verify_module(&m).unwrap();
+        fai_ir::verify_module(&m).unwrap();
         m.funcs[1].body.check_invariants().unwrap();
         assert_eq!(n, 3);
         let want = canon(

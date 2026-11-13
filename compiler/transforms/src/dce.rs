@@ -15,7 +15,7 @@
 //! `Pure` asks for no regions, no call, no stack allocation, not a terminator, operands that are
 //! all variables (no holes), and a computation that only reads the core and fails only by UB or
 //! getting stuck (`ReadOnly`) for any operand values. Which kinds qualify is not decided here: the
-//! pass asks the generated contract ([`crate::contract`]), whose permissions come from Lean's
+//! pass asks the generated contract ([`fai_ir::contract`]), whose permissions come from Lean's
 //! `Fir.Dce.dcePerm`, and `Fir.Dce.dcePerm_sound` proves every kind it lets go pure (an op of such
 //! a kind with no regions and variable operands is `Pure` by `Fir.Dce.Pure.of_kind`). The kinds:
 //! constants, `poison`, `copy`, `select`, bitwise ops, comparisons, extensions and truncations,
@@ -40,14 +40,14 @@
 //! `fir-ref check-dce`, on the pass's output (`tests/dce_check.rs`): `Fir.Dce.checkFunc_sound` says
 //! that its acceptance implies the output refines the input. The Rust checker is not proved.
 
-use crate::body::{Body, OpId, OperandKind, ValueDef};
-use crate::contract::Policy;
-use crate::ir::OpKind;
+use fai_ir::body::{Body, OpId, OperandKind, ValueDef};
+use fai_ir::contract::Policy;
+use fai_ir::ir::OpKind;
 
 use super::{Remarks, at, walk};
 
 /// Whether dead code elimination may delete ops of this kind under `policy`: the generated
-/// contract's permission ([`crate::contract`], from Lean's `Fir.Dce.dcePerm`), which
+/// contract's permission ([`fai_ir::contract`], from Lean's `Fir.Dce.dcePerm`), which
 /// `Fir.Dce.dcePerm_sound` proves pure when its evidence is `Proved`.
 pub fn pure_kind(k: OpKind, policy: Policy) -> bool {
     k.contract().dce.allows(policy)

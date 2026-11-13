@@ -327,7 +327,7 @@ fn mutations() -> Vec<Mutation> {
             name: "dce-deletes-a-trap",
             what: "the Rust DCE planner deletes ops the contract keeps; its independent checker refuses the candidate",
             edits: vec![edit(
-                "crates/fir/src/passes/dce.rs",
+                "compiler/transforms/src/dce.rs",
                 "        is_pure(body, op, policy) && body.results(op).all(|v| uses[v.index()] == 0)",
                 "        body.regions(op).is_empty()\n            && !body.kind(op).is_terminator()\n            && !body.kind(op).contract().calls\n            && body.results(op).next().is_some()\n            && body.results(op).all(|v| uses[v.index()] == 0)",
             )],
@@ -342,7 +342,7 @@ fn mutations() -> Vec<Mutation> {
             name: "dce-checker-weaker-than-proved",
             what: "the Rust DCE checker alone lets `freeze` go (the planner is right, so no pass output shows it); the agreement test's random candidates reach the proved checker, which refuses",
             edits: vec![edit(
-                "crates/fir/src/passes/dce.rs",
+                "compiler/transforms/src/dce.rs",
                 "        if !k.contract().dce.allows(policy) {",
                 "        if !k.contract().dce.allows(policy) && k.mnemonic() != \"freeze\" {",
             )],
@@ -379,12 +379,12 @@ fn mutations() -> Vec<Mutation> {
             what: "the planner and the Rust checker both wrong (a checker bug); the Lean-proved checker refuses the output",
             edits: vec![
                 edit(
-                    "crates/fir/src/passes/dce.rs",
+                    "compiler/transforms/src/dce.rs",
                     "        is_pure(body, op, policy) && body.results(op).all(|v| uses[v.index()] == 0)",
                     "        body.regions(op).is_empty()\n            && !body.kind(op).is_terminator()\n            && !body.kind(op).contract().calls\n            && body.results(op).next().is_some()\n            && body.results(op).all(|v| uses[v.index()] == 0)",
                 ),
                 edit(
-                    "crates/fir/src/passes/dce.rs",
+                    "compiler/transforms/src/dce.rs",
                     "        if !k.contract().dce.allows(policy) {",
                     "        if !k.contract().dce.allows(policy) && false {",
                 ),

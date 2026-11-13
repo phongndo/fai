@@ -19,8 +19,8 @@
 //! bijection of allocation ids. Stack allocation can't fail in the semantics, so no failure is
 //! lost; if it could (stack overflow), deleting one would only remove a behavior.
 
-use crate::body::Body;
-use crate::ir::OpKind;
+use fai_ir::body::Body;
+use fai_ir::ir::OpKind;
 
 use super::{Remarks, at, walk};
 
