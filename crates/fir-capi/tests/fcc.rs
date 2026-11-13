@@ -5,8 +5,9 @@
 //! by a pipeline whose every step of dead code elimination the proved checker accepted
 //! (`Fir.Dce.checkModule`; `docs/assurance/dce.md` says what that does and doesn't establish).
 //! Without a reference (or with `FIR_REF=none`) they build unchecked, which `FIR_REQUIRE_FULL=1`
-//! refuses. The evidence (`fcc_corpus`) counts the checked builds and steps. The ABI torture
-//! test below doesn't check its `-O` builds.
+//! refuses. The evidence (`fcc_corpus`) counts the checked builds and steps. The x86-64 corpus
+//! (`fcc_x86_64_corpus`, below) checks its `-O` builds the same way. The ABI torture test below
+//! doesn't check its `-O` builds.
 //!
 //! Builds `fcc` with CMake against this crate's static library, then compiles every program
 //! of the corpus (`frontends/c/tests/*.c`) three ways: by the reference compiler (the AArch64 C
@@ -36,7 +37,7 @@
 //! `FCC_PASSES=p,q,…` adds a fourth build, `fcc --passes p,q,… --experimental` (the named
 //! passes to a fixed point, experimental ones included, such as `mem2reg`), which must match the
 //! reference too, and the interpreter runs the MFIR and the allocated LFIR it makes as two more
-//! layers.
+//! layers. The x86-64 corpus adds the same build for x86-64.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -816,7 +817,11 @@ fn x86_limit(src: &str, stderr: &str) -> Option<&'static str> {
 struct X86Tally {
     native: usize,
     native_opt: usize,
+    native_passes: usize,
     fir_match: usize,
+    dce_checked_builds: usize,
+    dce_steps: u64,
+    dce_deletions: u64,
     ran: Vec<String>,
     refused: Vec<String>,
     fir_other_externs: Vec<String>,
@@ -824,14 +829,16 @@ struct X86Tally {
 }
 
 /// One corpus program on x86-64: refused for a declared limitation, or built by the reference
-/// compiler, `fcc --target x86_64`, and `fcc --target x86_64 -O`, run, and compared, with
-/// its x86-64 HFIR run in the interpreter too.
+/// compiler, `fcc --target x86_64`, and `fcc --target x86_64 -O` (with `--check-dce` when
+/// there is a Lean reference tool, as for AArch64), and with `FCC_PASSES`'s passes, run, and
+/// compared, with its x86-64 HFIR run in the interpreter too.
 fn one_x86(
     file: &Path,
     fcc_exe: &Path,
     tc: &Toolchain,
     rt: &Path,
     out: &Path,
+    check_dce: Option<&Path>,
     tally: &Mutex<X86Tally>,
 ) {
     let name = file.file_stem().unwrap().to_string_lossy().into_owned();
@@ -941,17 +948,47 @@ fn one_x86(
         Ok(b) => b,
         Err(e) => return fail(format!("the reference binary: {e}")),
     };
-    let mut ok = [false; 2];
-    for (i, opt) in [false, true].into_iter().enumerate() {
-        let exe = out.join(format!("{name}{}", if opt { ".O" } else { "" }));
+    // The builds: without and with -O, and with `FCC_PASSES`'s passes, as for AArch64.
+    let mut builds: Vec<(&str, String, Vec<String>)> = vec![
+        ("", String::new(), vec![]),
+        (".O", " -O".to_owned(), vec!["-O".to_owned()]),
+    ];
+    if let Some(spec) = exp_passes() {
+        builds.push((
+            ".passes",
+            format!(" --passes {spec}"),
+            vec!["--passes".to_owned(), spec, "--experimental".to_owned()],
+        ));
+    }
+    let mut ok = [false; 3];
+    for (i, (suffix, o, flags)) in builds.iter().enumerate() {
+        let exe = out.join(format!("{name}{suffix}"));
         let mut cmd = fai_cmd();
-        cmd.args(&objs).arg("-lm").arg("-o").arg(&exe);
-        if opt {
-            cmd.arg("-O");
+        cmd.args(&objs).arg("-lm").arg("-o").arg(&exe).args(flags);
+        let opt = *suffix == ".O";
+        if let (true, Some(t)) = (opt, check_dce) {
+            cmd.arg("--check-dce").arg(t);
         }
-        let o = if opt { " -O" } else { "" };
         match run_limited(&mut cmd, Duration::from_secs(120)) {
-            Ok(b) if b.status.success() => {}
+            Ok(b) if b.status.success() => {
+                if opt && check_dce.is_some() {
+                    match dce_summary(&String::from_utf8_lossy(&b.stderr)) {
+                        Some((steps, deletions)) => {
+                            let mut t = tally.lock().unwrap();
+                            t.dce_checked_builds += 1;
+                            t.dce_steps += steps;
+                            t.dce_deletions += deletions;
+                        }
+                        None => {
+                            fail(format!(
+                                "fcc -O --check-dce printed no checker summary:\n{}",
+                                String::from_utf8_lossy(&b.stderr)
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            }
             Ok(b) => {
                 fail(format!(
                     "fcc{o} failed:\n{}",
@@ -993,6 +1030,7 @@ fn one_x86(
     t.ran.push(name);
     t.native += usize::from(ok[0]);
     t.native_opt += usize::from(ok[1]);
+    t.native_passes += usize::from(ok[2]);
     t.fir_match += usize::from(fir_ok);
 }
 
@@ -1028,6 +1066,7 @@ fn fcc_x86_64_corpus() {
         return;
     };
     let fcc_exe = fcc();
+    let check_dce = fir_ref();
     let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fcc-x86_64");
     std::fs::create_dir_all(&out).unwrap();
     let rt = out.join("fai_runtime.o");
@@ -1051,7 +1090,7 @@ fn fcc_x86_64_corpus() {
                     let Some(file) = next.lock().unwrap().next() else {
                         break;
                     };
-                    one_x86(file, fcc_exe, &tc, &rt, &out, &tally);
+                    one_x86(file, fcc_exe, &tc, &rt, &out, check_dce.as_deref(), &tally);
                 }
             });
         }
@@ -1067,10 +1106,17 @@ fn fcc_x86_64_corpus() {
     }
     t.refused.sort();
     t.fir_other_externs.sort();
+    if let Some(spec) = exp_passes() {
+        eprintln!(
+            "fcc x86-64 corpus: native runs matching with --passes {spec}: {}",
+            t.native_passes
+        );
+    }
     eprintln!(
         "fcc x86-64 corpus: {} programs ran; native runs matching the reference: {} without \
          -O, {} with -O; fir run matching: {}, not comparable: {} (calling other external \
-         functions: {}); refused for declared limitations: {} ({})",
+         functions: {}); refused for declared limitations: {} ({}); -O builds checked by \
+         Fir.Dce.checkModule: {} ({} dce steps, {} deletions)",
         t.ran.len(),
         t.native,
         t.native_opt,
@@ -1078,7 +1124,10 @@ fn fcc_x86_64_corpus() {
         t.fir_other_externs.len(),
         t.fir_other_externs.join(", "),
         t.refused.len(),
-        t.refused.join(", ")
+        t.refused.join(", "),
+        t.dce_checked_builds,
+        t.dce_steps,
+        t.dce_deletions
     );
     assert!(
         t.failures.is_empty(),

@@ -36,9 +36,9 @@ fcc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]
 - `--check-dce FIR-REF` (with `-O`, or `--passes`) has every step of dead code elimination
   checked by the proved Lean checker (`FIR-REF` is `spec/.lake/build/bin/fir-ref`; see
   `docs/assurance/dce.md`): a refusal fails the compilation, and one line
-  (`fir: check-dce: N steps accepted by Fir.Dce.checkModule (…)`) goes to stderr. The corpus test
-  builds each program's `-O` binary this way (required in `cargo xtask verify full`; the ABI
-  torture test's `-O` builds are not checked).
+  (`fir: check-dce: N steps accepted by Fir.Dce.checkModule (…)`) goes to stderr. The corpus tests
+  build each program's `-O` binary this way, for AArch64 and for x86-64 (the AArch64 corpus is
+  required in `cargo xtask verify full`; the ABI torture test's `-O` builds are not checked).
 - `--target` picks the target: `aarch64` (the default) or `x86_64`. `-O`, `--passes`, and
   `--check-dce` run on the MFIR, before the target is involved, so they mean the same for both.
 - The linker is `$FIR_CC`, or `cc` when the host is the target (its CPU, on Linux; macOS's `cc`
@@ -139,8 +139,9 @@ build/fcc/fcc --target x86_64 prog.c frontends/c/tests/runtime/fai_runtime.c \
 `-D FAI_TEST_INTEGERS_ONLY` leaves `fai_test.h`'s float helpers out: `fcc` compiles every
 function a file defines, used or not. `cargo test -p fir-capi --test fcc fcc_x86_64_corpus`
 compiles the corpus this way and checks each program against the x86-64 reference compiler (the
-dev shell's Clang at `-O1`, or `$FIR_CC_X86_64`), natively, with and without `-O`, and its x86-64
-HFIR in `fir run`; a program the backend refuses must be refused for one of the limitations
+dev shell's Clang at `-O1`, or `$FIR_CC_X86_64`), natively, with and without `-O` (the `-O`
+builds with `--check-dce`, as for AArch64), with `FCC_PASSES`'s passes when it is set, and its
+x86-64 HFIR in `fir run`; a program the backend refuses must be refused for one of the limitations
 above. It runs on x86-64 Linux, or elsewhere with `x86_64-unknown-linux-gnu-cc` and
 `qemu-x86_64`.
 
