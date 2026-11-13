@@ -18,10 +18,10 @@
 // checker (`fir-ref check-dce`, run by the library: FIR_CHECK_DCE), fails if it refuses one, and
 // prints one summary line on stderr.
 //
-// The linker is $FIR_CC, or `cc` when the host is the target, else the target's cross compiler
-// (`aarch64-unknown-linux-gnu-cc`, which the dev shell has on x86-64 Linux, or
-// `x86_64-unknown-linux-gnu-cc`). Its system include directories are given to Clang (after
-// Clang's own headers), so <stdint.h> and friends are the target's.
+// The linker is $FIR_CC, or `cc` when the host is the target (its CPU, on Linux), else the
+// target's cross compiler (`aarch64-unknown-linux-gnu-cc`, which the dev shell has on x86-64
+// Linux, or `x86_64-unknown-linux-gnu-cc`). Its system include directories are given to Clang
+// (after Clang's own headers), so <stdint.h> and friends are the target's.
 
 #include "Lower.h"
 #include "fir.h"
@@ -154,9 +154,11 @@ const char *triple(const Options &o) {
 std::string linker(const Options &o) {
   if (const char *cc = std::getenv("FIR_CC"); cc && *cc)
     return cc;
-#if defined(__aarch64__)
+  // The host's `cc` only when it makes binaries for the target: the same CPU, and Linux (fcc's
+  // output is Linux ELF, which macOS's `cc` would hand to Apple's assembler).
+#if defined(__linux__) && defined(__aarch64__)
   bool native = !x86(o);
-#elif defined(__x86_64__)
+#elif defined(__linux__) && defined(__x86_64__)
   bool native = x86(o);
 #else
   bool native = false;

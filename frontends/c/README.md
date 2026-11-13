@@ -41,7 +41,8 @@ fcc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]
   torture test's `-O` builds are not checked).
 - `--target` picks the target: `aarch64` (the default) or `x86_64`. `-O`, `--passes`, and
   `--check-dce` run on the MFIR, before the target is involved, so they mean the same for both.
-- The linker is `$FIR_CC`, or `cc` when the host is the target, else the target's cross compiler
+- The linker is `$FIR_CC`, or `cc` when the host is the target (its CPU, on Linux; macOS's `cc`
+  makes Mach-O, so there `$FIR_CC` names a Linux cross compiler), else the target's cross compiler
   (`aarch64-unknown-linux-gnu-cc`, which the dev shell has on x86-64 Linux, or
   `x86_64-unknown-linux-gnu-cc`, which it has on other Linux hosts). Clang gets that compiler's
   system include directories after its own headers (Clang's resource directory, found when

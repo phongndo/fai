@@ -334,8 +334,8 @@ fn opt(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
 /// after and before register allocation (x86-64's machine code isn't an LFIR dialect yet);
 /// `--emit asm` (or `-o` naming a `.s` file) prints the assembly. Otherwise `-o OUT` is an
 /// object file (`.o`) or an executable, assembled and linked by `$FIR_CC`, or else by `cc` when
-/// the host is the target and by `aarch64-unknown-linux-gnu-cc` or `x86_64-unknown-linux-gnu-cc`
-/// elsewhere. AArch64 output is Linux ELF by default, or the host's format on macOS; `--os`
+/// the host is the target (its CPU and its OS: Linux, or macOS for `--os darwin`) and by
+/// `aarch64-unknown-linux-gnu-cc` or `x86_64-unknown-linux-gnu-cc` elsewhere. AArch64 output is Linux ELF by default, or the host's format on macOS; `--os`
 /// picks one. x86-64 output is Linux ELF. `-g` (AArch64 only, for now) writes source lines
 /// (`.file`/`.loc`) for the assembler's DWARF line table, from the locations the LFIR carries
 /// (`Options::debug_lines`). `--check-dce FIR-REF` (with `-O`) checks every step of `dce` with
@@ -482,7 +482,7 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     let s = dir.join("out.s");
     std::fs::write(&s, asm).map_err(|e| fail(e.to_string()))?;
     let cc = std::env::var("FIR_CC").unwrap_or_else(|_| {
-        let (native, cross) = if x86 {
+        let (arch, cross) = if x86 {
             (cfg!(target_arch = "x86_64"), "x86_64-unknown-linux-gnu-cc")
         } else {
             (
@@ -490,7 +490,15 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
                 "aarch64-unknown-linux-gnu-cc",
             )
         };
-        if native { "cc" } else { cross }.to_owned()
+        // The host's `cc` only when it makes binaries in the output's format: the same CPU and
+        // the same OS (Linux ELF from macOS's `cc` would reach Apple's assembler).
+        let os = if x86 { a64::Os::Linux } else { o.os };
+        if arch && os == a64::Os::host() {
+            "cc"
+        } else {
+            cross
+        }
+        .to_owned()
     });
     let mut cmd = std::process::Command::new(&cc);
     cmd.arg(&s).arg("-o").arg(out);
