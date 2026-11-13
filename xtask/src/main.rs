@@ -73,6 +73,8 @@ const SUITES: &[&str] = &[
     "aarch64_fixtures",
     "aarch64_fuzz",
     "aarch64_lfir",
+    "x86_64_fixtures",
+    "x86_64_fuzz",
     "run_fixtures",
     "interp_fuzz",
     "lower_fixtures",
@@ -275,6 +277,7 @@ impl Verify {
             ("clang", "clang", &["--version"][..], &root),
             ("cbindgen", "cbindgen", &["--version"][..], &root),
             ("qemu-aarch64", "qemu-aarch64", &["--version"][..], &root),
+            ("qemu-x86_64", "qemu-x86_64", &["--version"][..], &root),
             (
                 "aarch64-cc",
                 "aarch64-unknown-linux-gnu-cc",
@@ -314,8 +317,24 @@ impl Verify {
                 }
             }
         }
+        // The x86-64 backend's native tests run Linux binaries: natively on x86-64 Linux,
+        // elsewhere through a cross compiler and qemu-user.
+        let native_x86 = cfg!(all(target_arch = "x86_64", target_os = "linux"));
+        if !native_x86 {
+            for t in ["x86_64-unknown-linux-gnu-cc", "qemu-x86_64"] {
+                if !on_path(t) {
+                    missing.push(t);
+                }
+            }
+        }
         if missing.is_empty() {
-            self.pass("required tools", vec![format!("native AArch64: {native}")]);
+            self.pass(
+                "required tools",
+                vec![
+                    format!("native AArch64: {native}"),
+                    format!("native x86-64: {native_x86}"),
+                ],
+            );
             true
         } else if self.full {
             self.fail(
@@ -809,6 +828,10 @@ fn check_evidence(
     );
     need(&mut bad, "aarch64_fuzz", "(programs)", Some(fuzz));
     need(&mut bad, "aarch64_fuzz", "native matches", None);
+    need(&mut bad, "x86_64_fixtures", "native matches", None);
+    need(&mut bad, "x86_64_fixtures", "native -O matches", None);
+    need(&mut bad, "x86_64_fuzz", "(programs)", Some(fuzz));
+    need(&mut bad, "x86_64_fuzz", "native matches", None);
     need(
         &mut bad,
         "run_fixtures",
@@ -860,6 +883,9 @@ fn check_evidence(
     if !get("aarch64_fixtures")["facts"]["native"].is_string() {
         bad.push("aarch64_fixtures: no native runner recorded".into());
     }
+    if !get("x86_64_fixtures")["facts"]["native"].is_string() {
+        bad.push("x86_64_fixtures: no native runner recorded".into());
+    }
     // Coverage: every op constructor a component claims was exercised by its comparisons.
     let manifest: Value = std::fs::read_to_string(root.join("docs/assurance/op-contracts.json"))
         .ok()
@@ -888,6 +914,7 @@ fn check_evidence(
             .collect()
     };
     let native_ops = executed_ops(&[&get("aarch64_fixtures"), &get("aarch64_fuzz")]);
+    let x86_ops = executed_ops(&[&get("x86_64_fixtures"), &get("x86_64_fuzz")]);
     let interp_ops = executed_ops(&[
         &get("run_fixtures"),
         &get("interp_fuzz"),
@@ -895,7 +922,11 @@ fn check_evidence(
         &get("aarch64_lfir_fuzz"),
     ]);
     let mut table = serde_json::Map::new();
-    for (comp, exercised) in [("isel.aarch64", &native_ops), ("interp", &interp_ops)] {
+    for (comp, exercised) in [
+        ("isel.aarch64", &native_ops),
+        ("isel.x86_64", &x86_ops),
+        ("interp", &interp_ops),
+    ] {
         let kinds = claimed(comp);
         let ctors: BTreeSet<&str> = kinds
             .iter()

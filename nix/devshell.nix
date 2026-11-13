@@ -13,6 +13,11 @@ let
   cross = pkgs.pkgsCross.aarch64-multiplatform;
   needsCross = stdenv.hostPlatform.isLinux && !stdenv.hostPlatform.isAarch64;
 
+  # The x86-64 backend's tests run Linux x86-64 binaries: natively on x86-64 Linux; on other
+  # Linux hosts through a cross toolchain (`x86_64-unknown-linux-gnu-cc`) and qemu-user.
+  crossX86 = pkgs.pkgsCross.gnu64;
+  needsCrossX86 = stdenv.hostPlatform.isLinux && !stdenv.hostPlatform.isx86_64;
+
   # The C benchmark harness (frontends/c/bench/cbench.py) links every benchmark statically against
   # the AArch64 target's glibc, so the same binary runs under qemu-user and on any AArch64 Linux
   # machine; its QEMU plugin needs glib's headers (qemu-plugin.h includes glib.h). Linux only.
@@ -86,7 +91,12 @@ in
   ++ lib.optionals needsCross [
     cross.stdenv.cc
     pkgs.qemu-user
-  ];
+  ]
+  # x86-64 backend tests on other Linux hosts: `x86_64-unknown-linux-gnu-cc` and `qemu-x86_64`.
+  ++ lib.optionals needsCrossX86 [
+    crossX86.stdenv.cc
+  ]
+  ++ lib.optionals (needsCrossX86 && !needsCross) [ pkgs.qemu-user ];
 
   # rust-analyzer needs the standard library sources for go-to-definition and completion.
   RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";

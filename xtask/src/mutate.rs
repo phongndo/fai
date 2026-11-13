@@ -433,6 +433,30 @@ fn mutations() -> Vec<Mutation> {
             in_decl: None,
         },
         Mutation {
+            name: "x86-64-corrupted-allocation",
+            what: "the x86-64 allocator puts every value in rbx; its assignment check refuses it",
+            edits: vec![edit(
+                "crates/fir/src/backend/x86_64/regalloc.rs",
+                "        if let Some(r) = pick {\n            homes[v] = Home::Reg(r);",
+                "        if let Some(r) = pick {\n            homes[v] = Home::Reg(3);",
+            )],
+            steps: vec![test(&["-p", "fir", "--test", "x86_64", "fixtures"])],
+            expect: vec!["register allocation is invalid", "differences"],
+            in_decl: None,
+        },
+        Mutation {
+            name: "x86-64-bad-output-code",
+            what: "the x86-64 emitter prints `subq` for every `addq`; the native comparison refuses it",
+            edits: vec![edit(
+                "crates/fir/src/backend/x86_64/emit.rs",
+                "AluOp::Add => \"addq\",",
+                "AluOp::Add => \"subq\",",
+            )],
+            steps: vec![test(&["-p", "fir", "--test", "x86_64", "fixtures"])],
+            expect: vec!["native\n  want", "differences"],
+            in_decl: None,
+        },
+        Mutation {
             name: "miscompile-next-to-an-address",
             what: "multiplication by a constant miscompiled; a fixture that observes an unrelated address must still fail (the previous rule excused it)",
             edits: vec![edit(

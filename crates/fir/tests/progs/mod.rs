@@ -63,18 +63,41 @@ use num_bigint::BigInt;
 
 /// A small deterministic random number generator (SplitMix64). A *narrow* one also makes the
 /// generator keep integers to at most 64 bits and the data layout to the default (64-bit
-/// pointers), as the AArch64 backend needs.
-pub struct Rng(u64, bool);
+/// pointers), as the AArch64 backend needs. An *integer* one is narrow and leaves out what the
+/// x86-64 backend doesn't compile yet: floats, variadic functions, structs and arrays passed
+/// whole, and integer arguments narrower than 32 bits to external functions. It makes the same
+/// draws as the others where it leaves something out ([`Rng::unless_integers`]), so the other
+/// generators' programs don't change.
+pub struct Rng(u64, bool, bool);
 
 impl Rng {
     pub fn new(seed: u64) -> Rng {
-        Rng(seed, false)
+        Rng(seed, false, false)
     }
 
     // Only the AArch64 test uses it.
     #[allow(dead_code)]
     pub fn narrow(seed: u64) -> Rng {
-        Rng(seed, true)
+        Rng(seed, true, false)
+    }
+
+    // Only the x86-64 test uses it.
+    #[allow(dead_code)]
+    pub fn integers(seed: u64) -> Rng {
+        Rng(seed, true, true)
+    }
+
+    /// [`Rng::chance`] of something an integer generator leaves out: always false for one.
+    pub fn unless_integers(&mut self, p: u64) -> bool {
+        self.chance(p) && !self.2
+    }
+
+    /// An integer width from `ws` for an external function's parameter: at least 32 bits for an
+    /// integer generator (C callees on x86-64 expect narrower ones extended by their signedness,
+    /// which FIR's signatures don't say).
+    pub fn c_width(&mut self, ws: &[u32]) -> u32 {
+        let w = self.width(ws);
+        if self.2 { w.max(32) } else { w }
     }
 
     /// An integer width from `ws`, at most 64 for a narrow generator.
@@ -204,7 +227,7 @@ fn make_vtys(rng: &mut Rng) {
             if !nested.is_empty() && rng.chance(25) {
                 return rng.pick(&nested);
             }
-            if rng.chance(15) {
+            if rng.unless_integers(15) {
                 return T::F(rng.pick(&[32, 64]));
             }
             match rng.below(10) {
@@ -279,7 +302,7 @@ fn pick_composite(rng: &mut Rng, p: u64, c: bool) -> Option<T> {
         .map(T::V)
         .filter(|&t| if c { c_composite(t) } else { composite(t) })
         .collect();
-    (!ts.is_empty() && rng.chance(p)).then(|| rng.pick(&ts))
+    (!ts.is_empty() && rng.unless_integers(p)).then(|| rng.pick(&ts))
 }
 
 /// The types of a list of variadic arguments: up to `max` integers of 8 to 64 bits, pointers
@@ -971,7 +994,7 @@ impl Gen<'_> {
     }
 
     fn mem_type(&mut self) -> T {
-        if self.rng.chance(12) {
+        if self.rng.unless_integers(12) {
             return T::F(self.rng.pick(&[32, 64]));
         }
         match self.rng.below(10) {
@@ -987,7 +1010,7 @@ impl Gen<'_> {
         if self.va.is_some() && self.depth == 0 && self.rng.chance(15) {
             return self.va_op();
         }
-        if self.rng.chance(14) {
+        if self.rng.unless_integers(14) {
             return self.float_op();
         }
         if !self.mfir && self.depth < 3 && self.rng.chance(4) {
@@ -1341,7 +1364,7 @@ impl Gen<'_> {
         if !self.mfir && num_vtys() > 0 && self.rng.chance(15) {
             return T::V(self.rng.below(num_vtys() as u64) as u8);
         }
-        if self.rng.chance(12) {
+        if self.rng.unless_integers(12) {
             return T::F(self.rng.pick(&[32, 64]));
         }
         if self.rng.chance(25) {
@@ -1751,7 +1774,7 @@ impl Gen<'_> {
 
     /// A value type for a field or element.
     fn field_type(&mut self) -> T {
-        if self.rng.chance(10) {
+        if self.rng.unless_integers(10) {
             return T::F(self.rng.pick(&[32, 64]));
         }
         match self.rng.below(12) {
@@ -2773,7 +2796,7 @@ pub fn program(rng: &mut Rng) -> Program {
     }
     let pick_v = |rng: &mut Rng, p: u64| -> Option<T> {
         let n = num_vtys() as u64;
-        (n > 0 && rng.chance(p)).then(|| T::V(rng.below(n) as u8))
+        (n > 0 && rng.unless_integers(p)).then(|| T::V(rng.below(n) as u8))
     };
     let mut sigs = Vec::new();
     for i in 0..nfuncs {
@@ -2786,7 +2809,7 @@ pub fn program(rng: &mut Rng) -> Program {
                     t
                 } else if rng.chance(if i == 0 { 15 } else { 55 }) {
                     T::P
-                } else if rng.chance(15) {
+                } else if rng.unless_integers(15) {
                     T::F(rng.pick(&[32, 64]))
                 } else {
                     T::I(rng.width(&[1, 8, 32, 64, 7, 128]))
@@ -2796,7 +2819,7 @@ pub fn program(rng: &mut Rng) -> Program {
         let rets: Vec<T> = (0..rng.below(3))
             .map(|_| match pick_v(rng, 15) {
                 Some(t) => t,
-                None if rng.chance(15) => T::F(rng.pick(&[32, 64])),
+                None if rng.unless_integers(15) => T::F(rng.pick(&[32, 64])),
                 None => match rng.below(10) {
                     0..=1 => T::P,
                     2 => T::B(rng.pick(&[8, 32])),
@@ -2805,7 +2828,7 @@ pub fn program(rng: &mut Rng) -> Program {
             })
             .collect();
         let va = rng
-            .chance(if i == 0 { 15 } else { 25 })
+            .unless_integers(if i == 0 { 15 } else { 25 })
             .then(|| va_tys(rng, 6, ptr_size, i > 0));
         sigs.push(Sig { params, rets, va });
     }
@@ -2818,16 +2841,16 @@ pub fn program(rng: &mut Rng) -> Program {
                     t
                 } else if rng.chance(55) {
                     T::P
-                } else if rng.chance(10) {
+                } else if rng.unless_integers(10) {
                     T::F(rng.pick(&[32, 64]))
                 } else {
-                    T::I(rng.width(&[1, 8, 32, 64, 128]))
+                    T::I(rng.c_width(&[1, 8, 32, 64, 128]))
                 }
             })
             .collect();
         let rets: Vec<T> = (0..rng.below(3))
             .map(|_| match rng.below(10) {
-                _ if rng.chance(8) => T::F(rng.pick(&[32, 64])),
+                _ if rng.unless_integers(8) => T::F(rng.pick(&[32, 64])),
                 0..=2 => T::P,
                 3 => T::B(rng.pick(&[8, 32])),
                 _ => T::I(rng.width(&[1, 8, 32, 64, 65, 128])),
@@ -2838,7 +2861,9 @@ pub fn program(rng: &mut Rng) -> Program {
             None => rets,
         };
         // Sometimes variadic, with more than eight arguments of a class.
-        let va = rng.chance(30).then(|| va_tys(rng, 12, ptr_size, true));
+        let va = rng
+            .unless_integers(30)
+            .then(|| va_tys(rng, 12, ptr_size, true));
         sigs.push(Sig { params, rets, va });
     }
     let entry_params = sigs[0].params.clone();
