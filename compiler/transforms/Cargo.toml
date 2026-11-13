@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 fai-ir = { path = "../ir" }
+rustc-hash = "2"
 
 # The examples in the docs are written against the supported interface, the `fir` crate.
 [dev-dependencies]

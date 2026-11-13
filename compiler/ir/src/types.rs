@@ -122,6 +122,12 @@ impl Types {
         self.same_hash.clear();
     }
 
+    /// Whether the two tables hold the same types under the same ids, so a [`Ty`] means the
+    /// same in both. (The hash index is derived from the entries.)
+    pub fn same_as(&self, other: &Types) -> bool {
+        self.entries == other.entries && self.parts == other.parts
+    }
+
     pub fn shrink_to_fit(&mut self) {
         self.entries.shrink_to_fit();
         self.parts.shrink_to_fit();

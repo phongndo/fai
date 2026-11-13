@@ -503,6 +503,36 @@ impl Body {
         self.entry
     }
 
+    /// Whether `self` and `other` give every id that ops refer to the same meaning: the same
+    /// values (names, types, facts, and where each is defined), strings, integers, holes,
+    /// successors, cases, and types, under the same ids. Ops, their order, and regions' contents
+    /// are not compared. With this, an op of one body and an op of the other with equal kinds,
+    /// results, operands, and locations print the same, which is what lets a checker compare a
+    /// body before and after a pass id by id (`fai_transforms::dce::check_output`).
+    pub fn same_tables(&self, other: &Body) -> bool {
+        let values = self.value_ty == other.value_ty
+            && self.value_info.len() == other.value_info.len()
+            && self.value_info.iter().zip(&other.value_info).all(|(a, b)| {
+                self.text[a.name.range()] == other.text[b.name.range()]
+                    && self.facts[a.facts.range()] == other.facts[b.facts.range()]
+                    && a.def.unpack() == b.def.unpack()
+            });
+        let strs = self.strs.len() == other.strs.len()
+            && self
+                .strs
+                .iter()
+                .zip(&other.strs)
+                .all(|(a, b)| self.text[a.range()] == other.text[b.range()]);
+        values
+            && strs
+            && self.small_ints == other.small_ints
+            && self.big_ints == other.big_ints
+            && self.holes == other.holes
+            && self.succs == other.succs
+            && self.cases == other.cases
+            && self.types.same_as(&other.types)
+    }
+
     /// The table of the struct, array, and function types the body names.
     pub fn types(&self) -> &Types {
         &self.types

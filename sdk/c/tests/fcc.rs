@@ -7,8 +7,8 @@
 //! Without a reference (or with `FIR_REF=none`) they build unchecked, which `FIR_REQUIRE_FULL=1`
 //! refuses. The evidence (`fcc_corpus`) counts the checked builds and steps. The x86-64 corpus
 //! (`fcc_x86_64_corpus`, below) checks its `-O` builds the same way, and its evidence
-//! (`fcc_x86_64_corpus`) counts them too. The ABI torture test below
-//! doesn't check its `-O` builds.
+//! (`fcc_x86_64_corpus`) counts them too. With `FCC_PASSES` (below), that build is checked the
+//! same way, on both targets. The ABI torture test below doesn't check its `-O` builds.
 //!
 //! Builds `fcc` with CMake against this crate's static library, then compiles every program
 //! of the corpus (`frontends/c/tests/*.c`) three ways: by the reference compiler (the AArch64 C
@@ -370,6 +370,10 @@ struct Tally {
     /// `-O` builds whose dead code elimination the proved checker checked, its accepted steps,
     /// and the deletions in them as the pass counted them (the checker doesn't count).
     dce_checked_builds: usize,
+    /// The same for the `FCC_PASSES` builds.
+    dce_passes_builds: usize,
+    dce_passes_steps: u64,
+    dce_passes_deletions: u64,
     dce_steps: u64,
     dce_deletions: u64,
     failures: Vec<String>,
@@ -500,23 +504,33 @@ fn one(
             .arg(&exe)
             .args(flags);
         let opt = *suffix == ".O";
-        if let (true, Some(t)) = (opt, check_dce) {
+        // The `FCC_PASSES` build's dead code elimination is checked too: those are the
+        // pipelines being tried (the experimental promotion passes among them).
+        let checked = opt || *suffix == ".passes";
+        if let (true, Some(t)) = (checked, check_dce) {
             cmd.arg("--check-dce").arg(t);
         }
         let built = run_limited(&mut cmd, Duration::from_secs(120));
         match built {
             Ok(o) if o.status.success() => {
-                if opt && check_dce.is_some() {
+                if checked && check_dce.is_some() {
                     match dce_summary(&String::from_utf8_lossy(&o.stderr)) {
-                        Some((steps, deletions)) => {
+                        Some((steps, deletions)) if opt => {
                             let mut t = tally.lock().unwrap();
                             t.dce_checked_builds += 1;
                             t.dce_steps += steps;
                             t.dce_deletions += deletions;
                         }
+                        Some((steps, deletions)) => {
+                            let mut t = tally.lock().unwrap();
+                            t.dce_passes_builds += 1;
+                            t.dce_passes_steps += steps;
+                            t.dce_passes_deletions += deletions;
+                        }
                         None => {
                             fail(format!(
-                                "fcc -O --check-dce printed no checker summary:\n{}",
+                                "fcc{} --check-dce printed no checker summary:\n{}",
+                                if opt { " -O" } else { " --passes" },
                                 String::from_utf8_lossy(&o.stderr)
                             ));
                             continue;
@@ -711,8 +725,9 @@ fn fcc_corpus() {
     t.fir_other_externs.sort();
     if let Some(spec) = exp_passes() {
         eprintln!(
-            "fcc corpus: native runs matching with --passes {spec}: {}",
-            t.native_passes
+            "fcc corpus: native runs matching with --passes {spec}: {}; those builds checked by \
+             Fir.Dce.checkModule: {} ({} dce steps, {} deletions)",
+            t.native_passes, t.dce_passes_builds, t.dce_passes_steps, t.dce_passes_deletions
         );
     }
     eprintln!(
@@ -740,6 +755,13 @@ fn fcc_corpus() {
     );
     ev.count("dce steps accepted by Fir.Dce.checkModule", t.dce_steps);
     ev.count("dce deletions (the pass's count)", t.dce_deletions);
+    if exp_passes().is_some() {
+        ev.count(
+            "FCC_PASSES builds checked by Fir.Dce.checkModule",
+            t.dce_passes_builds as u64,
+        );
+        ev.count("FCC_PASSES dce steps accepted", t.dce_passes_steps);
+    }
     ev.count("failures", t.failures.len() as u64);
     ev.write();
     assert!(
@@ -821,6 +843,10 @@ struct X86Tally {
     native_passes: usize,
     fir_match: usize,
     dce_checked_builds: usize,
+    /// The same for the `FCC_PASSES` builds.
+    dce_passes_builds: usize,
+    dce_passes_steps: u64,
+    dce_passes_deletions: u64,
     dce_steps: u64,
     dce_deletions: u64,
     ran: Vec<String>,
@@ -967,22 +993,32 @@ fn one_x86(
         let mut cmd = fai_cmd();
         cmd.args(&objs).arg("-lm").arg("-o").arg(&exe).args(flags);
         let opt = *suffix == ".O";
-        if let (true, Some(t)) = (opt, check_dce) {
+        // The `FCC_PASSES` build's dead code elimination is checked too: those are the
+        // pipelines being tried (the experimental promotion passes among them).
+        let checked = opt || *suffix == ".passes";
+        if let (true, Some(t)) = (checked, check_dce) {
             cmd.arg("--check-dce").arg(t);
         }
         match run_limited(&mut cmd, Duration::from_secs(120)) {
             Ok(b) if b.status.success() => {
-                if opt && check_dce.is_some() {
+                if checked && check_dce.is_some() {
                     match dce_summary(&String::from_utf8_lossy(&b.stderr)) {
-                        Some((steps, deletions)) => {
+                        Some((steps, deletions)) if opt => {
                             let mut t = tally.lock().unwrap();
                             t.dce_checked_builds += 1;
                             t.dce_steps += steps;
                             t.dce_deletions += deletions;
                         }
+                        Some((steps, deletions)) => {
+                            let mut t = tally.lock().unwrap();
+                            t.dce_passes_builds += 1;
+                            t.dce_passes_steps += steps;
+                            t.dce_passes_deletions += deletions;
+                        }
                         None => {
                             fail(format!(
-                                "fcc -O --check-dce printed no checker summary:\n{}",
+                                "fcc{} --check-dce printed no checker summary:\n{}",
+                                if opt { " -O" } else { " --passes" },
                                 String::from_utf8_lossy(&b.stderr)
                             ));
                             continue;
@@ -1110,8 +1146,9 @@ fn fcc_x86_64_corpus() {
     t.fir_other_externs.sort();
     if let Some(spec) = exp_passes() {
         eprintln!(
-            "fcc x86-64 corpus: native runs matching with --passes {spec}: {}",
-            t.native_passes
+            "fcc x86-64 corpus: native runs matching with --passes {spec}: {}; those builds \
+             checked by Fir.Dce.checkModule: {} ({} dce steps, {} deletions)",
+            t.native_passes, t.dce_passes_builds, t.dce_passes_steps, t.dce_passes_deletions
         );
     }
     eprintln!(
@@ -1145,6 +1182,13 @@ fn fcc_x86_64_corpus() {
     );
     ev.count("dce steps accepted by Fir.Dce.checkModule", t.dce_steps);
     ev.count("dce deletions (the pass's count)", t.dce_deletions);
+    if exp_passes().is_some() {
+        ev.count(
+            "FCC_PASSES builds checked by Fir.Dce.checkModule",
+            t.dce_passes_builds as u64,
+        );
+        ev.count("FCC_PASSES dce steps accepted", t.dce_passes_steps);
+    }
     ev.count("failures", t.failures.len() as u64);
     ev.write();
     assert!(

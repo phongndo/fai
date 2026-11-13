@@ -6,7 +6,8 @@ relative to the Lean semantics in `spec/`. It was built as an experiment (branch
 
 **What it is not.** Nothing here makes the compiler formally verified end to end. One pass's
 permissions are proved, one checker is proved and runs on the pass's real outputs in the tests
-and, when asked (`--check-dce`, `FIR_CHECK_DCE`), in the compiler itself,
+and, when asked (`--check-dce`, `FIR_CHECK_DCE`), in the compiler itself (a Rust
+transcription of it, tested against it but not proved, checks every DCE output by default),
 one transformation validator runs on every compilation but is not proved, and several links
 (scalarization, `cf.try` lowering, module composition, instruction selection, encoding) are
 tested only. The table under [Guarantees](#guarantees) is the exact status of each link.
@@ -267,9 +268,9 @@ under AddressSanitizer in the full one. No noisy lint groups were enabled.
 | DCE: a deletion is a refinement | **proved** (per function, fixed module, `Decided` source) | `Fir.Dce.refines` |
 | DCE: the checker that runs is the proved one, and relates functions name by name | **proved** | `Fir.Dce.checkFuncL_eq` (the counting checker `fir-ref check-dce` runs equals `checkFunc`), `Fir.Dce.checkModule_sound` (per name, over `Module.find?`; the function a call runs in a verified module, by reading) |
 | DCE: the Rust pass's output on the tested inputs | **checked by a proved checker** | `Fir.Dce.checkModule_sound` via `fir-ref check-dce` in `tests/dce_check.rs`, on one `dce` step and on every step of the `-O` pipeline |
-| DCE: the `-O` binaries the C corpus runs | **checked by a proved checker**, every step | `fcc -O --check-dce` in `fcc_corpus` (AArch64) and `fcc_x86_64_corpus` (x86-64, the programs it compiles); `verify full` requires every program's build checked ([dce.md](dce.md)) |
-| DCE: the Rust pass's output on any input | checked (unproved checker) by default; **by the proved checker on request** | `passes::dce::check`, every run; with `fir compile`/`fcc`/`fir opt --check-dce FIR-REF` or `FIR_CHECK_DCE` (`backend::optimize`, `passes::reference`), every step of that run |
-| DCE: the Rust checker's rules against the proved checker's | tested | `the_rust_and_lean_checkers_agree_on_random_candidates`; mutation `dce-checker-weaker-than-proved` ([layer-audit.md](layer-audit.md#3-the-dce-checker-lean-and-rust)) |
+| DCE: the `-O` binaries the C corpus runs | **checked by a proved checker**, every step | `fcc -O --check-dce` in `fcc_corpus` (AArch64) and `fcc_x86_64_corpus` (x86-64, the programs it compiles); `verify full` requires every program's build checked ([dce.md](dce.md)); with `FCC_PASSES`, that pipeline's builds too |
+| DCE: the Rust pass's output on any input | checked by default: the candidate (`passes::dce::check`) and the **output** (`passes::dce::check_output`, a transcription of `Fir.Dce.checkFuncL`), both unproved; **by the proved checker on request** | every run that deletes something; with `fir compile`/`fcc`/`fir opt --check-dce FIR-REF` or `FIR_CHECK_DCE` (`backend::optimize`, `passes::reference`), every step of that run ([dce.md](dce.md#without---check-dce-every-compilation-by-default)) |
+| DCE: the Rust checkers' verdicts against the proved checker's | tested | `the_rust_and_lean_checkers_agree_on_random_candidates` (candidates, and the targets they give, plus operand swaps), `the_pass_is_validated_by_the_proved_checker`; mutations `dce-checker-weaker-than-proved`, `dce-output-check-weaker-than-proved`, `dce-apply-deletes-more` ([layer-audit.md](layer-audit.md#3-the-dce-checker-lean-and-rust)) |
 | DSE, forwarding, copy propagation | proved relations; Rust passes tested | `Fir.Dse/Fwd/CopyProp.refines`; `tests/opt.rs` |
 | Composing passes, optimizing a whole module | **open** | intermediate programs' `Decided`ness and refinement over calls are not proved |
 | HFIR lowering: expansion | proved (per function) | `Fir.Lower.Proof.Expand.refines`, `lowerFunc_refines` |
@@ -291,7 +292,8 @@ builds `fir-ref` (the proved checker runs as compiled code); the text round trip
 printer's output parsed by the Lean parser, itself tested against `fir-ref fmt`; the receipt
 shows they agree on each checked text, not that the text means what the in-memory module does);
 that the `fir-ref` given to `--check-dce` is built from these proofs (`verify full` rebuilds it);
-the Rust `check` and `erase_many` for compilations without `--check-dce`; the allocation validator's code and its ABI assumptions
+for compilations without `--check-dce`, the Rust `check_output` (and `Body::same_tables`, which
+it relies on to compare ops id by id), tested against the proved checker; the allocation validator's code and its ABI assumptions
 (callees preserve `x19`–`x28`, `x29`, `sp`, and the caller's frame; program accesses never reach
 the spill or save areas, which would be out of bounds and so UB); qemu, the cross toolchain, and
 the assembler.
@@ -305,14 +307,18 @@ the assembler.
 2. **Make the proved DCE checker the default.** It now runs in the tests, in the C corpus's
    `-O` builds, and in any compilation that asks (`--check-dce`, `FIR_CHECK_DCE`); it is no longer quadratic
    (`checkFuncL`, proved equal to `checkFunc`, linear in size times nesting depth by construction: 0.7 s for one function of 128,000 ops, mostly
-   parsing and printing). By default the compiler still runs only the Rust `check`, which a
-   differential test holds to the same verdicts on random candidates but nothing proves equal,
-   and which checks a candidate, not the output (`erase_many` is trusted). Running it by default
-   needs Lean in process or in the toolchain. Also open for DCE: `Decided` (assumed) and
+   parsing and printing). By default the compiler runs the Rust `check` on the candidate and
+   the Rust `check_output`, a transcription of `checkFuncL`, on the output (so `erase_many` is
+   no longer trusted); a differential test holds both to the proved checker's verdicts, but
+   nothing proves them equal. Running the proved code itself by default needs Lean in process
+   or in the toolchain. Also open for DCE: `Decided` (assumed) and
    composition (obligation 3). [dce.md](dce.md#next-steps-by-value-per-cost).
 3. **Module composition and `Decided`.** Every pass theorem is about one function in a fixed
    module with a `Decided` source; optimizing every function of a module, and running passes in
    sequence, needs refinement to compose over calls and `Decided` to be preserved or replaced.
+   [dce.md](dce.md#why-composition-link-12-is-open-and-what-closing-it-takes) says where the
+   lockstep framework stops (cores must be equal, and they hold the functions) and the three
+   steps that would generalize it.
 4. **Scalarization, `cf.try` lowering, and whole-module lowering** (decision: Lowering proofs).
 5. **Effects.** The declared effects are unchecked and, for `freeze`, `ptr.addr`, `ptr.with_addr`,
    and `func.addr`, incomplete. Either prove them (an `effects` ⇒ property theorem per kind, like
@@ -339,7 +345,10 @@ Measured on the development machine (x86-64 Linux, qemu-user for AArch64):
   which takes 9 ms of a 37.5 ms backend for 200,000 ops, where selection and assembly output
   dominate. It is not optimized; a reverse index from values to locations would remove most of
   its cost.
-* **DCE's seam** adds one walk of the body to recount reads (the checker) per run. The proved
+* **DCE's seam** adds one walk of the body to recount reads (the checker) per run, and a run
+  that deletes something also copies the body and checks the output (`check_output`): on one
+  function of 128,000 ops with 64,000 deleted, `dce` goes from 6.1 ms to 13.4 ms of a 60 ms
+  `fir opt -O`; a run that deletes nothing costs nothing more. The proved
   checker runs in the tests (about 400 short `fir-ref` processes) and in the C corpus's `-O`
   builds; with `--check-dce` a compilation costs one `fir-ref` process per `dce` step that
   changed the module (about 15 ms per program on the corpus, nearly all process start and the

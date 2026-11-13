@@ -18,7 +18,11 @@ step's input is `Decided` (assumed), and not anything about the other passes, th
 instruction selection, or the encoding, which are tested or checked by unproved code. The checker
 runs as code compiled by Lean's compiler, and it reads the module as text the Rust printer
 wrote, so those are trusted. Without `--check-dce` or `FIR_CHECK_DCE`, which is the default, no
-proved code runs at compile time: the compiler's own Rust checker is tested against the proved one, not proved.
+proved code runs at compile time. What runs instead, in every compilation, is two Rust checkers:
+one judges the pass's candidate before it is applied, and one, a transcription of the proved
+checker, judges the output after it is applied (`dce::check_output`). Neither is proved; both
+are tested against the proved checker, on the pass's outputs and on thousands of targets it
+would never produce.
 
 ## Vocabulary
 
@@ -41,7 +45,7 @@ proved code runs at compile time: the compiler's own Rust checker is tested agai
 | 3 | `checkFunc` accepting implies that relation | **Proved** | `Fir.Dce.checkFunc_sound` |
 | 4 | The faster checker that runs (`checkFuncL`) decides what `checkFunc` does | **Proved** (new) | `Fir.Dce.checkFuncL_eq`: equal verdicts on every pair of functions |
 | 5 | Accepting two modules relates their functions name by name | **Proved** (new) | `Fir.Dce.checkModule_sound`, stated over `Module.find?` (the first function of a name). The interpreter's calls take the *last* of a name (`Core.funcs`); the two agree because `fir-ref` verifies both modules and the verifier refuses duplicate names (`Verify.lean`), a fact the theorem doesn't carry. Before, this pairing was unproved code in `Main.lean` |
-| 6 | The Rust pass's plan and `erase_many` | not relied on when checking | the output is checked whatever produced it |
+| 6 | The Rust pass's plan and `erase_many` | not relied on when checking | the output is checked whatever produced it (by the proved checker with `--check-dce`; by its Rust transcription in every compilation) |
 | 7 | The module the checker reads is the module the pipeline holds | **Trusted**, partly **checked** | the Rust printer writes the module; Lean parses it and prints it back; the receipt must equal the Rust text byte for byte (`passes::reference`). That shows the printer and Lean's parser agree on *this text*, not that the text means what the in-memory module does. It also relies on link 9: a stand-in `fir-ref` that prints its inputs back would pass it |
 | 8 | The checker computes what its Lean definition says | **Trusted** | `fir-ref` is Lean code compiled to C by Lean's compiler, then compiled and linked with Lean's runtime by the host's C compiler and linker (the Lean toolchain's, not the AArch64 target's) |
 | 9 | The `fir-ref` used is built from these proofs | **Trusted** (checked in CI) | `verify full` rebuilds `spec/` from scratch (not with `--no-lean-clean`); a path given by hand is the caller's responsibility (the receipt doesn't name a version) |
@@ -60,13 +64,39 @@ optimized program is correct"; 14–18 are everything else between the C source 
 
 ### Without `--check-dce` (every compilation by default)
 
-Links 1–2 still hold for the *relation*, but no proved code runs. The compiler applies a deletion
-only if the Rust checker `passes::dce::check` accepts it (**checked (unproved)**), and then
-`Body::erase_many` performs it (**trusted**). That the Rust checker accepts only what the proved
-one would is **tested**: `the_rust_and_lean_checkers_agree_on_random_candidates` gives both the
-same candidates (thousands per run, none disagreeing), and the mutation
-`dce-checker-weaker-than-proved` shows a weakened Rust checker is caught. The Rust checker checks
-the *candidate*, not the output, so a bug in `erase_many` would not be seen by it.
+Links 1–2 still hold for the *relation*, but no proved code runs. Each run of `dce` that deletes
+anything does three things (`passes::dce::run`):
+
+1. The Rust checker `passes::dce::check` accepts the candidate (the ops to delete) or the run
+   fails (**checked (unproved)**). That it accepts only what the proved checker would is
+   **tested**: `the_rust_and_lean_checkers_agree_on_random_candidates` gives both the same
+   candidates, and the mutation `dce-checker-weaker-than-proved` shows a weakened Rust checker is
+   caught.
+2. `Body::erase_many` performs the deletion.
+3. `passes::dce::check_output` compares the body after with a copy of the body before, and the
+   run fails, with the copy put back, unless the result is what the proved checker would accept
+   (**checked (unproved)**). It is a transcription of `Fir.Dce.checkFuncL` over the compiler's
+   own representation: the same greedy matching region by region, the same deletability rule
+   (a kind `dcePerm` deletes, no regions, operands all variables, no read of its results by
+   name among the target ops not yet matched in its region, at any depth), and the same read
+   counts. It compares ops id by id, after checking that both bodies give every id the same
+   meaning (`Body::same_tables`: the same values with the same names, types, and facts, the
+   same strings, constants, holes, successors, cases, and types), which makes it stricter than
+   Lean's comparison of names and printed fields, never looser. That its verdicts are the
+   proved checker's is **tested**, not proved: the agreement test sends every target it builds
+   to both (below), and the mutation `dce-output-check-weaker-than-proved` shows a weakened
+   output check is caught. The mutation `dce-apply-deletes-more` plants the bug step 2 could
+   have (applying an approved deletion also erases the function's stores, which verifies and
+   which no candidate check sees) and the output check refuses the result.
+
+So without `--check-dce`, `erase_many` is no longer trusted: its result is checked, by unproved
+code that is tested against the proved code. A run with nothing to delete doesn't touch the
+body, and is not checked.
+
+`check_output` follows the pipeline's policy as the pass does: under `Policy::AllowTrusted` (the
+default) it would let a kind with a *trusted* permission go, which the proved checker refuses.
+No kind has one today (every `Dce::Delete` in the generated contracts is `Evidence::Proved`), so
+the two policies decide the same.
 
 ## The theorem the check rests on
 
@@ -118,7 +148,57 @@ world's answers. `fcc` emits `ptr.from_exposed` for casts from integers to point
 (`frontends/c/tests/pointer_int_casts.c`), so within a C program those casts are the likeliest
 place for the assumption to fail. Nothing checks it today.
 
-## What changed in this round, and what it cost
+## What the third round changed: the output checked in every compilation
+
+The second round (next section) put the proved checker on the compiler's path, on request. This
+round makes what runs by default check the pass's *output*, and puts more of the pipelines
+programs actually go through under the proved checker.
+
+1. **The output check, on by default.** `passes::dce::check_output` (described above, under
+   *Without `--check-dce`*) runs in every `dce` run that deletes something, in `fir opt`,
+   `fir compile`, `fcc`, and the C API alike. It closes the gap the previous section left open:
+   the default path checked a candidate and trusted `erase_many` to apply it.
+2. **Held to the proved checker by a differential test.** In `tests/rust/dce_check.rs`:
+   * every module the pass changes in `the_pass_is_validated_by_the_proved_checker` (the
+     fixtures, 200 random programs, and their lowered MFIR) goes to both: 1,089 function pairs,
+     all accepted by both;
+   * `the_rust_and_lean_checkers_agree_on_random_candidates` builds a target for every random
+     candidate that can be written out (erasures of planned, kept, and arbitrary ops, from
+     inside regions too), plus targets that aren't deletions at all (two operands of an op
+     swapped), and requires `check_output` and `fir-ref check-dce` to agree on each one that
+     verifies. At the default size: 78 deletions accepted by both, 1,761 deletions and 626
+     swaps refused by both, and 2,239 deletions whose targets don't verify (the proved checker
+     never sees those; `check_output` refused them all). At `FIR_FUZZ=800`: 238 accepted by
+     both, 5,128 deletions and 1,194 swaps refused by both. None disagreed.
+   * Unit tests in `dce.rs` give it a deleted store, a deleted read op, ops changed in place
+     (at the top level and inside a region), a changed operand, a deleted region op and
+     terminator, a `freeze`, and a body from elsewhere, and check each reason.
+3. **Cost.** On one function of 128,000 ops of which 64,000 are dead (the measurement of the
+   previous section), `dce` takes 6.1 ms without the output check, 9.0 ms with only the copy of
+   the body, and 13.4 ms with copy and check (release build, best of five, `fir opt -O
+   --stats`); the whole `fir opt -O` takes 60 ms. A `dce` run that deletes nothing, which is most
+   runs (every fixed-point pipeline ends with one), costs nothing extra. The proved checker on
+   the same function takes 0.69 s, nearly all of it the text round trip.
+4. **The `FCC_PASSES` builds are checked too.** The C corpus test now passes `--check-dce` to
+   the build with `FCC_PASSES`'s pipeline as well as to `-O`, on both targets, and counts those
+   steps separately (and records them as evidence when `FCC_PASSES` is set). With the
+   experimental promotion pipeline (`FCC_PASSES=mem2reg,stackdce,fwd,copyprop,dse,dce`):
+
+   | | AArch64 | x86-64 |
+   |---|---|---|
+   | programs (x86-64: those it compiles) | 69 | 49 |
+   | `-O` builds checked, all running as GCC's do | 69 | 49 |
+   | `-O` `dce` steps accepted (deletions, the pass's count) | 73 (3,471) | 42 (3,301) |
+   | `FCC_PASSES` builds checked, all running as GCC's do | 69 | 49 |
+   | `FCC_PASSES` `dce` steps accepted (deletions) | 17 (5,998) | 9 (3,240) |
+   | steps refused | 0 | 0 |
+
+   Most programs' promotion pipeline gives `dce` nothing to do: `mem2reg` and `stackdce` delete
+   the loads, stores, and slots they make dead themselves, and no checker sees those deletions
+   (they are experimental and unproved: [README.md](README.md#guarantees)). Where `dce` does
+   delete after promotion, the deletions are larger than `-O`'s.
+
+## What the second round changed, and what it cost
 
 1. **A faster proved checker.** `checkFunc`'s `deletable` scans the rest of the region for each
    deleted op, so the proved checker was quadratic: 16.5 s for one function of 128,000 ops (half
@@ -169,24 +249,56 @@ fcc FILE.c -O --check-dce spec/.lake/build/bin/fir-ref -o a.out
 cargo test -p fir --test dce_check                  # the checker on fixtures, random programs, -O
 cargo test -p fir-capi --test fcc -- fcc_corpus --nocapture   # the C corpus, checked
 cargo test -p fir-capi --test fcc -- fcc_x86_64_corpus --nocapture   # the same on x86-64
+FCC_PASSES=mem2reg,stackdce,fwd,copyprop,dse,dce \
+  cargo test -p fir-capi --test fcc -- fcc_corpus fcc_x86_64_corpus --nocapture   # and the promotion pipeline's builds
+cargo test -p fai-transforms --lib dce::tests       # the default output check, unit tests
+cargo xtask mutate dce-apply-deletes-more dce-output-check-weaker-than-proved   # its planted defects
 cd spec && lake exe fir-audit --lock ../docs/assurance/proofs.lock.json   # the claims
 ```
 
+## Why composition (link 12) is open, and what closing it takes
+
+`checkModule_sound` relates each target function to its source *in the source module*: the
+target function's calls run the source's callees. Running the optimized module runs the
+target's. The lockstep framework every pass proof uses (`spec/Fir/CodeRel.lean`) is where this
+shows: `MRel` relates machines with **equal cores**, and the core holds the module's functions
+(`Core.funcs`), so the two machines must be running the same module. A call pushes the callee's
+body on both stacks unchanged (`execFlat_eq`, the `.func f` case, `(.refl _)`).
+
+The semantics reads `Core.funcs` in three places only (`spec/Fir/Interp.lean`): `callTarget`, for
+direct calls and for indirect ones (after resolving the pointer to a function's name), and
+`funcAddr`, which asks only whether a name is defined. Nothing writes it after `Core.initial`.
+So the step that would close link 12 for every pass built on `CodeRel` is:
+
+1. generalize `MRel` to cores that are equal except for `funcs`, whose entries are related by
+   the code relation (same names, parameters, results, and variadicity; bodies related by
+   `OpsRel L`), which `checkModule` establishes for DCE through `checkOps_sound`;
+2. show that every core computation `step` runs, other than those three lookups, neither reads
+   nor writes `funcs` (one lemma per computation `execFlat` and `terminate` run, the evaluators
+   of every op among them), and that the lookups give related functions on related cores;
+3. let the call case push related bodies instead of equal ones.
+
+The existing `Simulation.refines` then gives refinement between the two modules' runs. The size
+is in step 2: it is a statement about most of the interpreter, which is why this round did not
+attempt it. Until it is done, "checked" means each optimized function is correct in the context
+of the unoptimized module, and the differential tests (`tests/opt.rs`, the C corpus) are what
+show the optimized module as a whole behaves.
+
 ## Next steps, by value per cost
 
-1. **A checked `Decided` for the common case**: for a function that resolves a pointer it was
+1. **Module composition** (link 12), as above: it is what would let "checked" mean the
+   optimized module is correct, and every pass built on `CodeRel` needs it.
+2. **A checked `Decided` for the common case**: for a function that resolves a pointer it was
    given, `Decided` as defined can't be established from its code alone (arguments are
-   arbitrary). The step is a weaker hypothesis the pass
-   theorems can use instead: refinement for runs whose arguments and world answers carry
-   provenance, plus a proved syntactic check that the code can't make an address-only pointer
-   itself. Where that applies, link 11 goes from assumed to checked; the restriction on arguments
-   becomes a statement about callers, to be discharged by module composition.
-2. **Module composition** (link 12): if every function of the target refines its namesake in the
-   source module, the target module refines the source module. This is what would let "checked"
-   mean the optimized module is correct, and every pass needs it.
-3. **Run the proved checker in CI builds of the corpus** (done here) and **in process**
-   (Lean's C output linked into `fir` behind `@[export]`), which would remove the process and the
-   files, but not the text round trip, and would put Lean's runtime in the compiler.
-4. **An output checker in Rust**, a transcription of `checkOpsL`, run on every compilation and
-   held to the Lean one by the agreement test: still unproved, but it would check the output
-   instead of trusting `erase_many`, cheaply, without Lean at compile time.
+   arbitrary). The step is a weaker hypothesis the pass theorems can use instead: refinement for
+   runs whose arguments and world answers carry provenance, plus a proved syntactic check that
+   the code can't make an address-only pointer itself. Where that applies, link 11 goes from
+   assumed to checked; the restriction on arguments becomes a statement about callers, to be
+   discharged by module composition.
+3. **The proved checker in process** (Lean's C output linked into `fir` behind `@[export]`),
+   which would remove the process and the files, but not the text round trip, and would put
+   Lean's runtime in the compiler. With it, the output check could be the proved code itself
+   rather than a transcription tested against it. (Done: the corpus's `-O` and `FCC_PASSES`
+   builds run the proved checker in CI, and every compilation runs the Rust transcription.)
+4. **Checkers for the passes that delete without one**: `mem2reg` and `stackdce` delete loads,
+   stores, and slots that no checker sees (the corpus numbers above). They need theorems first.

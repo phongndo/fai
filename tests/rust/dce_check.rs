@@ -19,6 +19,12 @@
 //! be refused by the Lean checker (or, where the deletion leaves a use without a definition, by
 //! the verifier before it); and an op changed rather than deleted must be refused by the Lean
 //! checker.
+//!
+//! The compiler's default output check (`passes::dce::check_output`, a Rust transcription of
+//! `Fir.Dce.checkFuncL` that every compilation runs) is held to the proved checker the same way:
+//! it must accept every pass output the proved checker accepts, and give the proved checker's
+//! verdict on every random candidate's target that verifies and on targets whose ops had two
+//! operands swapped.
 
 //!
 //! Last, the compiler's own entry points: `fir compile -O --check-dce FIR-REF`, and
@@ -159,6 +165,17 @@ fn check_one(tool: &Path, m: &fir::Module, name: &str, ev: &Evidence, fails: &Mu
                         "functions accepted by Fir.Dce.checkFunc",
                         accepted.functions(),
                     );
+                    // The compiler's own output check must accept what the proved one does.
+                    for (s, t) in src.funcs.iter().zip(&tgt.funcs) {
+                        match dce::check_output(&s.body, &t.body, Policy::VerifiedOnly) {
+                            Ok(_) => ev.count("functions accepted by the output check too", 1),
+                            Err(e) => fails.lock().unwrap().push(format!(
+                                "{name} @{}: the proved checker accepted, the output check \
+                                 refused: {e}",
+                                s.name
+                            )),
+                        }
+                    }
                     if n > 0 {
                         ev.count("modules with deletions accepted", 1);
                     }
@@ -470,6 +487,41 @@ enum Verdict {
     LeanRefused,
 }
 
+/// The compiler's output check (`passes::dce::check_output`, a transcription of
+/// `Fir.Dce.checkFuncL` that every compilation runs) against the proved checker's verdict on the
+/// same target: they must agree whenever the target verifies (the proved checker sees only
+/// verified modules). What it says of a target that doesn't verify is tallied, not compared.
+fn output_agreement(
+    src: &fir::Body,
+    tgt: &fir::Body,
+    lean: Verdict,
+    what: &str,
+    fails: &Mutex<Vec<String>>,
+) -> &'static str {
+    let out = dce::check_output(src, tgt, Policy::VerifiedOnly);
+    let swap = what.contains(" swap ");
+    match (&out, lean) {
+        (Ok(_), Verdict::Accepted) => "output check: both accepted",
+        (Err(_), Verdict::LeanRefused) if swap => "output check, operands swapped: both refused",
+        (Err(_), Verdict::LeanRefused) => "output check: both refused",
+        (Ok(_), Verdict::Unverifiable) => "output check: accepted, target doesn't verify",
+        (Err(_), Verdict::Unverifiable) => "output check: refused, target doesn't verify",
+        (Ok(_), _) => {
+            fails
+                .lock()
+                .unwrap()
+                .push(format!("{what}: the output check accepted, Lean refused"));
+            "output check: accepted, Lean refused"
+        }
+        (Err(e), _) => {
+            fails.lock().unwrap().push(format!(
+                "{what}: Lean accepted, the output check refused: {e}"
+            ));
+            "output check: Lean accepted, refused"
+        }
+    }
+}
+
 /// The production Rust checker (`passes::dce::check`) and the proved Lean one (`Fir.Dce.checkFunc`)
 /// must agree on what a deletion may be, not only on the pass's own plans: for each module, random
 /// candidates go to both checkers: each kind of unread op the plan leaves (calls, loads,
@@ -581,6 +633,48 @@ fn the_rust_and_lean_checkers_agree_on_random_candidates() {
                             cands.push((f, erase));
                         }
                     }
+                    // Edits that aren't deletions: two operands of one op swapped. Lean's
+                    // checker refuses them unless the op is also deletable and unread.
+                    for f in 0..src.funcs.len() {
+                        let b = &src.funcs[f].body;
+                        let swappable: Vec<fir::OpId> = all_ops(b)
+                            .into_iter()
+                            .filter(|&op| {
+                                let os = b.operands(op);
+                                os.len() >= 2
+                                    && matches!((os[0].get(), os[1].get()),
+                                        (fir::OperandKind::Value(x), fir::OperandKind::Value(y))
+                                            if x != y && b.ty(x) == b.ty(y))
+                            })
+                            .collect();
+                        for _ in 0..2 {
+                            if swappable.is_empty() {
+                                break;
+                            }
+                            let op = swappable[rng.below(swappable.len() as u64) as usize];
+                            let mut tgt = src.clone();
+                            let tb = &mut tgt.funcs[f].body;
+                            let (x, y) = (tb.operands(op)[0], tb.operands(op)[1]);
+                            tb.set_operand(op, 0, y);
+                            tb.set_operand(op, 1, x);
+                            let lean = if fir::verify_module(&tgt).is_err() {
+                                Verdict::Unverifiable
+                            } else {
+                                match lean_check(&tool, &src, &tgt, &format!("{name}-swap")) {
+                                    Ok(_) => Verdict::Accepted,
+                                    Err(_) => Verdict::LeanRefused,
+                                }
+                            };
+                            let what = output_agreement(
+                                &src.funcs[f].body,
+                                &tgt.funcs[f].body,
+                                lean,
+                                &format!("{name} @{} swap {op:?}", src.funcs[f].name),
+                                &fails,
+                            );
+                            *tally.lock().unwrap().entry(what).or_default() += 1;
+                        }
+                    }
                     for (c, (f, erase)) in cands.into_iter().enumerate() {
                         let mut body = src.funcs[f].body.clone();
                         let rust_ok = dce::check(
@@ -623,6 +717,16 @@ fn the_rust_and_lean_checkers_agree_on_random_candidates() {
                                 Err(_) => Verdict::LeanRefused,
                             }
                         };
+                        if !dangling {
+                            let what = output_agreement(
+                                &src.funcs[f].body,
+                                &tgt.funcs[f].body,
+                                lean,
+                                &format!("{name} @{} erase {erase:?}", src.funcs[f].name),
+                                &fails,
+                            );
+                            *tally.lock().unwrap().entry(what).or_default() += 1;
+                        }
                         let what = match (rust_ok, lean) {
                             (true, Verdict::Accepted) => "both accepted",
                             (false, Verdict::LeanRefused) => "both refused",

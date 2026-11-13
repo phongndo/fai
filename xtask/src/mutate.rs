@@ -366,6 +366,39 @@ fn mutations() -> Vec<Mutation> {
             in_decl: None,
         },
         Mutation {
+            name: "dce-apply-deletes-more",
+            what: "applying an approved deletion also erases every store (which verifies, and no candidate check sees); the output check, run on every compilation, refuses the result",
+            edits: vec![edit(
+                "compiler/transforms/src/dce.rs",
+                "    body.erase_many(&a.erase);\n    a.erase.len() as u32",
+                "    let mut erase = a.erase.clone();\n    let mut all = Vec::new();\n    walk(body, &mut all);\n    erase.extend(all.into_iter().filter(|&o| body.kind(o).mnemonic() == \"mem.store\"));\n    body.erase_many(&erase);\n    a.erase.len() as u32",
+            )],
+            steps: vec![test(&["-p", "fai-transforms", "--lib", "dce::tests"])],
+            expect: vec![
+                "its output failed the output check",
+                "mem.store @3:3 is missing from the target, and may not be deleted",
+            ],
+            in_decl: None,
+        },
+        Mutation {
+            name: "dce-output-check-weaker-than-proved",
+            what: "the compiler's DCE output check lets `freeze` go; the agreement test gives it targets the proved checker refuses",
+            edits: vec![edit(
+                "compiler/transforms/src/dce.rs",
+                "        if !pure_kind(k, self.policy) {",
+                "        if !pure_kind(k, self.policy) && k.mnemonic() != \"freeze\" {",
+            )],
+            steps: vec![test(&[
+                "-p",
+                "fir",
+                "--test",
+                "dce_check",
+                "the_rust_and_lean_checkers_agree",
+            ])],
+            expect: vec!["disagreements", "the output check accepted, Lean refused"],
+            in_decl: None,
+        },
+        Mutation {
             name: "compiler-ignores-check-dce",
             what: "the compiler's -O path ignores FIR_CHECK_DCE, so `fcc -O --check-dce` and the C API would check nothing; the compile-path test finds no checker summary",
             edits: vec![edit(

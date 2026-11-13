@@ -39,7 +39,8 @@ fcc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]
   (`fir: check-dce: N steps accepted by Fir.Dce.checkModule (…)`) goes to stderr. The corpus tests
   build each program's `-O` binary this way, for AArch64 and for x86-64 (both corpora are
   required in `cargo xtask verify full` on Linux; the ABI torture test's `-O` builds are not
-  checked).
+  checked), and the `FCC_PASSES` build too when it is set. Without the flag, every step's
+  output is still checked, by an unproved Rust transcription of the same checker.
 - `--target` picks the target: `aarch64` (the default) or `x86_64`. `-O`, `--passes`, and
   `--check-dce` run on the MFIR, before the target is involved, so they mean the same for both.
 - The linker is `$FIR_CC`, or `cc` when the host is the target (its CPU, on Linux; macOS's `cc`

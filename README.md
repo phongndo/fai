@@ -15,7 +15,8 @@ The first phase is the ahead-of-time compiler. Here is what exists:
   and a reference interpreter that agrees with Lean's (`fir-ref`).
 - **Passes.** The `-O` pipeline (dse, fwd, copyprop, dce) holds only passes with Lean
   refinement proofs. A proved Lean checker can check every DCE step of a compilation on request
-  (`--check-dce`). `mem2reg` and `stackdce` are experimental: they are unproved and run only
+  (`--check-dce`); by default, an unproved Rust transcription of it, tested against it, checks
+  every DCE step's output. `mem2reg` and `stackdce` are experimental: they are unproved and run only
   when a pipeline opts in (`--experimental`).
 - **AArch64 backend.** It compiles MFIR through the `aarch64` LFIR dialect to Linux ELF or
   macOS Mach-O, and checks the register allocation on every compile.

@@ -39,8 +39,21 @@
 //! remaining op anywhere may read a deleted result), and the tests run the proved checker itself,
 //! `fir-ref check-dce`, on the pass's output (`tests/dce_check.rs`): `Fir.Dce.checkFunc_sound` says
 //! that its acceptance implies the output refines the input. The Rust checker is not proved.
+//!
+//! **Output check.** [`check`] judges the candidate; [`apply`] and [`Body::erase_many`] then edit
+//! the body, and nothing above looks at what they produced. [`check_output`] does, on every run
+//! that deletes anything ([`run`]): it takes the body before and after, and decides what Lean's
+//! `Fir.Dce.checkFuncL` decides (proved equal to `Fir.Dce.checkFunc`, whose acceptance
+//! `Fir.Dce.checkFunc_sound` proves implies refinement): the target's ops are the source's, in
+//! order and region by region, with ops of permitted kinds left out whose results no target op
+//! left after them in their region reads. It is a transcription, not the proved code: that it
+//! accepts exactly what `fir-ref check-dce` accepts is tested, not proved
+//! (`tests/rust/dce_check.rs`: the pass's outputs, and the targets of random candidates and of
+//! edits that aren't deletions, go to both).
+//! It runs in every compilation, with or without `--check-dce`, in time linear in the body's size
+//! times its nesting depth.
 
-use fai_ir::body::{Body, OpId, OperandKind, ValueDef};
+use fai_ir::body::{Body, OpId, OperandKind, RegionId, ValueDef};
 use fai_ir::contract::Policy;
 use fai_ir::ir::OpKind;
 
@@ -117,10 +130,24 @@ pub struct Accepted<'a> {
 /// Delete every pure op whose results nothing reads, and then those that only the deleted ops
 /// read, if the checker accepts the deletion. Returns how many were deleted, or the checker's
 /// objection (the body is then unchanged).
+///
+/// The output is then checked against the body as it was ([`check_output`]): a run that deletes
+/// anything keeps a copy of the body first, and if the result isn't that copy with deletable ops
+/// left out, the copy is put back and the run fails. A run with nothing to delete doesn't touch
+/// the body.
 pub fn run(body: &mut Body, remarks: &mut Remarks, policy: Policy) -> Result<u32, String> {
     let candidate = plan(body, policy);
+    if candidate.erase.is_empty() {
+        return Ok(0);
+    }
+    let before = body.clone();
     let accepted = check(body, candidate, policy)?;
-    Ok(apply(accepted, remarks))
+    let n = apply(accepted, remarks);
+    if let Err(e) = check_output(&before, body, policy) {
+        *body = before;
+        return Err(format!("its output failed the output check: {e}"));
+    }
+    Ok(n)
 }
 
 /// Find the ops to delete, without changing anything.
@@ -254,6 +281,191 @@ pub fn apply(a: Accepted<'_>, remarks: &mut Remarks) -> u32 {
     a.erase.len() as u32
 }
 
+/// Accept `tgt` as `src` after dead code elimination: what Lean's `Fir.Dce.checkFuncL` decides
+/// for the two function bodies, transcribed. Both must be versions of one body (`tgt` is `src`
+/// edited; [`Body::same_tables`]), so ops are compared id by id: an op of `tgt` matches one of
+/// `src` when their kinds, results, operands, and locations are equal and their regions are
+/// related in the same way. Going through each region in order, the next source op either
+/// matches the next target op, or is left out, which needs its kind to be one the contract lets
+/// dead code elimination delete under `policy` (under [`Policy::VerifiedOnly`], exactly Lean's
+/// `dcePerm`), no regions, only values as operands, and results whose names no target op not
+/// yet matched in that region reads, at any depth. Reads are counted by name, as Lean counts
+/// them. Returns how many source ops were left out, at any depth.
+///
+/// Matching is greedy, as in Lean. Comparing ids is stricter than comparing what they mean
+/// (Lean compares names and printed fields), so this accepts only pairs Lean's checker would
+/// (given that the printer writes the same text for equal ops, which [`Body::same_tables`]
+/// makes so).
+pub fn check_output(src: &Body, tgt: &Body, policy: Policy) -> Result<u64, String> {
+    if !src.same_tables(tgt) {
+        return Err(
+            "the target isn't a version of the source body (their value, string, \
+                    constant, or type tables differ)"
+                .to_owned(),
+        );
+    }
+    // A class per name: the first value with it. Reads are counted per class.
+    let mut first: rustc_hash::FxHashMap<&str, u32> = rustc_hash::FxHashMap::default();
+    first.reserve(src.num_values());
+    let class: Vec<u32> = (0..src.num_values() as u32)
+        .map(|i| {
+            let v = fai_ir::body::ValueId::from_raw(i);
+            *first.entry(src.name(v)).or_insert(i)
+        })
+        .collect();
+    let mut c = OutputCheck {
+        src,
+        tgt,
+        policy,
+        class,
+        pool: Vec::new(),
+        left_out: 0,
+    };
+    c.region(tgt.entry(), src.entry())?;
+    Ok(c.left_out)
+}
+
+struct OutputCheck<'a> {
+    src: &'a Body,
+    tgt: &'a Body,
+    policy: Policy,
+    class: Vec<u32>,
+    /// Count arrays (by name class) for the regions being checked, innermost last, reused:
+    /// each is all zeros again when its region is accepted.
+    pool: Vec<Vec<i32>>,
+    left_out: u64,
+}
+
+impl OutputCheck<'_> {
+    /// Lean's `opTick`: add `d` to the count of every name `op` reads, at any depth.
+    fn tick(&self, counts: &mut [i32], op: OpId, d: i32) {
+        let b = self.tgt;
+        let mut work = vec![op];
+        while let Some(o) = work.pop() {
+            for x in b.operands(o) {
+                if let OperandKind::Value(v) = x.get() {
+                    counts[self.class[v.index()] as usize] += d;
+                }
+            }
+            for &r in b.regions(o) {
+                work.extend(b.ops(r));
+            }
+        }
+    }
+
+    /// Lean's `checkRegionsL` for one pair of regions: the same parameters and label, and
+    /// `checkOpsL` on their ops, starting from the counts of every read in the target's.
+    fn region(&mut self, tr: RegionId, sr: RegionId) -> Result<(), String> {
+        let (src, tgt) = (self.src, self.tgt);
+        if !tgt.params(tr).eq(src.params(sr)) || tgt.label(tr) != src.label(sr) {
+            return Err("a region's parameters or label differ".to_owned());
+        }
+        let t: Vec<OpId> = tgt.ops(tr).collect();
+        let mut counts = self.pool.pop().unwrap_or_else(|| vec![0; self.class.len()]);
+        for &o in &t {
+            self.tick(&mut counts, o, 1);
+        }
+        let r = self.region_ops(&t, sr, &mut counts);
+        if r.is_ok() {
+            // Every target op was matched and its reads taken off: all zeros again.
+            debug_assert!(counts.iter().all(|&n| n == 0));
+            self.pool.push(counts);
+        }
+        r
+    }
+
+    /// Lean's `checkOpsL` for the target ops `t` of a region and the source region `sr`, from
+    /// the counts of `t`'s reads.
+    fn region_ops(&mut self, t: &[OpId], sr: RegionId, counts: &mut [i32]) -> Result<(), String> {
+        let (src, tgt) = (self.src, self.tgt);
+        let mut i = 0;
+        for s in src.ops(sr) {
+            if i < t.len() && self.same_op(t[i], s)? {
+                self.tick(counts, t[i], -1);
+                i += 1;
+                continue;
+            }
+            if let Err(why) = self.deletable(counts, s) {
+                let next = match t.get(i) {
+                    Some(&o) => format!(
+                        "the target has {} {} there",
+                        tgt.kind(o).mnemonic(),
+                        at(tgt.loc(o))
+                    ),
+                    None => "the target's region has ended".to_owned(),
+                };
+                return Err(format!(
+                    "{} {} is missing from the target, and may not be deleted: {why} ({next})",
+                    src.kind(s).mnemonic(),
+                    at(src.loc(s))
+                ));
+            }
+            self.left_out += 1;
+        }
+        if let Some(&o) = t.get(i) {
+            return Err(format!(
+                "{} {} in the target matches no op of the source",
+                tgt.kind(o).mnemonic(),
+                at(tgt.loc(o))
+            ));
+        }
+        Ok(())
+    }
+
+    /// Lean's `checkOpL`: the same op, up to related regions. When everything but the regions'
+    /// contents matches and those don't, this is the error from inside them: the source op has
+    /// regions, so it can't be left out either, and Lean's checker refuses the pair too.
+    fn same_op(&mut self, t: OpId, s: OpId) -> Result<bool, String> {
+        let (src, tgt) = (self.src, self.tgt);
+        if tgt.kind(t) != src.kind(s)
+            || !tgt.results(t).eq(src.results(s))
+            || tgt
+                .operands(t)
+                .iter()
+                .map(|o| o.raw())
+                .ne(src.operands(s).iter().map(|o| o.raw()))
+            || tgt.loc(t) != src.loc(s)
+            || tgt.regions(t).len() != src.regions(s).len()
+        {
+            return Ok(false);
+        }
+        for (&a, &b) in tgt.regions(t).iter().zip(src.regions(s)) {
+            self.region(a, b)?;
+        }
+        Ok(true)
+    }
+
+    /// Lean's `deletableC`: a permitted kind, no regions, only values as operands, and results
+    /// whose names the target ops not yet matched don't read.
+    fn deletable(&self, counts: &[i32], s: OpId) -> Result<(), String> {
+        let b = self.src;
+        let k = b.kind(s);
+        if !pure_kind(k, self.policy) {
+            return Err(format!(
+                "the contract keeps it ({:?}, policy {:?})",
+                k.contract().dce,
+                self.policy
+            ));
+        }
+        if !b.regions(s).is_empty() {
+            return Err("it has regions".to_owned());
+        }
+        if !b
+            .operands(s)
+            .iter()
+            .all(|o| matches!(o.get(), OperandKind::Value(_)))
+        {
+            return Err("it reads a hole".to_owned());
+        }
+        for v in b.results(s) {
+            if counts[self.class[v.index()] as usize] != 0 {
+                return Err(format!("the target still reads %{}", b.name(v)));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_util::{apply as apply_pass, canon};
@@ -372,5 +584,119 @@ mod tests {
         let (n, out, _) = apply_pass(src, |b, r| run(b, r, Policy::VerifiedOnly).unwrap());
         assert_eq!(n, 2);
         assert!(!out.contains("int."));
+    }
+
+    const OUT: &str = "func @f(%x: i32, %p: ptr, %c: i1) -> i32 {
+  %y: i32 = copy %x @1:3
+  %z: i32 = int.add.wrap %y, %x @2:3
+  mem.store i32 %x, %p, align 4 @3:3
+  %w: i32 = int.mul.wrap %x, %x @4:3
+  cf.if %c @5:3 {
+    %a: i32 = int.add.wrap %x, %x @6:5
+    cf.yield
+  }
+  func.ret %w @8:3
+}
+";
+
+    fn body(text: &str) -> Body {
+        let m = fai_ir::parse_module(text).unwrap();
+        fai_ir::verify_module(&m).unwrap();
+        m.funcs.into_iter().next().unwrap().body
+    }
+
+    fn op_at(b: &Body, line: u32) -> OpId {
+        let mut ops = Vec::new();
+        walk(b, &mut ops);
+        ops.into_iter()
+            .find(|&o| b.loc(o).is_some_and(|l| l.line == line))
+            .unwrap()
+    }
+
+    /// What the pass produces is accepted, at any depth, and counted.
+    #[test]
+    fn the_output_check_accepts_the_pass_output() {
+        let src = body(OUT);
+        let mut tgt = src.clone();
+        let n = run(&mut tgt, &mut Remarks::new(false), Policy::VerifiedOnly).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(check_output(&src, &tgt, Policy::VerifiedOnly), Ok(3));
+        assert_eq!(check_output(&src, &src, Policy::VerifiedOnly), Ok(0));
+    }
+
+    /// Outputs that aren't a dead code elimination of the input are refused, each for its reason,
+    /// whatever produced them.
+    #[test]
+    fn the_output_check_refuses_other_edits() {
+        let src = body(OUT);
+        let refuse = |edit: &dyn Fn(&mut Body), why: &str| {
+            let mut tgt = src.clone();
+            edit(&mut tgt);
+            let e = check_output(&src, &tgt, Policy::VerifiedOnly).unwrap_err();
+            assert!(e.contains(why), "{e}");
+        };
+        // A store nothing reads is still kept.
+        refuse(
+            &|b| b.erase(op_at(b, 3)),
+            "mem.store @3:3 is missing from the target, and may not be deleted: the contract keeps it",
+        );
+        // A pure op whose result is read.
+        refuse(
+            &|b| b.erase(op_at(b, 4)),
+            "int.mul.wrap @4:3 is missing from the target, and may not be deleted: the target still reads %w",
+        );
+        // An op changed rather than deleted (inside a region too).
+        refuse(
+            &|b| {
+                let o = op_at(b, 4);
+                let k = b.kind(op_at(b, 2));
+                b.set_kind(o, k);
+            },
+            "int.mul.wrap @4:3 is missing from the target",
+        );
+        refuse(
+            &|b| {
+                let o = op_at(b, 6);
+                let k = b.kind(op_at(b, 4));
+                b.set_kind(o, k);
+            },
+            // Greedy matching, as in Lean: the source's add is left out (nothing reads it), and
+            // then the target's changed op matches nothing.
+            "cf.yield @? is missing from the target, and may not be deleted: the contract keeps it (Keep, policy VerifiedOnly) (the target has int.mul.wrap @6:5 there)",
+        );
+        refuse(
+            &|b| {
+                let o = op_at(b, 4);
+                let y = b.operands(op_at(b, 2))[0];
+                b.set_operand(o, 1, y);
+            },
+            "int.mul.wrap @4:3 is missing from the target",
+        );
+        // A region op can't be left out, nor can the terminator.
+        refuse(
+            &|b| b.erase(op_at(b, 5)),
+            "cf.if @5:3 is missing from the target, and may not be deleted",
+        );
+        refuse(
+            &|b| b.erase(op_at(b, 8)),
+            "func.ret @8:3 is missing from the target",
+        );
+        // A body that isn't a version of this one.
+        refuse(
+            &|b| {
+                b.add_str("other");
+            },
+            "isn't a version of the source body",
+        );
+    }
+
+    /// The policy decides which kinds may go, as in the pass.
+    #[test]
+    fn the_output_check_follows_the_contract() {
+        let src = body("func @f(%x: i32) {\n  %a: i32 = freeze %x @1:3\n  func.ret @2:3\n}\n");
+        let mut tgt = src.clone();
+        tgt.erase(op_at(&tgt, 1));
+        let e = check_output(&src, &tgt, Policy::VerifiedOnly).unwrap_err();
+        assert!(e.contains("freeze @1:3"), "{e}");
     }
 }
