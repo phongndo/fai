@@ -1463,6 +1463,7 @@ fn options() -> a64::Options {
         os: a64::Os::Linux,
         prefix: "fir_".to_owned(),
         extern_prefix: String::new(),
+        debug_lines: false,
     }
 }
 

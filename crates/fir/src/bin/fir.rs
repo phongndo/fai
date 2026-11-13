@@ -9,7 +9,7 @@
 //!              [--dump-dir DIR] [--check-dce FIR-REF]
 //!                                            optimize, print canonical text
 //! fir opt --list-passes                      the passes, with what backs each
-//! fir compile FILE [-O] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]
+//! fir compile FILE [-O] [-g] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]
 //!                                            compile to AArch64 (see `compile`)
 //! fir lower FILE [--no-locs]                  lower an HFIR module to MFIR and print it
 //! ```
@@ -119,7 +119,7 @@ fn run(args: &[&str]) -> Result<(), ExitCode> {
         }
         _ => {
             eprintln!(
-                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each] [--no-locs]\n         [--print-before P,...] [--print-after P,...] [--print-changed] [--dump-dir DIR] [--check-dce FIR-REF]\n  fir opt --list-passes\n  fir compile FILE [-O] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]\n  fir lower FILE [--no-locs]"
+                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each] [--no-locs]\n         [--print-before P,...] [--print-after P,...] [--print-changed] [--dump-dir DIR] [--check-dce FIR-REF]\n  fir opt --list-passes\n  fir compile FILE [-O] [-g] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]\n  fir lower FILE [--no-locs]"
             );
             Err(ExitCode::from(2))
         }
@@ -327,7 +327,8 @@ fn opt(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
 /// file) the assembly. Otherwise `-o OUT` is an object file (`.o`) or an
 /// executable, assembled and linked by `$FIR_CC`, or else by `cc` on an AArch64 host and by
 /// `aarch64-unknown-linux-gnu-cc` (from the dev shell) elsewhere. Linux ELF by default, or the
-/// host's format on macOS; `--os` picks one.
+/// host's format on macOS; `--os` picks one. `-g` writes source lines (`.file`/`.loc`) for the
+/// assembler's DWARF line table, from the locations the LFIR carries (`Options::debug_lines`).
 fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     use fir::backend::aarch64 as a64;
     let fail = |e: String| {
@@ -342,6 +343,10 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     while let Some(&opt) = it.next() {
         if opt == "-O" {
             optimize = true;
+            continue;
+        }
+        if opt == "-g" {
+            o.debug_lines = true;
             continue;
         }
         match (opt, it.next()) {

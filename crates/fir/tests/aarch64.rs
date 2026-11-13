@@ -704,6 +704,7 @@ fn build(
         os: a64::Os::host(),
         prefix: "fir_".to_owned(),
         extern_prefix: "fir_ext_".to_owned(),
+        debug_lines: false,
     };
     let asm = a64::compile(m, &o)?;
     let s = dir.join(format!("{name}.s"));

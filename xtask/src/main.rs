@@ -47,6 +47,7 @@ const CLEARED: &[&str] = &[
     "FIR_FUZZ_SEED",
     "FIR_FUZZ_LEAN",
     "FIR_PASSES",
+    "FIR_DEBUG_LINES_DIR",
     "FIR_ABI",
     "FIR_ABI_SEED",
     "FIR_SHOW_ADDRESS_DIFFS",
@@ -63,6 +64,8 @@ const SUITES: &[&str] = &[
     "dce_check",
     "dce_adversarial",
     "dce_agreement",
+    "debug_lines",
+    "debug_lines_edges",
     "regcheck_adversarial",
     "aarch64_fixtures",
     "aarch64_fuzz",
@@ -714,6 +717,13 @@ fn check_evidence(
         "refused by Fir.Dce.checkFunc",
         None,
     );
+    need(
+        &mut bad,
+        "debug_lines",
+        "instructions with a source location",
+        None,
+    );
+    need(&mut bad, "debug_lines_edges", "modules", None);
     // The Rust and Lean DCE checkers must each have judged candidates both ways.
     need(&mut bad, "dce_agreement", "both accepted", None);
     need(&mut bad, "dce_agreement", "both refused", None);
