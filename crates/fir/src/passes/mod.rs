@@ -41,6 +41,11 @@
 //! | [`copyprop`] | after `%y = copy %x`, later ops of the block up to the first with regions or a call read `%x` for `%y` | `Fir.CopyProp.refines` |
 //! | [`dce`] | a pure op whose results nothing reads is deleted | `Fir.Dce.refines` |
 //!
+//! Experimental passes ([`Assurance::Experimental`]) are unproved and run only when a pipeline
+//! opts in ([`Pipeline::parse_experimental`], `--experimental`): [`mem2reg`] promotes stack
+//! slots to values, and [`stackdce`] deletes the allocations it leaves ([`EXPERIMENTAL_O`]; see
+//! `docs/design/05-optimizing-c.md`).
+//!
 //! Passes need a verified module: they rely on every name being defined once per function and
 //! used only where it is visible, so value ids and Lean's names agree. The pipeline verifies
 //! after every pass in development builds and names the pass that broke the module (decision:
@@ -57,7 +62,9 @@ pub mod copyprop;
 pub mod dce;
 pub mod dse;
 pub mod fwd;
+pub mod mem2reg;
 pub mod reference;
+pub mod stackdce;
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -143,12 +150,40 @@ pub const PASSES: &[Pass] = &[
         assurance: Assurance::Proved("Fir.Dce.refines"),
         run: PassFn::Func(dce::run),
     },
+    Pass {
+        name: "mem2reg",
+        summary: "promote stack slots accessed only by loads and stores of one type to values",
+        assurance: Assurance::Experimental(
+            "no theorem yet; differential tests against the interpreter (tests/mem2reg.rs)",
+        ),
+        run: PassFn::Module(|m, r, _| {
+            let mut n = 0;
+            for (i, f) in m.funcs.iter_mut().enumerate() {
+                r.set_func(i as u32);
+                n += mem2reg::run(&mut f.body, r, &m.space);
+            }
+            Ok(n)
+        }),
+    },
+    Pass {
+        name: "stackdce",
+        summary: "delete stack allocations whose pointer nothing uses",
+        assurance: Assurance::Experimental(
+            "assumes allocation numbers are unobservable; tested up to renaming them",
+        ),
+        run: PassFn::Func(|b, r, _| Ok(stackdce::run(b, r))),
+    },
 ];
 
 /// The default `-O` pipeline, run to a fixed point: forwarding makes copies, copy propagation
 /// leaves them unread, dead code elimination deletes them, and the stores they separated become
 /// adjacent for dead store elimination in the next round.
 pub const DEFAULT: &[&str] = &["fwd", "copyprop", "dse", "dce"];
+
+/// A pipeline with the experimental promotion passes, for trying them on C (`fai-cc --passes`,
+/// `fir compile --passes`, with `--experimental`): promote slots, delete the slots promotion
+/// leaves, then the default passes, to a fixed point. Not proved, never the default.
+pub const EXPERIMENTAL_O: &[&str] = &["mem2reg", "stackdce", "fwd", "copyprop", "dse", "dce"];
 
 /// The pass with this name.
 pub fn pass(name: &str) -> Option<&'static Pass> {
@@ -369,6 +404,16 @@ impl Pipeline {
         Pipeline::parse_with(spec, false)
     }
 
+    /// Passes by name, as [`Pipeline::parse`] takes them (experimental ones only with
+    /// `experimental`), run in order to a fixed point like the default pipeline: what a
+    /// compiler's `--passes` means (`fir compile`, `fai-cc`), where passes enable each other.
+    pub fn parse_fixpoint(spec: &str, experimental: bool) -> Result<Pipeline, String> {
+        let mut p = Pipeline::parse_with(spec, experimental)?;
+        p.fixpoint = true;
+        p.max_rounds = 16;
+        Ok(p)
+    }
+
     /// Like [`Pipeline::parse`], but experimental (unproved) passes are allowed too.
     pub fn parse_experimental(spec: &str) -> Result<Pipeline, String> {
         Pipeline::parse_with(spec, true)
@@ -381,7 +426,7 @@ impl Pipeline {
                 Some(p) if !experimental && matches!(p.assurance, Assurance::Experimental(_)) => {
                     return Err(format!(
                         "pass {name:?} is experimental (unproved); opt in to run it \
-                         (`fir opt --experimental`)"
+                         (`--experimental`)"
                     ));
                 }
                 Some(p) => passes.push(p),
@@ -739,7 +784,7 @@ mod tests {
         assert!(!p.fixpoint);
         assert_eq!(
             Pipeline::parse("dse,gvn").err().unwrap(),
-            "no pass \"gvn\"; the passes are dse, fwd, copyprop, dce"
+            "no pass \"gvn\"; the passes are dse, fwd, copyprop, dce, mem2reg, stackdce"
         );
     }
 }

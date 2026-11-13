@@ -26,6 +26,17 @@ pub fn prepare(m: &Module, optimize: bool) -> Result<Module, String> {
     Ok(out)
 }
 
+/// Like [`prepare`], with `pipeline` (if any) run on the MFIR instead of the default one
+/// ([`optimize_with`]): how experimental passes reach the backend (`fir compile --passes`,
+/// `fai-cc --passes`).
+pub fn prepare_with(m: &Module, pipeline: Option<&Pipeline>) -> Result<Module, String> {
+    let mut out = to_mfir(m)?;
+    if let Some(p) = pipeline {
+        optimize_with(&mut out, p)?;
+    }
+    Ok(out)
+}
+
 /// [`prepare`], showing `observer` every pass run of `-O` (and ignoring the environment).
 pub fn prepare_observed(
     m: &Module,
@@ -57,10 +68,15 @@ fn to_mfir(m: &Module) -> Result<Module, String> {
 /// an error (a run where `dce` changes nothing sends it nothing), and on success one summary
 /// line goes to stderr (`fir: check-dce: N steps accepted by Fir.Dce.checkModule (…)`).
 pub fn optimize(m: &mut Module) -> Result<(), String> {
+    optimize_with(m, &Pipeline::default_opt())
+}
+
+/// [`optimize`] with `pipeline` instead of the default one (`FIR_CHECK_DCE` included).
+pub fn optimize_with(m: &mut Module, pipeline: &Pipeline) -> Result<(), String> {
     let Some(mut check) = CheckDce::from_env()? else {
-        return optimize_observed(m, &mut ());
+        return run_observed(m, pipeline, &mut ());
     };
-    let r = optimize_observed(m, &mut check);
+    let r = run_observed(m, pipeline, &mut check);
     check.finish();
     r?;
     eprintln!("fir: {}", check.summary());
@@ -69,8 +85,16 @@ pub fn optimize(m: &mut Module) -> Result<(), String> {
 
 /// [`optimize`], showing `observer` every pass run (and ignoring the environment).
 pub fn optimize_observed(m: &mut Module, observer: &mut dyn Observer) -> Result<(), String> {
-    let mut pipeline = Pipeline::default_opt();
-    pipeline.verify_each = cfg!(debug_assertions);
+    run_observed(m, &Pipeline::default_opt(), observer)
+}
+
+fn run_observed(
+    m: &mut Module,
+    pipeline: &Pipeline,
+    observer: &mut dyn Observer,
+) -> Result<(), String> {
+    let mut pipeline = pipeline.clone();
+    pipeline.verify_each |= cfg!(debug_assertions);
     pipeline
         .run_observed(m, &mut Remarks::new(false), observer)
         .map_err(|e| e.to_string())?;

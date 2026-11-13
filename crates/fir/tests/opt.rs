@@ -65,8 +65,49 @@ enum Cmp {
     SourceAmbiguous,
 }
 
+/// A run's line with its allocations renumbered in order of first appearance (`ptr #7` and
+/// `ptr #7+8` become `#a0` and `#a0+8`, the next one `#a1`, …): what is left of a run once
+/// allocation numbers are taken as unobservable.
+fn rename_allocs(line: &str) -> String {
+    let mut names: Vec<&str> = Vec::new();
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(i) = rest.find('#') {
+        out.push_str(&rest[..=i]);
+        rest = &rest[i + 1..];
+        let n = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if n > 0 {
+            let id = &rest[..n];
+            let k = names.iter().position(|x| *x == id).unwrap_or_else(|| {
+                names.push(id);
+                names.len() - 1
+            });
+            out.push_str(&format!("a{k}"));
+            rest = &rest[n..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Whether target run `t` refines source run `s` (both as `fir run` prints them, or the error).
+/// With `stackdce` in the pipeline, which deletes allocations and so renumbers the later ones,
+/// the runs are compared up to renaming allocations ([`rename_allocs`]), the assumption that
+/// pass rests on.
 fn refines(t: &Result<String, String>, s: &Result<String, String>) -> Result<Cmp, String> {
+    if in_pipeline("stackdce") {
+        let (t, s) = (
+            t.clone().map(|l| rename_allocs(&l)),
+            s.clone().map(|l| rename_allocs(&l)),
+        );
+        return refines_exactly(&t, &s);
+    }
+    refines_exactly(t, s)
+}
+
+fn refines_exactly(t: &Result<String, String>, s: &Result<String, String>) -> Result<Cmp, String> {
     let (Ok(tl), Ok(sl)) = (t, s) else {
         return if t == s {
             Ok(Cmp::Equal)
@@ -606,10 +647,13 @@ fn optimized_memory_programs_refine_the_originals() {
         fails.len(),
         fails.join("\n")
     );
+    // The memory programs' slots escape, or are read with another type than they are written,
+    // so promotion (and deleting the slots it leaves) has nothing to do there: `tests/mem2reg.rs`
+    // generates programs for it.
     for (p, n) in PASSES
         .iter()
         .zip(&fired)
-        .filter(|(p, _)| in_pipeline(p.name))
+        .filter(|(p, _)| in_pipeline(p.name) && !["mem2reg", "stackdce"].contains(&p.name))
     {
         assert!(*n > 0, "pass {} never fired on the memory programs", p.name);
     }
@@ -675,7 +719,20 @@ dce: deleted unused copy @4:3
     );
     let (_, err, code) = opt(&["--passes", "gvn"]);
     assert_eq!(code, Some(1));
-    assert!(err.ends_with("no pass \"gvn\"; the passes are dse, fwd, copyprop, dce\n"));
+    assert!(
+        err.ends_with(
+            "no pass \"gvn\"; the passes are dse, fwd, copyprop, dce, mem2reg, stackdce\n"
+        )
+    );
+}
+
+#[test]
+fn renames_allocations_in_order() {
+    assert_eq!(
+        rename_allocs("@x0(ptr #6+8, ptr #13) -> (); threw ptr #6"),
+        "@x0(ptr #a0+8, ptr #a1) -> (); threw ptr #a0"
+    );
+    assert_eq!(rename_allocs("returned i32 3"), "returned i32 3");
 }
 
 #[test]
