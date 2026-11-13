@@ -3,13 +3,17 @@
 // verifies it and compiles it to AArch64 assembly; the system's AArch64 C compiler assembles and
 // links it, as `fir compile` does.
 //
-//   fai-cc FILE.c [-O] [-o OUT] [--emit hfir|mfir|asm] [INPUT...] [-I DIR] [-D NAME[=V]]
-//          [-l LIB] [-L DIR] [-- CLANG-FLAG...]
+//   fai-cc FILE.c [-O [--check-dce FIR-REF]] [-o OUT] [--emit hfir|mfir|asm] [INPUT...]
+//          [-I DIR] [-D NAME[=V]] [-l LIB] [-L DIR] [-- CLANG-FLAG...]
 //
 // Without --emit, OUT (default a.out) is an executable, or an object file when it ends in `.o`
 // (or assembly when it ends in `.s`); further INPUTs (objects, archives, C or assembly files)
 // and -l/-L are passed to the linker. --emit prints HFIR (as lowered), MFIR (lowered, and
 // optimized with -O), or assembly, to OUT or standard output. Flags after `--` go to Clang.
+//
+// --check-dce FIR-REF checks every step of dead code elimination in -O with the proved Lean
+// checker (`fir-ref check-dce`, run by the library: FIR_CHECK_DCE), fails if it refuses one, and
+// prints one summary line on stderr.
 //
 // The linker is $FIR_CC, or `cc` on an AArch64 host and `aarch64-unknown-linux-gnu-cc` (the dev
 // shell's cross compiler) elsewhere. Its system include directories are given to Clang (after
@@ -43,13 +47,14 @@
 namespace {
 
 const char *kUsage =
-    "usage: fai-cc FILE.c [-O] [-o OUT] [--emit hfir|mfir|asm] [INPUT...] [-I DIR] [-D NAME[=V]]\n"
-    "              [-l LIB] [-L DIR] [-- CLANG-FLAG...]\n";
+    "usage: fai-cc FILE.c [-O [--check-dce FIR-REF]] [-o OUT] [--emit hfir|mfir|asm] [INPUT...]\n"
+    "              [-I DIR] [-D NAME[=V]] [-l LIB] [-L DIR] [-- CLANG-FLAG...]\n";
 
 struct Options {
   std::string file;
   std::string out;
   std::string emit;
+  std::string checkDce;
   bool optimize = false;
   std::vector<std::string> clangArgs;
   std::vector<std::string> linkArgs;
@@ -73,6 +78,9 @@ bool parseArgs(int argc, char **argv, Options &o) {
       o.optimize = true;
     } else if (a == "-o") {
       if (!value(o.out))
+        return false;
+    } else if (a == "--check-dce") {
+      if (!value(o.checkDce) || o.checkDce.empty())
         return false;
     } else if (a == "--emit") {
       if (!value(o.emit))
@@ -104,6 +112,10 @@ bool parseArgs(int argc, char **argv, Options &o) {
     } else {
       o.linkArgs.push_back(a);
     }
+  }
+  if (!o.checkDce.empty() && !o.optimize) {
+    llvm::errs() << "fai-cc: --check-dce checks -O's dead code elimination; add -O\n";
+    return false;
   }
   return !o.file.empty();
 }
@@ -216,9 +228,12 @@ struct ModuleHandle {
 int compileAndLink(FirModule *m, const Options &o) {
   FirString as;
   if (fir_module_compile(m, "aarch64", o.optimize, FIR_OS_LINUX, &as.s) != FIR_OK) {
-    llvm::errs() << o.file
-                 << ": the AArch64 backend can't compile this program: " << fir_module_error(m)
-                 << "\n";
+    std::string err = fir_module_error(m);
+    if (!o.checkDce.empty() && err.find("check-dce") != std::string::npos)
+      llvm::errs() << o.file << ": the proved DCE checker refused -O's output: " << err << "\n";
+    else
+      llvm::errs() << o.file << ": the AArch64 backend can't compile this program: " << err
+                   << "\n";
     return 1;
   }
   if (o.emit == "asm")
@@ -269,6 +284,9 @@ int main(int argc, char **argv) {
     llvm::errs() << kUsage;
     return 2;
   }
+  // The library's -O pipeline runs the proved checker when this names a fir-ref.
+  if (!o.checkDce.empty())
+    setenv("FIR_CHECK_DCE", o.checkDce.c_str(), 1);
   std::vector<std::string> args = {"-target", "aarch64-unknown-linux-gnu", "-nostdlibinc"};
   std::string res = FAI_CC_RESOURCE_DIR;
   if (const char *r = std::getenv("FAI_CC_RESOURCE_DIR"); r && *r)

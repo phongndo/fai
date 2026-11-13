@@ -753,6 +753,10 @@ FirStatus fir_module_lower(struct FirModule *m, struct FirModule **out);
 
 // Verify a module and run the default pass pipeline on a copy, as `fir opt -O` does: `*out`
 // gets the optimized module, verified (free it with `fir_module_free`), and `m` is unchanged.
+// With `FIR_CHECK_DCE` naming a `fir-ref` in the environment, every step of dead code
+// elimination is also checked by the proved Lean checker, and a refusal is `FIR_ERR_COMPILE`;
+// on success the library writes one summary line to stderr
+// (`fir: check-dce: N steps accepted by Fir.Dce.checkModule (…)`).
 //
 // # Safety
 //
@@ -765,7 +769,8 @@ FirStatus fir_module_optimize(struct FirModule *m, struct FirModule **out);
 
 // Verify a module and compile it for `target` (`"aarch64"`, the only one so far) to GNU
 // assembly, as `fir compile --emit asm` does: HFIR is lowered to MFIR first, and with
-// `optimize` the default pass pipeline runs on the MFIR (`fir compile -O`). `*out` gets the
+// `optimize` the default pass pipeline runs on the MFIR (`fir compile -O`; with `FIR_CHECK_DCE`
+// set, as for `fir_module_optimize`, its dead code elimination is checked). `*out` gets the
 // assembly text; free it with `fir_string_free`. `FIR_ERR_COMPILE` if the module uses what the
 // backend doesn't support yet (integers wider than 64 bits, floats, holes, other data layouts).
 // Exceptions use an error-return convention: an exception that escapes a compiled function is

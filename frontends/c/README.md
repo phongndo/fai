@@ -8,8 +8,8 @@ C API only (`crates/fir-capi/include/fir.h`), verifies it, compiles it with `fir
 compiler, as `fir compile` does.
 
 ```
-fai-cc FILE.c [-O] [-o OUT] [--emit hfir|mfir|asm] [INPUT...] [-I DIR] [-D NAME[=V]]
-       [-l LIB] [-L DIR] [-- CLANG-FLAG...]
+fai-cc FILE.c [-O [--check-dce FIR-REF]] [-o OUT] [--emit hfir|mfir|asm] [INPUT...]
+       [-I DIR] [-D NAME[=V]] [-l LIB] [-L DIR] [-- CLANG-FLAG...]
 ```
 
 - Without `--emit`, `OUT` (default `a.out`) is an executable; an object file if it ends in `.o`;
@@ -18,6 +18,12 @@ fai-cc FILE.c [-O] [-o OUT] [--emit hfir|mfir|asm] [INPUT...] [-I DIR] [-D NAME[
 - `--emit hfir` prints the HFIR as lowered, `--emit mfir` the MFIR (optimized with `-O`), and
   `--emit asm` the assembly, to `OUT` or standard output.
 - `-I`, `-D`, `-U`, and `-std=` go to Clang, and so does everything after `--`.
+- `--check-dce FIR-REF` (with `-O`) has every step of dead code elimination checked by the proved
+  Lean checker (`FIR-REF` is `spec/.lake/build/bin/fir-ref`; see
+  `docs/assurance/dce.md`): a refusal fails the compilation, and one line
+  (`fir: check-dce: N steps accepted by Fir.Dce.checkModule (…)`) goes to stderr. The corpus test
+  builds each program's `-O` binary this way (required in `cargo xtask verify full`; the ABI
+  torture test's `-O` builds are not checked).
 - The linker is `$FIR_CC`, or `cc` on an AArch64 host and `aarch64-unknown-linux-gnu-cc` (the dev
   shell's cross compiler) elsewhere. Clang gets that compiler's system include directories after
   its own headers (Clang's resource directory, found when `fai-cc` is built, or

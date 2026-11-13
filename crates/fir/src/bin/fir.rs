@@ -9,8 +9,8 @@
 //!              [--dump-dir DIR] [--check-dce FIR-REF]
 //!                                            optimize, print canonical text
 //! fir opt --list-passes                      the passes, with what backs each
-//! fir compile FILE [-O] [-g] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]
-//!                                            compile to AArch64 (see `compile`)
+//! fir compile FILE [-O [--check-dce FIR-REF]] [-g] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs]
+//!             [--os linux|darwin]            compile to AArch64 (see `compile`)
 //! fir lower FILE [--no-locs]                  lower an HFIR module to MFIR and print it
 //! ```
 //!
@@ -34,7 +34,9 @@
 //! after every pass run to numbered files (`000-input.fir`, `001-r1-fwd.fir`, …; with
 //! `--print-changed`, only runs that changed something), to diff. `--check-dce FIR-REF` runs the
 //! proved Lean checker (`fir-ref check-dce`) on every step of `dce` in this run and fails if it
-//! refuses one (`fir::passes::reference`); `--stats` then says how many it checked and the time.
+//! refuses one (`fir::passes::reference`), and prints a summary on stderr (how many steps it checked, and the time).
+//! Without the flag, `FIR_CHECK_DCE=FIR-REF` in the environment does the same, as for
+//! `fir compile -O` and the C API.
 //! Experimental passes (unproved; `--list-passes` labels each pass) run only with
 //! `--experimental`, and are never in `-O`. A FILE of `-` is standard input.
 
@@ -119,7 +121,7 @@ fn run(args: &[&str]) -> Result<(), ExitCode> {
         }
         _ => {
             eprintln!(
-                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each] [--no-locs]\n         [--print-before P,...] [--print-after P,...] [--print-changed] [--dump-dir DIR] [--check-dce FIR-REF]\n  fir opt --list-passes\n  fir compile FILE [-O] [-g] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]\n  fir lower FILE [--no-locs]"
+                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each] [--no-locs]\n         [--print-before P,...] [--print-after P,...] [--print-changed] [--dump-dir DIR] [--check-dce FIR-REF]\n  fir opt --list-passes\n  fir compile FILE [-O [--check-dce FIR-REF]] [-g] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]\n  fir lower FILE [--no-locs]"
             );
             Err(ExitCode::from(2))
         }
@@ -267,15 +269,16 @@ fn opt(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
             "--print-changed" => dumps.changed_only = true,
             "--dump-dir" => dumps.dir = Some(value(&mut it, o)?.into()),
             "--check-dce" => {
-                let tool = value(&mut it, o)?;
-                let dir =
-                    std::env::temp_dir().join(format!("fir-check-dce-{}", std::process::id()));
-                check_dce = Some(CheckDce::new(tool, dir));
+                check_dce = Some(CheckDce::in_temp_dir(value(&mut it, o)?).map_err(fail)?);
             }
             _ => return Err(fail(format!("unknown option {o}"))),
         }
     }
     dumps.locs = locs;
+    // As `fir compile -O` and the C API do (`fir::backend::optimize`).
+    if check_dce.is_none() {
+        check_dce = CheckDce::from_env().map_err(fail)?;
+    }
     if dumps.changed_only && dumps.after.is_empty() && dumps.dir.is_none() {
         dumps.after.push("all".to_owned());
     }
@@ -302,9 +305,11 @@ fn opt(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
         Some(c) => c,
         None => &mut none,
     };
-    let report = pipeline
-        .run_observed(&mut m, &mut log, &mut Both(&mut dumps, checker))
-        .map_err(|e| fail(e.to_string()))?;
+    let report = pipeline.run_observed(&mut m, &mut log, &mut Both(&mut dumps, checker));
+    if let Some(c) = &check_dce {
+        c.finish();
+    }
+    let report = report.map_err(|e| fail(e.to_string()))?;
     fir::verify_module(&m)
         .map_err(|e| fail(format!("the optimized module doesn't verify: {e}")))?;
     for r in log.list() {
@@ -312,9 +317,10 @@ fn opt(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     }
     if stats {
         eprint!("{report}");
-        if let Some(c) = &check_dce {
-            eprintln!("{}", c.summary());
-        }
+    }
+    // A checked run always says so, as `fir compile` does.
+    if let Some(c) = &check_dce {
+        eprintln!("fir: {}", c.summary());
     }
     print!("{}", m.render(locs));
     Ok(())
@@ -329,6 +335,9 @@ fn opt(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
 /// `aarch64-unknown-linux-gnu-cc` (from the dev shell) elsewhere. Linux ELF by default, or the
 /// host's format on macOS; `--os` picks one. `-g` writes source lines (`.file`/`.loc`) for the
 /// assembler's DWARF line table, from the locations the LFIR carries (`Options::debug_lines`).
+/// `--check-dce FIR-REF` (with `-O`) checks every step of `dce` with the proved Lean checker, as
+/// `fir opt --check-dce` does, fails if it refuses one, and prints a summary on stderr; so does
+/// `FIR_CHECK_DCE=FIR-REF` in the environment (`fir::backend::optimize`).
 fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     use fir::backend::aarch64 as a64;
     let fail = |e: String| {
@@ -338,6 +347,7 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     let mut out = None;
     let mut emit = None;
     let mut optimize = false;
+    let mut check_dce = None;
     let mut o = a64::Options::default();
     let mut it = opts.iter();
     while let Some(&opt) = it.next() {
@@ -352,6 +362,7 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
         match (opt, it.next()) {
             ("-o", Some(&v)) => out = Some(v),
             ("--emit", Some(&v)) => emit = Some(v),
+            ("--check-dce", Some(&v)) => check_dce = Some(v),
             ("--os", Some(&"linux")) => o.os = a64::Os::Linux,
             ("--os", Some(&"darwin")) => o.os = a64::Os::Darwin,
             _ => {
@@ -362,7 +373,21 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     }
     let m = fir::parse_module(&read(file)?).map_err(fail)?;
     fir::verify_module(&m).map_err(fail)?;
-    let m = fir::backend::prepare(&m, optimize).map_err(fail)?;
+    let m = match check_dce {
+        None => fir::backend::prepare(&m, optimize).map_err(fail)?,
+        Some(_) if !optimize => {
+            eprintln!("fir compile: --check-dce checks the -O pipeline's dce; add -O");
+            return Err(ExitCode::from(2));
+        }
+        Some(tool) => {
+            let mut c = fir::passes::reference::CheckDce::in_temp_dir(tool).map_err(fail)?;
+            let r = fir::backend::prepare_observed(&m, true, &mut c);
+            c.finish();
+            let m = r.map_err(fail)?;
+            eprintln!("fir: {}", c.summary());
+            m
+        }
+    };
     let write = |text: String| -> Result<(), ExitCode> {
         match out {
             Some(p) => std::fs::write(p, text).map_err(|e| {

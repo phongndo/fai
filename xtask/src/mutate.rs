@@ -357,6 +357,24 @@ fn mutations() -> Vec<Mutation> {
             in_decl: None,
         },
         Mutation {
+            name: "compiler-ignores-check-dce",
+            what: "the compiler's -O path ignores FIR_CHECK_DCE, so `fai-cc -O --check-dce` and the C API would check nothing; the compile-path test finds no checker summary",
+            edits: vec![edit(
+                "crates/fir/src/backend/mod.rs",
+                "    let Some(mut check) = CheckDce::from_env()? else {",
+                "    let Some(mut check) = CheckDce::from_env()?.filter(|_| false) else {",
+            )],
+            steps: vec![test(&[
+                "-p",
+                "fir",
+                "--test",
+                "dce_check",
+                "the_compiler_runs_the_proved_checker",
+            ])],
+            expect: vec!["FIR_CHECK_DCE: no summary"],
+            in_decl: None,
+        },
+        Mutation {
             name: "dce-checker-also-wrong",
             what: "the planner and the Rust checker both wrong (a checker bug); the Lean-proved checker refuses the output",
             edits: vec![

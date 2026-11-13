@@ -3,7 +3,8 @@
 //! For every verified fixture and `FIR_FUZZ` (default 200) random programs, and the MFIR their
 //! lowering gives: the other passes run first (`fwd,copyprop,dse`, so there are dead copies to
 //! delete), then the Rust pass (`plan`, the Rust `check`, `apply`), and `fir-ref check-dce`
-//! runs `Fir.Dce.checkFunc` on the module before and after it. `Fir.Dce.checkFunc_sound` says
+//! runs `Fir.Dce.checkModule` on the module before and after it (`Fir.Dce.checkFuncL` on each
+//! pair of functions, proved equal to `Fir.Dce.checkFunc`). `Fir.Dce.checkModule_sound` says
 //! that, conditional on `Decided`, each accepted function refines its source in the fixed source
 //! module. The receipt binds this evidence to both complete snapshots; this does not prove
 //! refinement when composing the changed functions into a different module.
@@ -18,6 +19,13 @@
 //! be refused by the Lean checker (or, where the deletion leaves a use without a definition, by
 //! the verifier before it); and an op changed rather than deleted must be refused by the Lean
 //! checker.
+
+//!
+//! Last, the compiler's own entry points: `fir compile -O --check-dce FIR-REF`, and
+//! `FIR_CHECK_DCE=FIR-REF` with no flag (what `fai-cc -O --check-dce` and the C API use, and
+//! `fir opt -O` honours), must run
+//! the proved checker on a module with deletions, and must fail when the `fir-ref` they are given
+//! refuses, or accepts with a receipt for other modules.
 
 #[allow(dead_code)]
 mod common;
@@ -652,4 +660,144 @@ fn the_rust_and_lean_checkers_agree_on_random_candidates() {
         fails.len(),
         fails.join("\n")
     );
+}
+
+/// A fixture whose `-O` deletes ops (219 of them, in one step of `dce`).
+const DELETES: &str = "tests/abi/classes.fir";
+
+fn fir_compile(file: &Path, flag: Option<&Path>, env: Option<&Path>) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fir"));
+    cmd.arg("compile").arg(file).args(["-O", "--emit", "mfir"]);
+    if let Some(t) = flag {
+        cmd.arg("--check-dce").arg(t);
+    }
+    cmd.env_remove(fir::passes::reference::ENV);
+    if let Some(t) = env {
+        cmd.env(fir::passes::reference::ENV, t);
+    }
+    cmd.output().unwrap()
+}
+
+/// A stand-in for `fir-ref` that runs `body` as a shell script.
+fn fake_fir_ref(name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = scratch().join(name);
+    std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+#[test]
+fn the_compiler_runs_the_proved_checker_when_asked() {
+    let Some(tool) = common::reference() else {
+        return;
+    };
+    let ev = Evidence::new("dce_compile");
+    let file = common::repo().join(DELETES);
+    let plain = fir_compile(&file, None, None);
+    assert!(plain.status.success());
+    assert!(
+        plain.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    for (how, out) in [
+        ("--check-dce", fir_compile(&file, Some(&tool), None)),
+        ("FIR_CHECK_DCE", fir_compile(&file, None, Some(&tool))),
+    ] {
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{how}: {err}");
+        // The checked compilation produces the same module as the unchecked one.
+        assert_eq!(out.stdout, plain.stdout, "{how}");
+        let steps: u64 = err
+            .strip_prefix("fir: check-dce: ")
+            .and_then(|r| r.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{how}: no summary: {err}"));
+        assert!(
+            steps > 0 && err.contains("accepted by Fir.Dce.checkModule"),
+            "{how}: {err}"
+        );
+        ev.count(format!("checked compilations ({how})"), 1);
+        ev.count("dce steps accepted by Fir.Dce.checkModule", steps);
+    }
+    // `fir opt -O` honours the variable too.
+    let opt = Command::new(env!("CARGO_BIN_EXE_fir"))
+        .arg("opt")
+        .arg(&file)
+        .arg("-O")
+        .env(fir::passes::reference::ENV, &tool)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&opt.stderr);
+    assert!(
+        opt.status.success() && err.contains("accepted by Fir.Dce.checkModule"),
+        "fir opt: {err}"
+    );
+    // A checker that refuses, or that accepts something else, fails the compilation.
+    let refuses = fake_fir_ref("refusing-fir-ref", "echo 'no' >&2; exit 1");
+    let other = fake_fir_ref(
+        "other-receipt-fir-ref",
+        "echo 'ok 1'; echo 'source:'; exit 0",
+    );
+    for (tool, want) in [(&refuses, "refused it"), (&other, "receipt doesn't match")] {
+        for out in [
+            fir_compile(&file, Some(tool), None),
+            fir_compile(&file, None, Some(tool)),
+        ] {
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !out.status.success() && err.contains(want),
+                "{}: {err}",
+                tool.display()
+            );
+            ev.count("checker objections that failed the compilation", 1);
+        }
+    }
+    // A path that isn't an executable file fails even where nothing would be sent to the
+    // checker.
+    let text = scratch().join("not-executable-fir-ref");
+    std::fs::write(&text, "not a program\n").unwrap();
+    let out = fir_compile(
+        &common::repo().join("tests/fir1/calls.fir"),
+        None,
+        Some(&text),
+    );
+    assert!(
+        !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("no executable"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = fir_compile(
+        &common::repo().join("tests/fir1/calls.fir"),
+        None,
+        Some(Path::new("/nonexistent/fir-ref")),
+    );
+    assert!(
+        !out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    ev.write();
+}
+
+/// Found in review: snapshots were written through whatever was at their path, so a symlink
+/// planted there redirected the write. They replace the link instead.
+#[test]
+fn snapshots_are_not_written_through_symlinks() {
+    let Some(tool) = common::reference() else {
+        return;
+    };
+    let dir = scratch().join("symlinked-snapshots");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let victim = dir.join("victim.txt");
+    std::fs::write(&victim, "keep me\n").unwrap();
+    for end in ["src", "tgt"] {
+        std::os::unix::fs::symlink(&victim, dir.join(format!("step.{end}.fir"))).unwrap();
+    }
+    let m = fir::parse_module(KEPT).unwrap();
+    let n = fir::passes::reference::check_dce(&tool, &dir, "step", &m, &m).unwrap();
+    assert_eq!(n, m.funcs.len() as u64);
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me\n");
 }
