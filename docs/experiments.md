@@ -86,12 +86,24 @@ proof, and nothing here connects a measurement to the Lean theorems.
 
 ## Safety
 
-* Nothing outside `target/experiments/NAME/` (and the shared `target/experiments/.baseline-target`
-  build directory) is written. A baseline revision's worktree is removed when the experiment ends.
+* Nothing tracked is written, and nothing outside build outputs: the report, both measured
+  `fir` binaries (copied, so a concurrent build can't swap one mid-run), and the gate's logs and
+  evidence go to `target/experiments/NAME/`; the candidate builds where cargo builds
+  (`target/`, or `$CARGO_TARGET_DIR`), the baseline in `target/experiments/.baseline-target`,
+  both `--locked`; the gate's suites write their scratch files under `target/tmp/`, and its
+  `lake build` updates `spec/.lake/` (a no-op when the Lean build is current). A baseline
+  revision's worktree is removed when the experiment ends (a warning says so if it can't be),
+  and a killed run's registration is pruned by the next one.
 * The variables that weaken checks (`FIR_REF`, `FIR_FUZZ`, `FIR_CC`, …: `CLEARED` in
   `xtask/src/main.rs`) are cleared for every child; the gate sets only what it means to.
-* The candidate's tree is identified by revision, whether it is dirty, and a hash of its diff,
-  so a report can't be mistaken for one of another tree.
+* The candidate's tree is identified by revision, whether it is dirty, and a hash of its diff
+  and of every untracked file's name and contents, so a report can't be mistaken for one of
+  another tree.
+* A module either side can't measure at all (`fir measure` crashing, or exiting other than 0
+  or 1) rejects the experiment: it can't silently drop out of the comparison. One that neither
+  side can *prepare* (LFIR inputs, lowering limits) is listed as unmeasured.
+* The gate tests exactly the pipeline measured: every suite runs `FIR_PASSES` to a fixed point,
+  as `fir measure` does, and records it; `--none` (no passes) can only be measured.
 * `cargo xtask mutate experiment-rejects-a-miscompile` plants a miscompile (forwarding a store to
   a load through a *different* pointer) and requires the experiment to reject it, so the harness
   is itself tested the way the other checkers are (`docs/assurance/adversarial.md`).

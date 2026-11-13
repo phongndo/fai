@@ -188,6 +188,12 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     } else if experimental {
         return Err("--experimental goes with --passes".into());
     }
+    // The suites take a pipeline as `FIR_PASSES` (empty means `-O`): no passes can't be gated.
+    if o.gate && o.cand == Pipe::None {
+        return Err(
+            "--none can only be measured (--gate none): the gate's suites need passes".into(),
+        );
+    }
     if o.fuzz == 0 || o.jobs == 0 {
         return Err("--fuzz and --jobs must be positive".into());
     }
@@ -240,12 +246,17 @@ fn git(root: &Path, args: &[&str]) -> String {
 /// The revision, whether the tree is dirty, and a hash of its diff against that revision.
 fn identity(root: &Path) -> Value {
     let dirty = !git(root, &["status", "--porcelain"]).is_empty();
-    let diff = Command::new("git")
+    let mut diff = Command::new("git")
         .args(["diff", "HEAD", "--binary"])
         .current_dir(root)
         .output()
         .map(|o| o.stdout)
         .unwrap_or_default();
+    // Untracked files can be build inputs (a new pass): their names and contents count too.
+    for f in git(root, &["ls-files", "--others", "--exclude-standard"]).lines() {
+        diff.extend_from_slice(format!("\0untracked {f}\0").as_bytes());
+        diff.extend(std::fs::read(root.join(f)).unwrap_or_default());
+    }
     let hash = Command::new("git")
         .args(["hash-object", "--stdin"])
         .current_dir(root)
@@ -263,6 +274,7 @@ fn identity(root: &Path) -> Value {
         "revision": git(root, &["rev-parse", "HEAD"]),
         "branch": git(root, &["rev-parse", "--abbrev-ref", "HEAD"]),
         "dirty": dirty,
+        // Of `git diff HEAD` and every untracked file's name and contents.
         "diff hash": if dirty { hash } else { String::new() },
         "untracked files": git(root, &["ls-files", "--others", "--exclude-standard"]).lines().count(),
     })
@@ -320,9 +332,11 @@ fn measure_all(
                         .output();
                     let r = match out {
                         Err(e) => Err(format!("can't run {}: {e}", fir.display())),
+                        // `fir measure` exits 0 or 1 with its JSON; anything else (a panic, a
+                        // crash, bad usage) is a harness failure, whatever it printed.
                         Ok(o) => match serde_json::from_slice::<Value>(&o.stdout) {
-                            Ok(v) => Ok(v),
-                            Err(_) => Err(format!(
+                            Ok(v) if matches!(o.status.code(), Some(0 | 1)) => Ok(v),
+                            _ => Err(format!(
                                 "fir measure exited with {}: {}",
                                 o.status,
                                 String::from_utf8_lossy(&o.stderr).trim()
@@ -340,16 +354,20 @@ fn measure_all(
         .collect()
 }
 
-/// Build `fir` in release from the tree at `dir`, into `target`; the binary.
-fn build_fir(dir: &Path, target: &Path, log: &Path) -> Result<PathBuf, String> {
+/// Build `fir` in release from the tree at `dir`, into `target` (with the tree's own lock file),
+/// and copy the binary to `keep`, so another build into `target` (another experiment) can't
+/// replace it while this one measures; the copy.
+fn build_fir(dir: &Path, target: &Path, log: &Path, keep: &Path) -> Result<PathBuf, String> {
     let mut c = clean("cargo", dir);
-    c.args(["build", "--release", "--bin", "fir"])
+    c.args(["build", "--release", "--locked", "--bin", "fir"])
         .env("CARGO_TARGET_DIR", target);
     let (ok, tail) = logged(c, log);
     if !ok {
         return Err(format!("building fir in {} failed:\n{tail}", dir.display()));
     }
-    Ok(target.join("release/fir"))
+    std::fs::copy(target.join("release/fir"), keep)
+        .map_err(|e| format!("copying fir to {}: {e}", keep.display()))?;
+    Ok(keep.to_owned())
 }
 
 /// The worktree a baseline revision is checked out in, removed when dropped.
@@ -360,11 +378,17 @@ struct Worktree<'a> {
 
 impl Drop for Worktree<'_> {
     fn drop(&mut self) {
-        let _ = Command::new("git")
+        let removed = Command::new("git")
             .args(["worktree", "remove", "--force"])
             .arg(&self.path)
             .current_dir(self.root)
             .output();
+        if !removed.is_ok_and(|o| o.status.success()) {
+            eprintln!(
+                "warning: couldn't remove the baseline worktree {}: remove it with `git worktree remove --force` (the next experiment prunes it)",
+                self.path.display()
+            );
+        }
     }
 }
 
@@ -472,7 +496,12 @@ fn problems(files: &[String], base: &[Measured], cand: &[Measured]) -> (Vec<Stri
     for (i, f) in files.iter().enumerate() {
         let berr = match &base[i] {
             Ok(b) => b["error"].as_str().map(str::to_owned),
-            Err(e) => Some(e.clone()),
+            // The baseline couldn't be measured at all (not a refusal to prepare): the module
+            // would silently drop out of the comparison.
+            Err(e) => {
+                bad.push(format!("{f}: the baseline's measurement failed: {e}"));
+                continue;
+            }
         };
         match &cand[i] {
             Err(e) => bad.push(format!("{f}: the candidate's measurement failed: {e}")),
@@ -573,7 +602,14 @@ fn gate(root: &Path, out: &Path, o: &Opts, run_id: &str) -> Gate {
     let _ = std::fs::remove_dir_all(&evidence);
     let start = Instant::now();
     let mut c = clean("cargo", root);
-    c.args(["test", "--release", "--no-fail-fast", "-p", "fir"]);
+    c.args([
+        "test",
+        "--release",
+        "--locked",
+        "--no-fail-fast",
+        "-p",
+        "fir",
+    ]);
     for (t, _) in GATE {
         c.args(["--test", t]);
     }
@@ -712,7 +748,12 @@ pub fn main(root: &Path, args: &[String]) -> i32 {
     let cand_target = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("target"));
-    let cand_fir = match build_fir(root, &cand_target, &out.join("build-candidate.log")) {
+    let cand_fir = match build_fir(
+        root,
+        &cand_target,
+        &out.join("build-candidate.log"),
+        &out.join("fir-candidate"),
+    ) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{e}");
@@ -724,6 +765,12 @@ pub fn main(root: &Path, args: &[String]) -> i32 {
         None => (cand_fir.clone(), cand_id.clone()),
         Some(rev) => {
             let path = out.join("baseline-tree");
+            // A run that was killed leaves its worktree registered; its directory went with
+            // `out` above, so pruning unregisters it.
+            let _ = Command::new("git")
+                .args(["worktree", "prune"])
+                .current_dir(root)
+                .output();
             let added = Command::new("git")
                 .args(["worktree", "add", "--detach", "--quiet"])
                 .arg(&path)
@@ -750,7 +797,12 @@ pub fn main(root: &Path, args: &[String]) -> i32 {
             });
             // A target directory of its own, kept between experiments so the next one is fast.
             let target = root.join("target/experiments/.baseline-target");
-            match build_fir(&path, &target, &out.join("build-baseline.log")) {
+            match build_fir(
+                &path,
+                &target,
+                &out.join("build-baseline.log"),
+                &out.join("fir-baseline"),
+            ) {
                 Ok(p) => (p, identity(&path)),
                 Err(e) => {
                     eprintln!("{e}");
@@ -1136,6 +1188,13 @@ mod tests {
         assert!(bad[0].contains("doesn't refine"));
         assert!(bad[1].contains("the baseline prepares it"));
         assert_eq!(unmeasured.len(), 1);
+        // A baseline that couldn't be measured at all is a problem, not a missing module.
+        let base: Vec<Measured> = vec![Err("fir measure exited with 101".into())];
+        let (bad, _) = problems(&files[..1], &base, &[m(1, 1, 1)]);
+        assert!(
+            bad[0].contains("the baseline's measurement failed"),
+            "{bad:?}"
+        );
     }
 
     #[test]
@@ -1152,5 +1211,7 @@ mod tests {
         assert!(!o.gate);
         assert!(parse(&a("../x")).is_err());
         assert!(parse(&a("x --experimental")).is_err());
+        assert!(parse(&a("x --none")).is_err(), "no passes can't be gated");
+        assert!(parse(&a("x --none --gate none")).is_ok());
     }
 }

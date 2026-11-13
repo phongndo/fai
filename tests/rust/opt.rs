@@ -15,7 +15,8 @@
 //! on, and the lowering is optimized and compared the same way (with 16 times the fuel); the
 //! statistics count the programs with exceptions and their runs.
 //!
-//! `FIR_PASSES=p,q` tests that pipeline instead of `-O` (experimental passes included).
+//! `FIR_PASSES=p,q` tests that pipeline instead of `-O`, to a fixed point (experimental passes
+//! included).
 //! By default 200 programs run; `FIR_FUZZ=N` runs N, `FIR_FUZZ_SEED=S` picks another seed (as in
 //! `fuzz.rs`). The test prints how often each pass fired and how the runs compared. Failing
 //! programs are written to `target/tmp/opt/`, with their optimized form. `FIR_REF=none` skips
@@ -136,12 +137,14 @@ fn refines_exactly(t: &Result<String, String>, s: &Result<String, String>) -> Re
     }
 }
 
-/// The pipeline under test: the default `-O` one, or `FIR_PASSES=p,q,…` (run once each, in
-/// order; experimental passes allowed), so a new or experimental pass gets this whole
-/// differential suite without editing it. A full verification clears `FIR_PASSES`.
+/// The pipeline under test: the default `-O` one, or `FIR_PASSES=p,q,…` (in order, to a fixed
+/// point, as `fir compile --passes`, `fir measure`, and the backend suites run it; experimental
+/// passes allowed), so a new or experimental pass gets this whole differential suite without
+/// editing it, in the same configuration `cargo xtask experiment` measures. A full verification
+/// clears `FIR_PASSES`.
 fn pipeline() -> Pipeline {
     match std::env::var("FIR_PASSES") {
-        Ok(spec) if !spec.is_empty() => Pipeline::parse_experimental(&spec).expect("FIR_PASSES"),
+        Ok(spec) if !spec.is_empty() => Pipeline::parse_fixpoint(&spec, true).expect("FIR_PASSES"),
         _ => Pipeline::default_opt(),
     }
 }

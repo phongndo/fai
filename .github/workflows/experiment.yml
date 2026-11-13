@@ -57,6 +57,7 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@v16
       - uses: DeterminateSystems/magic-nix-cache-action@v8
       - name: Experiment
+        shell: bash
         run: |
           args=("$NAME" --gate "$GATE" --fuzz "$FUZZ")
           if [ -n "$PASSES" ]; then args+=(--passes "$PASSES"); fi

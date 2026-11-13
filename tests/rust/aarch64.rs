@@ -207,8 +207,8 @@ fn known_limit(e: &str) -> Option<&'static str> {
 
 /// Why emitting for macOS failed, if it is what the backend declares it doesn't support there yet
 /// (Apple's AAPCS64 variant: variadic arguments on the stack, composites passed on the stack).
-/// Only a macOS host emits for macOS, and only after selection and allocation, which don't
-/// depend on the OS, succeeded; anything else failing there is a failure.
+/// Only a macOS host emits for macOS; the module's selection and allocation, which don't depend
+/// on the OS, are still checked (see the caller), and anything else failing there is a failure.
 fn darwin_limit(e: &str) -> Option<&'static str> {
     [
         (
@@ -603,11 +603,22 @@ fn check_module(
         let bin = match build(tc, bm, &runs, dir, &bname) {
             Ok(b) => b,
             Err(e) if a64::Os::host() == a64::Os::Darwin && darwin_limit(&e).is_some() => {
+                // Emitting for macOS refuses before selection, so select, allocate (which
+                // validates the allocation), and verify this exact module's LFIR first: only
+                // the emission and the native run are left out.
+                if let Err(le) = lfir_modules(bm) {
+                    tally
+                        .lock()
+                        .unwrap()
+                        .fails
+                        .push(format!("{name} ({what}): LFIR: {le}"));
+                    return false;
+                }
                 let why = darwin_limit(&e).unwrap();
                 tally
                     .lock()
                     .unwrap()
-                    .count(format!("{what} not built: {why}"));
+                    .count(format!("{what} not built, its LFIR checked: {why}"));
                 continue;
             }
             Err(e) => {

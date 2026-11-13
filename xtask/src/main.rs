@@ -109,20 +109,48 @@ pub(crate) fn host() -> String {
 
 /// Why this host can't run `subject`, if [`HOST_GAPS`] says so.
 pub(crate) fn host_gap_reason(subject: &str) -> Option<&'static str> {
-    let h = host();
+    gap_on(&host(), subject)
+}
+
+/// Why host `h` can't run `subject`, if [`HOST_GAPS`] says so.
+fn gap_on(h: &str, subject: &str) -> Option<&'static str> {
     HOST_GAPS
         .iter()
         .find(|(gh, s, _)| *gh == h && *s == subject)
         .map(|(_, _, why)| *why)
 }
 
-/// The problems a host gap excuses, moved out of `bad`: a problem about a suite whose evidence
-/// is missing or declares a host gap, or about the coverage of a component (or one of its ops)
-/// that this host can't exercise, when [`HOST_GAPS`] declares it for this host.
-fn excuse_host_gaps(bad: Vec<String>, evs: &BTreeMap<String, Value>) -> (Vec<String>, Vec<String>) {
+/// The problems a host gap excuses, moved out of `bad`, when [`HOST_GAPS`] declares the gap for
+/// this host: a missing count or native runner of a suite whose evidence is from this run
+/// (`run`, when given) and says `host gap`, or the coverage of a component (or one of its ops)
+/// this host can't exercise. Never excused: a suite with no evidence, evidence from another
+/// run, a skip, or a failure, whatever the gap.
+fn excuse_host_gaps(
+    bad: Vec<String>,
+    evs: &BTreeMap<String, Value>,
+    run: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
+    excuse_on(&host(), bad, evs, run)
+}
+
+fn excuse_on(
+    h: &str,
+    bad: Vec<String>,
+    evs: &BTreeMap<String, Value>,
+    run: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
     let mut kept = Vec::new();
     let mut excused = Vec::new();
     for b in bad {
+        let integrity = b.contains(": evidence from another run")
+            || b.contains(": skipped ")
+            || b.contains(" failures")
+            || b.contains(": no evidence")
+            || b.contains("not built with -fsanitize");
+        if integrity {
+            kept.push(b);
+            continue;
+        }
         let reason = if let Some(rest) = b.strip_prefix("coverage: ") {
             // `coverage: COMP claims support for op OP, but …`
             let mut w = rest.split_whitespace();
@@ -131,14 +159,15 @@ fn excuse_host_gaps(bad: Vec<String>, evs: &BTreeMap<String, Value>) -> (Vec<Str
                 .split_once(" claims support for op ")
                 .and_then(|(_, r)| r.split(',').next())
                 .unwrap_or("");
-            host_gap_reason(&format!("coverage {comp}"))
-                .or_else(|| host_gap_reason(&format!("coverage {comp} {op}")))
+            gap_on(h, &format!("coverage {comp}"))
+                .or_else(|| gap_on(h, &format!("coverage {comp} {op}")))
         } else {
             let suite = b.split(':').next().unwrap_or("");
-            let gapped = evs
-                .get(suite)
-                .is_none_or(|ev| ev["facts"]["host gap"].is_string());
-            host_gap_reason(suite).filter(|_| gapped)
+            let gapped = evs.get(suite).is_some_and(|ev| {
+                ev["facts"]["host gap"].is_string()
+                    && run.is_none_or(|r| ev["run"].as_str() == Some(r))
+            });
+            gap_on(h, suite).filter(|_| gapped)
         };
         match reason {
             Some(why) => excused.push(format!("{b} (host gap: {why})")),
@@ -1145,7 +1174,7 @@ fn main() {
             // runs): used by `mutate` to show the check refuses incomplete evidence.
             let evs = load_evidence(Path::new(&args[1]));
             let (bad, _) = check_evidence(&root, &evs, None, None);
-            let (bad, _) = excuse_host_gaps(bad, &evs);
+            let (bad, _) = excuse_host_gaps(bad, &evs, None);
             for b in &bad {
                 eprintln!("{b}");
             }
@@ -1244,7 +1273,12 @@ fn main() {
                 Some(&v.run_id),
             );
             coverage.insert(profile.to_owned(), table);
-            let (bad, excused) = excuse_host_gaps(bad, &evs);
+            // The sanitizer run's suites are judged by their own evidence.
+            let mut all = evs.clone();
+            if profile == "debug" {
+                all.extend(asan.iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
+            let (bad, excused) = excuse_host_gaps(bad, &all, Some(&v.run_id));
             unverified.extend(excused);
             let name = format!("evidence ({profile})");
             if bad.is_empty() {
@@ -1267,7 +1301,7 @@ fn main() {
         v.skip("evidence", "fast mode doesn't require complete evidence");
         let evs = load_evidence(&ev_debug);
         let (bad, table) = check_evidence(&root, &evs, None, Some(&v.run_id));
-        let (bad, excused) = excuse_host_gaps(bad, &evs);
+        let (bad, excused) = excuse_host_gaps(bad, &evs, Some(&v.run_id));
         v.coverage = json!({"debug (informational)": table, "problems (informational)": bad, "excused by host gaps (informational)": excused});
     }
     let failed = v
@@ -1582,6 +1616,38 @@ fn matrix(paths: &[String]) -> i32 {
 #[cfg(test)]
 mod evidence_tests {
     use super::*;
+
+    /// Found in review: a declared gap excused everything about its suite, including stale
+    /// evidence, skips, and failures, and a suite with no evidence at all.
+    #[test]
+    fn host_gaps_excuse_only_missing_work_of_fresh_gap_evidence() {
+        let (h, suite) = ("aarch64-macos", "x86_64_fixtures");
+        assert!(gap_on(h, suite).is_some());
+        let gap = |run: &str| json!({"run": run, "facts": {"host gap": "why"}, "skipped": []});
+        let evs = BTreeMap::from([(suite.to_string(), gap("r1"))]);
+        let bad = vec![
+            format!("{suite}: native matches is 0"),
+            format!("{suite}: evidence from another run (\"r0\")"),
+            format!("{suite}: skipped \"x\""),
+            format!("{suite}: 3 failures"),
+        ];
+        let (kept, excused) = excuse_on(h, bad.clone(), &evs, Some("r1"));
+        assert_eq!(excused.len(), 1, "{excused:?}");
+        assert_eq!(kept.len(), 3, "{kept:?}");
+        // Gap evidence from another run excuses nothing; neither does no evidence.
+        let (kept, _) = excuse_on(h, bad.clone(), &evs, Some("r2"));
+        assert_eq!(kept.len(), 4);
+        let (kept, _) = excuse_on(h, bad.clone(), &BTreeMap::new(), Some("r1"));
+        assert_eq!(kept.len(), 4);
+        // And no host but the declared one excuses anything.
+        let (kept, _) = excuse_on("x86_64-linux", bad, &evs, Some("r1"));
+        assert_eq!(kept.len(), 4);
+    }
+
+    #[test]
+    fn linux_hosts_declare_no_gaps() {
+        assert!(HOST_GAPS.iter().all(|g| !g.0.ends_with("-linux")));
+    }
 
     #[test]
     fn static_presence_and_zero_counts_do_not_satisfy_execution_coverage() {

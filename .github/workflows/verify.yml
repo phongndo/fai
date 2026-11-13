@@ -85,7 +85,9 @@ jobs:
           pattern: verify-report-*
           path: reports
       - name: Cross-host matrix
-        # Only xtask and serde_json build: the runner's own Rust is enough.
+        # Only xtask and serde_json build: the runner's own Rust is enough. `shell: bash` sets
+        # pipefail, so a failing `cargo xtask matrix` fails the step despite `tee`.
+        shell: bash
         run: |
           shopt -s nullglob
           files=(reports/*/report.json)
