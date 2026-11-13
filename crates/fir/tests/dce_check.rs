@@ -430,3 +430,226 @@ fn check_dce_checks_steps_that_report_no_changes_but_change_the_module() {
         .unwrap();
     assert_eq!((checker.steps, checker.unchanged), (1, 1));
 }
+
+/// Every op of a body, outer before inner, as the pass walks them.
+fn all_ops(b: &fir::Body) -> Vec<fir::OpId> {
+    let mut out = Vec::new();
+    let mut stack = vec![b.ops(b.entry())];
+    while let Some(it) = stack.last_mut() {
+        match it.next() {
+            Some(op) => {
+                out.push(op);
+                for &r in b.regions(op).iter().rev() {
+                    stack.push(b.ops(r));
+                }
+            }
+            None => {
+                stack.pop();
+            }
+        }
+    }
+    out
+}
+
+/// How the Lean side judged one candidate deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Accepted,
+    /// The deletion leaves a use without its definition: the verifier refuses the module (Rust's
+    /// and, when `fir-ref` loads it, Lean's), so the Lean checker never sees it.
+    Unverifiable,
+    /// `fir-ref check-dce` refused it.
+    LeanRefused,
+}
+
+/// The production Rust checker (`passes::dce::check`) and the proved Lean one (`Fir.Dce.checkFunc`)
+/// must agree on what a deletion may be, not only on the pass's own plans: for each module, random
+/// candidates go to both checkers: each kind of unread op the plan leaves (calls, loads,
+/// `freeze`, terminators, …) deleted alone, once per function, and random mixes of one to three
+/// ops from the plan, from those unread ops, or from any op. A candidate the Rust checker
+/// accepts and the proved checker refuses would mean the compiler's checker is weaker than the
+/// proved one; one the proved checker accepts and Rust refuses, that Rust is stricter. Neither
+/// may occur. This is evidence on the inputs tried, not a proof of correspondence.
+#[test]
+fn the_rust_and_lean_checkers_agree_on_random_candidates() {
+    let ev = Evidence::new("dce_agreement");
+    let Some(tool) = common::reference() else {
+        ev.skip("no Lean reference");
+        ev.write();
+        return;
+    };
+    let count = env_u64("FIR_FUZZ", 200) / 4;
+    let seed = env_u64("FIR_FUZZ_SEED", 1);
+    let mut modules: Vec<(String, fir::Module)> = Vec::new();
+    for file in common::fir_files() {
+        let text = std::fs::read_to_string(&file).unwrap();
+        let Ok(m) = fir::parse_module(&text) else {
+            continue;
+        };
+        if fir::verify_module(&m).is_err() || matches!(m.layer, fir::Layer::Lfir(_)) {
+            continue;
+        }
+        modules.push((common::display_name(&file).replace(['/', '.'], "_"), m));
+    }
+    for k in 0..count {
+        let mut rng = progs::Rng::new(seed.wrapping_mul(0x2_0000_0003) ^ k);
+        let m = fir::parse_module(&progs::program(&mut rng).text).unwrap();
+        modules.push((format!("agree-s{seed}-p{k}"), m));
+    }
+    let tally = Mutex::new(std::collections::BTreeMap::<&'static str, u64>::new());
+    let fails = Mutex::new(Vec::new());
+    let next = Mutex::new(0usize);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                loop {
+                    let i = {
+                        let mut n = next.lock().unwrap();
+                        *n += 1;
+                        *n - 1
+                    };
+                    let Some((name, m)) = modules.get(i) else {
+                        return;
+                    };
+                    let mut src = m.clone();
+                    if Pipeline::parse("fwd,copyprop,dse")
+                        .unwrap()
+                        .run(&mut src, &mut Remarks::new(false))
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    let mut rng = progs::Rng::new(seed ^ (i as u64).wrapping_mul(0x9e37));
+                    let mut cands: Vec<(usize, Vec<fir::OpId>)> = Vec::new();
+                    for f in 0..src.funcs.len() {
+                        let b = &src.funcs[f].body;
+                        let ops = all_ops(b);
+                        if ops.is_empty() {
+                            continue;
+                        }
+                        let planned = dce::plan(b, Policy::VerifiedOnly).erase;
+                        // Unread ops the plan leaves: deleting one still verifies, so only
+                        // a checker can refuse it.
+                        let mut read = std::collections::HashSet::new();
+                        for &op in &ops {
+                            for o in b.operands(op) {
+                                if let fir::OperandKind::Value(v) = o.get() {
+                                    read.insert(v);
+                                }
+                            }
+                        }
+                        let kept: Vec<fir::OpId> = ops
+                            .iter()
+                            .copied()
+                            .filter(|&op| {
+                                !planned.contains(&op) && b.results(op).all(|v| !read.contains(&v))
+                            })
+                            .collect();
+                        // One of each kind kept, alone, so rare kinds (an unread `freeze`)
+                        // are always tried; then random mixes.
+                        let mut kinds = std::collections::HashSet::new();
+                        for &op in &kept {
+                            if kinds.insert(b.kind(op)) {
+                                cands.push((f, vec![op]));
+                            }
+                        }
+                        for _ in 0..4 {
+                            let mut erase = Vec::new();
+                            for _ in 0..1 + rng.below(3) {
+                                let r = rng.below(10);
+                                let pool = if !planned.is_empty() && r < 4 {
+                                    &planned
+                                } else if !kept.is_empty() && r < 8 {
+                                    &kept
+                                } else {
+                                    &ops
+                                };
+                                let op = pool[rng.below(pool.len() as u64) as usize];
+                                if !erase.contains(&op) {
+                                    erase.push(op);
+                                }
+                            }
+                            cands.push((f, erase));
+                        }
+                    }
+                    for (c, (f, erase)) in cands.into_iter().enumerate() {
+                        let mut body = src.funcs[f].body.clone();
+                        let rust_ok = dce::check(
+                            &mut body,
+                            Candidate {
+                                erase: erase.clone(),
+                            },
+                            Policy::VerifiedOnly,
+                        )
+                        .is_ok();
+                        // A deletion that leaves a read of its result can't be written out
+                        // (`erase_many` refuses it in debug builds; the verifier would).
+                        let b = &src.funcs[f].body;
+                        // Erasing an op erases the ops in its regions too.
+                        let mut gone = erase.clone();
+                        let mut i = 0;
+                        while i < gone.len() {
+                            for &r in b.regions(gone[i]) {
+                                gone.extend(b.ops(r));
+                            }
+                            i += 1;
+                        }
+                        let dangling = all_ops(b).into_iter().any(|op| {
+                            !gone.contains(&op)
+                                && b.operands(op).iter().any(|o| {
+                                    matches!(o.get(), fir::OperandKind::Value(v)
+                                        if matches!(b.def(v), fir::ValueDef::Result { op: d, .. }
+                                            if gone.contains(&d)))
+                                })
+                        });
+                        let mut tgt = src.clone();
+                        if !dangling {
+                            tgt.funcs[f].body.erase_many(&erase);
+                        }
+                        let lean = if dangling || fir::verify_module(&tgt).is_err() {
+                            Verdict::Unverifiable
+                        } else {
+                            match lean_check(&tool, &src, &tgt, &format!("{name}-c{c}")) {
+                                Ok(_) => Verdict::Accepted,
+                                Err(_) => Verdict::LeanRefused,
+                            }
+                        };
+                        let what = match (rust_ok, lean) {
+                            (true, Verdict::Accepted) => "both accepted",
+                            (false, Verdict::LeanRefused) => "both refused",
+                            (false, Verdict::Unverifiable) => "Rust refused, target doesn't verify",
+                            (true, v) => {
+                                fails.lock().unwrap().push(format!(
+                                    "{name} @{}: Rust accepted {erase:?}, Lean: {v:?}",
+                                    src.funcs[f].name
+                                ));
+                                "Rust accepted, Lean refused"
+                            }
+                            (false, _) => {
+                                fails.lock().unwrap().push(format!(
+                                    "{name} @{}: Lean accepted {erase:?}, Rust refused",
+                                    src.funcs[f].name
+                                ));
+                                "Lean accepted, Rust refused"
+                            }
+                        };
+                        *tally.lock().unwrap().entry(what).or_default() += 1;
+                    }
+                }
+            });
+        }
+    });
+    for (what, n) in tally.into_inner().unwrap() {
+        eprintln!("dce agreement: {what}: {n}");
+        ev.count(what, n);
+    }
+    ev.write();
+    let fails = fails.into_inner().unwrap();
+    assert!(
+        fails.is_empty(),
+        "{} disagreements:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}

@@ -62,6 +62,7 @@ const SUITES: &[&str] = &[
     "contracts",
     "dce_check",
     "dce_adversarial",
+    "dce_agreement",
     "regcheck_adversarial",
     "aarch64_fixtures",
     "aarch64_fuzz",
@@ -713,6 +714,9 @@ fn check_evidence(
         "refused by Fir.Dce.checkFunc",
         None,
     );
+    // The Rust and Lean DCE checkers must each have judged candidates both ways.
+    need(&mut bad, "dce_agreement", "both accepted", None);
+    need(&mut bad, "dce_agreement", "both refused", None);
     need(
         &mut bad,
         "dce_adversarial",

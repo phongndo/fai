@@ -339,6 +339,24 @@ fn mutations() -> Vec<Mutation> {
             in_decl: None,
         },
         Mutation {
+            name: "dce-checker-weaker-than-proved",
+            what: "the Rust DCE checker alone lets `freeze` go (the planner is right, so no pass output shows it); the agreement test's random candidates reach the proved checker, which refuses",
+            edits: vec![edit(
+                "crates/fir/src/passes/dce.rs",
+                "        if !k.contract().dce.allows(policy) {",
+                "        if !k.contract().dce.allows(policy) && k.mnemonic() != \"freeze\" {",
+            )],
+            steps: vec![test(&[
+                "-p",
+                "fir",
+                "--test",
+                "dce_check",
+                "the_rust_and_lean_checkers_agree",
+            ])],
+            expect: vec!["disagreements", "Rust accepted", "Lean: LeanRefused"],
+            in_decl: None,
+        },
+        Mutation {
             name: "dce-checker-also-wrong",
             what: "the planner and the Rust checker both wrong (a checker bug); the Lean-proved checker refuses the output",
             edits: vec![
