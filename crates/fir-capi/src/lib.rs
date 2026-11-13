@@ -84,7 +84,7 @@ mod ops;
 pub use ops::*;
 
 /// The API's version: the major version times 65536, plus the minor version.
-pub const FIR_API_VERSION: u32 = (1 << 16) | 5;
+pub const FIR_API_VERSION: u32 = (1 << 16) | 6;
 
 /// No id: what a call returns when it fails.
 pub const FIR_INVALID: u32 = u32::MAX;
@@ -1338,12 +1338,15 @@ pub unsafe extern "C" fn fir_module_optimize_passes(
     }
 }
 
-/// Verify a module and compile it for `target` (`"aarch64"`, the only one so far) to GNU
-/// assembly, as `fir compile --emit asm` does: HFIR is lowered to MFIR first, and with
-/// `optimize` the default pass pipeline runs on the MFIR (`fir compile -O`; with `FIR_CHECK_DCE`
-/// set, as for `fir_module_optimize`, its dead code elimination is checked). `*out` gets the
-/// assembly text; free it with `fir_string_free`. `FIR_ERR_COMPILE` if the module uses what the
-/// backend doesn't support yet (integers wider than 64 bits, floats, holes, other data layouts).
+/// Verify a module and compile it for `target` (`"aarch64"`, or `"x86_64"` since version 1.6)
+/// to GNU assembly, as `fir compile --emit asm [--target x86_64]` does: HFIR is lowered to MFIR
+/// first, and with `optimize` the default pass pipeline runs on the MFIR (`fir compile -O`; with
+/// `FIR_CHECK_DCE` set, as for `fir_module_optimize`, its dead code elimination is checked).
+/// `*out` gets the assembly text; free it with `fir_string_free`. `FIR_ERR_COMPILE` if the
+/// module uses what the backend doesn't support yet (for both: integers wider than 64 bits,
+/// holes, other data layouts; for x86-64 also floats, variadic functions defined in the module,
+/// structs and arrays by value, and integer arguments narrower than 32 bits to external or
+/// indirect callees). x86-64 output is for Linux only: `os` must be `FIR_OS_LINUX`.
 /// Exceptions use an error-return convention: an exception that escapes a compiled function is
 /// pending in `struct { void *flag; void *value; } __fir_exn` (nonzero `flag`) when it returns;
 /// a C caller checks `flag` after the call, and clears it to catch.
@@ -1395,12 +1398,20 @@ unsafe fn compile_with(
     unsafe {
         module_status(m, |m| {
             let target = cstr(target)?;
-            if target != "aarch64" {
-                return fail(FIR_ERR_INVALID, format!("unknown target '{target}'"));
-            }
+            let x86 = match target {
+                "aarch64" => false,
+                "x86_64" => true,
+                _ => return fail(FIR_ERR_INVALID, format!("unknown target '{target}'")),
+            };
             let os = match os {
                 FIR_OS_LINUX => a64::Os::Linux,
-                FIR_OS_DARWIN => a64::Os::Darwin,
+                FIR_OS_DARWIN if !x86 => a64::Os::Darwin,
+                FIR_OS_DARWIN => {
+                    return fail(
+                        FIR_ERR_INVALID,
+                        "x86-64 output is for Linux only".to_owned(),
+                    );
+                }
                 n => return fail(FIR_ERR_INVALID, format!("{n} is not a FirOs")),
             };
             let module = m.mb.module();
@@ -1412,7 +1423,14 @@ unsafe fn compile_with(
                 ..a64::Options::default()
             };
             let asm = fir::backend::prepare_with(module, pipeline.as_ref())
-                .and_then(|l| a64::compile(&l, &o))
+                .and_then(|l| {
+                    if x86 {
+                        let o = fir::backend::x86_64::Options::default();
+                        fir::backend::x86_64::compile(&l, &o)
+                    } else {
+                        a64::compile(&l, &o)
+                    }
+                })
                 .or_else(|e| fail(FIR_ERR_COMPILE, e))?;
             if let Some(out) = out.as_mut() {
                 *out = c_string(asm).into_raw();

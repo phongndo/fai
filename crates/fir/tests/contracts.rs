@@ -84,6 +84,14 @@ fn contradictions(k: OpKind) -> Vec<String> {
             "an MFIR op instruction selection refuses: {isel:?}"
         ));
     }
+    // x86-64's selection refuses some MFIR ops for now (floats, varargs, the composites calls
+    // pass whole), but may claim no op a module it accepts can't contain.
+    if fir::backend::x86_64::isel::support(k).is_yes()
+        && !d.layers.mfir
+        && !matches!(k, OpKind::PtrField { .. } | OpKind::PtrIndex { .. })
+    {
+        bad("x86-64 instruction selection claims it, but it isn't MFIR".into());
+    }
     // The interpreter runs every op of every layer.
     if let Support::No(why) = fir::interp::support(k) {
         bad(format!("the interpreter refuses it: {why}"));

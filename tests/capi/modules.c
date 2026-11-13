@@ -906,6 +906,12 @@ static void building_blocks(void) {
   expect_error("unknown target 'x86'", __LINE__);
   CHECK(fir_module_compile(m, "aarch64", false, 7, &as) == FIR_ERR_INVALID && as == NULL);
   expect_error("7 is not a FirOs", __LINE__);
+  /* x86-64 (version 1.6) compiles integers for Linux; this module passes a struct whole. */
+  CHECK(fir_module_compile(m, "x86_64", false, FIR_OS_LINUX, &as) == FIR_ERR_COMPILE && as == NULL);
+  expect_error("@swap: structs and arrays by value aren't supported by the x86-64 backend yet",
+               __LINE__);
+  CHECK(fir_module_compile(m, "x86_64", false, FIR_OS_DARWIN, &as) == FIR_ERR_INVALID && as == NULL);
+  expect_error("x86-64 output is for Linux only", __LINE__);
   fir_module_free(m);
 
   /* What the backend can't compile yet is FIR_ERR_COMPILE. */
@@ -919,6 +925,26 @@ static void building_blocks(void) {
   CHECK(fir_module_compile(m, "aarch64", false, FIR_OS_DARWIN, &as) == FIR_ERR_COMPILE);
   expect_error("@wide: i128 is wider than 64 bits, which the AArch64 backend doesn't support yet",
                __LINE__);
+  CHECK(fir_module_compile(m, "x86_64", false, FIR_OS_LINUX, &as) == FIR_ERR_COMPILE);
+  expect_error("@wide: i128 is wider than 64 bits, which the x86-64 backend doesn't support yet",
+               __LINE__);
+  fir_module_free(m);
+
+  /* An integer function compiles to x86-64 assembly, with and without -O. */
+  m = cur = fir_module_new();
+  FirFunc twice = ID(fir_func_declare(m, "twice", &i64, 1, &i64, 1));
+  b = fir_func_begin(m, twice);
+  FirValue tx = ID(fir_builder_param(b, 0));
+  FirValue ty = ID(fir_int_arith(b, FIR_ARITH_OP_ADD, FIR_OVF_WRAP, tx, tx));
+  ID(fir_func_ret(b, &ty, 1));
+  OK(fir_func_end(b));
+  for (int opt = 0; opt < 2; opt++) {
+    char *xs = NULL;
+    OK(fir_module_compile(m, "x86_64", opt == 1, FIR_OS_LINUX, &xs));
+    CHECK(xs != NULL && strstr(xs, "twice:") != NULL && strstr(xs, "addq") != NULL &&
+          strstr(xs, "ret") != NULL);
+    fir_string_free(xs);
+  }
   fir_module_free(m);
 }
 

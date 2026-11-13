@@ -10,7 +10,8 @@
 //!                                            optimize, print canonical text
 //! fir opt --list-passes                      the passes, with what backs each
 //! fir compile FILE [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-g] [-o OUT]
-//!             [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]   compile to AArch64 (see `compile`)
+//!             [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin] [--target aarch64|x86_64]
+//!                                            compile to AArch64 or x86-64 (see `compile`)
 //! fir lower FILE [--no-locs]                  lower an HFIR module to MFIR and print it
 //! ```
 //!
@@ -121,7 +122,7 @@ fn run(args: &[&str]) -> Result<(), ExitCode> {
         }
         _ => {
             eprintln!(
-                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each] [--no-locs]\n         [--print-before P,...] [--print-after P,...] [--print-changed] [--dump-dir DIR] [--check-dce FIR-REF]\n  fir opt --list-passes\n  fir compile FILE [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-g] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]\n  fir lower FILE [--no-locs]"
+                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each] [--no-locs]\n         [--print-before P,...] [--print-after P,...] [--print-changed] [--dump-dir DIR] [--check-dce FIR-REF]\n  fir opt --list-passes\n  fir compile FILE [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-g] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin] [--target aarch64|x86_64]\n  fir lower FILE [--no-locs]"
             );
             Err(ExitCode::from(2))
         }
@@ -326,20 +327,24 @@ fn opt(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     Ok(())
 }
 
-/// `fir compile FILE`: compile an HFIR or MFIR module to AArch64. HFIR is lowered to MFIR first
-/// (what `fir lower` prints), and `-O` runs the default pass pipeline on the MFIR (what `fir opt`
-/// does); `--emit mfir` prints the MFIR that is compiled. `--emit lfir` and `--emit lfir-vregs`
-/// print the LFIR after and before register allocation; `--emit asm` (or `-o` naming a `.s`
-/// file) the assembly. Otherwise `-o OUT` is an object file (`.o`) or an
-/// executable, assembled and linked by `$FIR_CC`, or else by `cc` on an AArch64 host and by
-/// `aarch64-unknown-linux-gnu-cc` (from the dev shell) elsewhere. Linux ELF by default, or the
-/// host's format on macOS; `--os` picks one. `-g` writes source lines (`.file`/`.loc`) for the
-/// assembler's DWARF line table, from the locations the LFIR carries (`Options::debug_lines`).
-/// `--check-dce FIR-REF` (with `-O`) checks every step of `dce` with the proved Lean checker, as
-/// `fir opt --check-dce` does, fails if it refuses one, and prints a summary on stderr; so does
-/// `FIR_CHECK_DCE=FIR-REF` in the environment (`fir::backend::optimize`).
+/// `fir compile FILE`: compile an HFIR or MFIR module to AArch64 (the default) or, with
+/// `--target x86_64`, to x86-64. HFIR is lowered to MFIR first (what `fir lower` prints), and
+/// `-O` runs the default pass pipeline on the MFIR (what `fir opt` does); `--emit mfir` prints
+/// the MFIR that is compiled. For AArch64, `--emit lfir` and `--emit lfir-vregs` print the LFIR
+/// after and before register allocation (x86-64's machine code isn't an LFIR dialect yet);
+/// `--emit asm` (or `-o` naming a `.s` file) prints the assembly. Otherwise `-o OUT` is an
+/// object file (`.o`) or an executable, assembled and linked by `$FIR_CC`, or else by `cc` when
+/// the host is the target and by `aarch64-unknown-linux-gnu-cc` or `x86_64-unknown-linux-gnu-cc`
+/// elsewhere. AArch64 output is Linux ELF by default, or the host's format on macOS; `--os`
+/// picks one. x86-64 output is Linux ELF. `-g` (AArch64 only, for now) writes source lines
+/// (`.file`/`.loc`) for the assembler's DWARF line table, from the locations the LFIR carries
+/// (`Options::debug_lines`). `--check-dce FIR-REF` (with `-O`) checks every step of `dce` with
+/// the proved Lean checker, as `fir opt --check-dce` does, fails if it refuses one, and prints a
+/// summary on stderr; so does `FIR_CHECK_DCE=FIR-REF` in the environment
+/// (`fir::backend::optimize`). Both run on the MFIR, so they apply to either target.
 fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     use fir::backend::aarch64 as a64;
+    use fir::backend::x86_64 as x64;
     let fail = |e: String| {
         eprintln!("{file}: {e}");
         ExitCode::FAILURE
@@ -349,7 +354,9 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     let mut optimize = false;
     let mut check_dce = None;
     let (mut passes, mut experimental) = (None, false);
+    let mut x86 = false;
     let mut o = a64::Options::default();
+    let mut os_given = false;
     let mut it = opts.iter();
     while let Some(&opt) = it.next() {
         if opt == "-O" {
@@ -369,13 +376,23 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
             ("--emit", Some(&v)) => emit = Some(v),
             ("--check-dce", Some(&v)) => check_dce = Some(v),
             ("--passes", Some(&v)) => passes = Some(v),
-            ("--os", Some(&"linux")) => o.os = a64::Os::Linux,
-            ("--os", Some(&"darwin")) => o.os = a64::Os::Darwin,
+            ("--os", Some(&"linux")) => (o.os, os_given) = (a64::Os::Linux, true),
+            ("--os", Some(&"darwin")) => (o.os, os_given) = (a64::Os::Darwin, true),
+            ("--target", Some(&"aarch64")) => x86 = false,
+            ("--target", Some(&"x86_64")) => x86 = true,
             _ => {
                 eprintln!("fir compile: bad option '{opt}'");
                 return Err(ExitCode::from(2));
             }
         }
+    }
+    if x86 && os_given && o.os != a64::Os::Linux {
+        eprintln!("fir compile: x86-64 output is for Linux only");
+        return Err(ExitCode::from(2));
+    }
+    if x86 && o.debug_lines {
+        eprintln!("fir compile: -g isn't supported for x86-64 yet");
+        return Err(ExitCode::from(2));
     }
     let m = fir::parse_module(&read(file)?).map_err(fail)?;
     fir::verify_module(&m).map_err(fail)?;
@@ -423,21 +440,40 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     if emit == Some("mfir") {
         return write(m.render(true));
     }
-    let mut mm = a64::select(&m).map_err(fail)?;
-    if emit == Some("lfir-vregs") {
-        return write(a64::lfir::to_module(&m, &mm).render(true));
-    }
-    a64::allocate(&m, &mut mm).map_err(fail)?;
-    match emit {
-        Some("lfir") => return write(a64::lfir::to_module(&m, &mm).render(true)),
-        Some("asm") => return write(a64::emit::emit(&m, &mm, &o)),
-        Some(e) => {
-            eprintln!("fir compile: unknown --emit '{e}'");
-            return Err(ExitCode::from(2));
+    let asm = if x86 {
+        match emit {
+            None | Some("asm") => {}
+            Some("lfir" | "lfir-vregs") => {
+                eprintln!(
+                    "fir compile: x86-64 machine code isn't an LFIR dialect yet: use --emit asm"
+                );
+                return Err(ExitCode::from(2));
+            }
+            Some(e) => {
+                eprintln!("fir compile: unknown --emit '{e}'");
+                return Err(ExitCode::from(2));
+            }
         }
-        None => {}
+        x64::compile(&m, &x64::Options::default()).map_err(fail)?
+    } else {
+        let mut mm = a64::select(&m).map_err(fail)?;
+        if emit == Some("lfir-vregs") {
+            return write(a64::lfir::to_module(&m, &mm).render(true));
+        }
+        a64::allocate(&m, &mut mm).map_err(fail)?;
+        match emit {
+            Some("lfir") => return write(a64::lfir::to_module(&m, &mm).render(true)),
+            None | Some("asm") => {}
+            Some(e) => {
+                eprintln!("fir compile: unknown --emit '{e}'");
+                return Err(ExitCode::from(2));
+            }
+        }
+        a64::emit::emit(&m, &mm, &o)
+    };
+    if emit == Some("asm") {
+        return write(asm);
     }
-    let asm = a64::emit::emit(&m, &mm, &o);
     let Some(out) = out.filter(|p| !p.ends_with(".s")) else {
         return write(asm);
     };
@@ -446,11 +482,15 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     let s = dir.join("out.s");
     std::fs::write(&s, asm).map_err(|e| fail(e.to_string()))?;
     let cc = std::env::var("FIR_CC").unwrap_or_else(|_| {
-        if cfg!(target_arch = "aarch64") {
-            "cc".to_owned()
+        let (native, cross) = if x86 {
+            (cfg!(target_arch = "x86_64"), "x86_64-unknown-linux-gnu-cc")
         } else {
-            "aarch64-unknown-linux-gnu-cc".to_owned()
-        }
+            (
+                cfg!(target_arch = "aarch64"),
+                "aarch64-unknown-linux-gnu-cc",
+            )
+        };
+        if native { "cc" } else { cross }.to_owned()
     });
     let mut cmd = std::process::Command::new(&cc);
     cmd.arg(&s).arg("-o").arg(out);

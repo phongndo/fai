@@ -13,7 +13,8 @@
 //!
 //! **Declared half.** Each component that dispatches on op kinds declares what it does with each
 //! ([`Support`]) in a function next to its code: [`crate::interp::support`],
-//! [`crate::lower_support`], and [`crate::backend::aarch64::isel::support`]. They match every
+//! [`crate::lower_support`], [`crate::backend::aarch64::isel::support`], and
+//! [`crate::backend::x86_64::isel::support`]. They match every
 //! variant without a wildcard (`clippy::wildcard_enum_match_arm` is denied there), so a new op
 //! is a compile error until each component decides. `tests/contracts.rs` checks the declarations
 //! against the generated contracts and the op declarations (an HFIR-only op the lowering doesn't
@@ -121,9 +122,10 @@ pub enum Lowering {
 pub type SupportFn = fn(OpKind) -> Support;
 
 /// The components that declare their support, by name, for reports and `tests/contracts.rs`.
-pub fn components() -> [(&'static str, SupportFn); 2] {
+pub fn components() -> [(&'static str, SupportFn); 3] {
     [
         ("interp", crate::interp::support),
         ("isel.aarch64", crate::backend::aarch64::isel::support),
+        ("isel.x86_64", crate::backend::x86_64::isel::support),
     ]
 }

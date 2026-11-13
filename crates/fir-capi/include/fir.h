@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 // The API's version: the major version times 65536, plus the minor version.
-#define FIR_API_VERSION ((1 << 16) | 5)
+#define FIR_API_VERSION ((1 << 16) | 6)
 
 // No id: what a call returns when it fails.
 #define FIR_INVALID UINT32_MAX
@@ -785,12 +785,15 @@ FirStatus fir_module_optimize_passes(struct FirModule *m,
                                      bool experimental,
                                      struct FirModule **out);
 
-// Verify a module and compile it for `target` (`"aarch64"`, the only one so far) to GNU
-// assembly, as `fir compile --emit asm` does: HFIR is lowered to MFIR first, and with
-// `optimize` the default pass pipeline runs on the MFIR (`fir compile -O`; with `FIR_CHECK_DCE`
-// set, as for `fir_module_optimize`, its dead code elimination is checked). `*out` gets the
-// assembly text; free it with `fir_string_free`. `FIR_ERR_COMPILE` if the module uses what the
-// backend doesn't support yet (integers wider than 64 bits, floats, holes, other data layouts).
+// Verify a module and compile it for `target` (`"aarch64"`, or `"x86_64"` since version 1.6)
+// to GNU assembly, as `fir compile --emit asm [--target x86_64]` does: HFIR is lowered to MFIR
+// first, and with `optimize` the default pass pipeline runs on the MFIR (`fir compile -O`; with
+// `FIR_CHECK_DCE` set, as for `fir_module_optimize`, its dead code elimination is checked).
+// `*out` gets the assembly text; free it with `fir_string_free`. `FIR_ERR_COMPILE` if the
+// module uses what the backend doesn't support yet (for both: integers wider than 64 bits,
+// holes, other data layouts; for x86-64 also floats, variadic functions defined in the module,
+// structs and arrays by value, and integer arguments narrower than 32 bits to external or
+// indirect callees). x86-64 output is for Linux only: `os` must be `FIR_OS_LINUX`.
 // Exceptions use an error-return convention: an exception that escapes a compiled function is
 // pending in `struct { void *flag; void *value; } __fir_exn` (nonzero `flag`) when it returns;
 // a C caller checks `flag` after the call, and clears it to catch.
