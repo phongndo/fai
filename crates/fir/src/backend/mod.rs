@@ -12,7 +12,7 @@
 
 pub use crate::codegen::data;
 pub use fai_target_aarch64 as aarch64;
-pub mod x86_64;
+pub use fai_target_x86_64 as x86_64;
 
 pub use crate::driver::{
     optimize, optimize_observed, optimize_with, prepare, prepare_observed, prepare_with,

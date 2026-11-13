@@ -67,7 +67,7 @@ pub mod contract {
 }
 
 // The IR's modules, under the names this crate's own modules use.
-use fai_ir::{body, ir, sem, types};
+use fai_ir::ir;
 
 pub use fai_ir::body::{
     Body, Case, CasesId, HoleId, Int, IntId, OpId, Operand, OperandKind, Ops, RegionId, StrId,

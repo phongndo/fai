@@ -64,6 +64,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fai-target-x86_64"
+version = "0.1.0"
+dependencies = [
+ "fai-codegen",
+ "fai-ir",
+ "fir",
+ "num-bigint",
+ "rustc-hash",
+]
+
+[[package]]
 name = "fai-transforms"
 version = "0.1.0"
 dependencies = [
@@ -80,6 +91,7 @@ dependencies = [
  "fai-ir",
  "fai-lowering",
  "fai-target-aarch64",
+ "fai-target-x86_64",
  "fai-transforms",
  "num-bigint",
  "rustc-hash",

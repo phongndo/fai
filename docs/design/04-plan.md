@@ -644,7 +644,7 @@ Decisions: C frontend (by-value mapping), C struct layout (empty structs), C fro
 Goal: compile and run integer C functions on x86-64 Linux through `fcc`, branches and calls
 included, tested against a reference compiler. Decisions: x86-64 target, x86-64 backend testing.
 
-- **Backend** (`crates/fir/src/backend/x86_64/`, about 3,700 lines): instruction selection from
+- **Backend** (`targets/x86_64/`, about 3,700 lines): instruction selection from
   MFIR for integers up to 64 bits (and wider ones where only their low bits matter), pointers,
   memory, every control-flow op, direct, indirect, and variadic calls, traps, and exceptions;
   System V's integer convention (six argument registers, stack slots, `rax`/`rdx` results, results

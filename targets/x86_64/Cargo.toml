@@ -1,0 +1,20 @@
+[package]
+name = "fai-target-x86_64"
+version = "0.1.0"
+description = "FIR's x86-64 backend: the integer subset of MFIR to GNU assembly for x86-64 Linux (System V)"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fai-codegen = { path = "../../compiler/codegen" }
+fai-ir = { path = "../../compiler/ir" }
+num-bigint = "0.4"
+rustc-hash = "2"
+
+# The examples in the docs are written against the supported interface, the `fir` crate.
+[dev-dependencies]
+fir = { path = "../../crates/fir" }
+
+[lints]
+workspace = true

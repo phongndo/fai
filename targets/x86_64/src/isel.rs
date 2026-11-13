@@ -50,15 +50,15 @@
 use rustc_hash::FxHashMap;
 
 use super::mir::*;
-use crate::body::{Body, OpId, OperandKind, RegionId, ValueId};
-use crate::contract::Support;
-use crate::ir::ShiftOp as ShiftOp2;
-use crate::ir::{
+use fai_ir::body::{Body, OpId, OperandKind, RegionId, ValueId};
+use fai_ir::contract::Support;
+use fai_ir::ir::ShiftOp as ShiftOp2;
+use fai_ir::ir::{
     AllocFail, ArithOp, BitOp, DivOp, Edge, Loc, Module, OpKind, Ovf, Pred, Shape, ShiftEdge,
     SpaceCfg, Ty,
 };
-use crate::sem::TrapReason;
-use crate::types::{Types, align_up};
+use fai_ir::sem::TrapReason;
+use fai_ir::types::{Types, align_up};
 
 const NONE: u32 = u32::MAX;
 
@@ -164,7 +164,7 @@ impl<'a> ModuleCx<'a> {
             m,
             funcs,
             globals,
-            throws: crate::codegen::may_throw(m),
+            throws: fai_codegen::may_throw(m),
         }
     }
 
@@ -193,9 +193,9 @@ pub fn check_module(m: &Module) -> Result<()> {
     // (AAPCS64's agree for integers and pointers); a module laid out otherwise would compile
     // into code that disagrees with its own semantics. The `va_list` layout isn't used: the
     // `va.*` ops are refused.
-    let sysv = crate::ir::SpaceCfg::default();
+    let sysv = fai_ir::ir::SpaceCfg::default();
     if m.space.ptr_align != sysv.ptr_align || m.space.ints != sysv.ints {
-        let ints = |s: &crate::ir::SpaceCfg| {
+        let ints = |s: &fai_ir::ir::SpaceCfg| {
             s.ints
                 .iter()
                 .map(|(w, a)| format!("{w}:{a}"))
@@ -211,7 +211,7 @@ pub fn check_module(m: &Module) -> Result<()> {
             ints(&m.space)
         ));
     }
-    if let crate::Layer::Lfir(_) = m.layer {
+    if let fai_ir::Layer::Lfir(_) = m.layer {
         return Err("the module is already LFIR".to_owned());
     }
     for x in &m.externs {
@@ -244,7 +244,7 @@ const COMPOSITES: Support = Support::No(
     "makes or takes apart a struct or array passed whole: structs and arrays by value aren't supported by the x86-64 backend yet",
 );
 
-/// What instruction selection does with ops of a kind ([`crate::contract`]): the integer,
+/// What instruction selection does with ops of a kind ([`fai_ir::contract`]): the integer,
 /// pointer, memory, control-flow, call, and exception ops of MFIR, and `ptr.field` and
 /// `ptr.index`; not yet floats, `va.*`, or the composites calls pass whole. The HFIR building
 /// blocks need lowering first, and LFIR is already selected. Integers wider than 64 bits are a
@@ -366,7 +366,7 @@ pub fn support(k: OpKind) -> Support {
 
 /// Whether an op's results, and its operands, may be integers wider than 64 bits, held as
 /// their low 64 bits: the ops whose results' low 64 bits depend only on their operands' (as
-/// on AArch64; see `crate::backend::aarch64::isel`).
+/// on AArch64; see `fir::backend::aarch64::isel`).
 fn low_bits_only(k: OpKind) -> (bool, bool) {
     match k {
         OpKind::Const(_) | OpKind::Copy | OpKind::Freeze | OpKind::Select | OpKind::Bit(_) => {
@@ -449,10 +449,10 @@ fn mask(w: u32) -> u64 {
 }
 
 /// An integer's low 64 bits (two's complement).
-fn int_low_bits(n: crate::body::Int<'_>) -> u64 {
+fn int_low_bits(n: fai_ir::body::Int<'_>) -> u64 {
     match n {
-        crate::body::Int::Small(n) => n as u64,
-        crate::body::Int::Big(n) => {
+        fai_ir::body::Int::Small(n) => n as u64,
+        fai_ir::body::Int::Big(n) => {
             let m = num_bigint::BigInt::from(1) << 64;
             let r = ((n % &m) + &m) % &m;
             u64::try_from(r).unwrap_or(0)

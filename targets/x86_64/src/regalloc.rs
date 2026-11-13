@@ -1,5 +1,5 @@
 //! Register allocation for x86-64: linear scan with spilling, as on AArch64 (see
-//! `crate::backend::aarch64::regalloc`), over one register class.
+//! `fir::backend::aarch64::regalloc`), over one register class.
 //!
 //! **Intervals.** Instruction `i` reads its registers at position `2i` and writes them at
 //! `2i + 1`. A virtual register's interval is the hull of its reads, its writes, and the block

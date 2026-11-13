@@ -13,6 +13,8 @@
 //! what it refuses, is in [`isel`]: the integer, pointer, memory, control-flow, call, and
 //! exception subset of MFIR; not yet floats, variadic definitions, or structs by value.
 
+#![forbid(unsafe_code)]
+
 pub mod emit;
 pub mod isel;
 pub mod mir;
@@ -20,7 +22,7 @@ pub mod regalloc;
 
 pub use emit::Options;
 
-use crate::ir::{Module, Ty};
+use fai_ir::ir::{Module, Ty};
 use mir::{CallShape, MModule};
 
 /// Each callee's argument and result registers, by callee index (functions, then external
@@ -82,7 +84,7 @@ pub fn allocate(m: &Module, mm: &mut MModule) -> Result<(), String> {
     results.into_iter().collect()
 }
 
-/// Compile a verified MFIR module (see [`crate::backend::prepare`]) to assembly.
+/// Compile a verified MFIR module (see `fir::backend::prepare`) to assembly.
 pub fn compile(m: &Module, o: &Options) -> Result<String, String> {
     let mut mm = select(m)?;
     allocate(m, &mut mm)?;

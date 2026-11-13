@@ -9,8 +9,8 @@
 //! Blocks are runs of `insts`, in layout order, each ending in a terminator; a function's
 //! prologue and epilogue are the emitter's, from [`Frame`].
 
-use crate::ir::{Loc, Ty};
-use crate::sem::TrapReason;
+use fai_ir::ir::{Loc, Ty};
+use fai_ir::sem::TrapReason;
 
 /// A register: one of the sixteen general-purpose registers by its hardware number, or a
 /// virtual register.

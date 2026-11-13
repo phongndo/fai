@@ -436,7 +436,7 @@ fn mutations() -> Vec<Mutation> {
             name: "x86-64-corrupted-allocation",
             what: "the x86-64 allocator puts every value in rbx; its assignment check refuses it",
             edits: vec![edit(
-                "crates/fir/src/backend/x86_64/regalloc.rs",
+                "targets/x86_64/src/regalloc.rs",
                 "        if let Some(r) = pick {\n            homes[v] = Home::Reg(r);",
                 "        if let Some(r) = pick {\n            homes[v] = Home::Reg(3);",
             )],
@@ -448,7 +448,7 @@ fn mutations() -> Vec<Mutation> {
             name: "x86-64-bad-output-code",
             what: "the x86-64 emitter prints `subq` for every `addq`; the native comparison refuses it",
             edits: vec![edit(
-                "crates/fir/src/backend/x86_64/emit.rs",
+                "targets/x86_64/src/emit.rs",
                 "AluOp::Add => \"addq\",",
                 "AluOp::Add => \"subq\",",
             )],
