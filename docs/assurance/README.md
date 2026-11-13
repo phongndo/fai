@@ -5,7 +5,8 @@ relative to the Lean semantics in `spec/`. It was built as an experiment (branch
 `experiment/lean-rust-conformance`); the last section says which parts are worth keeping.
 
 **What it is not.** Nothing here makes the compiler formally verified end to end. One pass's
-permissions are proved, one checker is proved and runs on the pass's real outputs in the tests,
+permissions are proved, one checker is proved and runs on the pass's real outputs in the tests
+and, when asked (`--check-dce`, `FIR_CHECK_DCE`), in the compiler itself,
 one transformation validator runs on every compilation but is not proved, and several links
 (scalarization, `cf.try` lowering, module composition, instruction selection, encoding) are
 tested only. The table under [Guarantees](#guarantees) is the exact status of each link.
@@ -14,9 +15,10 @@ Files here:
 
 | File | What | Made by |
 |---|---|---|
+| `dce.md` | Dead code elimination from the theorem to the binary, link by link: what is proved, checked, tested, assumed, and trusted | by hand |
 | `layer-audit.md` | The HFIR → MFIR → LFIR boundaries audited, a vertical slice, the DCE checkers compared and measured, the observation tooling, and source lines in native code | by hand |
 | `op-contracts.json` | Per op kind (536 kinds, modifiers included): identity, fields, modifiers, layers, typing, declared effects, and the DCE permission with its evidence | `lake exe gen-rust manifest` |
-| `proofs.lock.json` | Reviewed fingerprints of the 35 registered claims: statement, hypothesis count, axioms, and fingerprints of the `Fir` definitions they depend on | `lake exe fir-audit --update` |
+| `proofs.lock.json` | Reviewed fingerprints of the 40 registered claims: statement, hypothesis count, axioms, and fingerprints of the `Fir` definitions they depend on | `lake exe fir-audit --update` |
 | `proofs.md` | The claims as Lean prints them, with axioms and dependency counts | `lake exe fir-audit --report` |
 | `adversarial.md` | The last `cargo xtask mutate` run: each planted defect and the diagnostic that caught it | `cargo xtask mutate` |
 
@@ -49,7 +51,7 @@ toolchain's version):
    fuzz counts set explicitly (200 programs, seed 1).
 7. **The C API tests under AddressSanitizer.**
 8. **Evidence.** Each suite writes what it actually did to `FIR_EVIDENCE`
-   (`crates/fir/tests/common/evidence.rs`). The run fails if a required suite (17 of them, the ABI torture test included) wrote
+   (`crates/fir/tests/common/evidence.rs`). The run fails if a required suite (21 of them, the ABI torture test included, and on Linux the C corpus, every one of whose `-O` builds must have been checked by the proved DCE checker) wrote
    nothing, recorded a skip or a failure, ran fewer programs than configured, compared fewer
    runs with `fir-ref` than it had run lines, or if any op constructor that a component claims
    to support was never exercised by that component's differential comparison. The coverage is
@@ -253,8 +255,10 @@ under AddressSanitizer in the full one. No noisy lint groups were enabled.
 | Op declarations → Rust `OpKind`, tables, builders, C API, contracts | generated, checked fresh | gen-rust, gen-builder, cbindgen; `verify` compares bytes |
 | DCE: which kinds may be deleted | **proved** | `Fir.Dce.dcePerm_sound` (+ `Pure.of_kind`, `dcePerm_erase`) |
 | DCE: a deletion is a refinement | **proved** (per function, fixed module, `Decided` source) | `Fir.Dce.refines` |
-| DCE: the Rust pass's output on the tested inputs | **checked by a proved checker** | `Fir.Dce.checkFunc_sound` via `fir-ref check-dce` in `tests/dce_check.rs`, on one `dce` step and on every step of the `-O` pipeline |
-| DCE: the Rust pass's output on any input | checked (unproved checker); **by the proved checker on request** | `passes::dce::check`, every run; `fir opt --check-dce FIR-REF` (`passes::reference`), every step of that run |
+| DCE: the checker that runs is the proved one, and relates functions name by name | **proved** | `Fir.Dce.checkFuncL_eq` (the counting checker `fir-ref check-dce` runs equals `checkFunc`), `Fir.Dce.checkModule_sound` (per name, over `Module.find?`; the function a call runs in a verified module, by reading) |
+| DCE: the Rust pass's output on the tested inputs | **checked by a proved checker** | `Fir.Dce.checkModule_sound` via `fir-ref check-dce` in `tests/dce_check.rs`, on one `dce` step and on every step of the `-O` pipeline |
+| DCE: the `-O` binaries the C corpus runs | **checked by a proved checker**, every step | `fai-cc -O --check-dce` in `fai_cc_corpus`; `verify full` requires every program's build checked ([dce.md](dce.md)) |
+| DCE: the Rust pass's output on any input | checked (unproved checker) by default; **by the proved checker on request** | `passes::dce::check`, every run; with `fir compile`/`fai-cc`/`fir opt --check-dce FIR-REF` or `FIR_CHECK_DCE` (`backend::optimize`, `passes::reference`), every step of that run |
 | DCE: the Rust checker's rules against the proved checker's | tested | `the_rust_and_lean_checkers_agree_on_random_candidates`; mutation `dce-checker-weaker-than-proved` ([layer-audit.md](layer-audit.md#3-the-dce-checker-lean-and-rust)) |
 | DSE, forwarding, copy propagation | proved relations; Rust passes tested | `Fir.Dse/Fwd/CopyProp.refines`; `tests/opt.rs` |
 | Composing passes, optimizing a whole module | **open** | intermediate programs' `Decided`ness and refinement over calls are not proved |
@@ -273,8 +277,10 @@ under AddressSanitizer in the full one. No noisy lint groups were enabled.
 
 **Trusted base** (beyond Lean's kernel and the three standard axioms): the Lean compiler that
 builds `fir-ref` (the proved checker runs as compiled code); the text round trip (the Rust
-printer's output parsed by the Lean parser, itself tested against `fir-ref fmt`); the Rust
-`check` for inputs outside the tests; the allocation validator's code and its ABI assumptions
+printer's output parsed by the Lean parser, itself tested against `fir-ref fmt`; the receipt
+shows they agree on each checked text, not that the text means what the in-memory module does);
+that the `fir-ref` given to `--check-dce` is built from these proofs (`verify full` rebuilds it);
+the Rust `check` and `erase_many` for compilations without `--check-dce`; the allocation validator's code and its ABI assumptions
 (callees preserve `x19`–`x28`, `x29`, `sp`, and the caller's frame; program accesses never reach
 the spill or save areas, which would be out of bounds and so UB); qemu, the cross toolchain, and
 the assembler.
@@ -285,13 +291,14 @@ the assembler.
    output refines the input as LFIR programs. The validator is shaped for it (it reads only the
    two programs), but the proof needs a simulation between machines with different register
    files and a frame, and the ABI assumptions as hypotheses about callees.
-2. **Extract or port the DCE checker with a proof of correspondence.** Today the proved checker
-   runs in the tests and on request (`fir opt --check-dce`), and the Rust `check` runs in the
-   compiler; a differential test holds them to the same verdicts on random candidates, but
-   nothing proves the Rust one equal to the Lean one, and the Rust one checks a candidate, not
-   the output (`erase_many` is trusted). The proved checker is quadratic in a function's size
-   (21 s for one function of 128,000 ops); a linear variant is needed before it runs always.
-   Options and costs: [layer-audit.md](layer-audit.md#options-for-closing-the-gap-by-cost).
+2. **Make the proved DCE checker the default.** It now runs in the tests, in the C corpus's
+   `-O` builds, and in any compilation that asks (`--check-dce`, `FIR_CHECK_DCE`); it is no longer quadratic
+   (`checkFuncL`, proved equal to `checkFunc`, linear in size times nesting depth by construction: 0.7 s for one function of 128,000 ops, mostly
+   parsing and printing). By default the compiler still runs only the Rust `check`, which a
+   differential test holds to the same verdicts on random candidates but nothing proves equal,
+   and which checks a candidate, not the output (`erase_many` is trusted). Running it by default
+   needs Lean in process or in the toolchain. Also open for DCE: `Decided` (assumed) and
+   composition (obligation 3). [dce.md](dce.md#next-steps-by-value-per-cost).
 3. **Module composition and `Decided`.** Every pass theorem is about one function in a fixed
    module with a `Decided` source; optimizing every function of a module, and running passes in
    sequence, needs refinement to compose over calls and `Decided` to be preserved or replaced.
@@ -322,7 +329,10 @@ Measured on the development machine (x86-64 Linux, qemu-user for AArch64):
   dominate. It is not optimized; a reverse index from values to locations would remove most of
   its cost.
 * **DCE's seam** adds one walk of the body to recount reads (the checker) per run. The proved
-  checker runs only in the tests (about 400 short `fir-ref` processes).
+  checker runs in the tests (about 400 short `fir-ref` processes) and in the C corpus's `-O`
+  builds; with `--check-dce` a compilation costs one `fir-ref` process per `dce` step that
+  changed the module (about 15 ms per program on the corpus, nearly all process start and the
+  text round trip).
 * **The audit** takes 2 s. The lock changes whenever a definition a claim depends on changes,
   which for the interpreter is often: `lake exe fir-audit --update` after reading the diff of
   `proofs.lock.json` (statements are shown in full; dependencies as names with fingerprints).
@@ -465,7 +475,8 @@ of value per cost:
 4. **Adopt checked transformation seams where a proved checker exists or is planned** (DCE now;
    the allocation validator as the next proof target). The plan/check/apply shape costs little
    and keeps passes from mutating around validation. Running the proved checker in the tests
-   gives proof-backed results on the test corpus today; extracting it into the compiler is the
+   and the C corpus's builds gives proof-backed results there today (`--check-dce` gives them
+   for any compilation that asks); running it in process, by default, is the
    step that would make it hold for every input.
 5. **Adopt the proof audit, with care about churn.** Rejecting `sorry`, custom axioms, and
    unregistered theorems is high value and quiet. The dependency fingerprints are noisy (any

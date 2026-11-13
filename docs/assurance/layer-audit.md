@@ -140,6 +140,13 @@ interpreter's world doesn't model. The corpus test takes 23 s.
 
 ## 3. The DCE checker: Lean and Rust
 
+> **Later:** options 1 and 2 below are done, and the proved checker now runs on the compiler's own
+> path on request (`fai-cc`/`fir compile -O --check-dce`, `FIR_CHECK_DCE`) and on every `-O`
+> build of the C corpus. The checker is no longer quadratic (`Fir.Dce.checkFuncL`, proved equal to
+> `checkFunc`), and the module-level pairing is proved (`Fir.Dce.checkModule_sound`). The
+> measurements below are of the quadratic checker. [dce.md](dce.md) is the current account, link
+> by link.
+
 ### What exists, checked rather than assumed
 
 - `Fir.Dce.checkFunc tgt src` is proved: `checkFunc_sound : checkFunc tgt src = true →
@@ -231,9 +238,11 @@ allocations). It does not cover:
 
 ### Options for closing the gap, by cost
 
-1. **Run the proved checker in CI over a corpus** (done for the tests; the C corpus run is
-   `fir opt … --check-dce`): cheap, covers the configurations tested.
-2. **A linear checker in Lean**, proved equal to `deletable`: needed before anything always-on.
+1. **Run the proved checker in CI over a corpus** (done: the tests, and every `fai-cc -O` build
+   of the C corpus): cheap, covers the configurations tested.
+2. **A linear checker in Lean**, proved equal to `deletable` (done, linear in size times
+   nesting depth: `checkFuncL_eq`, proved
+   equal to `checkFunc`; 0.7 s instead of 16.5 s for one function of 128,000 ops).
 3. **Call it in process** (Lean's C output linked into `fir` behind `@[export]`): removes the
    process and the files, not the text round trip; adds Lean's runtime to the binary.
 4. **Port `checkOps` to Rust as an output checker** and keep the agreement test: always-on and
