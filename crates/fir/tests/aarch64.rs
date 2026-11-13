@@ -47,7 +47,8 @@
 //! tests compare them: as their scalars, except one struct or array result, which calls pass
 //! whole), so the native output, which prints the lowered function's results, is compared with
 //! the HFIR semantics directly. Where the default `-O` pipeline changes the MFIR, the optimized
-//! program is built and run natively too.
+//! program is built and run natively too; `FIR_PASSES=p,q,…` runs that pipeline instead
+//! (experimental passes included).
 //!
 //! Structs and arrays cross the C boundary by value (decision: C ABI for aggregates): the
 //! generated `main` declares a C struct with each composite's layout and AAPCS64 class (a
@@ -104,6 +105,17 @@ struct Toolchain {
     /// The emulator binaries run under, if not natively.
     runner: Option<String>,
     runtime: PathBuf,
+}
+
+/// The pipeline the optimized builds run: the default `-O` one, or `FIR_PASSES=p,q,…` (run to a
+/// fixed point; experimental passes allowed), as `tests/opt.rs` takes it.
+fn opt_pipeline() -> fir::passes::Pipeline {
+    match std::env::var("FIR_PASSES") {
+        Ok(spec) if !spec.is_empty() => {
+            fir::passes::Pipeline::parse_fixpoint(&spec, true).expect("FIR_PASSES")
+        }
+        _ => fir::passes::Pipeline::default_opt(),
+    }
 }
 
 fn on_path(name: &str) -> bool {
@@ -1316,9 +1328,10 @@ fn check_module(
         .iter()
         .map(|(f, a, _, _, _)| (f.clone(), a.clone()))
         .collect();
-    // The program as compiled, and with `-O` when that changes it.
+    // The program as compiled, and with `-O` (or the `FIR_PASSES` pipeline) when that changes
+    // it.
     let mut builds = vec![("native", m.clone())];
-    match fir::backend::prepare(src, true) {
+    match fir::backend::prepare_with(src, Some(&opt_pipeline())) {
         Ok(o) if o.render(false) != m.render(false) => builds.push(("native -O", o)),
         Ok(_) => {}
         Err(e) => {

@@ -767,6 +767,24 @@ FirStatus fir_module_lower(struct FirModule *m, struct FirModule **out);
 // Each is used only during the call.
 FirStatus fir_module_optimize(struct FirModule *m, struct FirModule **out);
 
+// Like `fir_module_optimize`, with the passes `passes` names (separated by commas, as
+// `fir compile --passes` takes them) run in order to a fixed point instead of the default
+// pipeline (`FIR_CHECK_DCE` checks its `dce` steps too). Experimental (unproved) passes, such as `mem2reg`, are refused unless
+// `experimental`: `FIR_ERR_INVALID` for them and for an unknown name.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `passes` is null or points to a NUL-terminated string.
+// * `out` is null or points to a writable `*mut FirModule`.
+//
+// Each is used only during the call.
+FirStatus fir_module_optimize_passes(struct FirModule *m,
+                                     const char *passes,
+                                     bool experimental,
+                                     struct FirModule **out);
+
 // Verify a module and compile it for `target` (`"aarch64"`, the only one so far) to GNU
 // assembly, as `fir compile --emit asm` does: HFIR is lowered to MFIR first, and with
 // `optimize` the default pass pipeline runs on the MFIR (`fir compile -O`; with `FIR_CHECK_DCE`
@@ -790,6 +808,27 @@ FirStatus fir_module_compile(struct FirModule *m,
                              bool optimize,
                              FirOs os,
                              char **out);
+
+// Like `fir_module_compile`, with the passes `passes` names (separated by commas, as
+// `fir compile --passes` takes them) run on the MFIR in order to a fixed point instead of the
+// default pipeline; an empty string runs none. Experimental (unproved) passes, such as
+// `mem2reg`, are refused unless `experimental`: `FIR_ERR_INVALID` for them and for an unknown
+// name.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+// * `target` and `passes` are null or point to NUL-terminated strings.
+// * `out` is null or points to a writable `*mut c_char`.
+//
+// Each is used only during the call.
+FirStatus fir_module_compile_passes(struct FirModule *m,
+                                    const char *target,
+                                    const char *passes,
+                                    bool experimental,
+                                    FirOs os,
+                                    char **out);
 
 // `iN`, for `1 <= width < 2^30`.
 FirType fir_type_int(uint32_t width);

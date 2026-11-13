@@ -9,8 +9,8 @@
 //!              [--dump-dir DIR] [--check-dce FIR-REF]
 //!                                            optimize, print canonical text
 //! fir opt --list-passes                      the passes, with what backs each
-//! fir compile FILE [-O [--check-dce FIR-REF]] [-g] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs]
-//!             [--os linux|darwin]            compile to AArch64 (see `compile`)
+//! fir compile FILE [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-g] [-o OUT]
+//!             [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]   compile to AArch64 (see `compile`)
 //! fir lower FILE [--no-locs]                  lower an HFIR module to MFIR and print it
 //! ```
 //!
@@ -121,7 +121,7 @@ fn run(args: &[&str]) -> Result<(), ExitCode> {
         }
         _ => {
             eprintln!(
-                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each] [--no-locs]\n         [--print-before P,...] [--print-after P,...] [--print-changed] [--dump-dir DIR] [--check-dce FIR-REF]\n  fir opt --list-passes\n  fir compile FILE [-O [--check-dce FIR-REF]] [-g] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]\n  fir lower FILE [--no-locs]"
+                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each] [--no-locs]\n         [--print-before P,...] [--print-after P,...] [--print-changed] [--dump-dir DIR] [--check-dce FIR-REF]\n  fir opt --list-passes\n  fir compile FILE [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-g] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]\n  fir lower FILE [--no-locs]"
             );
             Err(ExitCode::from(2))
         }
@@ -348,11 +348,16 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     let mut emit = None;
     let mut optimize = false;
     let mut check_dce = None;
+    let (mut passes, mut experimental) = (None, false);
     let mut o = a64::Options::default();
     let mut it = opts.iter();
     while let Some(&opt) = it.next() {
         if opt == "-O" {
             optimize = true;
+            continue;
+        }
+        if opt == "--experimental" {
+            experimental = true;
             continue;
         }
         if opt == "-g" {
@@ -363,6 +368,7 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
             ("-o", Some(&v)) => out = Some(v),
             ("--emit", Some(&v)) => emit = Some(v),
             ("--check-dce", Some(&v)) => check_dce = Some(v),
+            ("--passes", Some(&v)) => passes = Some(v),
             ("--os", Some(&"linux")) => o.os = a64::Os::Linux,
             ("--os", Some(&"darwin")) => o.os = a64::Os::Darwin,
             _ => {
@@ -373,19 +379,33 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     }
     let m = fir::parse_module(&read(file)?).map_err(fail)?;
     fir::verify_module(&m).map_err(fail)?;
-    let m = match check_dce {
-        None => fir::backend::prepare(&m, optimize).map_err(fail)?,
-        Some(_) if !optimize => {
-            eprintln!("fir compile: --check-dce checks the -O pipeline's dce; add -O");
+    let m = if let Some(spec) = passes {
+        if check_dce.is_some() {
+            eprintln!("fir compile: --check-dce checks the -O pipeline's dce, not --passes");
             return Err(ExitCode::from(2));
         }
-        Some(tool) => {
-            let mut c = fir::passes::reference::CheckDce::in_temp_dir(tool).map_err(fail)?;
-            let r = fir::backend::prepare_observed(&m, true, &mut c);
-            c.finish();
-            let m = r.map_err(fail)?;
-            eprintln!("fir: {}", c.summary());
-            m
+        let p = fir::passes::Pipeline::parse_fixpoint(spec, experimental).map_err(fail)?;
+        if p.is_experimental() {
+            eprintln!(
+                "{file}: warning: running experimental (unproved) passes; see `fir opt --list-passes`"
+            );
+        }
+        fir::backend::prepare_with(&m, Some(&p)).map_err(fail)?
+    } else {
+        match check_dce {
+            None => fir::backend::prepare(&m, optimize).map_err(fail)?,
+            Some(_) if !optimize => {
+                eprintln!("fir compile: --check-dce checks the -O pipeline's dce; add -O");
+                return Err(ExitCode::from(2));
+            }
+            Some(tool) => {
+                let mut c = fir::passes::reference::CheckDce::in_temp_dir(tool).map_err(fail)?;
+                let r = fir::backend::prepare_observed(&m, true, &mut c);
+                c.finish();
+                let m = r.map_err(fail)?;
+                eprintln!("fir: {}", c.summary());
+                m
+            }
         }
     };
     let write = |text: String| -> Result<(), ExitCode> {

@@ -871,6 +871,36 @@ static void building_blocks(void) {
     CHECK(as != NULL && strstr(as, "blocks:") != NULL && strstr(as, "__fir_trap") != NULL);
     fir_string_free(as);
   }
+  /* Named passes to a fixed point, experimental ones only when asked for. */
+  {
+    const char *exp = "mem2reg,stackdce,fwd,copyprop,dse,dce";
+    FirModule *l = NULL, *o = NULL;
+    OK(fir_module_lower(m, &l));
+    cur = l;
+    CHECK(fir_module_optimize_passes(l, "mem2reg", false, &o) == FIR_ERR_INVALID && o == NULL);
+    expect_error("pass \"mem2reg\" is experimental (unproved); opt in to run it (`--experimental`)",
+                 __LINE__);
+    CHECK(fir_module_optimize_passes(l, "nope", true, &o) == FIR_ERR_INVALID && o == NULL);
+    OK(fir_module_optimize_passes(l, exp, true, &o));
+    CHECK(o != NULL);
+    if (o != NULL) {
+      expect_run(o, "blocks", ok_args, 2, ret);
+      expect_run(o, "blocks", oob_args, 2, "trap bounds");
+      fir_module_free(o);
+    }
+    fir_module_free(l);
+    cur = m;
+    char *as = NULL;
+    CHECK(fir_module_compile_passes(m, "aarch64", exp, false, FIR_OS_LINUX, &as) ==
+              FIR_ERR_INVALID &&
+          as == NULL);
+    OK(fir_module_compile_passes(m, "aarch64", exp, true, FIR_OS_LINUX, &as));
+    CHECK(as != NULL && strstr(as, "blocks:") != NULL);
+    fir_string_free(as);
+    OK(fir_module_compile_passes(m, "aarch64", "", false, FIR_OS_LINUX, &as));
+    CHECK(as != NULL && strstr(as, "blocks:") != NULL);
+    fir_string_free(as);
+  }
   char *as = NULL;
   CHECK(fir_module_compile(m, "x86", false, FIR_OS_LINUX, &as) == FIR_ERR_INVALID && as == NULL);
   expect_error("unknown target 'x86'", __LINE__);

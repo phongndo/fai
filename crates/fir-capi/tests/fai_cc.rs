@@ -32,6 +32,11 @@
 //! on Linux; elsewhere (macOS, whose binaries aren't Linux ones) only with `FAI_CC_TESTS=1`, and
 //! `FAI_CC_TESTS=0` turns it off. `FAI_CC_ONLY=name` runs only the programs whose names contain
 //! `name`; `--nocapture` shows the summary.
+//!
+//! `FAI_CC_PASSES=p,q,…` adds a fourth build, `fai-cc --passes p,q,… --experimental` (the named
+//! passes to a fixed point, experimental ones included, such as `mem2reg`), which must match the
+//! reference too, and the interpreter runs the MFIR and the allocated LFIR it makes as two more
+//! layers.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -241,8 +246,16 @@ fn run_fir(hfir: &str) -> Result<FirRun, String> {
     run_module(&m)
 }
 
+/// The passes of `FAI_CC_PASSES`, if set and not empty.
+fn exp_passes() -> Option<String> {
+    std::env::var("FAI_CC_PASSES")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 /// The program at every layer below HFIR, as `fir compile` makes them: MFIR as lowered, MFIR
-/// after `-O`, and LFIR for AArch64 before and after register allocation.
+/// after `-O`, and LFIR for AArch64 before and after register allocation; with
+/// `FAI_CC_PASSES`, also the MFIR those passes make and its allocated LFIR.
 fn layers(hfir: &fir::Module) -> Result<Vec<(&'static str, fir::Module)>, String> {
     use fir::backend::aarch64 as a64;
     let mfir = fir::backend::prepare(hfir, false)?;
@@ -251,12 +264,22 @@ fn layers(hfir: &fir::Module) -> Result<Vec<(&'static str, fir::Module)>, String
     let vregs = a64::lfir::to_module(&opt, &mm);
     a64::allocate(&opt, &mut mm)?;
     let lfir = a64::lfir::to_module(&opt, &mm);
-    Ok(vec![
+    let mut out = vec![
         ("mfir", mfir),
         ("mfir -O", opt),
         ("lfir-vregs", vregs),
         ("lfir", lfir),
-    ])
+    ];
+    if let Some(spec) = exp_passes() {
+        let p = fir::passes::Pipeline::parse_fixpoint(&spec, true)?;
+        let exp = fir::backend::prepare_with(hfir, Some(&p))?;
+        let mut mm = a64::select(&exp)?;
+        a64::allocate(&exp, &mut mm)?;
+        let lfir = a64::lfir::to_module(&exp, &mm);
+        out.push(("mfir --passes", exp));
+        out.push(("lfir --passes", lfir));
+    }
+    Ok(out)
 }
 
 /// The interpreter's run of `main` in `m` (any layer), as a native run's behavior.
@@ -320,6 +343,8 @@ struct Tally {
     programs: usize,
     native: usize,
     native_opt: usize,
+    /// Native runs of the `FAI_CC_PASSES` build that matched.
+    native_passes: usize,
     fir_match: usize,
     /// Programs whose run also matched at MFIR, MFIR -O, and LFIR before and after allocation.
     layers_match: usize,
@@ -432,9 +457,21 @@ fn one(
         Ok(b) => b,
         Err(e) => return fail(format!("the reference binary: {e}")),
     };
-    let mut ok = [false; 2];
-    for (i, opt) in [false, true].into_iter().enumerate() {
-        let exe = out.join(format!("{name}{}", if opt { ".O" } else { "" }));
+    // The builds: without and with -O, and with `FAI_CC_PASSES`'s passes.
+    let mut builds: Vec<(&str, String, Vec<String>)> = vec![
+        ("", String::new(), vec![]),
+        (".O", " -O".to_owned(), vec!["-O".to_owned()]),
+    ];
+    if let Some(spec) = exp_passes() {
+        builds.push((
+            ".passes",
+            format!(" --passes {spec}"),
+            vec!["--passes".to_owned(), spec, "--experimental".to_owned()],
+        ));
+    }
+    let mut ok = [false; 3];
+    for (i, (suffix, label, flags)) in builds.iter().enumerate() {
+        let exe = out.join(format!("{name}{suffix}"));
         let mut cmd = Command::new(fai);
         cmd.arg(file)
             .arg("-I")
@@ -442,12 +479,11 @@ fn one(
             .args(&objs)
             .arg("-lm")
             .arg("-o")
-            .arg(&exe);
-        if opt {
-            cmd.arg("-O");
-            if let Some(t) = check_dce {
-                cmd.arg("--check-dce").arg(t);
-            }
+            .arg(&exe)
+            .args(flags);
+        let opt = *suffix == ".O";
+        if let (true, Some(t)) = (opt, check_dce) {
+            cmd.arg("--check-dce").arg(t);
         }
         let built = run_limited(&mut cmd, Duration::from_secs(120));
         match built {
@@ -472,24 +508,22 @@ fn one(
             }
             Ok(o) => {
                 fail(format!(
-                    "fai-cc{} failed:\n{}",
-                    if opt { " -O" } else { "" },
+                    "fai-cc{label} failed:\n{}",
                     String::from_utf8_lossy(&o.stderr)
                 ));
                 continue;
             }
             Err(e) => {
-                fail(format!("fai-cc: {e}"));
+                fail(format!("fai-cc{label}: {e}"));
                 continue;
             }
         }
         match run_native(tc, &exe) {
             Ok(got) if got == want => ok[i] = true,
             Ok(got) => fail(format!(
-                "fai-cc{} gives {got:?}, the reference {want:?}",
-                if opt { " -O" } else { "" }
+                "fai-cc{label} gives {got:?}, the reference {want:?}"
             )),
-            Err(e) => fail(format!("fai-cc{}: {e}", if opt { " -O" } else { "" })),
+            Err(e) => fail(format!("fai-cc{label}: {e}")),
         }
     }
     let hfir = Command::new(fai)
@@ -554,6 +588,7 @@ fn one(
     t.programs += 1;
     t.native += usize::from(ok[0]);
     t.native_opt += usize::from(ok[1]);
+    t.native_passes += usize::from(ok[2]);
     t.fir_match += usize::from(fir_ok);
 }
 
@@ -658,6 +693,12 @@ fn fai_cc_corpus() {
     }
 
     t.fir_other_externs.sort();
+    if let Some(spec) = exp_passes() {
+        eprintln!(
+            "fai-cc corpus: native runs matching with --passes {spec}: {}",
+            t.native_passes
+        );
+    }
     eprintln!(
         "fai-cc corpus: {} programs; native runs matching the reference: {} without -O, {} with \
          -O; fir run matching: {} (and at every lower layer: {}), not comparable: {} (calling other external functions: {}); \

@@ -1304,6 +1304,40 @@ pub unsafe extern "C" fn fir_module_optimize(
     }
 }
 
+/// Like `fir_module_optimize`, with the passes `passes` names (separated by commas, as
+/// `fir compile --passes` takes them) run in order to a fixed point instead of the default
+/// pipeline (`FIR_CHECK_DCE` checks its `dce` steps too). Experimental (unproved) passes, such as `mem2reg`, are refused unless
+/// `experimental`: `FIR_ERR_INVALID` for them and for an unknown name.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `passes` is null or points to a NUL-terminated string.
+/// * `out` is null or points to a writable `*mut FirModule`.
+///
+/// Each is used only during the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_module_optimize_passes(
+    m: *mut FirModule,
+    passes: *const c_char,
+    experimental: bool,
+    out: *mut *mut FirModule,
+) -> FirStatus {
+    // SAFETY: `m`, `passes`, `out` are as this function's `# Safety` section requires; they are
+    // used only during the call.
+    unsafe {
+        derive(m, out, |module| {
+            let pipeline = fir::passes::Pipeline::parse_fixpoint(cstr(passes)?, experimental)
+                .or_else(|e| fail(FIR_ERR_INVALID, e))?;
+            let mut new = module.clone();
+            fir::backend::optimize_with(&mut new, &pipeline)
+                .or_else(|e| fail(FIR_ERR_COMPILE, e))?;
+            Ok(new)
+        })
+    }
+}
+
 /// Verify a module and compile it for `target` (`"aarch64"`, the only one so far) to GNU
 /// assembly, as `fir compile --emit asm` does: HFIR is lowered to MFIR first, and with
 /// `optimize` the default pass pipeline runs on the MFIR (`fir compile -O`; with `FIR_CHECK_DCE`
@@ -1330,6 +1364,31 @@ pub unsafe extern "C" fn fir_module_compile(
     os: FirOs,
     out: *mut *mut c_char,
 ) -> FirStatus {
+    // SAFETY: passed on: `m`, `target`, `out` are as this function's `# Safety` section
+    // requires.
+    unsafe {
+        compile_with(
+            m,
+            target,
+            optimize.then(fir::passes::Pipeline::default_opt),
+            os,
+            out,
+        )
+    }
+}
+
+/// `fir_module_compile` with `pipeline` (if any) run on the MFIR.
+///
+/// # Safety
+///
+/// As `fir_module_compile`'s.
+unsafe fn compile_with(
+    m: *mut FirModule,
+    target: *const c_char,
+    pipeline: Option<fir::passes::Pipeline>,
+    os: FirOs,
+    out: *mut *mut c_char,
+) -> FirStatus {
     use fir::backend::aarch64 as a64;
     // SAFETY: `m`, `target`, `out` are as this function's `# Safety` section requires; they are
     // used only during the call.
@@ -1352,7 +1411,7 @@ pub unsafe extern "C" fn fir_module_compile(
                 os,
                 ..a64::Options::default()
             };
-            let asm = fir::backend::prepare(module, optimize)
+            let asm = fir::backend::prepare_with(module, pipeline.as_ref())
                 .and_then(|l| a64::compile(&l, &o))
                 .or_else(|e| fail(FIR_ERR_COMPILE, e))?;
             if let Some(out) = out.as_mut() {
@@ -1360,6 +1419,46 @@ pub unsafe extern "C" fn fir_module_compile(
             }
             Ok(())
         })
+    }
+}
+
+/// Like `fir_module_compile`, with the passes `passes` names (separated by commas, as
+/// `fir compile --passes` takes them) run on the MFIR in order to a fixed point instead of the
+/// default pipeline; an empty string runs none. Experimental (unproved) passes, such as
+/// `mem2reg`, are refused unless `experimental`: `FIR_ERR_INVALID` for them and for an unknown
+/// name.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+/// * `target` and `passes` are null or point to NUL-terminated strings.
+/// * `out` is null or points to a writable `*mut c_char`.
+///
+/// Each is used only during the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_module_compile_passes(
+    m: *mut FirModule,
+    target: *const c_char,
+    passes: *const c_char,
+    experimental: bool,
+    os: FirOs,
+    out: *mut *mut c_char,
+) -> FirStatus {
+    // SAFETY: `m`, `target`, `passes`, `out` are as this function's `# Safety` section requires;
+    // they are used only during the call.
+    unsafe {
+        let pipeline = match cstr(passes) {
+            Ok("") => None,
+            Ok(spec) => match fir::passes::Pipeline::parse_fixpoint(spec, experimental) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    return module_status(m, |_| fail(FIR_ERR_INVALID, e));
+                }
+            },
+            Err(e) => return module_status(m, |_| Err(e.into())),
+        };
+        compile_with(m, target, pipeline, os, out)
     }
 }
 

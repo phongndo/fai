@@ -3,13 +3,16 @@
 // verifies it and compiles it to AArch64 assembly; the system's AArch64 C compiler assembles and
 // links it, as `fir compile` does.
 //
-//   fai-cc FILE.c [-O [--check-dce FIR-REF]] [-o OUT] [--emit hfir|mfir|asm] [INPUT...]
-//          [-I DIR] [-D NAME[=V]] [-l LIB] [-L DIR] [-- CLANG-FLAG...]
+//   fai-cc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]
+//          [--emit hfir|mfir|asm] [INPUT...] [-I DIR] [-D NAME[=V]] [-l LIB] [-L DIR]
+//          [-- CLANG-FLAG...]
 //
 // Without --emit, OUT (default a.out) is an executable, or an object file when it ends in `.o`
 // (or assembly when it ends in `.s`); further INPUTs (objects, archives, C or assembly files)
 // and -l/-L are passed to the linker. --emit prints HFIR (as lowered), MFIR (lowered, and
-// optimized with -O), or assembly, to OUT or standard output. Flags after `--` go to Clang.
+// optimized with -O or --passes), or assembly, to OUT or standard output. Flags after `--` go to
+// Clang. --passes runs the named passes to a fixed point instead of -O's; experimental
+// (unproved) ones, such as mem2reg, only with --experimental.
 //
 // --check-dce FIR-REF checks every step of dead code elimination in -O with the proved Lean
 // checker (`fir-ref check-dce`, run by the library: FIR_CHECK_DCE), fails if it refuses one, and
@@ -47,8 +50,9 @@
 namespace {
 
 const char *kUsage =
-    "usage: fai-cc FILE.c [-O [--check-dce FIR-REF]] [-o OUT] [--emit hfir|mfir|asm] [INPUT...]\n"
-    "              [-I DIR] [-D NAME[=V]] [-l LIB] [-L DIR] [-- CLANG-FLAG...]\n";
+    "usage: fai-cc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]\n"
+    "              [--emit hfir|mfir|asm] [INPUT...] [-I DIR] [-D NAME[=V]] [-l LIB] [-L DIR]\n"
+    "              [-- CLANG-FLAG...]\n";
 
 struct Options {
   std::string file;
@@ -56,6 +60,10 @@ struct Options {
   std::string emit;
   std::string checkDce;
   bool optimize = false;
+  // --passes: run these instead of -O's pipeline; `experimental` allows unproved ones.
+  bool hasPasses = false;
+  std::string passes;
+  bool experimental = false;
   std::vector<std::string> clangArgs;
   std::vector<std::string> linkArgs;
 };
@@ -76,6 +84,12 @@ bool parseArgs(int argc, char **argv, Options &o) {
     }
     if (a == "-O") {
       o.optimize = true;
+    } else if (a == "--passes") {
+      if (!value(o.passes))
+        return false;
+      o.hasPasses = true;
+    } else if (a == "--experimental") {
+      o.experimental = true;
     } else if (a == "-o") {
       if (!value(o.out))
         return false;
@@ -113,8 +127,9 @@ bool parseArgs(int argc, char **argv, Options &o) {
       o.linkArgs.push_back(a);
     }
   }
-  if (!o.checkDce.empty() && !o.optimize) {
-    llvm::errs() << "fai-cc: --check-dce checks -O's dead code elimination; add -O\n";
+  if (!o.checkDce.empty() && !o.optimize && !o.hasPasses) {
+    llvm::errs()
+        << "fai-cc: --check-dce checks the dead code elimination of -O or --passes; add one\n";
     return false;
   }
   return !o.file.empty();
@@ -227,13 +242,16 @@ struct ModuleHandle {
 
 int compileAndLink(FirModule *m, const Options &o) {
   FirString as;
-  if (fir_module_compile(m, "aarch64", o.optimize, FIR_OS_LINUX, &as.s) != FIR_OK) {
+  FirStatus st = o.hasPasses ? fir_module_compile_passes(m, "aarch64", o.passes.c_str(),
+                                                         o.experimental, FIR_OS_LINUX, &as.s)
+                             : fir_module_compile(m, "aarch64", o.optimize, FIR_OS_LINUX, &as.s);
+  if (st != FIR_OK) {
     std::string err = fir_module_error(m);
     if (!o.checkDce.empty() && err.find("check-dce") != std::string::npos)
-      llvm::errs() << o.file << ": the proved DCE checker refused -O's output: " << err << "\n";
-    else
-      llvm::errs() << o.file << ": the AArch64 backend can't compile this program: " << err
+      llvm::errs() << o.file << ": the proved DCE checker refused the optimized output: " << err
                    << "\n";
+    else
+      llvm::errs() << o.file << ": the AArch64 backend can't compile this program: " << err << "\n";
     return 1;
   }
   if (o.emit == "asm")
@@ -287,6 +305,8 @@ int main(int argc, char **argv) {
   // The library's -O pipeline runs the proved checker when this names a fir-ref.
   if (!o.checkDce.empty())
     setenv("FIR_CHECK_DCE", o.checkDce.c_str(), 1);
+  if (o.experimental && o.hasPasses)
+    llvm::errs() << "fai-cc: warning: --experimental: passes that are not proved may run\n";
   std::vector<std::string> args = {"-target", "aarch64-unknown-linux-gnu", "-nostdlibinc"};
   std::string res = FAI_CC_RESOURCE_DIR;
   if (const char *r = std::getenv("FAI_CC_RESOURCE_DIR"); r && *r)
@@ -332,8 +352,11 @@ int main(int argc, char **argv) {
       return 1;
     }
     ModuleHandle lh(l);
-    if (o.optimize) {
-      if (fir_module_optimize(l, &opt) != FIR_OK) {
+    if (o.optimize || o.hasPasses) {
+      FirStatus st = o.hasPasses
+                         ? fir_module_optimize_passes(l, o.passes.c_str(), o.experimental, &opt)
+                         : fir_module_optimize(l, &opt);
+      if (st != FIR_OK) {
         llvm::errs() << o.file << ": optimizing failed: " << fir_module_error(l) << "\n";
         return 1;
       }
