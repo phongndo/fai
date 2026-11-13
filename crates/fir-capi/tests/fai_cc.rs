@@ -1,5 +1,13 @@
 //! `fai-cc`, the C frontend in `frontends/c/`, against a reference C compiler.
 //!
+//! The corpus's `fai-cc -O` builds run with `--check-dce` and the Lean reference tool (`FIR_REF`,
+//! or `spec/.lake/build/bin/fir-ref`), so each optimized corpus binary that is run was produced
+//! by a pipeline whose every step of dead code elimination the proved checker accepted
+//! (`Fir.Dce.checkModule`; `docs/assurance/dce.md` says what that does and doesn't establish).
+//! Without a reference (or with `FIR_REF=none`) they build unchecked, which `FIR_REQUIRE_FULL=1`
+//! refuses. The evidence (`fai_cc_corpus`) counts the checked builds and steps. The ABI torture
+//! test below doesn't check its `-O` builds.
+//!
 //! Builds `fai-cc` with CMake against this crate's static library, then compiles every program
 //! of the corpus (`frontends/c/tests/*.c`) three ways: by the reference compiler (the AArch64 C
 //! compiler: `$FIR_CC`, `cc` on AArch64, else `aarch64-unknown-linux-gnu-cc`, at `-O1`, with
@@ -30,6 +38,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+#[path = "../../fir/tests/common/evidence.rs"]
+mod evidence;
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -313,11 +324,58 @@ struct Tally {
     /// Programs whose run also matched at MFIR, MFIR -O, and LFIR before and after allocation.
     layers_match: usize,
     fir_other_externs: Vec<String>,
+    /// `-O` builds whose dead code elimination the proved checker checked, its accepted steps,
+    /// and the deletions in them as the pass counted them (the checker doesn't count).
+    dce_checked_builds: usize,
+    dce_steps: u64,
+    dce_deletions: u64,
     failures: Vec<String>,
 }
 
+/// The Lean reference tool, for `fai-cc --check-dce`: `FIR_REF`, or the one `lake build` makes.
+/// `None` (the `-O` builds then go unchecked) only where a full run isn't required.
+fn fir_ref() -> Option<PathBuf> {
+    let p = match std::env::var_os("FIR_REF") {
+        Some(s) if s == "none" => None,
+        Some(s) => Some(PathBuf::from(s)),
+        None => Some(repo().join("spec/.lake/build/bin/fir-ref")),
+    };
+    match p {
+        Some(p) if p.is_file() => Some(p),
+        _ => {
+            evidence::require("no Lean reference tool to check fai-cc -O's dead code elimination");
+            None
+        }
+    }
+}
+
+/// The steps and deletions in `fai-cc --check-dce`'s summary line on stderr.
+fn dce_summary(stderr: &str) -> Option<(u64, u64)> {
+    let line = stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("fir: check-dce: "))?;
+    let steps = line.split(' ').next()?.parse().ok()?;
+    let deletions = line
+        .split_once("function pairs, ")?
+        .1
+        .split(' ')
+        .next()?
+        .parse()
+        .ok()?;
+    line.contains("accepted by Fir.Dce.checkModule")
+        .then_some((steps, deletions))
+}
+
 /// One corpus program: build it three ways, run, and compare.
-fn one(file: &Path, fai: &Path, tc: &Toolchain, rt: &Path, out: &Path, tally: &Mutex<Tally>) {
+fn one(
+    file: &Path,
+    fai: &Path,
+    tc: &Toolchain,
+    rt: &Path,
+    out: &Path,
+    check_dce: Option<&Path>,
+    tally: &Mutex<Tally>,
+) {
     let name = file.file_stem().unwrap().to_string_lossy().into_owned();
     let inc = repo().join("frontends/c/tests/runtime");
     let fail = |msg: String| {
@@ -387,10 +445,31 @@ fn one(file: &Path, fai: &Path, tc: &Toolchain, rt: &Path, out: &Path, tally: &M
             .arg(&exe);
         if opt {
             cmd.arg("-O");
+            if let Some(t) = check_dce {
+                cmd.arg("--check-dce").arg(t);
+            }
         }
         let built = run_limited(&mut cmd, Duration::from_secs(120));
         match built {
-            Ok(o) if o.status.success() => {}
+            Ok(o) if o.status.success() => {
+                if opt && check_dce.is_some() {
+                    match dce_summary(&String::from_utf8_lossy(&o.stderr)) {
+                        Some((steps, deletions)) => {
+                            let mut t = tally.lock().unwrap();
+                            t.dce_checked_builds += 1;
+                            t.dce_steps += steps;
+                            t.dce_deletions += deletions;
+                        }
+                        None => {
+                            fail(format!(
+                                "fai-cc -O --check-dce printed no checker summary:\n{}",
+                                String::from_utf8_lossy(&o.stderr)
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            }
             Ok(o) => {
                 fail(format!(
                     "fai-cc{} failed:\n{}",
@@ -538,6 +617,7 @@ fn fai_cc_corpus() {
     }
     let tc = toolchain();
     let fai = fai_cc();
+    let check_dce = fir_ref();
     let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fai-cc-corpus");
     std::fs::create_dir_all(&out).unwrap();
     let rt = out.join("fai_runtime.o");
@@ -562,7 +642,7 @@ fn fai_cc_corpus() {
                     let Some(file) = next.lock().unwrap().next() else {
                         break;
                     };
-                    one(file, fai, &tc, &rt, &out, &tally);
+                    one(file, fai, &tc, &rt, &out, check_dce.as_deref(), &tally);
                 }
             });
         }
@@ -581,7 +661,7 @@ fn fai_cc_corpus() {
     eprintln!(
         "fai-cc corpus: {} programs; native runs matching the reference: {} without -O, {} with \
          -O; fir run matching: {} (and at every lower layer: {}), not comparable: {} (calling other external functions: {}); \
-         error tests: {}",
+         error tests: {}; -O builds checked by Fir.Dce.checkModule: {} ({} dce steps, {} deletions)",
         t.programs,
         t.native,
         t.native_opt,
@@ -589,8 +669,22 @@ fn fai_cc_corpus() {
         t.layers_match,
         t.fir_other_externs.len(),
         t.fir_other_externs.join(", "),
-        errors
+        errors,
+        t.dce_checked_builds,
+        t.dce_steps,
+        t.dce_deletions
     );
+    let ev = evidence::Evidence::new("fai_cc_corpus");
+    ev.count("programs", t.programs as u64);
+    ev.count("native -O runs matching the reference", t.native_opt as u64);
+    ev.count(
+        "-O builds checked by Fir.Dce.checkModule",
+        t.dce_checked_builds as u64,
+    );
+    ev.count("dce steps accepted by Fir.Dce.checkModule", t.dce_steps);
+    ev.count("dce deletions (the pass's count)", t.dce_deletions);
+    ev.count("failures", t.failures.len() as u64);
+    ev.write();
     assert!(
         t.failures.is_empty(),
         "{} failures:\n{}",

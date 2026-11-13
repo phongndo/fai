@@ -51,6 +51,8 @@ const CLEARED: &[&str] = &[
     "FIR_ABI",
     "FIR_ABI_SEED",
     "FIR_SHOW_ADDRESS_DIFFS",
+    "FIR_CHECK_DCE",
+    "FAI_CC_ONLY",
     "CBINDGEN",
 ];
 
@@ -64,6 +66,7 @@ const SUITES: &[&str] = &[
     "dce_check",
     "dce_adversarial",
     "dce_agreement",
+    "dce_compile",
     "debug_lines",
     "debug_lines_edges",
     "regcheck_adversarial",
@@ -725,6 +728,63 @@ fn check_evidence(
     );
     need(&mut bad, "debug_lines_edges", "modules", None);
     // The Rust and Lean DCE checkers must each have judged candidates both ways.
+    // The compiler's own entry points run the proved checker when asked, and fail on its
+    // objections.
+    need(
+        &mut bad,
+        "dce_compile",
+        "dce steps accepted by Fir.Dce.checkModule",
+        None,
+    );
+    need(
+        &mut bad,
+        "dce_compile",
+        "checker objections that failed the compilation",
+        Some(4),
+    );
+    // The C corpus (it runs Linux binaries, so it is required on Linux): every `fai-cc -O`
+    // binary that runs was built with every step of dce accepted by the proved checker.
+    if cfg!(target_os = "linux") {
+        match evs.get("fai_cc_corpus") {
+            None => bad.push("fai_cc_corpus: no evidence (the C corpus didn't run)".into()),
+            Some(ev) => {
+                // Against the corpus on disk, not the suite's own count, so a filtered run
+                // can't pass.
+                let corpus = std::fs::read_dir(root.join("frontends/c/tests"))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "c"))
+                    .count() as u64;
+                let built = count(ev, "-O builds checked by Fir.Dce.checkModule");
+                let ran = count(ev, "native -O runs matching the reference");
+                if corpus == 0
+                    || built != corpus
+                    || ran != corpus
+                    || count(ev, "programs") != corpus
+                {
+                    bad.push(format!(
+                        "fai_cc_corpus: {built} -O builds checked by Fir.Dce.checkModule, {ran} \
+                         of them run natively and matching the reference, and {} programs, of \
+                         {corpus} in frontends/c/tests",
+                        count(ev, "programs")
+                    ));
+                }
+                if count(ev, "failures") > 0 {
+                    bad.push(format!("fai_cc_corpus: {} failures", count(ev, "failures")));
+                }
+                for sk in ev["skipped"].as_array().into_iter().flatten() {
+                    bad.push(format!("fai_cc_corpus: skipped {sk}"));
+                }
+            }
+        }
+        need(
+            &mut bad,
+            "fai_cc_corpus",
+            "dce steps accepted by Fir.Dce.checkModule",
+            None,
+        );
+    }
     need(&mut bad, "dce_agreement", "both accepted", None);
     need(&mut bad, "dce_agreement", "both refused", None);
     need(
@@ -1134,6 +1194,50 @@ mod evidence_tests {
         assert_eq!(
             executed_ops(&[&json!({"executed ops": {"int.add.wrap": 3}})])["int.add.wrap"],
             3
+        );
+    }
+
+    /// Found in review: checked builds satisfied the gate without evidence that the binaries
+    /// were run and compared. Every program's checked `-O` build must also have run natively and
+    /// matched the reference.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn checked_corpus_builds_must_also_have_run() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let corpus = std::fs::read_dir(root.join("frontends/c/tests"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "c"))
+            .count() as u64;
+        let ev = |ran: u64| {
+            BTreeMap::from([(
+                "fai_cc_corpus".to_owned(),
+                json!({"counts": {
+                    "programs": corpus,
+                    "-O builds checked by Fir.Dce.checkModule": corpus,
+                    "dce steps accepted by Fir.Dce.checkModule": 1,
+                    "native -O runs matching the reference": ran,
+                }}),
+            )])
+        };
+        let corpus_problems = |ran| {
+            check_evidence(&root, &ev(ran), None, None)
+                .0
+                .into_iter()
+                .filter(|b| b.starts_with("fai_cc_corpus"))
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            corpus_problems(corpus).is_empty(),
+            "{:?}",
+            corpus_problems(corpus)
+        );
+        assert!(
+            corpus_problems(0)
+                .iter()
+                .any(|b| b.contains("0 of them run natively")),
+            "{:?}",
+            corpus_problems(0)
         );
     }
 
