@@ -1,0 +1,14 @@
+[package]
+name = "fai-lowering"
+version = "0.1.0"
+description = "FIR's lowering from HFIR to MFIR, as fir-ref lower does it"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fai-ir = { path = "../ir" }
+num-bigint = "0.4"
+
+[lints]
+workspace = true

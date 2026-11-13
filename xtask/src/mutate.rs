@@ -137,7 +137,7 @@ fn mutations() -> Vec<Mutation> {
             steps: vec![regen_ops(), cmd("cargo", &["build", "-p", "fir"])],
             expect: vec![
                 "non-exhaustive patterns: `ops::OpKind::Popcount` not covered",
-                "--> crates/fir/src/lower.rs:",
+                "--> compiler/lowering/src/lib.rs:",
                 "--> compiler/interp/src/lib.rs:",
                 "--> crates/fir/src/backend/aarch64/isel.rs:",
                 "could not compile `fir` (lib) due to 3 previous errors",

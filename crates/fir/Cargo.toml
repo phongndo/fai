@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 fai-interp = { path = "../../compiler/interp" }
 fai-ir = { path = "../../compiler/ir" }
+fai-lowering = { path = "../../compiler/lowering" }
 num-bigint = "0.4"
 rustc-hash = "2"
 rustc_apfloat = "0.2.3"

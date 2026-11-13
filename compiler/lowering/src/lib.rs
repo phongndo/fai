@@ -15,18 +15,20 @@
 //! The walk follows the crate's data-oriented rules: each source value maps to a run of target
 //! values in one flat array, and the operand, result, and leaf lists are reused buffers.
 
+#![forbid(unsafe_code)]
+
 use num_bigint::BigInt;
 
-use crate::body::{
+use fai_ir::body::{
     Body, Case, Int, OpId, Operand, OperandKind, RegionId, Succ, ValueId, ValueSpec,
 };
-use crate::contract::Lowering;
-use crate::decl::{Imm, Layer};
-use crate::ir::*;
-use crate::types::Shape;
-use crate::verify::render_loc;
+use fai_ir::contract::Lowering;
+use fai_ir::decl::{Imm, Layer};
+use fai_ir::ir::*;
+use fai_ir::types::Shape;
+use fai_ir::verify::render_loc;
 
-/// What the lowering does with ops of a kind, and what backs it ([`crate::contract`]): MFIR ops
+/// What the lowering does with ops of a kind, and what backs it ([`fai_ir::contract`]): MFIR ops
 /// stay; checked arithmetic, `ptr.field`, and `ptr.index` are expanded (proved:
 /// `Fir.Lower.Proof.Expand.refines`); aggregate, union, and slice ops are scalarized (`agg.*`
 /// stay where they make or take apart a composite calls pass whole) and `cf.try` is lowered to
@@ -172,7 +174,7 @@ pub fn lower_module(m: &Module) -> Result<Module, String> {
 /// Lower a verified HFIR module and verify the result (what `fir lower` and `fir-ref lower` do).
 pub fn lower_checked(m: &Module) -> Result<Module, String> {
     let l = lower_module(m)?;
-    match crate::verify_module(&l) {
+    match fai_ir::verify_module(&l) {
         Ok(_) => Ok(l),
         Err(e) => Err(format!("the lowering doesn't verify: {e}")),
     }
@@ -1154,7 +1156,7 @@ impl<'a> Lowerer<'a> {
     fn fix_succs(&mut self, k: OpKind, args: &[Operand]) -> (OpKind, Vec<Operand>) {
         let src: &'a Body = self.src;
         let k2 = self.import_kind(k);
-        let with_nargs = |me: &mut Self, s: crate::body::SuccId, n: usize| {
+        let with_nargs = |me: &mut Self, s: fai_ir::body::SuccId, n: usize| {
             let s = me.dst.succ(s);
             me.dst.add_succ(Succ {
                 label: s.label,
@@ -1237,7 +1239,7 @@ impl<'a> Lowerer<'a> {
     }
 }
 
-fn import_int(src: &Body, dst: &mut Body, n: crate::body::IntId) -> crate::body::IntId {
+fn import_int(src: &Body, dst: &mut Body, n: fai_ir::body::IntId) -> fai_ir::body::IntId {
     match src.int(n) {
         Int::Small(n) => dst.add_small_int(n),
         Int::Big(n) => dst.add_int(n.clone()),
@@ -1361,7 +1363,7 @@ impl<'a> Exn<'a> {
         format!(".x{}", self.x - 1)
     }
 
-    fn label(&mut self, l: &str, nargs: u32) -> crate::body::SuccId {
+    fn label(&mut self, l: &str, nargs: u32) -> fai_ir::body::SuccId {
         let label = self.dst.add_str(l);
         self.dst.add_succ(Succ { label, nargs })
     }

@@ -53,7 +53,7 @@ lower to are `cf.check.REASON %ok`, a core op (decision: Checks):
 | Field and element addresses | `ptr.field`, `ptr.index` (core HFIR ops) | `ptr.offset` by `int.const` offsets and exact products | Lowering proved |
 | Exceptions | `cf.try { } catch(%e: ptr) { }`, `exn.throw` (an exception is a `ptr`) | `cf.blocks` with the handler as a block; throws jump to it and calls that may throw name it (`func.invoke`); `cf.blocks` in between leave by `cf.yield` with a flag (decision: Exceptions in MFIR). AArch64: an error-return convention through the exception slot `__fir_exn` (decision: Exceptions at run time) | Built; lowering tested |
 
-The lowering (`Fir.Lower`, `crates/fir/src/lower.rs`; `fir lower FILE`) scalarizes each function,
+The lowering (`Fir.Lower`, `compiler/lowering/src/lib.rs`; `fir lower FILE`) scalarizes each function,
 then expands it (decision: HFIR lowering). Both tools print the same lowering, and the tests run
 every fixture and fuzzed HFIR program before and after lowering: the same outcome, or, where the
 HFIR run is UB, the same events first. `Lower.Proof.Expand.refines` proves the expansion pass, and

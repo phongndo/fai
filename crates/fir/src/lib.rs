@@ -54,7 +54,6 @@ pub mod backend;
 pub mod codegen;
 mod driver;
 pub use fai_interp as interp;
-mod lower;
 pub mod passes;
 
 pub use fai_ir::{builder, dialect, float};
@@ -68,7 +67,7 @@ pub mod contract {
 }
 
 // The IR's modules, under the names this crate's own modules use.
-use fai_ir::{body, decl, ir, sem, types, verify};
+use fai_ir::{body, ir, sem, types, verify};
 
 pub use fai_ir::body::{
     Body, Case, CasesId, HoleId, Int, IntId, OpId, Operand, OperandKind, Ops, RegionId, StrId,
@@ -88,4 +87,4 @@ pub use fai_ir::parse::parse_module;
 pub use fai_ir::sem::TrapReason;
 pub use fai_ir::types::align_up;
 pub use fai_ir::verify::{Hole, render_loc, verify_module};
-pub use lower::{lower_checked, lower_module, support as lower_support};
+pub use fai_lowering::{lower_checked, lower_module, support as lower_support};
