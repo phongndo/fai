@@ -199,12 +199,39 @@ impl<'a> ModuleCx<'a> {
     }
 }
 
-/// Check that a module can be compiled: 64-bit pointers and addresses.
+/// Check that a module can be compiled: 64-bit pointers and addresses, and otherwise exactly
+/// the data layout the backend implements (AAPCS64's, `SpaceCfg::default()`): integer and
+/// pointer alignments and the `va_list` layout. Selection and the ABI hard-code AAPCS64's, so a
+/// module laid out otherwise would compile into code that disagrees with its own semantics (a
+/// struct passed to C with its fields where C doesn't look; `va.start` writing 32 bytes into an
+/// 8-byte `va_list`).
 pub fn check_module(m: &Module) -> Result<()> {
     if m.space.ptr_bits != 64 || m.space.addr_bits != 64 {
         return Err(format!(
             "the AArch64 backend needs 64-bit pointers and addresses, not ptr {} addr {}",
             m.space.ptr_bits, m.space.addr_bits
+        ));
+    }
+    let aapcs = crate::ir::SpaceCfg::default();
+    let ints = |s: &crate::ir::SpaceCfg| {
+        s.ints
+            .iter()
+            .map(|(w, a)| format!("{w}:{a}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    if m.space != aapcs {
+        return Err(format!(
+            "the AArch64 backend needs AAPCS64's data layout (ptr align {}, int {}, valist {}:{}), \
+             not ptr align {}, int {}, valist {}:{}",
+            aapcs.ptr_align,
+            ints(&aapcs),
+            aapcs.va_size,
+            aapcs.va_align,
+            m.space.ptr_align,
+            ints(&m.space),
+            m.space.va_size,
+            m.space.va_align
         ));
     }
     if let crate::Layer::Lfir(_) = m.layer {

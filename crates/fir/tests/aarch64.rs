@@ -2036,6 +2036,58 @@ fn aggregate_values_need_lowering() {
     a64::compile(&lowered, &a64::Options::default()).unwrap();
 }
 
+/// Found by the layer audit: instruction selection checked only the pointer and address widths
+/// of a module's data layout and hard-coded the rest of AAPCS64's. A 64-bit layout with 4-byte
+/// `i64` alignment compiled a struct argument to C with its `i64` where C doesn't look (the
+/// callee saw 0 for 2); one with an 8-byte `va_list` compiled `va.start` writing AAPCS64's 32
+/// bytes into it, over the frame (stuck in the LFIR machine, a crash natively). The backend now
+/// refuses any layout but AAPCS64's; the same modules with the default layout compile.
+#[test]
+fn layer_audit_foreign_data_layouts_are_refused() {
+    let cases = [
+        "memspace default ptr 64 addr 64 int 8:1 16:2 32:4 64:4
+extern func @take(struct<C>{i32, i64}) -> i64 effects[] assume
+func @go() -> i64 {
+  %a: i32 = int.const 1
+  %b: i64 = int.const 2
+  %s: struct<C>{i32, i64} = agg.make %a, %b
+  %r: i64 = func.call @take(%s)
+  func.ret %r
+}
+",
+        "memspace default ptr 64 addr 64 valist 8:8
+func @first(...) -> i64 {
+  %ap: ptr = mem.stack.of va_list, align 8
+  va.start %ap
+  %n: i64 = va.arg %ap
+  va.end %ap
+  func.ret %n
+}
+",
+        "memspace default ptr 64 addr 64 align 4
+func @f() -> i64 {
+  %n: i64 = int.const 1
+  func.ret %n
+}
+",
+    ];
+    for text in cases {
+        let m = fir::parse_module(text).unwrap();
+        fir::verify_module(&m).unwrap();
+        let lowered = fir::backend::prepare(&m, false).unwrap();
+        let e = a64::compile(&lowered, &a64::Options::default()).unwrap_err();
+        assert!(e.contains("needs AAPCS64's data layout"), "{e}");
+        let default = text.lines().skip(1).collect::<Vec<_>>().join("\n");
+        let m = fir::parse_module(&default).unwrap();
+        fir::verify_module(&m).unwrap();
+        a64::compile(
+            &fir::backend::prepare(&m, false).unwrap(),
+            &a64::Options::default(),
+        )
+        .unwrap();
+    }
+}
+
 /// Found in review: a `struct<packed>{i8, ptr}` passed by value had its pointer shifted across
 /// two `x` registers, which leaves its address bits only, so a `read(args)` callee no longer
 /// reached the allocation in the LFIR machine (and natively) as it does in the semantics: the
