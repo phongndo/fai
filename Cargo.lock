@@ -24,6 +24,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fai-driver"
+version = "0.1.0"
+dependencies = [
+ "fai-interp",
+ "fai-ir",
+ "fai-lowering",
+ "fai-target-aarch64",
+ "fai-target-x86_64",
+ "fai-transforms",
+]
+
+[[package]]
 name = "fai-interp"
 version = "0.1.0"
 dependencies = [
@@ -87,6 +99,7 @@ name = "fir"
 version = "0.1.0"
 dependencies = [
  "fai-codegen",
+ "fai-driver",
  "fai-interp",
  "fai-ir",
  "fai-lowering",
@@ -94,8 +107,6 @@ dependencies = [
  "fai-target-x86_64",
  "fai-transforms",
  "num-bigint",
- "rustc-hash",
- "rustc_apfloat",
 ]
 
 [[package]]

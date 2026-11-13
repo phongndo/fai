@@ -1,0 +1,18 @@
+[package]
+name = "fai-driver"
+version = "0.1.0"
+description = "FIR's pipeline orchestration: lower, optimize (with the optional proved DCE check), hand MFIR to a target"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fai-interp = { path = "../interp" }
+fai-ir = { path = "../ir" }
+fai-lowering = { path = "../lowering" }
+fai-target-aarch64 = { path = "../../targets/aarch64" }
+fai-target-x86_64 = { path = "../../targets/x86_64" }
+fai-transforms = { path = "../transforms" }
+
+[lints]
+workspace = true

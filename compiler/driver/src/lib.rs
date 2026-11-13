@@ -4,13 +4,15 @@
 //! that declare what they do with each op kind ([`components`]). Reached as `fir::backend::*`
 //! and `fir::contract::components`.
 
-use crate::Layer;
-use crate::ir::Module;
-use crate::passes::reference::CheckDce;
-use crate::passes::{Observer, Pipeline, Remarks};
+#![forbid(unsafe_code)]
+
+use fai_ir::Layer;
+use fai_ir::ir::Module;
+use fai_transforms::reference::CheckDce;
+use fai_transforms::{Observer, Pipeline, Remarks};
 
 /// The MFIR module a backend compiles, from a verified module: HFIR is lowered
-/// ([`crate::lower_checked`], which verifies its output), MFIR is taken as it is, and with
+/// ([`fai_lowering::lower_checked`], which verifies its output), MFIR is taken as it is, and with
 /// `optimize` the default `-O` pipeline runs on the result ([`optimize`]). LFIR is an error.
 pub fn prepare(m: &Module, optimize: bool) -> Result<Module, String> {
     let mut out = to_mfir(m)?;
@@ -46,7 +48,7 @@ pub fn prepare_observed(
 
 fn to_mfir(m: &Module) -> Result<Module, String> {
     match m.layer {
-        Layer::Hfir => crate::lower_checked(m),
+        Layer::Hfir => fai_lowering::lower_checked(m),
         Layer::Mfir => Ok(m.clone()),
         Layer::Lfir(_) => Err("the module is already LFIR".to_owned()),
     }
@@ -56,7 +58,7 @@ fn to_mfir(m: &Module) -> Result<Module, String> {
 /// every pass too, in development builds, as `fir opt` does). What `fir compile -O`, `fcc -O`,
 /// and the C API's `fir_module_optimize` and `fir_module_compile` run.
 ///
-/// With `FIR_CHECK_DCE=FIR-REF` in the environment ([`crate::passes::reference::ENV`]), every
+/// With `FIR_CHECK_DCE=FIR-REF` in the environment ([`fai_transforms::reference::ENV`]), every
 /// step of `dce` is also checked by the proved Lean checker ([`CheckDce`]): a refusal, a path
 /// that isn't an executable file, or a `fir-ref` that fails to run when a step is sent to it is
 /// an error (a run where `dce` changes nothing sends it nothing), and on success one summary
@@ -92,16 +94,16 @@ fn run_observed(
     pipeline
         .run_observed(m, &mut Remarks::new(false), observer)
         .map_err(|e| e.to_string())?;
-    crate::verify_module(m)
+    fai_ir::verify_module(m)
         .map(drop)
         .map_err(|e| format!("the optimized module doesn't verify: {e}"))
 }
 
 /// The components that declare their support, by name, for reports and `tests/contracts.rs`.
-pub fn components() -> [(&'static str, crate::contract::SupportFn); 3] {
+pub fn components() -> [(&'static str, fai_ir::contract::SupportFn); 3] {
     [
-        ("interp", crate::interp::support),
-        ("isel.aarch64", crate::backend::aarch64::isel::support),
-        ("isel.x86_64", crate::backend::x86_64::isel::support),
+        ("interp", fai_interp::support),
+        ("isel.aarch64", fai_target_aarch64::isel::support),
+        ("isel.x86_64", fai_target_x86_64::isel::support),
     ]
 }

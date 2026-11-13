@@ -7,15 +7,16 @@ license.workspace = true
 
 [dependencies]
 fai-codegen = { path = "../../compiler/codegen" }
+fai-driver = { path = "../../compiler/driver" }
 fai-interp = { path = "../../compiler/interp" }
 fai-ir = { path = "../../compiler/ir" }
 fai-lowering = { path = "../../compiler/lowering" }
 fai-target-aarch64 = { path = "../../targets/aarch64" }
 fai-target-x86_64 = { path = "../../targets/x86_64" }
 fai-transforms = { path = "../../compiler/transforms" }
+
+[dev-dependencies]
 num-bigint = "0.4"
-rustc-hash = "2"
-rustc_apfloat = "0.2.3"
 
 [lints]
 workspace = true
