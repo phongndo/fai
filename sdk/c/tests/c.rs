@@ -165,13 +165,24 @@ fn end_to_end_through_the_c_api() {
     let exe = dir.join("e2e-host");
     build_c(&repo().join("tests/capi/e2e.c"), &exe);
     let mut cmd = Command::new(&exe);
-    let tc = aarch64_toolchain();
+    // `tests/capi/e2e.c` builds its native half as Linux ELF (`FIR_OS_LINUX`), which macOS's
+    // `cc` can't link: a host gap there (`cargo xtask verify` declares it), not a skip.
+    let tc = if cfg!(target_os = "macos") {
+        evidence::host_gap(
+            &ev,
+            "tests/capi/e2e.c builds its native half as Linux ELF; macOS links Mach-O",
+        );
+        None
+    } else {
+        aarch64_toolchain()
+    };
     match &tc {
         Some((cc, runner)) => {
             cmd.env("FIR_E2E_CC", cc)
                 .env("FIR_E2E_RUN", runner)
                 .env("FIR_E2E_DIR", &dir);
         }
+        None if cfg!(target_os = "macos") => {}
         None => {
             evidence::require("e2e: no AArch64 toolchain or emulator for the native half");
             ev.skip("native half: no AArch64 toolchain or emulator");

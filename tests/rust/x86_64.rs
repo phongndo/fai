@@ -89,6 +89,16 @@ fn toolchain(dir: &Path) -> Result<Toolchain, String> {
 }
 
 fn native(dir: &Path, ev: &common::evidence::Evidence) -> Option<Toolchain> {
+    ev.fact("pipeline", common::evidence::pipeline());
+    // The output is Linux ELF: on macOS nothing can run it (qemu-user is Linux-only), which
+    // `cargo xtask verify` declares as a host gap there.
+    if cfg!(target_os = "macos") {
+        common::evidence::host_gap(
+            ev,
+            "the x86-64 backend emits Linux ELF, which macOS can't run (qemu-user is Linux-only)",
+        );
+        return None;
+    }
     match toolchain(dir) {
         Ok(tc) => {
             ev.fact(
@@ -329,7 +339,15 @@ fn check_module(
         .map(|(f, a, _, _, _)| (f.clone(), a.clone()))
         .collect();
     let mut builds = vec![("native", m.clone())];
-    match fir::backend::prepare(src, true) {
+    // `FIR_PASSES` tests that pipeline instead of `-O`, as `aarch64.rs` does.
+    let optimized = match std::env::var("FIR_PASSES") {
+        Ok(spec) if !spec.is_empty() => fir::backend::prepare_with(
+            src,
+            Some(&fir::passes::Pipeline::parse_fixpoint(&spec, true).expect("FIR_PASSES")),
+        ),
+        _ => fir::backend::prepare(src, true),
+    };
+    match optimized {
         Ok(o) if o.render(false) != m.render(false) => builds.push(("native -O", o)),
         Ok(_) => {}
         Err(e) => {

@@ -56,6 +56,18 @@ fn on_path(name: &str) -> bool {
 
 /// The exit status of `f` linked with `harness` and run on AArch64 (under qemu off AArch64), or
 /// `None` without a toolchain (a failure when a full run is required).
+/// A harness written for Linux, in Mach-O's spelling (the emitter writes the host's format):
+/// symbols take a leading `_`, and a page address is `@PAGE`/`@PAGEOFF`.
+fn darwin(harness: &str) -> String {
+    harness
+        .replace(".global main\nmain:", ".globl _main\n.p2align 2\n_main:")
+        .replace(" bl f\n", " bl _f\n")
+        .replace(
+            " adrp x1, __fir_exn\n ldr x0, [x1, :lo12:__fir_exn]\n",
+            " adrp x1, ___fir_exn@PAGE\n add x1, x1, ___fir_exn@PAGEOFF\n ldr x0, [x1]\n",
+        )
+}
+
 fn native_status(m: &fir::Module, f: MFunc, harness: &str, name: &str) -> Option<i32> {
     use std::process::Command;
     let native = cfg!(target_arch = "aarch64");
@@ -80,7 +92,12 @@ fn native_status(m: &fir::Module, f: MFunc, harness: &str, name: &str) -> Option
     );
     let source = dir.join("test.s");
     let bin = dir.join("test");
-    std::fs::write(&source, asm + harness).unwrap();
+    let harness = if a64::Os::host() == a64::Os::Darwin {
+        darwin(harness)
+    } else {
+        harness.to_owned()
+    };
+    std::fs::write(&source, asm + &harness).unwrap();
     let built = Command::new(cc)
         .arg(&source)
         .arg("-o")

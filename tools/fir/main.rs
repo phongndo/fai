@@ -13,6 +13,9 @@
 //!             [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin] [--target aarch64|x86_64]
 //!                                            compile to AArch64 or x86-64 (see `compile`)
 //! fir lower FILE [--no-locs]                  lower an HFIR module to MFIR and print it
+//! fir measure FILE [-O | --none | --passes P,... [--experimental]] [--fuel N]
+//!                                            what a pipeline does to a module, as JSON
+//!                                            (see `measure.rs`; `cargo xtask experiment`)
 //! ```
 //!
 //! `check` prints what `fir-ref check` prints: `ok`, or one `hole ?NAME: TYPE @LOC` line per
@@ -42,6 +45,8 @@
 //! `--experimental`, and are never in `-O`. A FILE of `-` is standard input.
 
 use std::process::ExitCode;
+
+mod measure;
 
 fn read(file: &str) -> Result<String, ExitCode> {
     if file == "-" {
@@ -113,6 +118,7 @@ fn run(args: &[&str]) -> Result<(), ExitCode> {
         }
         ["opt", file, opts @ ..] => opt(file, opts),
         ["compile", file, opts @ ..] => compile(file, opts),
+        ["measure", file, opts @ ..] => measure::measure(file, opts, &read(file)?),
         ["lower", file, opts @ ..] => {
             let m = fir::parse_module(&read(file)?).map_err(|e| fail(file, e))?;
             fir::verify_module(&m).map_err(|e| fail(file, e))?;
@@ -122,7 +128,7 @@ fn run(args: &[&str]) -> Result<(), ExitCode> {
         }
         _ => {
             eprintln!(
-                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each] [--no-locs]\n         [--print-before P,...] [--print-after P,...] [--print-changed] [--dump-dir DIR] [--check-dce FIR-REF]\n  fir opt --list-passes\n  fir compile FILE [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-g] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin] [--target aarch64|x86_64]\n  fir lower FILE [--no-locs]"
+                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each] [--no-locs]\n         [--print-before P,...] [--print-after P,...] [--print-changed] [--dump-dir DIR] [--check-dce FIR-REF]\n  fir opt --list-passes\n  fir compile FILE [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-g] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin] [--target aarch64|x86_64]\n  fir lower FILE [--no-locs]\n  fir measure FILE [-O | --none | --passes P,... [--experimental]] [--fuel N]"
             );
             Err(ExitCode::from(2))
         }

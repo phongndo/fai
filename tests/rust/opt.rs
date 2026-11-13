@@ -241,6 +241,7 @@ fn optimized_fixtures_refine_the_originals() {
     }
     eprintln!("{files} fixtures, {runs} runs; changes:");
     let ev = common::evidence::Evidence::new("opt_fixtures");
+    ev.fact("pipeline", common::evidence::pipeline());
     for (p, n) in PASSES.iter().zip(&totals) {
         eprintln!("  {n:6}  {}", p.name);
         ev.count(format!("pass {}: changes", p.name), *n);
@@ -373,6 +374,7 @@ fn optimized_random_programs_refine_the_originals() {
     });
     let fired = fired.into_inner().unwrap();
     let ev = common::evidence::Evidence::new("opt_fuzz");
+    ev.fact("pipeline", common::evidence::pipeline());
     ev.fact("seed", seed.to_string());
     ev.count("programs", count);
     eprintln!("{count} programs (seed {seed}); changes, and programs changed, per pass:");

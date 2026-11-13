@@ -1,8 +1,19 @@
-# The required checks: the dev shell builds on every platform (`nix flake check`), and the full
-# verification passes on Linux (`cargo xtask verify full`: Lean from scratch, generated files,
-# the proof audit, formatting and lints, every Rust suite in debug and release with the Lean
-# reference and qemu required, the C API under AddressSanitizer, and the evidence that the work
-# ran). Its report is uploaded whether it passes or not.
+# The required checks, on two native hosts:
+#
+# * x86-64 Linux (ubuntu-24.04): the dev shell builds (`nix flake check`), and the full
+#   verification passes (`cargo xtask verify full`: Lean from scratch, generated files, the proof
+#   audit, formatting and lints, every Rust suite in debug and release with the Lean reference
+#   and qemu required, the C API under AddressSanitizer, and the evidence that the work ran).
+#   x86-64 code runs natively here; AArch64 Linux code runs under qemu-user.
+# * Apple-silicon macOS (macos-15, arm64): the same command, natively. AArch64 code runs natively
+#   as Mach-O. What macOS can't run by construction (x86-64 and AArch64 Linux binaries, the
+#   Linux ABI torture test, fcc's corpus, the C API's Linux native half) is declared in
+#   `HOST_GAPS` (xtask/src/main.rs); the run must report host verification with exactly those
+#   gaps unverified, and never reports full verification.
+#
+# Each host's report is uploaded whether it passes or not, and the last job puts both side by
+# side (`cargo xtask matrix`) in the run's summary: what ran natively, under an emulator, or not
+# at all.
 name: verify
 
 on:
@@ -12,22 +23,75 @@ on:
 
 jobs:
   verify:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            host: x86_64-linux
+            # The verdict this host must reach (report.json).
+            require: full_verification
+          - runner: macos-15
+            host: aarch64-macos
+            require: host_verification
+    name: verify (${{ matrix.host }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v16
       - uses: DeterminateSystems/magic-nix-cache-action@v8
       - name: Dev shell builds
         run: nix flake check
-      - name: Full verification
+      - name: Verification
         run: nix develop -c cargo xtask verify full
+      - name: Required verdict
+        run: |
+          nix develop -c python3 - <<'EOF'
+          import json, sys
+          r = json.load(open("target/verify/report.json"))
+          want = "${{ matrix.require }}"
+          print(r["verdict"])
+          if r.get("host") != "${{ matrix.host }}":
+              sys.exit(f"report is for {r.get('host')}, not ${{ matrix.host }}")
+          if r.get(want) is not True:
+              sys.exit(f"{want} is not true")
+          if want == "full_verification" and r.get("unverified_on_this_host"):
+              sys.exit("a host that must verify fully declares host gaps")
+          EOF
+      - name: Summary
+        if: always()
+        run: cat target/verify/report.md >> "$GITHUB_STEP_SUMMARY" || true
       - name: Upload the verification report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: verify-report
+          name: verify-report-${{ matrix.host }}
           path: |
             target/verify/report.json
             target/verify/report.md
             target/verify/proofs.md
+
+  matrix:
+    name: what each host verified
+    needs: verify
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: verify-report-*
+          path: reports
+      - name: Cross-host matrix
+        # Only xtask and serde_json build: the runner's own Rust is enough.
+        run: |
+          shopt -s nullglob
+          files=(reports/*/report.json)
+          if [ ${#files[@]} -eq 0 ]; then echo "no reports" >> "$GITHUB_STEP_SUMMARY"; exit 1; fi
+          cargo xtask matrix "${files[@]}" | tee matrix.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verify-matrix
+          path: matrix.md

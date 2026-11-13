@@ -30,6 +30,14 @@ nix develop -c cargo xtask verify fast     # local, partial: says what it skippe
 nix develop -c cargo xtask mutate [NAME…]  # the checkers' own adversarial tests
 ```
 
+CI runs `verify full` on x86-64 Linux and natively on Apple-silicon macOS. A host that can't
+run some check by construction (macOS can't run Linux binaries) declares it in `HOST_GAPS`
+(`xtask/src/main.rs`); its tests record the gap in their evidence (decided by `cfg!`, never by a
+missing tool), and that host's verdict is **host verification**, with every gap listed as
+unverified there, never full verification. Only x86-64 Linux, which declares no gaps, reports
+full verification. [../experiments.md](../experiments.md#what-runs-where) has the table of what
+runs where.
+
 `verify full` succeeds only if every one of these ran and passed (`target/verify/report.md` and
 `report.json` record each, with times, the revision, whether the tree was dirty, and every
 toolchain's version):

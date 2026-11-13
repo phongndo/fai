@@ -194,7 +194,10 @@ fn check(
     };
     let (s, obj) = (dir.join(format!("{name}.s")), dir.join(format!("{name}.o")));
     std::fs::write(&s, &asm).unwrap();
-    let out = Command::new(cc)
+    let mut words = cc.split_whitespace();
+    let out = Command::new(words.next().unwrap_or(cc))
+        .args(words)
+        .arg("-w")
         .arg("-c")
         .arg(&s)
         .arg("-o")
@@ -275,13 +278,18 @@ fn check(
 /// (a panic under `FIR_REQUIRE_FULL`).
 fn toolchain(ev: &Evidence) -> Option<String> {
     let cc = std::env::var("FIR_CC").unwrap_or_else(|_| {
-        if cfg!(target_arch = "aarch64") {
+        // The test assembles Linux ELF: macOS's `cc` makes Mach-O, so there it is LLVM's
+        // assembler for Linux, which reads the same directives (nothing is linked or run).
+        if cfg!(target_os = "macos") {
+            "clang --target=aarch64-unknown-linux-gnu".to_owned()
+        } else if cfg!(target_arch = "aarch64") {
             "cc".to_owned()
         } else {
             "aarch64-unknown-linux-gnu-cc".to_owned()
         }
     });
-    if on_path(&cc) && on_path("llvm-dwarfdump") {
+    if on_path(cc.split_whitespace().next().unwrap_or("")) && on_path("llvm-dwarfdump") {
+        ev.fact("assembler", cc.clone());
         return Some(cc);
     }
     if std::env::var("FIR_REQUIRE_FULL").is_ok() {

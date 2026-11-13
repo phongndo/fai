@@ -57,10 +57,13 @@ cmake -S frontends/c -B build/fcc -G Ninja                     # fcc: configure,
 cmake --build build/fcc                                        # and build
 cargo xtask verify fast                                        # local; says what it skipped
 cargo xtask verify full                                        # the required check (CI)
+cargo xtask experiment NAME --passes P,Q [--experimental]      # propose, test, and measure a change
 ```
 
-[frontends/c/README.md](frontends/c/README.md) covers fcc, and
-[docs/assurance/README.md](docs/assurance/README.md) covers what `verify full` requires.
+[frontends/c/README.md](frontends/c/README.md) covers fcc,
+[docs/assurance/README.md](docs/assurance/README.md) covers what `verify full` requires, and
+[docs/experiments.md](docs/experiments.md) covers experiments and what CI runs natively on
+x86-64 Linux and on Apple-silicon macOS.
 
 ## License
 

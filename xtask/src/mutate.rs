@@ -477,6 +477,25 @@ fn mutations() -> Vec<Mutation> {
             expect: vec!["tests_aarch64_address-unrelated_fir @f", "differences"],
             in_decl: None,
         },
+        Mutation {
+            name: "experiment-rejects-a-miscompile",
+            what: "store-to-load forwarding ignores the pointer, so a load through another pointer gets the stored value; `cargo xtask experiment` must reject the change from its measurements alone",
+            edits: vec![edit(
+                "compiler/transforms/src/fwd.rs",
+                "|| lp != p || body.ty(r) != ty",
+                "|| body.ty(r) != ty",
+            )],
+            steps: vec![cmd(
+                "cargo",
+                &["xtask", "experiment", "mutate-fwd", "--gate", "none"],
+            )],
+            expect: vec![
+                "REJECTED",
+                "doesn't refine the source's",
+                "tests/fir1/noalias.fir",
+            ],
+            in_decl: None,
+        },
     ]
 }
 

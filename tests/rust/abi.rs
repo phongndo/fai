@@ -1325,6 +1325,18 @@ fn reordered_hfa(t: &T) -> bool {
 
 #[test]
 fn structs_cross_the_c_abi_both_ways() {
+    // The signatures are checked against AAPCS64 as Linux defines it, built for Linux; macOS's
+    // C compiler follows Apple's variant (variadic arguments on the stack), and the macOS dev
+    // shell has no Linux toolchain or qemu-user, so `cargo xtask verify` declares a host gap.
+    if cfg!(target_os = "macos") {
+        let ev = Evidence::new("abi_torture");
+        common::evidence::host_gap(
+            &ev,
+            "checks Linux's AAPCS64 against a Linux C compiler; macOS has Apple's variant and no Linux toolchain",
+        );
+        ev.write();
+        return;
+    }
     let native = cfg!(target_arch = "aarch64") && cfg!(target_os = "linux");
     let cc = match std::env::var("FIR_CC") {
         Ok(cc) => cc,

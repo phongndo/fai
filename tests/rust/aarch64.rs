@@ -205,6 +205,26 @@ fn known_limit(e: &str) -> Option<&'static str> {
     .map(|(_, why)| why)
 }
 
+/// Why emitting for macOS failed, if it is what the backend declares it doesn't support there yet
+/// (Apple's AAPCS64 variant: variadic arguments on the stack, composites passed on the stack).
+/// Only a macOS host emits for macOS, and only after selection and allocation, which don't
+/// depend on the OS, succeeded; anything else failing there is a failure.
+fn darwin_limit(e: &str) -> Option<&'static str> {
+    [
+        (
+            "variadic functions aren't supported on macOS yet",
+            "variadic functions on macOS (not supported yet)",
+        ),
+        (
+            "on the stack, which isn't supported on macOS yet",
+            "a composite passed on the stack on macOS (not supported yet)",
+        ),
+    ]
+    .into_iter()
+    .find(|(k, _)| e.contains(k))
+    .map(|(_, why)| why)
+}
+
 /// The LFIR of a module, before and after register allocation, verified.
 fn lfir_modules(m: &Module) -> Result<[Module; 2], String> {
     let mut mm = a64::select(m)?;
@@ -582,6 +602,14 @@ fn check_module(
         };
         let bin = match build(tc, bm, &runs, dir, &bname) {
             Ok(b) => b,
+            Err(e) if a64::Os::host() == a64::Os::Darwin && darwin_limit(&e).is_some() => {
+                let why = darwin_limit(&e).unwrap();
+                tally
+                    .lock()
+                    .unwrap()
+                    .count(format!("{what} not built: {why}"));
+                continue;
+            }
             Err(e) => {
                 tally
                     .lock()
@@ -740,6 +768,8 @@ fn fixtures_run_natively() {
 /// The native toolchain, or `None` with a note (a failure when a full run is required), recorded
 /// in the evidence.
 fn native(dir: &Path, ev: &common::evidence::Evidence) -> Option<Toolchain> {
+    ev.fact("pipeline", common::evidence::pipeline());
+    ev.fact("os", format!("{:?}", a64::Os::host()));
     match toolchain(dir) {
         Ok(tc) => {
             ev.fact(
@@ -1235,16 +1265,17 @@ func @f() -> i64 {
         let m = fir::parse_module(text).unwrap();
         fir::verify_module(&m).unwrap();
         let lowered = fir::backend::prepare(&m, false).unwrap();
-        let e = a64::compile(&lowered, &a64::Options::default()).unwrap_err();
+        // Linux's AAPCS64, on every host: macOS refuses the variadic case for another reason.
+        let linux = a64::Options {
+            os: a64::Os::Linux,
+            ..a64::Options::default()
+        };
+        let e = a64::compile(&lowered, &linux).unwrap_err();
         assert!(e.contains("needs AAPCS64's data layout"), "{e}");
         let default = text.lines().skip(1).collect::<Vec<_>>().join("\n");
         let m = fir::parse_module(&default).unwrap();
         fir::verify_module(&m).unwrap();
-        a64::compile(
-            &fir::backend::prepare(&m, false).unwrap(),
-            &a64::Options::default(),
-        )
-        .unwrap();
+        a64::compile(&fir::backend::prepare(&m, false).unwrap(), &linux).unwrap();
     }
 }
 

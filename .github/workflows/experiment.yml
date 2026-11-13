@@ -1,0 +1,75 @@
+# On demand: run `cargo xtask experiment` (xtask/src/experiment.rs) on both native hosts, for a
+# branch, and upload each host's report. Not a required check: an experiment's verdict is
+# evidence for a proposal, and `verify` stays the gate for anything that lands.
+#
+#   gh workflow run experiment.yml --ref BRANCH -f name=NAME -f passes=P,Q -f experimental=true \
+#     [-f baseline_rev=main] [-f gate=quick|none] [-f fuzz=200]
+name: experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: experiment name (letters, digits, '-', '_', '.')
+        required: true
+      passes:
+        description: candidate pipeline, comma-separated (empty for -O)
+        default: ""
+      experimental:
+        description: allow experimental (unproved) passes
+        type: boolean
+        default: false
+      baseline_rev:
+        description: build the baseline from this revision (empty for this tree)
+        default: ""
+      gate:
+        description: quick (differential suites with the candidate) or none
+        default: quick
+      fuzz:
+        description: random programs per fuzzing suite in the gate
+        default: "200"
+
+jobs:
+  experiment:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            host: x86_64-linux
+          - runner: macos-15
+            host: aarch64-macos
+    name: experiment (${{ matrix.host }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      NAME: ${{ inputs.name }}
+      PASSES: ${{ inputs.passes }}
+      EXPERIMENTAL: ${{ inputs.experimental }}
+      BASELINE_REV: ${{ inputs.baseline_rev }}
+      GATE: ${{ inputs.gate }}
+      FUZZ: ${{ inputs.fuzz }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A baseline revision has to be in the clone.
+          fetch-depth: 0
+      - uses: DeterminateSystems/nix-installer-action@v16
+      - uses: DeterminateSystems/magic-nix-cache-action@v8
+      - name: Experiment
+        run: |
+          args=("$NAME" --gate "$GATE" --fuzz "$FUZZ")
+          if [ -n "$PASSES" ]; then args+=(--passes "$PASSES"); fi
+          if [ "$EXPERIMENTAL" = "true" ]; then args+=(--experimental); fi
+          if [ -n "$BASELINE_REV" ]; then args+=(--baseline-rev "$BASELINE_REV"); fi
+          nix develop -c cargo xtask experiment "${args[@]}"
+      - name: Summary
+        if: always()
+        run: cat "target/experiments/$NAME/report.md" >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: experiment-${{ matrix.host }}
+          path: |
+            target/experiments/${{ inputs.name }}/report.json
+            target/experiments/${{ inputs.name }}/report.md

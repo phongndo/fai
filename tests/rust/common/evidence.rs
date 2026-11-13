@@ -31,6 +31,29 @@ pub fn require(why: &str) {
     eprintln!("skipped: {why}");
 }
 
+/// Record that this host can't run `ev`'s check by construction (Linux binaries on macOS, say),
+/// with why, instead of skipping it: not a failure under `FIR_REQUIRE_FULL`, because `cargo xtask
+/// verify` accepts it only where its `HOST_GAPS` table declares that gap for this host, and then
+/// reports the check as unverified there and the run as host verification, never full. Call it
+/// only on a condition fixed at compile time (`cfg!`), never on a missing tool.
+pub fn host_gap(ev: &Evidence, why: &str) {
+    eprintln!(
+        "host gap on {}-{}: {why}",
+        std::env::consts::ARCH,
+        std::env::consts::OS
+    );
+    ev.fact("host gap", why);
+}
+
+/// The pipeline the optimizing suites test: `FIR_PASSES`, or `-O` (recorded as the `pipeline`
+/// fact, so `cargo xtask experiment` can check its gate tested the candidate's).
+pub fn pipeline() -> String {
+    match std::env::var("FIR_PASSES") {
+        Ok(s) if !s.is_empty() => s,
+        _ => "-O".to_owned(),
+    }
+}
+
 /// One test's evidence. Thread-safe, so parallel workers can share one.
 #[derive(Default)]
 pub struct Evidence {

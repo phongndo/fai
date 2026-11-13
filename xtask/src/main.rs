@@ -26,6 +26,7 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
+mod experiment;
 mod mutate;
 
 /// How many random programs each fuzzing suite runs in a full verification (the suites'
@@ -36,8 +37,119 @@ const FUZZ: &[(&str, &str)] = &[
     ("FIR_FUZZ_LEAN", "100"),
 ];
 
+/// Checks a host can't run by construction, each with why: `(host, subject, why)`, `host` as
+/// [`host`] spells it. A subject is a suite (its evidence must be missing or say `host gap`, and
+/// then none of its counts are required) or `coverage COMPONENT` (that component's differential
+/// coverage can't come from this host), optionally narrowed to one op: `coverage COMPONENT OP`.
+/// A gap declared here is never a pass: `verify full` on such a host reports **host
+/// verification**, lists every gap as unverified there, and never reports full verification.
+/// Only the Linux hosts, where every check runs (AArch64 under qemu-user off AArch64), can.
+const HOST_GAPS: &[(&str, &str, &str)] = &[
+    (
+        "aarch64-macos",
+        "x86_64_fixtures",
+        "the x86-64 backend emits Linux ELF; macOS can't run it, and qemu-user doesn't exist for macOS",
+    ),
+    (
+        "aarch64-macos",
+        "x86_64_fuzz",
+        "the x86-64 backend emits Linux ELF; macOS can't run it, and qemu-user doesn't exist for macOS",
+    ),
+    (
+        "aarch64-macos",
+        "coverage isel.x86_64",
+        "no x86-64 runs on this host (see x86_64_fixtures)",
+    ),
+    (
+        "aarch64-macos",
+        "abi_torture",
+        "the ABI test checks AAPCS64 as Linux defines it; Apple's variant passes variadic arguments on the stack, and the backend doesn't support that yet",
+    ),
+    (
+        "aarch64-macos",
+        "fcc_corpus",
+        "fcc targets Linux, so its corpus runs Linux binaries",
+    ),
+    (
+        "aarch64-macos",
+        "fcc_x86_64_corpus",
+        "fcc targets Linux, so its corpus runs Linux binaries",
+    ),
+    (
+        "aarch64-macos",
+        "capi_e2e",
+        "tests/capi/e2e.c builds its native half as Linux ELF (FIR_OS_LINUX); macOS links Mach-O (porting it is open)",
+    ),
+    (
+        "aarch64-macos",
+        "capi_e2e_address",
+        "tests/capi/e2e.c builds its native half as Linux ELF (FIR_OS_LINUX); macOS links Mach-O (porting it is open)",
+    ),
+    (
+        "aarch64-macos",
+        "coverage isel.aarch64 vaStart",
+        "the backend refuses variadic functions for macOS (open item: macOS varargs), so no native comparison can run them here",
+    ),
+    (
+        "aarch64-macos",
+        "coverage isel.aarch64 vaArg",
+        "the backend refuses variadic functions for macOS (open item: macOS varargs), so no native comparison can run them here",
+    ),
+    (
+        "aarch64-macos",
+        "coverage isel.aarch64 vaEnd",
+        "the backend refuses variadic functions for macOS (open item: macOS varargs), so no native comparison can run them here",
+    ),
+];
+
+/// This host, as [`HOST_GAPS`] spells it: `ARCH-OS`.
+pub(crate) fn host() -> String {
+    format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
+}
+
+/// Why this host can't run `subject`, if [`HOST_GAPS`] says so.
+pub(crate) fn host_gap_reason(subject: &str) -> Option<&'static str> {
+    let h = host();
+    HOST_GAPS
+        .iter()
+        .find(|(gh, s, _)| *gh == h && *s == subject)
+        .map(|(_, _, why)| *why)
+}
+
+/// The problems a host gap excuses, moved out of `bad`: a problem about a suite whose evidence
+/// is missing or declares a host gap, or about the coverage of a component (or one of its ops)
+/// that this host can't exercise, when [`HOST_GAPS`] declares it for this host.
+fn excuse_host_gaps(bad: Vec<String>, evs: &BTreeMap<String, Value>) -> (Vec<String>, Vec<String>) {
+    let mut kept = Vec::new();
+    let mut excused = Vec::new();
+    for b in bad {
+        let reason = if let Some(rest) = b.strip_prefix("coverage: ") {
+            // `coverage: COMP claims support for op OP, but …`
+            let mut w = rest.split_whitespace();
+            let comp = w.next().unwrap_or("");
+            let op = rest
+                .split_once(" claims support for op ")
+                .and_then(|(_, r)| r.split(',').next())
+                .unwrap_or("");
+            host_gap_reason(&format!("coverage {comp}"))
+                .or_else(|| host_gap_reason(&format!("coverage {comp} {op}")))
+        } else {
+            let suite = b.split(':').next().unwrap_or("");
+            let gapped = evs
+                .get(suite)
+                .is_none_or(|ev| ev["facts"]["host gap"].is_string());
+            host_gap_reason(suite).filter(|_| gapped)
+        };
+        match reason {
+            Some(why) => excused.push(format!("{b} (host gap: {why})")),
+            None => kept.push(b),
+        }
+    }
+    (kept, excused)
+}
+
 /// Variables that would weaken or redirect the checks; cleared for every child.
-const CLEARED: &[&str] = &[
+pub(crate) const CLEARED: &[&str] = &[
     "FIR_REF",
     "FIR_GEN_RUST",
     "FIR_GEN_BUILDER",
@@ -114,6 +226,8 @@ struct Verify {
     checks: Vec<Check>,
     identity: BTreeMap<String, String>,
     coverage: Value,
+    /// Evidence problems a declared host gap excused (`HOST_GAPS`), with why.
+    unverified: Vec<String>,
 }
 
 fn on_path(name: &str) -> bool {
@@ -321,7 +435,8 @@ impl Verify {
         // The x86-64 backend's native tests run Linux binaries: natively on x86-64 Linux,
         // elsewhere through a cross compiler and qemu-user.
         let native_x86 = cfg!(all(target_arch = "x86_64", target_os = "linux"));
-        if !native_x86 {
+        // Where the x86-64 runs are a declared host gap, nothing can run them: nothing to need.
+        if !native_x86 && host_gap_reason("x86_64_fixtures").is_none() {
             for t in ["x86_64-unknown-linux-gnu-cc", "qemu-x86_64"] {
                 if !on_path(t) {
                     missing.push(t);
@@ -334,6 +449,10 @@ impl Verify {
                 vec![
                     format!("native AArch64: {native}"),
                     format!("native x86-64: {native_x86}"),
+                    format!(
+                        "declared host gaps: {}",
+                        HOST_GAPS.iter().filter(|g| g.0 == host()).count()
+                    ),
                 ],
             );
             true
@@ -601,14 +720,14 @@ impl Verify {
 }
 
 /// How many tests a `test result:` line says were filtered out.
-fn filtered_out(line: &str) -> u64 {
+pub(crate) fn filtered_out(line: &str) -> u64 {
     line.split(';')
         .find_map(|part| part.trim().strip_suffix(" filtered out"))
         .and_then(|n| n.trim().parse().ok())
         .unwrap_or(0)
 }
 
-fn load_evidence(dir: &Path) -> BTreeMap<String, Value> {
+pub(crate) fn load_evidence(dir: &Path) -> BTreeMap<String, Value> {
     let mut out = BTreeMap::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
@@ -1011,7 +1130,7 @@ fn check_evidence(
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: cargo xtask verify [fast|full] [--no-lean-clean] [--report-dir DIR]\n       cargo xtask mutate [NAME...]\n       cargo xtask evidence DIR";
+    let usage = "usage: cargo xtask verify [fast|full] [--no-lean-clean] [--report-dir DIR]\n       cargo xtask mutate [NAME...]\n       cargo xtask evidence DIR\n       cargo xtask experiment NAME [OPTIONS] (see xtask/src/experiment.rs)\n       cargo xtask matrix REPORT.json...";
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .canonicalize()
@@ -1019,10 +1138,14 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("verify") => {}
         Some("mutate") => std::process::exit(mutate::main(&root, &args[1..])),
+        Some("experiment") => std::process::exit(experiment::main(&root, &args[1..])),
+        Some("matrix") if args.len() > 1 => std::process::exit(matrix(&args[1..])),
         Some("evidence") if args.len() == 2 => {
             // Check one evidence directory as a full verification would (without the sanitizer
             // runs): used by `mutate` to show the check refuses incomplete evidence.
-            let (bad, _) = check_evidence(&root, &load_evidence(Path::new(&args[1])), None, None);
+            let evs = load_evidence(Path::new(&args[1]));
+            let (bad, _) = check_evidence(&root, &evs, None, None);
+            let (bad, _) = excuse_host_gaps(bad, &evs);
             for b in &bad {
                 eprintln!("{b}");
             }
@@ -1068,6 +1191,7 @@ fn main() {
         checks: Vec::new(),
         identity: BTreeMap::new(),
         coverage: Value::Null,
+        unverified: Vec::new(),
     };
     let start = Instant::now();
     eprintln!("cargo xtask verify {}", if full { "full" } else { "fast" });
@@ -1110,6 +1234,7 @@ fn main() {
         v.asan(&ev_asan);
         let asan = load_evidence(&ev_asan);
         let mut coverage = serde_json::Map::new();
+        let mut unverified = BTreeSet::new();
         for (profile, dir) in [("debug", &ev_debug), ("release", &ev_release)] {
             let evs = load_evidence(dir);
             let (bad, table) = check_evidence(
@@ -1119,6 +1244,8 @@ fn main() {
                 Some(&v.run_id),
             );
             coverage.insert(profile.to_owned(), table);
+            let (bad, excused) = excuse_host_gaps(bad, &evs);
+            unverified.extend(excused);
             let name = format!("evidence ({profile})");
             if bad.is_empty() {
                 let n = evs.len();
@@ -1133,13 +1260,15 @@ fn main() {
             }
         }
         v.coverage = Value::Object(coverage);
+        v.unverified = unverified.into_iter().collect();
     } else {
         v.skip("rust tests (release)", "fast mode");
         v.skip("C API under AddressSanitizer", "fast mode");
         v.skip("evidence", "fast mode doesn't require complete evidence");
         let evs = load_evidence(&ev_debug);
         let (bad, table) = check_evidence(&root, &evs, None, Some(&v.run_id));
-        v.coverage = json!({"debug (informational)": table, "problems (informational)": bad});
+        let (bad, excused) = excuse_host_gaps(bad, &evs);
+        v.coverage = json!({"debug (informational)": table, "problems (informational)": bad, "excused by host gaps (informational)": excused});
     }
     let failed = v
         .checks
@@ -1151,9 +1280,23 @@ fn main() {
         .iter()
         .filter(|c| matches!(c.status, Status::Skipped(_)))
         .count();
-    let verified = full && failed == 0 && skipped == 0;
+    // A host with declared gaps verifies only what it can run: never "full".
+    let gaps: Vec<(&str, &str)> = HOST_GAPS
+        .iter()
+        .filter(|g| g.0 == host())
+        .map(|g| (g.1, g.2))
+        .collect();
+    let host_verified = full && failed == 0 && skipped == 0;
+    let verified = host_verified && gaps.is_empty();
+    let host_verdict = format!(
+        "HOST VERIFICATION PASSED ON {}: every check this host can run passed; {} declared host gaps unverified here, so this is not a full verification",
+        host(),
+        gaps.len()
+    );
     let verdict = if verified {
         "FULL VERIFICATION PASSED"
+    } else if host_verified {
+        host_verdict.as_str()
     } else if full {
         "FULL VERIFICATION FAILED"
     } else if failed == 0 {
@@ -1178,6 +1321,11 @@ fn main() {
         "mode": if full { "full" } else { "fast" },
         "verdict": verdict,
         "full_verification": verified,
+        "host_verification": host_verified,
+        "host": host(),
+        "unverified_on_this_host": gaps.iter().map(|(s, w)| json!({"subject": s, "why": w})).collect::<Vec<_>>(),
+        "excused_by_host_gaps": v.unverified,
+        "execution": execution(&load_evidence(&ev_debug)),
         "seconds": start.elapsed().as_secs_f64(),
         "identity": v.identity,
         "checks": checks,
@@ -1219,6 +1367,24 @@ fn main() {
         )
         .unwrap();
     }
+    if !gaps.is_empty() {
+        writeln!(md, "\n## Unverified on this host ({})\n", host()).unwrap();
+        for (s, w) in &gaps {
+            writeln!(md, "- `{s}`: {w}").unwrap();
+        }
+        for e in &v.unverified {
+            writeln!(md, "- excused: {}", e.replace('|', "/")).unwrap();
+        }
+    }
+    md += "\n## How the native suites ran\n\n| Suite | Ran |\n|---|---|\n";
+    for (suite, how) in execution(&load_evidence(&ev_debug)) {
+        writeln!(
+            md,
+            "| {suite} | {} |",
+            how.as_str().unwrap_or("").replace('|', "/")
+        )
+        .unwrap();
+    }
     md += "\n## Details\n\n";
     for c in &v.checks {
         if !c.details.is_empty() {
@@ -1237,11 +1403,180 @@ fn main() {
         v.checks.len(),
         out_dir.join("report.md").display()
     );
-    std::process::exit(if failed == 0 && (verified || !full) {
+    std::process::exit(if failed == 0 && (host_verified || !full) {
         0
     } else {
         1
     });
+}
+
+/// The suites that run compiled code, and how this run's evidence says each ran: natively, under
+/// an emulator, as a declared host gap, or not at all.
+fn execution(evs: &BTreeMap<String, Value>) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    for s in [
+        "aarch64_fixtures",
+        "aarch64_fuzz",
+        "x86_64_fixtures",
+        "x86_64_fuzz",
+        "abi_torture",
+        "capi_e2e",
+        "debug_lines",
+        "fcc_corpus",
+        "fcc_x86_64_corpus",
+    ] {
+        let how = match evs.get(s) {
+            None => match host_gap_reason(s) {
+                Some(why) => format!("unverified here (host gap: {why})"),
+                None => "no evidence".to_owned(),
+            },
+            Some(ev) => {
+                if let Some(g) = ev["facts"]["host gap"].as_str() {
+                    format!("unverified here (host gap: {g})")
+                } else if let Some(r) = ev["facts"]["native"]
+                    .as_str()
+                    .or(ev["facts"]["runner"].as_str())
+                {
+                    if r == "native" || r.is_empty() {
+                        format!("natively on {}", host())
+                    } else {
+                        format!("under {r} on {}", host())
+                    }
+                } else if !ev["skipped"].as_array().is_none_or(Vec::is_empty) {
+                    format!("skipped: {}", ev["skipped"])
+                } else {
+                    format!("ran on {} (no runner recorded)", host())
+                }
+            }
+        };
+        out.insert(s.to_owned(), json!(how));
+    }
+    out
+}
+
+/// `cargo xtask matrix REPORT.json...`: one table of what each host's verification ran, from the
+/// reports `verify` wrote on each (CI uploads one per host): each check's status per host, how
+/// each native suite ran there, and what each host couldn't run. Prints Markdown.
+fn matrix(paths: &[String]) -> i32 {
+    let mut reports = Vec::new();
+    for p in paths {
+        match std::fs::read_to_string(p).map(|t| serde_json::from_str::<Value>(&t)) {
+            Ok(Ok(r)) => reports.push(r),
+            Ok(Err(e)) => {
+                eprintln!("{p}: {e}");
+                return 1;
+            }
+            Err(e) => {
+                eprintln!("{p}: {e}");
+                return 1;
+            }
+        }
+    }
+    let host = |r: &Value| {
+        r["host"]
+            .as_str()
+            .or(r["identity"]["host"].as_str())
+            .unwrap_or("?")
+            .to_owned()
+    };
+    let hosts: Vec<String> = reports.iter().map(host).collect();
+    let mut md = String::from("# Verification across hosts\n\n| | ");
+    md += &hosts.join(" | ");
+    md += " |\n|---|";
+    md += &"---|".repeat(hosts.len());
+    md += "\n| verdict |";
+    for r in &reports {
+        write!(
+            md,
+            " {} |",
+            r["verdict"].as_str().unwrap_or("?").replace('|', "/")
+        )
+        .unwrap();
+    }
+    md += "\n| revision |";
+    for r in &reports {
+        write!(
+            md,
+            " `{}` |",
+            r["identity"]["revision"].as_str().unwrap_or("?")
+        )
+        .unwrap();
+    }
+    md += "\n";
+    let mut checks: Vec<String> = Vec::new();
+    for r in &reports {
+        for c in r["checks"].as_array().into_iter().flatten() {
+            let n = c["name"].as_str().unwrap_or("").to_owned();
+            if !checks.contains(&n) {
+                checks.push(n);
+            }
+        }
+    }
+    for n in &checks {
+        write!(md, "| {n} |").unwrap();
+        for r in &reports {
+            let st = r["checks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|c| c["name"].as_str() == Some(n))
+                .map_or("not run", |c| c["status"].as_str().unwrap_or("?"));
+            write!(md, " {st} |").unwrap();
+        }
+        md += "\n";
+    }
+    let mut suites: Vec<String> = Vec::new();
+    for r in &reports {
+        for (k, _) in r["execution"].as_object().into_iter().flatten() {
+            if !suites.contains(k) {
+                suites.push(k.clone());
+            }
+        }
+    }
+    if !suites.is_empty() {
+        md += "\n## How the native suites ran\n\n| Suite | ";
+        md += &hosts.join(" | ");
+        md += " |\n|---|";
+        md += &"---|".repeat(hosts.len());
+        md += "\n";
+        for s in &suites {
+            write!(md, "| {s} |").unwrap();
+            for r in &reports {
+                write!(
+                    md,
+                    " {} |",
+                    r["execution"][s]
+                        .as_str()
+                        .unwrap_or("(not reported)")
+                        .replace('|', "/")
+                )
+                .unwrap();
+            }
+            md += "\n";
+        }
+    }
+    md += "\n## Unverified per host\n\n";
+    for (h, r) in hosts.iter().zip(&reports) {
+        let gaps = r["unverified_on_this_host"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if gaps.is_empty() {
+            writeln!(md, "- **{h}**: nothing declared").unwrap();
+        }
+        for g in gaps {
+            writeln!(
+                md,
+                "- **{h}**: `{}`: {}",
+                g["subject"].as_str().unwrap_or(""),
+                g["why"].as_str().unwrap_or("")
+            )
+            .unwrap();
+        }
+    }
+    md += "\nA host gap is a check that host can't run; the hosts together still don't make a full verification of every target on every OS: AArch64 Linux runs under qemu-user on x86-64 Linux, not natively, unless an AArch64 Linux host reports.\n";
+    print!("{md}");
+    0
 }
 
 #[cfg(test)]
