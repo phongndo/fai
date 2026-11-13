@@ -24,7 +24,6 @@ use std::fmt::Write;
 
 use super::mir::{Inst, MFunc, MModule};
 use crate::ir::*;
-use crate::types::Shape;
 
 /// The object format and its assembler conventions.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -105,20 +104,7 @@ struct Emitter<'a> {
     at: Option<(usize, u32, u32)>,
 }
 
-/// A symbol as the assembler writes it: quoted unless it is a plain identifier.
-fn quote(s: &str) -> String {
-    let plain = s
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$');
-    if plain {
-        s.to_owned()
-    } else {
-        format!("\"{s}\"")
-    }
-}
+use crate::backend::data::quote;
 
 const XREGS: [&str; 31] = [
     "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14",
@@ -661,130 +647,16 @@ impl Emitter<'_> {
         }
     }
 
-    /// A global's bytes, and the symbols stored in it (offset, symbol).
-    fn image(&self, t: Ty, init: Init, out: &mut Vec<u8>, relocs: &mut Vec<(usize, String)>) {
-        let gs = &self.m.globals;
-        let sp = &self.m.space;
-        let size = gs.types.size(sp, t) as usize;
-        let start = out.len();
-        match (init, t) {
-            (Init::Zero, _) | (Init::Null, _) => out.resize(start + size, 0),
-            (Init::Int(i), Ty::Int(w) | Ty::Byte(w)) => {
-                let n = gs.int(i);
-                let m = num_bigint::BigInt::from(1) << w;
-                let v = ((n % &m) + &m) % &m;
-                let (_, mut bytes) = v.to_bytes_le();
-                bytes.resize((w / 8) as usize, 0);
-                out.extend_from_slice(&bytes);
-            }
-            (Init::Float(f, i), Ty::Float(g)) if f == g => {
-                let b = gs.float(i);
-                out.extend((0..f.width() / 8).map(|k| (b >> (8 * k)) as u8));
-            }
-            (Init::Sym(r), Ty::Ptr) => {
-                let name = gs.text(r);
-                let s = if gs_has(gs, name) || self.m.funcs.iter().any(|f| f.name == name) {
-                    self.sym(name, true)
-                } else {
-                    self.sym(&format!("{}{name}", self.o.extern_prefix), false)
-                };
-                relocs.push((start, s));
-                out.resize(start + 8, 0);
-            }
-            (Init::Bytes(r), _) => out.extend_from_slice(gs.bytes(r)),
-            (Init::List(r), Ty::Agg(id)) => {
-                out.resize(start + size, 0);
-                let items = gs.items(r);
-                let mut part = Vec::new();
-                let mut put = |off: usize,
-                               ty: Ty,
-                               item: Init,
-                               out: &mut Vec<u8>,
-                               relocs: &mut Vec<(usize, String)>| {
-                    part.clear();
-                    let mut rs = Vec::new();
-                    self.image(ty, item, &mut part, &mut rs);
-                    let off = start + off;
-                    let n = part.len().min(out.len().saturating_sub(off));
-                    out[off..off + n].copy_from_slice(&part[..n]);
-                    relocs.extend(rs.into_iter().map(|(o, s)| (o + off, s)));
-                };
-                match gs.types.shape(id) {
-                    Shape::Struct(p, fs) => {
-                        let (offs, _, _) = gs.types.place(sp, p, fs);
-                        for ((&f, &item), off) in fs.iter().zip(items).zip(offs) {
-                            put(off as usize, f, item, out, relocs);
-                        }
-                    }
-                    Shape::Array(n, e) => {
-                        let stride = gs.types.stride(sp, e) as usize;
-                        for (i, &item) in items.iter().take(n as usize).enumerate() {
-                            put(i * stride, e, item, out, relocs);
-                        }
-                    }
-                    Shape::Func(..) | Shape::Union(_) => {}
-                }
-            }
-            _ => out.resize(start + size, 0),
-        }
-    }
-
     fn globals(&mut self) {
-        let gs = &self.m.globals;
-        for g in 0..gs.len() {
-            let t = gs.ty(g);
-            let align = gs.types.align(&self.m.space, t).max(u64::from(gs.align(g)));
-            let mut bytes = Vec::new();
-            let mut relocs = Vec::new();
-            self.image(t, gs.init(g), &mut bytes, &mut relocs);
-            if bytes.is_empty() {
-                bytes.push(0);
-            }
-            let section = match (self.o.os, gs.is_const(g), relocs.is_empty()) {
-                (Os::Linux, true, true) => ".section .rodata",
-                (Os::Linux, true, false) => ".section .data.rel.ro,\"aw\"",
-                (Os::Linux, false, _) => ".data",
-                (Os::Darwin, true, true) => ".section __TEXT,__const",
-                (Os::Darwin, true, false) => ".section __DATA,__const",
-                (Os::Darwin, false, _) => ".data",
-            };
-            let s = self.sym(gs.name(g), true);
-            self.out.push('\n');
-            self.line(section);
-            self.linef(format_args!(".globl {s}"));
-            self.linef(format_args!(".p2align {}", align.trailing_zeros()));
-            if self.o.os == Os::Linux {
-                self.linef(format_args!(".type {s}, %object"));
-                self.linef(format_args!(".size {s}, {}", bytes.len()));
-            }
-            let _ = writeln!(self.out, "{s}:");
-            let mut i = 0;
-            let mut ri = relocs.iter().peekable();
-            while i < bytes.len() {
-                if let Some((o, sym)) = ri.peek()
-                    && *o == i
-                {
-                    self.linef(format_args!(".quad {sym}"));
-                    i += 8;
-                    ri.next();
-                    continue;
-                }
-                let end = relocs
-                    .iter()
-                    .map(|r| r.0)
-                    .find(|&o| o > i)
-                    .unwrap_or(bytes.len())
-                    .min(i + 16);
-                let items: Vec<String> = bytes[i..end].iter().map(|b| b.to_string()).collect();
-                self.linef(format_args!(".byte {}", items.join(", ")));
-                i = end;
-            }
-        }
+        let darwin = self.o.os == Os::Darwin;
+        let text = crate::backend::data::globals(
+            self.m,
+            &|name, own| self.sym(name, own),
+            &self.o.extern_prefix,
+            darwin,
+        );
+        self.out.push_str(&text);
     }
-}
-
-fn gs_has(gs: &Globals, name: &str) -> bool {
-    (0..gs.len()).any(|g| gs.name(g) == name)
 }
 
 /// Assembly for a module whose functions are allocated.

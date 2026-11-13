@@ -1,14 +1,15 @@
 //! Backends: from MFIR to a target's LFIR dialect, and from there to assembly.
 //!
 //! The first target is AArch64 ([`aarch64`]); see `docs/design/03-plan.md` (LFIR for AArch64)
-//! and the decision log (LFIR for AArch64). A backend compiles MFIR: [`prepare`] makes it from
-//! any verified module, lowering HFIR first.
+//! and the decision log (LFIR for AArch64). What backends emit for globals is in [`data`]. A
+//! backend compiles MFIR: [`prepare`] makes it from any verified module, lowering HFIR first.
 //!
 //! ```text
 //! HFIR ──lower──▶ MFIR ──-O (optional)──▶ MFIR ──isel──▶ LFIR ──regalloc──▶ .s
 //! ```
 
 pub mod aarch64;
+pub mod data;
 
 use crate::Layer;
 use crate::ir::Module;
