@@ -83,9 +83,9 @@ The verifier (`Fir.Verify`, `verify.rs`) checks a module against its layer befor
     access per leaf, at `ptr.offset.wrap` by the leaf's offset, with alignment
     `gcd(align, offset)`. Padding is neither read nor written (decision: Aggregate values).
   - A `union` is a tagged sum value. It has no layout and can't be stored, so it is not C's
-    `union`: `fai-cc` represents a C union as a struct of its size.
+    `union`: `fcc` represents a C union as a struct of its size.
   - A slice is a pointer and a length.
-- **Made by:** `fai-cc --emit hfir`, the builder and C API, or text. **Read by:** `fir lower`;
+- **Made by:** `fcc --emit hfir`, the builder and C API, or text. **Read by:** `fir lower`;
   `fir run`; `fir opt` (passes don't check the layer and are proved over the shared semantics, so
   they run on HFIR too); and `fir compile`, which lowers first (`backend::prepare`).
 
@@ -152,7 +152,7 @@ else as its scalars (`Lower.lowerValue`). **Proved:** the expansion step only
 the Rust text equals Lean's (`tests/lower.rs`, `tests/fuzz.rs`), and each fixture run of the
 lowering gives the same outcome as the HFIR run, or the same events before HFIR UB
 (`RunOutput::lowers_to`). The C corpus is also run at every layer
-(`crates/fir-capi/tests/fai_cc.rs`).
+(`crates/fir-capi/tests/fcc.rs`).
 
 | Item | What happens | Semantic loss? |
 |---|---|---|
@@ -235,7 +235,7 @@ under qemu.
 | G1, G2 | Layouts other than AAPCS64's miscompiled C calls and overran `va_list` | fixed: refused by `isel::check_module` |
 | G3 | An MFIR `cf.if` yielding a struct verifies, then selection refuses it as "HFIR only" | open; the cause is G9 |
 | G4 | `int.add.overflow.s` on `i64` lowers to `i65` ops that verify, then selection refuses them | open |
-| G5 | A source name the lowering also makes breaks it ("defined more than once"). That covers temporaries like `%.e0`, and also a scalar name: `%s.1: i32` next to `%s: struct<C>{i32, i32}` verifies and runs as HFIR, and its lowering doesn't verify. `fai-cc` renames clashing locals to this same form (`x.1`, `nameValue`). The corpus doesn't hit it | open (refused, not miscompiled) |
+| G5 | A source name the lowering also makes breaks it ("defined more than once"). That covers temporaries like `%.e0`, and also a scalar name: `%s.1: i32` next to `%s: struct<C>{i32, i32}` verifies and runs as HFIR, and its lowering doesn't verify. `fcc` renames clashing locals to this same form (`x.1`, `nameValue`). The corpus doesn't hit it | open (refused, not miscompiled) |
 | G6 | Facts are dropped by selection, and no trust level means anything to the compiler | open |
 | G7 | `tests/lower.rs` skips runs whose arguments don't parse at both layers, so it never compares functions whose signatures scalarization changes | open |
 | G8 | **HFIR and MFIR stacks are unbounded; LFIR's and native code's are not.** A recursive MFIR function with a 64-byte slot returns `100000` for `@deep(100000)` in `fir run`. The LFIR machine gives `ub out-of-bounds (offset -8, …, allocation size 1048576)`, and qemu crashes with a segfault. The target is less defined than its source. No test exercises it: fixtures don't recurse that deep | open (P6) |

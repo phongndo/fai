@@ -1,39 +1,39 @@
-//! `fai-cc`, the C frontend in `frontends/c/`, against a reference C compiler.
+//! `fcc`, the C frontend in `frontends/c/`, against a reference C compiler.
 //!
-//! The corpus's `fai-cc -O` builds run with `--check-dce` and the Lean reference tool (`FIR_REF`,
+//! The corpus's `fcc -O` builds run with `--check-dce` and the Lean reference tool (`FIR_REF`,
 //! or `spec/.lake/build/bin/fir-ref`), so each optimized corpus binary that is run was produced
 //! by a pipeline whose every step of dead code elimination the proved checker accepted
 //! (`Fir.Dce.checkModule`; `docs/assurance/dce.md` says what that does and doesn't establish).
 //! Without a reference (or with `FIR_REF=none`) they build unchecked, which `FIR_REQUIRE_FULL=1`
-//! refuses. The evidence (`fai_cc_corpus`) counts the checked builds and steps. The ABI torture
+//! refuses. The evidence (`fcc_corpus`) counts the checked builds and steps. The ABI torture
 //! test below doesn't check its `-O` builds.
 //!
-//! Builds `fai-cc` with CMake against this crate's static library, then compiles every program
+//! Builds `fcc` with CMake against this crate's static library, then compiles every program
 //! of the corpus (`frontends/c/tests/*.c`) three ways: by the reference compiler (the AArch64 C
 //! compiler: `$FIR_CC`, `cc` on AArch64, else `aarch64-unknown-linux-gnu-cc`, at `-O1`, with
-//! `-ffp-contract=off`: `fai-cc` never fuses `a * b + c` into an `fma`), by `fai-cc`, and by
-//! `fai-cc -O`. Each binary is linked with the output helpers of
+//! `-ffp-contract=off`: `fcc` never fuses `a * b + c` into an `fma`), by `fcc`, and by
+//! `fcc -O`. Each binary is linked with the output helpers of
 //! `frontends/c/tests/runtime/fai_runtime.c` and libm, and with `frontends/c/tests/extern/NAME.c`
 //! compiled by the reference compiler if the program has one (C functions it calls, and that
 //! call it, compiled separately), and run (under `qemu-aarch64` off AArch64), and the three must
 //! print the same and exit with the same code. Each program's HFIR
-//! (`fai-cc --emit hfir`) also runs in the interpreter, under Arm's NaN choice (the NaNs the
+//! (`fcc --emit hfir`) also runs in the interpreter, under Arm's NaN choice (the NaNs the
 //! hardware gives, as the backend's harness does), whose calls of the output helpers (events)
 //! must spell the same text and whose result the same exit code; a program that calls other
 //! external functions (libm's, or libc's `printf`) isn't comparable there, since the
 //! interpreter's world answers them with zeros: it is listed with the first such function.
 //!
-//! The programs under `frontends/c/tests/errors/` use what `fai-cc` doesn't support yet: each
-//! says where and what in `// expect: LINE:COL: TEXT` lines, and `fai-cc` must report exactly
+//! The programs under `frontends/c/tests/errors/` use what `fcc` doesn't support yet: each
+//! says where and what in `// expect: LINE:COL: TEXT` lines, and `fcc` must report exactly
 //! those diagnostics (`FILE:LINE:COL: error: …TEXT…`) and exit with 1, not crash.
 //!
 //! The test needs the dev shell's CMake, Ninja, Clang libraries, AArch64 C compiler, and (off
 //! AArch64) `qemu-aarch64`, and fails with a message naming what's missing. It runs by default
-//! on Linux; elsewhere (macOS, whose binaries aren't Linux ones) only with `FAI_CC_TESTS=1`, and
-//! `FAI_CC_TESTS=0` turns it off. `FAI_CC_ONLY=name` runs only the programs whose names contain
+//! on Linux; elsewhere (macOS, whose binaries aren't Linux ones) only with `FCC_TESTS=1`, and
+//! `FCC_TESTS=0` turns it off. `FCC_ONLY=name` runs only the programs whose names contain
 //! `name`; `--nocapture` shows the summary.
 //!
-//! `FAI_CC_PASSES=p,q,…` adds a fourth build, `fai-cc --passes p,q,… --experimental` (the named
+//! `FCC_PASSES=p,q,…` adds a fourth build, `fcc --passes p,q,… --experimental` (the named
 //! passes to a fixed point, experimental ones included, such as `mem2reg`), which must match the
 //! reference too, and the interpreter runs the MFIR and the allocated LFIR it makes as two more
 //! layers.
@@ -60,16 +60,16 @@ fn on_path(name: &str) -> bool {
 }
 
 fn enabled() -> bool {
-    match std::env::var("FAI_CC_TESTS").as_deref() {
+    match std::env::var("FCC_TESTS").as_deref() {
         Ok("0") => {
-            eprintln!("fai-cc: FAI_CC_TESTS=0, so the corpus doesn't run");
+            eprintln!("fcc: FCC_TESTS=0, so the corpus doesn't run");
             false
         }
         Ok(_) => true,
         Err(_) if cfg!(target_os = "linux") => true,
         Err(_) => {
             eprintln!(
-                "fai-cc: the corpus runs Linux binaries; on this host it runs only with FAI_CC_TESTS=1"
+                "fcc: the corpus runs Linux binaries; on this host it runs only with FCC_TESTS=1"
             );
             false
         }
@@ -111,43 +111,43 @@ fn static_lib() -> PathBuf {
     target.join("release/libfir_capi.a")
 }
 
-/// `fai-cc`, built once for the tests here.
-fn fai_cc() -> &'static Path {
+/// `fcc`, built once for the tests here.
+fn fcc() -> &'static Path {
     static FAI: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    FAI.get_or_init(build_fai_cc)
+    FAI.get_or_init(build_fcc)
 }
 
-/// Configure and build `fai-cc`; its path.
-fn build_fai_cc() -> PathBuf {
+/// Configure and build `fcc`; its path.
+fn build_fcc() -> PathBuf {
     for tool in ["cmake", "ninja"] {
         assert!(
             on_path(tool),
-            "fai-cc: {tool} is missing: run the tests in the dev shell (`nix develop`), or set \
-             FAI_CC_TESTS=0 to skip the C frontend's corpus"
+            "fcc: {tool} is missing: run the tests in the dev shell (`nix develop`), or set \
+             FCC_TESTS=0 to skip the C frontend's corpus"
         );
     }
     let lib = static_lib();
-    let build = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fai-cc-build");
+    let build = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fcc-build");
     let configured = Command::new("cmake")
         .arg("-S")
         .arg(repo().join("frontends/c"))
         .arg("-B")
         .arg(&build)
-        .args(["-G", "Ninja", "-DFAI_CC_BUILD_CAPI=OFF"])
+        .args(["-G", "Ninja", "-DFCC_BUILD_CAPI=OFF"])
         .arg(format!("-DFIR_CAPI_LIB={}", lib.display()))
         .output()
         .expect("running cmake");
     assert!(
         configured.status.success(),
-        "configuring fai-cc failed (are Clang's libraries on CMAKE_PREFIX_PATH, as in the dev \
+        "configuring fcc failed (are Clang's libraries on CMAKE_PREFIX_PATH, as in the dev \
          shell?):\n{}",
         String::from_utf8_lossy(&configured.stderr)
     );
     check(
         Command::new("cmake").arg("--build").arg(&build),
-        "building fai-cc",
+        "building fcc",
     );
-    build.join("fai-cc")
+    build.join("fcc")
 }
 
 struct Toolchain {
@@ -164,14 +164,14 @@ fn toolchain() -> Toolchain {
     };
     assert!(
         on_path(&cc) || Path::new(&cc).is_file(),
-        "fai-cc: no AArch64 C compiler ('{cc}'): use the dev shell, or set FIR_CC"
+        "fcc: no AArch64 C compiler ('{cc}'): use the dev shell, or set FIR_CC"
     );
     let runner = if native {
         None
     } else {
         assert!(
             on_path("qemu-aarch64"),
-            "fai-cc: qemu-aarch64 is missing: use the dev shell"
+            "fcc: qemu-aarch64 is missing: use the dev shell"
         );
         Some("qemu-aarch64".to_owned())
     };
@@ -239,23 +239,21 @@ enum FirRun {
     Calls(String),
 }
 
-/// The interpreter's run of `main` in the HFIR `fai-cc` printed, as a native run's behavior.
+/// The interpreter's run of `main` in the HFIR `fcc` printed, as a native run's behavior.
 fn run_fir(hfir: &str) -> Result<FirRun, String> {
     let m = fir::parse_module(hfir).map_err(|e| format!("the HFIR doesn't parse: {e}"))?;
     fir::verify_module(&m).map_err(|e| format!("the HFIR doesn't verify: {e}"))?;
     run_module(&m)
 }
 
-/// The passes of `FAI_CC_PASSES`, if set and not empty.
+/// The passes of `FCC_PASSES`, if set and not empty.
 fn exp_passes() -> Option<String> {
-    std::env::var("FAI_CC_PASSES")
-        .ok()
-        .filter(|s| !s.is_empty())
+    std::env::var("FCC_PASSES").ok().filter(|s| !s.is_empty())
 }
 
 /// The program at every layer below HFIR, as `fir compile` makes them: MFIR as lowered, MFIR
 /// after `-O`, and LFIR for AArch64 before and after register allocation; with
-/// `FAI_CC_PASSES`, also the MFIR those passes make and its allocated LFIR.
+/// `FCC_PASSES`, also the MFIR those passes make and its allocated LFIR.
 fn layers(hfir: &fir::Module) -> Result<Vec<(&'static str, fir::Module)>, String> {
     use fir::backend::aarch64 as a64;
     let mfir = fir::backend::prepare(hfir, false)?;
@@ -327,7 +325,7 @@ fn run_module(m: &fir::Module) -> Result<FirRun, String> {
 }
 
 fn corpus(dir: &Path) -> Vec<PathBuf> {
-    let only = std::env::var("FAI_CC_ONLY").unwrap_or_default();
+    let only = std::env::var("FCC_ONLY").unwrap_or_default();
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -343,7 +341,7 @@ struct Tally {
     programs: usize,
     native: usize,
     native_opt: usize,
-    /// Native runs of the `FAI_CC_PASSES` build that matched.
+    /// Native runs of the `FCC_PASSES` build that matched.
     native_passes: usize,
     fir_match: usize,
     /// Programs whose run also matched at MFIR, MFIR -O, and LFIR before and after allocation.
@@ -357,7 +355,7 @@ struct Tally {
     failures: Vec<String>,
 }
 
-/// The Lean reference tool, for `fai-cc --check-dce`: `FIR_REF`, or the one `lake build` makes.
+/// The Lean reference tool, for `fcc --check-dce`: `FIR_REF`, or the one `lake build` makes.
 /// `None` (the `-O` builds then go unchecked) only where a full run isn't required.
 fn fir_ref() -> Option<PathBuf> {
     let p = match std::env::var_os("FIR_REF") {
@@ -368,13 +366,13 @@ fn fir_ref() -> Option<PathBuf> {
     match p {
         Some(p) if p.is_file() => Some(p),
         _ => {
-            evidence::require("no Lean reference tool to check fai-cc -O's dead code elimination");
+            evidence::require("no Lean reference tool to check fcc -O's dead code elimination");
             None
         }
     }
 }
 
-/// The steps and deletions in `fai-cc --check-dce`'s summary line on stderr.
+/// The steps and deletions in `fcc --check-dce`'s summary line on stderr.
 fn dce_summary(stderr: &str) -> Option<(u64, u64)> {
     let line = stderr
         .lines()
@@ -394,7 +392,7 @@ fn dce_summary(stderr: &str) -> Option<(u64, u64)> {
 /// One corpus program: build it three ways, run, and compare.
 fn one(
     file: &Path,
-    fai: &Path,
+    fcc_exe: &Path,
     tc: &Toolchain,
     rt: &Path,
     out: &Path,
@@ -457,7 +455,7 @@ fn one(
         Ok(b) => b,
         Err(e) => return fail(format!("the reference binary: {e}")),
     };
-    // The builds: without and with -O, and with `FAI_CC_PASSES`'s passes.
+    // The builds: without and with -O, and with `FCC_PASSES`'s passes.
     let mut builds: Vec<(&str, String, Vec<String>)> = vec![
         ("", String::new(), vec![]),
         (".O", " -O".to_owned(), vec!["-O".to_owned()]),
@@ -472,7 +470,7 @@ fn one(
     let mut ok = [false; 3];
     for (i, (suffix, label, flags)) in builds.iter().enumerate() {
         let exe = out.join(format!("{name}{suffix}"));
-        let mut cmd = Command::new(fai);
+        let mut cmd = Command::new(fcc_exe);
         cmd.arg(file)
             .arg("-I")
             .arg(&inc)
@@ -498,7 +496,7 @@ fn one(
                         }
                         None => {
                             fail(format!(
-                                "fai-cc -O --check-dce printed no checker summary:\n{}",
+                                "fcc -O --check-dce printed no checker summary:\n{}",
                                 String::from_utf8_lossy(&o.stderr)
                             ));
                             continue;
@@ -508,25 +506,23 @@ fn one(
             }
             Ok(o) => {
                 fail(format!(
-                    "fai-cc{label} failed:\n{}",
+                    "fcc{label} failed:\n{}",
                     String::from_utf8_lossy(&o.stderr)
                 ));
                 continue;
             }
             Err(e) => {
-                fail(format!("fai-cc{label}: {e}"));
+                fail(format!("fcc{label}: {e}"));
                 continue;
             }
         }
         match run_native(tc, &exe) {
             Ok(got) if got == want => ok[i] = true,
-            Ok(got) => fail(format!(
-                "fai-cc{label} gives {got:?}, the reference {want:?}"
-            )),
-            Err(e) => fail(format!("fai-cc{label}: {e}")),
+            Ok(got) => fail(format!("fcc{label} gives {got:?}, the reference {want:?}")),
+            Err(e) => fail(format!("fcc{label}: {e}")),
         }
     }
-    let hfir = Command::new(fai)
+    let hfir = Command::new(fcc_exe)
         .arg(file)
         .arg("-I")
         .arg(&inc)
@@ -535,7 +531,7 @@ fn one(
         .unwrap();
     let fir_ok = if !hfir.status.success() {
         fail(format!(
-            "fai-cc --emit hfir failed:\n{}",
+            "fcc --emit hfir failed:\n{}",
             String::from_utf8_lossy(&hfir.stderr)
         ));
         false
@@ -607,14 +603,14 @@ fn expectations(src: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn error_test(file: &Path, fai: &Path) -> Result<(), String> {
+fn error_test(file: &Path, fcc_exe: &Path) -> Result<(), String> {
     let src = std::fs::read_to_string(file).unwrap();
     let want = expectations(&src);
     if want.is_empty() {
         return Err("no `// expect:` lines".to_owned());
     }
     let out = run_limited(
-        Command::new(fai)
+        Command::new(fcc_exe)
             .arg(file)
             .arg("-I")
             .arg(repo().join("frontends/c/tests/runtime"))
@@ -646,14 +642,14 @@ fn error_test(file: &Path, fai: &Path) -> Result<(), String> {
 }
 
 #[test]
-fn fai_cc_corpus() {
+fn fcc_corpus() {
     if !enabled() {
         return;
     }
     let tc = toolchain();
-    let fai = fai_cc();
+    let fcc_exe = fcc();
     let check_dce = fir_ref();
-    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fai-cc-corpus");
+    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fcc-corpus");
     std::fs::create_dir_all(&out).unwrap();
     let rt = out.join("fai_runtime.o");
     check(
@@ -677,7 +673,7 @@ fn fai_cc_corpus() {
                     let Some(file) = next.lock().unwrap().next() else {
                         break;
                     };
-                    one(file, fai, &tc, &rt, &out, check_dce.as_deref(), &tally);
+                    one(file, fcc_exe, &tc, &rt, &out, check_dce.as_deref(), &tally);
                 }
             });
         }
@@ -687,7 +683,7 @@ fn fai_cc_corpus() {
     let mut t = tally.into_inner().unwrap();
     for file in corpus(&tests.join("errors")) {
         errors += 1;
-        if let Err(e) = error_test(&file, fai) {
+        if let Err(e) = error_test(&file, fcc_exe) {
             t.failures.push(format!("{}: {e}", file.display()));
         }
     }
@@ -695,12 +691,12 @@ fn fai_cc_corpus() {
     t.fir_other_externs.sort();
     if let Some(spec) = exp_passes() {
         eprintln!(
-            "fai-cc corpus: native runs matching with --passes {spec}: {}",
+            "fcc corpus: native runs matching with --passes {spec}: {}",
             t.native_passes
         );
     }
     eprintln!(
-        "fai-cc corpus: {} programs; native runs matching the reference: {} without -O, {} with \
+        "fcc corpus: {} programs; native runs matching the reference: {} without -O, {} with \
          -O; fir run matching: {} (and at every lower layer: {}), not comparable: {} (calling other external functions: {}); \
          error tests: {}; -O builds checked by Fir.Dce.checkModule: {} ({} dce steps, {} deletions)",
         t.programs,
@@ -715,7 +711,7 @@ fn fai_cc_corpus() {
         t.dce_steps,
         t.dce_deletions
     );
-    let ev = evidence::Evidence::new("fai_cc_corpus");
+    let ev = evidence::Evidence::new("fcc_corpus");
     ev.count("programs", t.programs as u64);
     ev.count("native -O runs matching the reference", t.native_opt as u64);
     ev.count(
@@ -737,11 +733,11 @@ fn fai_cc_corpus() {
 
 // Interop torture: random signatures of structs and unions (every AAPCS64 class, bitfields,
 // unions, 16-byte aligned members, `aligned` attributes, nesting, arrays, pointers), written in
-// C, with the callers in one file and the callees in another. Each file is compiled by `fai-cc`
+// C, with the callers in one file and the callees in another. Each file is compiled by `fcc`
 // (with and without `-O`) or by the reference compiler, and every pairing must agree: the
 // callees check every member of every argument they receive (directly, through a function
 // pointer, and through `...` read by `va_arg`) and the callers every member of every result.
-// `FAI_CC_ABI=N` sets the number of signatures (default 240), `FAI_CC_ABI_SEED` the seed.
+// `FCC_ABI=N` sets the number of signatures (default 240), `FCC_ABI_SEED` the seed.
 
 /// A deterministic random source (xorshift64*), as `crates/fir/tests/abi.rs`'s.
 struct Rng(u64);
@@ -987,7 +983,7 @@ impl Torture {
         }
         // `aligned(16)` only beside an integer, pointer, or bitfield, so that neither this
         // record nor one holding it is an HFA: GCC aligns a 16-byte aligned HFA on the stack,
-        // which FIR can't, and `fai-cc` rejects it (`tests/errors/struct_by_value.c`).
+        // which FIR can't, and `fcc` rejects it (`tests/errors/struct_by_value.c`).
         let not_hfa = members.iter().any(|m| match m {
             Member::Plain { ty: Ty::S(s), .. } => !matches!(s, Sc::F32 | Sc::F64),
             Member::Plain {
@@ -1045,7 +1041,7 @@ impl Torture {
     }
 
     /// Whether GCC aligns an argument of this type to 16 (its fields' alignment, not an
-    /// attribute on the type itself): `fai-cc` doesn't pass those through `...`.
+    /// attribute on the type itself): `fcc` doesn't pass those through `...`.
     fn arg_align16(&self, t: &Ty) -> bool {
         match t {
             Ty::Rec(r) => self.align16_fields(&self.recs[*r].members),
@@ -1198,7 +1194,7 @@ fn torture_batch(seed: u64, n: usize) -> (String, String, TCounts, Torture) {
     let mut callees = head;
     let mut main = String::from("int main(void) {\n");
     // Each check has a number of its own (string literals would be generated globals whose
-    // names clash between two `fai-cc` objects: FIR has no linkage yet).
+    // names clash between two `fcc` objects: FIR has no linkage yet).
     let id = std::cell::Cell::new(0usize);
     let checks = |ls: &[(String, String)], out: &mut String| {
         for (p, v) in ls {
@@ -1312,33 +1308,33 @@ fn torture_batch(seed: u64, n: usize) -> (String, String, TCounts, Torture) {
 }
 
 #[test]
-fn fai_cc_abi_torture() {
+fn fcc_abi_torture() {
     if !enabled() {
         return;
     }
     let tc = toolchain();
-    let fai = fai_cc();
-    let n: usize = std::env::var("FAI_CC_ABI")
+    let fcc_exe = fcc();
+    let n: usize = std::env::var("FCC_ABI")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(240);
-    let seed: u64 = std::env::var("FAI_CC_ABI_SEED")
+    let seed: u64 = std::env::var("FCC_ABI_SEED")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
-    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("fai-cc-abi-{seed}"));
+    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("fcc-abi-{seed}"));
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out).unwrap();
     const BATCH: usize = 20;
     let batches = n.div_ceil(BATCH);
-    // The pairings: (callers, callees), each `gcc`, `fai`, or `fai -O`.
+    // The pairings: (callers, callees), each `gcc`, `fcc`, or `fcc -O`.
     const PAIRS: &[(&str, &str)] = &[
         ("gcc", "gcc"),
-        ("fai", "gcc"),
-        ("faiO", "gcc"),
-        ("gcc", "fai"),
-        ("gcc", "faiO"),
-        ("fai", "faiO"),
+        ("fcc", "gcc"),
+        ("fccO", "gcc"),
+        ("gcc", "fcc"),
+        ("gcc", "fccO"),
+        ("fcc", "fccO"),
     ];
     // What ran, and the record types made: in all, HFA-like, unions, with bitfields, aligned,
     // empty.
@@ -1364,15 +1360,15 @@ fn fai_cc_abi_torture() {
                     for (side, src) in [("callers", &callers), ("callees", &callees)] {
                         let c = dir.join(format!("{side}.c"));
                         std::fs::write(&c, src).unwrap();
-                        for how in ["gcc", "fai", "faiO"] {
+                        for how in ["gcc", "fcc", "fccO"] {
                             let o = dir.join(format!("{side}.{how}.o"));
                             let mut cmd = if how == "gcc" {
                                 let mut cmd = Command::new(&tc.cc);
                                 cmd.args(["-O1", "-w", "-std=gnu17", "-c"]);
                                 cmd
                             } else {
-                                let mut cmd = Command::new(fai);
-                                if how == "faiO" {
+                                let mut cmd = Command::new(fcc_exe);
+                                if how == "fccO" {
                                     cmd.arg("-O");
                                 }
                                 cmd
@@ -1448,7 +1444,7 @@ fn fai_cc_abi_torture() {
     });
     let (c, k) = totals.into_inner().unwrap();
     eprintln!(
-        "fai-cc ABI torture (seed {seed}): {} signatures over {} record types ({} of floats only, \
+        "fcc ABI torture (seed {seed}): {} signatures over {} record types ({} of floats only, \
          {} unions, {} with bitfields, {} aligned by an attribute or a 16-byte member, {} \
          empty); {} \
          parameters, {} of them also through `...`; {} members checked in each of {} pairings \

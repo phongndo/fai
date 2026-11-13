@@ -85,7 +85,7 @@ int main(void) {
   fclassify(HUGE_VALF);
   fclassify(1e-40f);
   /* The quiet comparisons (<math.h>'s macros for them are statement expressions under Clang,
-   * which fai-cc doesn't support yet). */
+   * which fcc doesn't support yet). */
   double nan = in[0] - INFINITY + INFINITY;
   show("isgreater", __builtin_isgreater(in[0], in[1]));
   show("isless", __builtin_isless(in[0], nan));

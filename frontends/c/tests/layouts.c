@@ -1,6 +1,6 @@
 /* Struct and union layouts that need care: _Alignas members, flexible array members, bitfields
  * at odd offsets and next to other members, anonymous struct and union members, and nested
- * unions; fai-cc checks FIR's layout of each against Clang's. */
+ * unions; fcc checks FIR's layout of each against Clang's. */
 #include "fai_test.h"
 #include <stddef.h>
 #include <stdlib.h>

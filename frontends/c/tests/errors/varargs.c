@@ -1,4 +1,4 @@
-/* What fai-cc's varargs don't cover yet: long double (binary128) arguments, and returning a
+/* What fcc's varargs don't cover yet: long double (binary128) arguments, and returning a
  * va_list. */
 #include <stdarg.h>
 

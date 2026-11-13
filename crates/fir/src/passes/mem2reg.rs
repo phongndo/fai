@@ -38,7 +38,7 @@
 //! backward dataflow over the function's ops, whose edges are the structured control flow's
 //! (falling through, entering regions, `cf.yield`, `cf.break`, `cf.continue`, branches); loads
 //! read their slot and stores write it. Without the pruning, C's block-scoped variables (which
-//! `fai-cc` makes at the function's entry) would become state of every loop and parameters of
+//! `fcc` makes at the function's entry) would become state of every loop and parameters of
 //! every block around them, and the moves and spills that costs can outweigh the loads saved.
 //!
 //! Skipped: functions with an op with regions other than those three (`cf.try`, LFIR code) or a

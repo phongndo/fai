@@ -7,12 +7,12 @@ C ABI. Decisions are in [decisions.md](decisions.md) (rows Next round, C fronten
 ops, Float semantics, NaN determinism).
 
 ```
- file.c ──clang (parse, type-check)──▶ AST ──fai-cc──C API──▶ HFIR ──fir lower/opt/compile──▶ AArch64 binary
+ file.c ──clang (parse, type-check)──▶ AST ──fcc──C API──▶ HFIR ──fir lower/opt/compile──▶ AArch64 binary
 ```
 
 ## Done when
 
-`fai-cc` compiles a corpus of C programs (integers, pointers, structs, unions, arrays, globals,
+`fcc` compiles a corpus of C programs (integers, pointers, structs, unions, arrays, globals,
 string literals, every statement form including `goto` and `switch`, function pointers,
 `float`/`double`, variadic functions defined and called, structs passed and returned by value,
 and calls to libc including `printf`) to AArch64 binaries whose output matches the same programs
@@ -24,7 +24,7 @@ runs in `fir run` with the same output where its run is defined.
 | Track | What | Depends on |
 |---|---|---|
 | M: Floats in the IR | `f32`/`f64` types and `float.*` ops through Lean (bit-precise IEEE 754 semantics), the op table, both interpreters, verifiers, builder and C API, lowering, passes, fixtures, the fuzzer | — |
-| F: C frontend | `frontends/c`: `fai-cc`, a Clang LibTooling tool that lowers Clang's AST to HFIR through the C API; the integer, pointer, aggregate-in-memory, and control-flow subset first; a differential test corpus against clang | — |
+| F: C frontend | `frontends/c`: `fcc`, a Clang LibTooling tool that lowers Clang's AST to HFIR through the C API; the integer, pointer, aggregate-in-memory, and control-flow subset first; a differential test corpus against clang | — |
 | N: Floats on AArch64 | FP/SIMD registers (`s`/`d`), float LFIR ops with Lean semantics, isel, a second register class in the allocator and its checker, AAPCS64 float arguments and results | M |
 | V: Varargs | Variadic signatures, calls, `va.*` ops in Lean and Rust, their lowering, and AAPCS64's `va_list` on AArch64 (Linux), so FIR calls `printf` and defines variadic functions C can call | N |
 | A: Aggregates by value | AAPCS64 composite rules for FIR functions and external functions: HFAs in float registers, composites up to 16 bytes in `x` registers, larger ones by reference, results through `x8` | N |
@@ -61,10 +61,10 @@ M and F run in parallel; then N; then V and A one after the other (both change t
 
 ## C frontend (tracks F and F2)
 
-- `frontends/c/`: `fai-cc` in C++ against Clang's LibTooling, built with CMake from the dev shell
+- `frontends/c/`: `fcc` in C++ against Clang's LibTooling, built with CMake from the dev shell
   (which adds the LLVM/Clang libraries), linking `crates/fir-capi`'s static library. It builds
   modules only through `fir.h`; if the C API is missing something, the track adds it to the API.
-- `fai-cc FILE.c [-O] [-o OUT] [--emit hfir|mfir|asm] [clang flags…]`: parse and type-check with
+- `fcc FILE.c [-O] [-o OUT] [--emit hfir|mfir|asm] [clang flags…]`: parse and type-check with
   Clang (preprocessor and headers included), lower the AST to HFIR, verify, then compile through
   `fir_module_compile` and link as `fir compile` does.
 - **Mapping:** each C rule becomes an explicit modifier: signed `+ - *` are `.nsw` (overflow is UB
@@ -73,7 +73,7 @@ M and F run in parallel; then N; then V and A one after the other (both change t
   (mem2reg comes later); `char` accesses and `memcpy` are `b8` where bytes may hold pointers
   (decision: Pointer bytes as integers; as built, `char` is `i8`: see Progress); `goto` and `switch` use `cf.blocks`; C unions are
   memory (a struct of the largest member's size and alignment), accessed through pointers.
-- **Tests:** a corpus of C programs under `frontends/c/tests/`, each compiled by `fai-cc` and by
+- **Tests:** a corpus of C programs under `frontends/c/tests/`, each compiled by `fcc` and by
   clang, run, and compared; most print through a small extern print helper, whose calls the
   interpreter's run can be compared on, and some through `printf` (track F2b).
 
@@ -91,7 +91,7 @@ memory exactly as clang does, so FIR and clang-compiled C call each other.
 
 ### Track F: C frontend (done)
 
-`fai-cc` is in `frontends/c/` (about 2,600 lines of C++; build and usage in its README): Clang
+`fcc` is in `frontends/c/` (about 2,600 lines of C++; build and usage in its README): Clang
 parses and type-checks for `aarch64-unknown-linux-gnu` with the cross compiler's glibc headers,
 and the AST is lowered to HFIR through `fir.h` only, verified, compiled with `fir_module_compile`
 (`-O` runs the proved passes), and linked by the AArch64 C compiler. Decisions: C frontend, C
@@ -118,7 +118,7 @@ integers (`char` is `i8`, not `b8`).
   dynamic programming, and goto-, switch-, and Duff's-device-heavy programs) and 13 error tests.
   All 46 match the cross GCC at `-O1` under `qemu-aarch64`, with and without `-O`; 45 also match
   in `fir run` (the one that calls libc's `strlen`, `memcpy`, … can't be compared there). Every
-  error test gets exactly its expected diagnostics. `cargo test -p fir-capi --test fai_cc` runs it
+  error test gets exactly its expected diagnostics. `cargo test -p fir-capi --test fcc` runs it
   (on Linux by default).
 - **API added:** `fir_type_layout` and `fir_type_field_offset` (version 1.1), so the frontend checks
   every struct's FIR layout against Clang's.
@@ -127,7 +127,7 @@ integers (`char` is `i8`, not `b8`).
   - Global initializers can only name the start of a global, so `&table[2]` and `"abc" + 1` are
     rejected (Open item 1: initializers that point inside a global).
   - No external globals: `stdout`, `errno`, and any `extern int x;` defined elsewhere are rejected.
-  - No linkage: C's `static` functions and globals become global symbols, so two `fai-cc` objects
+  - No linkage: C's `static` functions and globals become global symbols, so two `fcc` objects
     with the same `static` name don't link together, and generated names (`str.0`, `f.counter`)
     rely on `.` to stay out of C's namespace.
   - No fill op: zeroing a local aggregate copies a constant zero global of its type
@@ -143,7 +143,7 @@ integers (`char` is `i8`, not `b8`).
     own file (ops get the expansion location).
   - Name lookups fail like errors: `fir_func_find` of a missing name overwrites the module's error
     message, and there is no `fir_global_find`.
-  - Linking is the caller's job: `fai-cc` repeats `fir compile`'s choice of `$FIR_CC` and its
+  - Linking is the caller's job: `fcc` repeats `fir compile`'s choice of `$FIR_CC` and its
     command line.
 - **Deferred:** floats, varargs, by-value structs, and `printf` (track F2); the gaps above;
   macOS binaries (the corpus needs Linux); an `effects` shorthand for "anything".
@@ -243,7 +243,7 @@ Instruction selection, Register allocation, Backend testing, Globals, Floats.
   pair and a mixed pair, an `f64` global) and that calls libm's `sqrt` and `fabsf` and a
   ten-double C function, and checks that a FIR call keeps `d8`…`d15`; `modules.c` builds every
   new LFIR op and float initializer.
-- **Not yet:** `fai-cc` still rejects floats (track F2); varargs with floats (track V) and HFAs
+- **Not yet:** `fcc` still rejects floats (track F2); varargs with floats (track V) and HFAs
   by value (track A); macOS's argument packing; a four-register `fmadd`; a proof that isel
   refines its source.
 - **Fixed after review:** the allocator's checker followed only value flow, so it accepted an
@@ -262,7 +262,7 @@ Instruction selection, Register allocation, Backend testing, Globals, Floats.
   register's value in hardware (`s37-p621`), so the analysis tracks `poison`. Fixtures and
   `FIR_FUZZ=3000` on seeds 21, 37, and 53: no differences.
 
-### Track F2a: floats in fai-cc (done)
+### Track F2a: floats in fcc (done)
 
 Decisions: C frontend (float mapping, no contraction), C frontend testing.
 
@@ -299,7 +299,7 @@ Decisions: C frontend (float mapping, no contraction), C frontend testing.
   uses: the payload of an op on two different NaNs (GCC commutes `+` and `*`), and quieting by
   an op GCC folds away (`x * 1.0`). `fai_test.h` prints floats as bits and a rounded decimal.
 - **API friction:** `fir_init_f32`/`fir_init_f64` take a host `float`/`double` while
-  `fir_float_const` takes bits, so `fai-cc` copies Clang's bits into a host float to initialize
+  `fir_float_const` takes bits, so `fcc` copies Clang's bits into a host float to initialize
   a global; a signaling NaN survives that on AArch64 and x86-64 (no conversion in passing), but
   a bits-based initializer would make it exact by construction. Otherwise `fir.h` had every op
   the mapping needed.
@@ -367,7 +367,7 @@ Lowering proofs, Backend testing, C external functions.
   several argument lists). The first native runs found that a `va_list`'s bytes, loaded as
   `bN` and returned, are the cursor's in FIR and the target's natively: any byte now refines a
   cursor's, as it refines `poison` (`Byte.Refines`).
-- **Not yet:** `fai-cc`'s varargs (track F2); macOS's variant (open item 4); aggregates as
+- **Not yet:** `fcc`'s varargs (track F2); macOS's variant (open item 4); aggregates as
   variadic arguments (track A); integers wider than 64 bits as variadic arguments.
 - **Fixed after review:** variadic arguments take 8-byte slots, but a pointer was encoded at its
   full width, so with `memspace default ptr 128 addr 64` the next argument overwrote a pointer's
@@ -385,7 +385,7 @@ Lowering proofs, Backend testing, C external functions.
   trap with it is tainted. Self-tests reject both reported outcomes and accept the legitimate
   cases.
 
-### Track F2b: varargs and printf in fai-cc (done)
+### Track F2b: varargs and printf in fcc (done)
 
 Decisions: C frontend (varargs mapping), C external functions, C frontend testing; Varargs and
 va_list (track V) unchanged.
@@ -551,7 +551,7 @@ Instruction selection, Backend testing, Builder API, API.
   read them with `va.arg`, 707 to 835 native runs (each with and without `-O`) pass structs by
   value, and 1 to 7 runs are skipped as a declared limit for a split pointer.
 - **API:** version 1.5 (no new functions; external and MFIR functions take composites).
-- **Not yet:** `fai-cc`'s structs by value (done in track F2c); macOS's stack packing (composites
+- **Not yet:** `fcc`'s structs by value (done in track F2c); macOS's stack packing (composites
   on the stack are a compile error there); integer leaves wider than 64 bits in a passed composite
   (`__int128` fields: the backend rejects them); composites in MFIR region state and memory
   accesses (the lowering never makes them; isel rejects them); other targets' classifications;
@@ -560,7 +560,7 @@ Instruction selection, Backend testing, Builder API, API.
   do anywhere); 16-byte aligned composites through `...` (no C composite FIR has is 16-byte
   aligned without an `i128` leaf).
 
-### Track F2c: structs and unions by value in fai-cc (done)
+### Track F2c: structs and unions by value in fcc (done)
 
 Decisions: C frontend (by-value mapping), C struct layout (empty structs), C frontend testing
 (helpers compiled by the reference compiler, the ABI torture); C ABI for aggregates unchanged.
@@ -612,12 +612,12 @@ Decisions: C frontend (by-value mapping), C struct layout (empty structs), C fro
   (`struct_extern` joins the 9 that call other external functions); 13 error tests. A one-off
   run of the corpus compiled by Clang 23 (`-O1 -ffp-contract=off` for AArch64, glibc's headers,
   GCC's linker) printed what GCC's binaries print for all 67.
-- **ABI torture** (`fai_cc_abi_torture` in `crates/fir-capi/tests/fai_cc.rs`): random C
+- **ABI torture** (`fcc_abi_torture` in `crates/fir-capi/tests/fcc.rs`): random C
   signatures (up to 14 parameters and a result; structs and unions of every scalar type, arrays,
   nesting, bitfields with zero-width ones, HFA candidates through arrays, nesting, and unions,
   `_Alignas(16)` members, `aligned(8)` and `aligned(16)` attributes, empty structs, pointers)
-  in a callers file and a callees file, each compiled by GCC, `fai-cc`, or `fai-cc -O`; six
-  pairings (gcc/gcc, fai/gcc, fai -O/gcc, gcc/fai, gcc/fai -O, fai/fai -O) must each find every
+  in a callers file and a callees file, each compiled by GCC, `fcc`, or `fcc -O`; six
+  pairings (gcc/gcc, fcc/gcc, fcc -O/gcc, gcc/fcc, gcc/fcc -O, fcc/fcc -O) must each find every
   member of every argument (direct, through a function pointer, and through `...` by `va_arg`)
   and of every result. 240 signatures by default (about 1,150 parameters, 12,000 members per
   pairing, 5 seconds); 20 seeds of 1,000 signatures each passed: 129,258 record types (61,734
@@ -633,7 +633,7 @@ Decisions: C frontend (by-value mapping), C struct layout (empty structs), C fro
   (variadic composites have no zero-length arrays); a richer alignment on `struct<C>` would
   cover both. FIR has no unions among composite values, so a union travels as an HFA's floats or
   its bytes, and its pointers as exposed bytes. A call result needs a temporary in memory (there
-  are no aggregate locals in registers until mem2reg). Two `fai-cc` objects with string literals
+  are no aggregate locals in registers until mem2reg). Two `fcc` objects with string literals
   don't link together (the generated `str.N` names; no linkage yet), so the torture's callees
   avoid them.
 - **Not yet:** the rejections above; `long double`, `_Complex`, and the other gaps track F2a
@@ -643,7 +643,7 @@ Decisions: C frontend (by-value mapping), C struct layout (empty structs), C fro
 
 Against "Done when", item by item:
 
-- **A corpus of C programs compiled by `fai-cc` to AArch64 binaries:** met. 67 programs: integers
+- **A corpus of C programs compiled by `fcc` to AArch64 binaries:** met. 67 programs: integers
   (`arith_*`, `bigint`, `bit_tricks`, `number_theory`, …), pointers (`pointers`, `linked_list`,
   `bst`, `pointer_int_casts`), structs (`structs`, `aggregates`, `layouts`, `bitfields`), unions
   (`unions`, `struct_classes`), arrays (`arrays`, `matrix`, `sieve`), globals (`globals`,
@@ -658,7 +658,7 @@ Against "Done when", item by item:
   with one substitution: the harness's reference compiler is the dev shell's AArch64 GCC (16.2,
   decision C frontend testing), and all 67 match it without and with `-O`. Clang compiled the
   same 67 for AArch64 once (by hand, not in the harness), and its binaries print what GCC's
-  print, so `fai-cc`'s match Clang's too.
+  print, so `fcc`'s match Clang's too.
 - **Natively on AArch64:** not run here (the host is x86-64); the harness runs the binaries
   directly when it is on AArch64.
 - **Each program's HFIR also runs in `fir run` with the same output where its run is defined:**
@@ -671,5 +671,5 @@ Against "Done when", item by item:
 - Proofs beyond the float semantics and the purity of the new pure ops: scalarizing, lowering
   `cf.try`, composing rewrites, and the trust round's checkers stay open.
 - `f16`/`bf16`, vectors, fast-math modifiers, rounding modes, `long double` beyond `double`
-  (AAPCS64's `long double` is 128-bit; `fai-cc` rejects it), `_Complex`, atomics, threads,
+  (AAPCS64's `long double` is 128-bit; `fcc` rejects it), `_Complex`, atomics, threads,
   `volatile`, `setjmp`/`longjmp`, VLAs, inline assembly, and macOS binaries.

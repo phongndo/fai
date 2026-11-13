@@ -342,7 +342,7 @@ fn native_addresses_recover_the_source_locations_of_their_ops() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("debug-lines");
     std::fs::create_dir_all(&dir).unwrap();
     let mut fails = Vec::new();
-    // `FIR_DEBUG_LINES_DIR`: more modules to check, such as `fai-cc --emit hfir` output of the C
+    // `FIR_DEBUG_LINES_DIR`: more modules to check, such as `fcc --emit hfir` output of the C
     // corpus, whose functions carry their own files and locations on every op.
     let mut files = common::fir_files();
     if let Ok(d) = std::env::var("FIR_DEBUG_LINES_DIR") {

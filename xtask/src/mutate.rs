@@ -358,7 +358,7 @@ fn mutations() -> Vec<Mutation> {
         },
         Mutation {
             name: "compiler-ignores-check-dce",
-            what: "the compiler's -O path ignores FIR_CHECK_DCE, so `fai-cc -O --check-dce` and the C API would check nothing; the compile-path test finds no checker summary",
+            what: "the compiler's -O path ignores FIR_CHECK_DCE, so `fcc -O --check-dce` and the C API would check nothing; the compile-path test finds no checker summary",
             edits: vec![edit(
                 "crates/fir/src/backend/mod.rs",
                 "    let Some(mut check) = CheckDce::from_env()? else {",

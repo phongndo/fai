@@ -22,7 +22,7 @@
 
 //!
 //! Last, the compiler's own entry points: `fir compile -O --check-dce FIR-REF`, and
-//! `FIR_CHECK_DCE=FIR-REF` with no flag (what `fai-cc -O --check-dce` and the C API use, and
+//! `FIR_CHECK_DCE=FIR-REF` with no flag (what `fcc -O --check-dce` and the C API use, and
 //! `fir opt -O` honours), must run
 //! the proved checker on a module with deletions, and must fail when the `fir-ref` they are given
 //! refuses, or accepts with a receipt for other modules.

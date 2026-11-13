@@ -1,4 +1,4 @@
-/* Duff's device: case labels inside a do-while, so the switch jumps into the loop. fai-cc
+/* Duff's device: case labels inside a do-while, so the switch jumps into the loop. fcc
  * lowers such a function to basic blocks. */
 #include "fai_test.h"
 

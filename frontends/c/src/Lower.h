@@ -1,4 +1,4 @@
-// fai-cc: lowering Clang's AST of a C translation unit to HFIR, through FIR's C API only.
+// fcc: lowering Clang's AST of a C translation unit to HFIR, through FIR's C API only.
 #pragma once
 
 #include "fir.h"

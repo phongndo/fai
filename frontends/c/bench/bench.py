@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Dynamic and static costs of the C corpus under several fai-cc pipelines (see README.md).
+"""Dynamic and static costs of the C corpus under several fcc pipelines (see README.md).
 
-For each program of frontends/c/tests: build it with the reference compiler (GCC -O1), fai-cc,
-fai-cc -O, and fai-cc with the experimental pipeline ($BENCH_PASSES, and each of $BENCH_MORE,
+For each program of frontends/c/tests: build it with the reference compiler (GCC -O1), fcc,
+fcc -O, and fcc with the experimental pipeline ($BENCH_PASSES, and each of $BENCH_MORE,
 separated by `;`); link non-PIE; run under qemu-aarch64 with the counting plugin restricted to
 the program's own object's .text (not libc's, the runtime's, or the C helpers'); and check that
 every build prints the same and exits the same as the reference. With BENCH_HIST=1, also count
@@ -10,7 +10,7 @@ executed instructions by mnemonic. Writes OUTDIR/results.json; summarize.py prin
 
 Usage, in the dev shell, after build-plugins.sh OUTDIR:
   python3 -I bench.py REPO OUTDIR [NAME-FILTER]
-$BENCH_FAI picks the fai-cc binary (default REPO/build/fai-cc/fai-cc).
+$BENCH_FCC picks the fcc binary (default REPO/build/fcc/fcc).
 """
 import concurrent.futures as cf
 import json
@@ -26,15 +26,15 @@ HIST = os.path.join(OUT, "libhist.so") if os.environ.get("BENCH_HIST") else None
 CC = "aarch64-unknown-linux-gnu-cc"
 TESTS = os.path.join(REPO, "frontends/c/tests")
 INC = os.path.join(TESTS, "runtime")
-FAI = os.environ.get("BENCH_FAI") or os.path.join(REPO, "build/fai-cc/fai-cc")
+FCC = os.environ.get("BENCH_FCC") or os.path.join(REPO, "build/fcc/fcc")
 EXP = os.environ.get("BENCH_PASSES", "mem2reg,stackdce,fwd,copyprop,dse,dce")
 CONFIGS = [
     ("gcc-O1", None),
-    ("fai", []),
-    ("fai-O", ["-O"]),
-    ("fai-exp", ["--passes", EXP, "--experimental"]),
+    ("fcc", []),
+    ("fcc-O", ["-O"]),
+    ("fcc-exp", ["--passes", EXP, "--experimental"]),
 ] + [
-    (f"fai-exp{i}", ["--passes", p, "--experimental"])
+    (f"fcc-exp{i}", ["--passes", p, "--experimental"])
     for i, p in enumerate(filter(None, os.environ.get("BENCH_MORE", "").split(";")), 2)
 ]
 os.makedirs(OUT, exist_ok=True)
@@ -82,7 +82,7 @@ def one(file):
         if flags is None:
             r = sh([CC, "-O1", "-w", "-std=gnu17", "-ffp-contract=off", "-c", "-I", INC, file, "-o", obj])
         else:
-            r = sh([FAI, file, "-I", INC, "-o", obj] + flags)
+            r = sh([FCC, file, "-I", INC, "-o", obj] + flags)
         if r.returncode:
             res[cfg] = {"error": r.stderr[-400:]}
             continue
@@ -115,7 +115,7 @@ def one(file):
             res[cfg]["hist"] = hist
     for cfg, flags in CONFIGS:
         if flags and "error" not in res[cfg]:
-            m = sh([FAI, file, "-I", INC, "--emit", "mfir"] + flags).stdout
+            m = sh([FCC, file, "-I", INC, "--emit", "mfir"] + flags).stdout
             res[cfg]["mfir_loads"] = m.count("mem.load")
             res[cfg]["mfir_stores"] = m.count("mem.store")
             res[cfg]["mfir_slots"] = m.count("mem.stack")

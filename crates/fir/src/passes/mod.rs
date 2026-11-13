@@ -180,7 +180,7 @@ pub const PASSES: &[Pass] = &[
 /// adjacent for dead store elimination in the next round.
 pub const DEFAULT: &[&str] = &["fwd", "copyprop", "dse", "dce"];
 
-/// A pipeline with the experimental promotion passes, for trying them on C (`fai-cc --passes`,
+/// A pipeline with the experimental promotion passes, for trying them on C (`fcc --passes`,
 /// `fir compile --passes`, with `--experimental`): promote slots, delete the slots promotion
 /// leaves, then the default passes, to a fixed point. Not proved, never the default.
 pub const EXPERIMENTAL_O: &[&str] = &["mem2reg", "stackdce", "fwd", "copyprop", "dse", "dce"];
@@ -406,7 +406,7 @@ impl Pipeline {
 
     /// Passes by name, as [`Pipeline::parse`] takes them (experimental ones only with
     /// `experimental`), run in order to a fixed point like the default pipeline: what a
-    /// compiler's `--passes` means (`fir compile`, `fai-cc`), where passes enable each other.
+    /// compiler's `--passes` means (`fir compile`, `fcc`), where passes enable each other.
     pub fn parse_fixpoint(spec: &str, experimental: bool) -> Result<Pipeline, String> {
         let mut p = Pipeline::parse_with(spec, experimental)?;
         p.fixpoint = true;

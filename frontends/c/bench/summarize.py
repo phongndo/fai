@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize bench.py's results: totals and geometric-mean ratios to fai-cc -O, the programs
+"""Summarize bench.py's results: totals and geometric-mean ratios to fcc -O, the programs
 that run longest, and (with BENCH_HIST=1 results) the executed instructions by category.
 Usage: summarize.py OUTDIR/results.json [N-PROGRAMS]"""
 import json, sys, math
@@ -8,7 +8,7 @@ cfgs = [c for c in next(iter(r.values())).keys()]
 bad = [(n, c) for n, v in r.items() for c in cfgs if not v[c].get("same", False)]
 print("mismatches or errors:", bad)
 def geo(xs): return math.exp(sum(map(math.log, xs)) / len(xs))
-base = "fai-O"
+base = "fcc-O"
 rows = []
 for n, v in sorted(r.items()):
     if any("error" in v[c] for c in cfgs): continue
@@ -28,7 +28,7 @@ for metric in ["mfir_loads", "mfir_stores", "mfir_slots"]:
             line += f" | {c}: {sum(v[c][metric] for _, v in rows):>6}"
     print(line)
 # Per-program top table
-print("\nprogram            gccO1-insns   fai-O-insns   exp-insns  exp/O  | loads O -> exp (gcc)")
+print("\nprogram            gccO1-insns   fcc-O-insns   exp-insns  exp/O  | loads O -> exp (gcc)")
 for n, v in sorted(rows, key=lambda x: -x[1][base]["insns"])[: int(sys.argv[2]) if len(sys.argv) > 2 else 25]:
     e = cfgs[-1]
     print(f"{n:18} {v['gcc-O1']['insns']:>12,} {v[base]['insns']:>12,} {v[e]['insns']:>11,}  {v[e]['insns']/v[base]['insns']:.2f}  | {v[base]['loads']:>9,} -> {v[e]['loads']:>9,} ({v['gcc-O1']['loads']:,})")

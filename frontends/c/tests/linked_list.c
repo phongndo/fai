@@ -1,4 +1,4 @@
-/* Linked lists on the heap (malloc and free, which fai-cc lowers to FIR's c.malloc
+/* Linked lists on the heap (malloc and free, which fcc lowers to FIR's c.malloc
  * allocations): push, append, reverse, merge sort, removal, and freeing everything. */
 #include "fai_test.h"
 #include <stdlib.h>

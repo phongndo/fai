@@ -1,6 +1,6 @@
 # Optimizing C: promotion first (experimental)
 
-`fai-cc` gives every C local and parameter a stack slot at the function's entry, and `-O`'s
+`fcc` gives every C local and parameter a stack slot at the function's entry, and `-O`'s
 passes (`fwd`, `copyprop`, `dse`, `dce`) match only adjacent accesses, so on C they do almost
 nothing: the layer audit found one change in a whole module ([layer-audit.md](../assurance/layer-audit.md),
 section 2). This note records a prototype of the missing piece, promoting slots to values, what
@@ -14,7 +14,7 @@ measurements say to do next. Everything here is opt-in and unproved: it never ru
   structs and promotion in one step), threading values through `cf.if` results, loop state, and
   block parameters where they are live. **`stackdce`** (experimental) deletes the allocations
   it leaves.
-- On the 67 corpus programs, against `fai-cc -O`, with every build's output identical to GCC's:
+- On the 67 corpus programs, against `fcc -O`, with every build's output identical to GCC's:
   loads executed **−95%**, stores **−92%**, instructions executed **−32%** (geometric mean of the
   per-program ratios ×0.845), code size ×0.85; 79% of MFIR stack slots go away.
 - Memory traffic is now within ~4× of GCC `-O1`'s, and is 3% of what runs. The remaining
@@ -29,15 +29,15 @@ measurements say to do next. Everything here is opt-in and unproved: it never ru
 ## How to try it
 
 ```sh
-fai-cc prog.c --passes mem2reg,stackdce,fwd,copyprop,dse,dce --experimental -o prog
-fai-cc prog.c --passes mem2reg,stackdce,fwd,copyprop,dse,dce --experimental --emit mfir
+fcc prog.c --passes mem2reg,stackdce,fwd,copyprop,dse,dce --experimental -o prog
+fcc prog.c --passes mem2reg,stackdce,fwd,copyprop,dse,dce --experimental --emit mfir
 fir opt prog.mfir --passes mem2reg,copyprop,dce --experimental --remarks
 fir compile prog.mfir --passes mem2reg,stackdce,fwd,copyprop,dse,dce --experimental -o prog
 ```
 
-`--passes` in `fai-cc` and `fir compile` runs the named passes in order to a fixed point
+`--passes` in `fcc` and `fir compile` runs the named passes in order to a fixed point
 (`Pipeline::parse_fixpoint`); `fir opt --passes` runs them once each, as before. Experimental
-passes are refused without `--experimental`, and print a warning with it. `fai-cc
+passes are refused without `--experimental`, and print a warning with it. `fcc
 --check-dce FIR-REF` (and `FIR_CHECK_DCE`) checks the `dce` steps of a `--passes` pipeline too;
 `fir compile --check-dce` stays with `-O`. The list above is
 `fir::passes::EXPERIMENTAL_O`. From C, `fir_module_compile_passes` and
@@ -47,7 +47,7 @@ passes are refused without `--experimental`, and print a warning with it. `fai-c
 |---|---|
 | `FIR_PASSES=… cargo test -p fir --test opt` | the differential suite (fixtures, random and memory programs) on that pipeline (existed) |
 | `FIR_PASSES=… cargo test -p fir --test aarch64` | the native suite's optimized builds use that pipeline |
-| `FAI_CC_PASSES=… cargo test -p fir-capi --test fai_cc` | a fourth native build of each C program, and two more interpreter layers (its MFIR, its allocated LFIR) |
+| `FCC_PASSES=… cargo test -p fir-capi --test fcc` | a fourth native build of each C program, and two more interpreter layers (its MFIR, its allocated LFIR) |
 | `cargo test -p fir --test mem2reg` | random programs made for promotion, and focused cases (always runs) |
 
 ## What was built
@@ -85,12 +85,12 @@ no uses. It is separate so that `mem2reg` itself never changes which allocations
 Assumptions).
 
 **Plumbing:** `backend::prepare_with` (compile with any pipeline), `fir compile --passes`,
-the two C API functions, `fai-cc --passes … --experimental`, and the test knobs above.
+the two C API functions, `fcc --passes … --experimental`, and the test knobs above.
 
 ### What liveness pruning was for
 
 The first version threaded every variable stored inside an op through it. C's block-scoped
-variables, which `fai-cc` makes at the function's entry, then became state of every loop and
+variables, which `fcc` makes at the function's entry, then became state of every loop and
 parameters of every block around them. On `interpreter.c` (a `switch` in a loop) each of its 15
 case blocks took six dead parameters, and the moves and spills made it **1.6× slower than
 `-O`** (119k instructions against 75k) with twice the loads. With pruning it runs 69k (−8%), with
@@ -134,7 +134,7 @@ always succeeds), so deleting one loses no failure. A scalar-replacement pass th
 struct slot into new slots would add allocations and need the same assumption, which is why
 `mem2reg` promotes fields in place instead.
 
-On the C side: `fai-cc` rejects `volatile`, so no volatile local is promoted. If it ever accepts
+On the C side: `fcc` rejects `volatile`, so no volatile local is promoted. If it ever accepts
 `volatile`, it must keep such locals unpromotable (FIR has no volatile access; making the slot
 escape would do). C allows promoting the other locals across `setjmp`/`longjmp` (their values
 are indeterminate after `longjmp`), and FIR models neither.
@@ -161,7 +161,7 @@ are indeterminate after `longjmp`), and FIR models neither.
   `stackdce`.
 - `FIR_PASSES` with the native suite (fixtures and random programs compiled with the pipeline
   and run under qemu).
-- `FAI_CC_PASSES` with the C corpus: all 67 programs match GCC natively, and the 57 the
+- `FCC_PASSES` with the C corpus: all 67 programs match GCC natively, and the 57 the
   interpreter can run match at MFIR after the pipeline and at its allocated LFIR.
 - The C API's tests call both new functions (refusal without the flag, an unknown pass, runs of
   the optimized module, assembly).
@@ -174,14 +174,14 @@ the text can't spell.
 
 ## Measurements
 
-Method (`frontends/c/bench/`): each corpus program is built by GCC `-O1`, `fai-cc`, `fai-cc -O`,
-and `fai-cc` with the experimental pipeline, linked non-PIE, and run under `qemu-aarch64` with
+Method (`frontends/c/bench/`): each corpus program is built by GCC `-O1`, `fcc`, `fcc -O`,
+and `fcc` with the experimental pipeline, linked non-PIE, and run under `qemu-aarch64` with
 TCG plugins that count instructions, loads, and stores executed in the program's own `.text`
 (libc and the GCC-compiled helpers excluded), and a per-instruction histogram. Every build's
 output and exit code match GCC's. Qemu-user's wall time isn't a proxy for hardware, so these
 are executed-instruction counts, not times.
 
-| | GCC `-O1` | `fai-cc -O` | + `mem2reg` (scalars) | + `mem2reg` (fields) |
+| | GCC `-O1` | `fcc -O` | + `mem2reg` (scalars) | + `mem2reg` (fields) |
 |---|---|---|---|---|
 | Instructions executed | 12.9M | 72.4M | 52.1M | **49.3M** |
 | — geometric mean vs `-O` | ×0.215 | 1 | ×0.869 | **×0.845** |
@@ -210,7 +210,7 @@ Field promotion is what moves `complex_math` (0.93 → 0.42) and `vec3` (0.92 �
 
 Executed instructions by kind, whole corpus:
 
-| | GCC `-O1` | `fai-cc -O` | promoted |
+| | GCC `-O1` | `fcc -O` | promoted |
 |---|---|---|---|
 | Loads + stores | 3% | 40% | 3% |
 | Constants and addresses (`movz`, `movk`, `adrp`, `mov`/`fmov` of an immediate) | 1% | 21% | 30% |

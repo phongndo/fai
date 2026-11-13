@@ -28,7 +28,7 @@ pub fn prepare(m: &Module, optimize: bool) -> Result<Module, String> {
 
 /// Like [`prepare`], with `pipeline` (if any) run on the MFIR instead of the default one
 /// ([`optimize_with`]): how experimental passes reach the backend (`fir compile --passes`,
-/// `fai-cc --passes`).
+/// `fcc --passes`).
 pub fn prepare_with(m: &Module, pipeline: Option<&Pipeline>) -> Result<Module, String> {
     let mut out = to_mfir(m)?;
     if let Some(p) = pipeline {
@@ -59,7 +59,7 @@ fn to_mfir(m: &Module) -> Result<Module, String> {
 }
 
 /// Run the default `-O` pipeline ([`Pipeline::default_opt`]) on `m` and verify the result (after
-/// every pass too, in development builds, as `fir opt` does). What `fir compile -O`, `fai-cc -O`,
+/// every pass too, in development builds, as `fir opt` does). What `fir compile -O`, `fcc -O`,
 /// and the C API's `fir_module_optimize` and `fir_module_compile` run.
 ///
 /// With `FIR_CHECK_DCE=FIR-REF` in the environment ([`crate::passes::reference::ENV`]), every

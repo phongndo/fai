@@ -13,7 +13,7 @@
 //! the snapshots byte for byte, so an acceptance can't be about other text: the Rust printer and
 //! the Lean parser are in the trusted base, and the match checks that they agree on these
 //! modules. This is what `tests/dce_check.rs` does in the tests, here available for any input:
-//! `fir opt --check-dce FIR-REF`, `fir compile -O --check-dce FIR-REF`, `fai-cc -O --check-dce
+//! `fir opt --check-dce FIR-REF`, `fir compile -O --check-dce FIR-REF`, `fcc -O --check-dce
 //! FIR-REF`, and any optimized compilation through [`crate::backend::optimize`] (the C API
 //! included) when [`ENV`] names a `fir-ref`. It validates each DCE step of this run; it says
 //! nothing about the other passes, about composing per-function refinements across a module's

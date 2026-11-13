@@ -105,23 +105,23 @@ long slice(int n) {
 ```
 
 ```sh
-fai-cc slice.c --emit hfir -o slice.hfir
+fcc slice.c --emit hfir -o slice.hfir
 fir lower slice.hfir > slice.mfir
 fir opt slice.mfir -O > slice.mfir-O
 fir compile slice.mfir-O --emit lfir-vregs -o slice.lfir-vregs
 fir compile slice.mfir-O --emit lfir -o slice.lfir
 fir run slice.LAYER @slice N; fir-ref run slice.LAYER @slice N      # each layer, both interpreters
-fai-cc slice.c [-O] -o slice.o && cc slice.o harness.c && qemu-aarch64 ./a.out
+fcc slice.c [-O] -o slice.o && cc slice.o harness.c && qemu-aarch64 ./a.out
 aarch64-unknown-linux-gnu-cc -O1 slice.c harness.c && qemu-aarch64 ./a.out   # the reference
 ```
 
 For `n` in 0, 1, 2, 3, 7, 100, 1000 the results (0, 8, 37, 66, 140, 1550, 15500) agree at all
-eight points: GCC, `fai-cc` with and without `-O` natively, and HFIR, MFIR, MFIR after `-O`, and
+eight points: GCC, `fcc` with and without `-O` natively, and HFIR, MFIR, MFIR after `-O`, and
 LFIR before and after allocation in `fir run` (and in `fir-ref run`, which runs LFIR on
 `Fir.AArch64Machine`). The design works as a system on it. What the slice showed besides:
 
 - **The optimizer has almost nothing to do on C.** `-O` made one change in the whole module (a
-  load forwarded from the store before it). `fai-cc` keeps every local in memory, and the passes
+  load forwarded from the store before it). `fcc` keeps every local in memory, and the passes
   match only adjacent accesses, so the loop loads and stores `i`, `a.sum`, and `a.count` every
   iteration. Promotion of non-escaping slots (mem2reg/SROA) is the missing piece, in the frontend
   or as an MFIR pass. (Since prototyped as the experimental MFIR pass `mem2reg`:
@@ -132,7 +132,7 @@ LFIR before and after allocation in `fir run` (and in `fir-ref run`, which runs 
   becomes `%.e1: i64 = int.const 4; ptr.offset.inbounds %a, %.e1`, and selection then
   materializes the constant (`movz x0, 4; add x0, x20, x0`) instead of folding it.
 
-The slice is now a permanent check for the whole corpus: `tests/fai_cc.rs` runs every program's
+The slice is now a permanent check for the whole corpus: `tests/fcc.rs` runs every program's
 `main` not only in HFIR but at MFIR, MFIR after `-O`, and LFIR before and after allocation, under
 Arm's NaN rule (the canonical-NaN rule `fir run` uses by default gives other, equally legal,
 NaN payloads than the LFIR machine, which `float_arith` shows). All 57 comparable programs match
@@ -142,7 +142,7 @@ interpreter's world doesn't model. The corpus test takes 23 s.
 ## 3. The DCE checker: Lean and Rust
 
 > **Later:** options 1 and 2 below are done, and the proved checker now runs on the compiler's own
-> path on request (`fai-cc`/`fir compile -O --check-dce`, `FIR_CHECK_DCE`) and on every `-O`
+> path on request (`fcc`/`fir compile -O --check-dce`, `FIR_CHECK_DCE`) and on every `-O`
 > build of the C corpus. The checker is no longer quadratic (`Fir.Dce.checkFuncL`, proved equal to
 > `checkFunc`), and the module-level pairing is proved (`Fir.Dce.checkModule_sound`). The
 > measurements below are of the quadratic checker. [dce.md](dce.md) is the current account, link
@@ -169,7 +169,7 @@ deletions (a review found that a `dce` changing the module while reporting zero 
 
 | Input | DCE steps checked | Function pairs | Deletions | Refused |
 |---|---|---|---|---|
-| C corpus, 67 programs (`fai-cc --emit mfir`, then `-O`) | 71 | 1,055 | 3,462 | 0 |
+| C corpus, 67 programs (`fcc --emit mfir`, then `-O`) | 71 | 1,055 | 3,462 | 0 |
 | Fixtures and 200 random programs (and their lowerings), `-O`, in `tests/dce_check.rs` | 344 | — | 14,759 | 0 |
 
 **Cost.** On the C corpus, `-O` takes 1.4 ms per module; with `--check-dce`, about 20 ms (95 ms
@@ -231,7 +231,7 @@ allocations). It does not cover:
   too, or composing steps across passes (`Func.Refines.trans` composes steps of one function in a
   fixed module);
 - the other passes (`fwd`, `copyprop`, `dse` have proved relations but no checker of outputs);
-- compilations without `--check-dce` (the compiler runs the unproved Rust checker; `fai-cc -O`
+- compilations without `--check-dce` (the compiler runs the unproved Rust checker; `fcc -O`
   and `fir compile -O` never run the proved one);
 - the trusted base: Lean's compiler (`fir-ref` runs as compiled code), the Rust printer and the
   Lean parser (the receipt shows they agree on these modules, not that the Rust in-memory module
@@ -239,7 +239,7 @@ allocations). It does not cover:
 
 ### Options for closing the gap, by cost
 
-1. **Run the proved checker in CI over a corpus** (done: the tests, and every `fai-cc -O` build
+1. **Run the proved checker in CI over a corpus** (done: the tests, and every `fcc -O` build
    of the C corpus): cheap, covers the configurations tested.
 2. **A linear checker in Lean**, proved equal to `deletable` (done, linear in size times
    nesting depth: `checkFuncL_eq`, proved
@@ -263,7 +263,7 @@ print), `bench_aarch64.rs` (the backend), `build_bench.rs` (the builder).
   `fir opt --list-passes` prints them. Experimental passes run only with `fir opt
   --experimental` (or `Pipeline::parse_experimental`), print a warning, and can't be in `-O`
   (a unit test checks the default pipeline). The first are `mem2reg` and `stackdce`
-  ([05-optimizing-c.md](../design/05-optimizing-c.md)); `fai-cc` and `fir compile` take them with
+  ([05-optimizing-c.md](../design/05-optimizing-c.md)); `fcc` and `fir compile` take them with
   `--passes … --experimental`.
 - `Pipeline::run_observed` shows an observer the module before and after every pass run, and
   lets it reject a step. `fir opt` uses it for `--print-before P`, `--print-after P` (`all`
@@ -277,7 +277,7 @@ print), `bench_aarch64.rs` (the backend), `build_bench.rs` (the builder).
 A pass experiment, end to end:
 
 ```sh
-fai-cc prog.c --emit hfir -o prog.hfir && fir lower prog.hfir > prog.mfir
+fcc prog.c --emit hfir -o prog.hfir && fir lower prog.hfir > prog.mfir
 fir opt prog.mfir --passes fwd,dce --print-changed --stats --check-dce spec/.lake/build/bin/fir-ref > prog.opt
 fir run prog.mfir; fir run prog.opt                         # same outcome, or a refinement
 FIR_PASSES=fwd,dce cargo test -p fir --test opt             # correctness on every fixture and random program
@@ -337,6 +337,6 @@ right about.
   `emit.rs`: line info.
 - Tests: `tests/dce_check.rs` (the `-O` pipeline, the agreement test), `tests/debug_lines.rs`,
   `tests/aarch64.rs` (`layer_audit_foreign_data_layouts_are_refused`), `tests/opt.rs`
-  (`FIR_PASSES`), `fir-capi/tests/fai_cc.rs` (every layer).
+  (`FIR_PASSES`), `fir-capi/tests/fcc.rs` (every layer).
 - `xtask`: `dce_agreement` and `debug_lines` evidence required; the mutation
   `dce-checker-weaker-than-proved`; `FIR_PASSES` and `FIR_DEBUG_LINES_DIR` cleared.

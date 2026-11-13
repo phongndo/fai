@@ -257,8 +257,8 @@ under AddressSanitizer in the full one. No noisy lint groups were enabled.
 | DCE: a deletion is a refinement | **proved** (per function, fixed module, `Decided` source) | `Fir.Dce.refines` |
 | DCE: the checker that runs is the proved one, and relates functions name by name | **proved** | `Fir.Dce.checkFuncL_eq` (the counting checker `fir-ref check-dce` runs equals `checkFunc`), `Fir.Dce.checkModule_sound` (per name, over `Module.find?`; the function a call runs in a verified module, by reading) |
 | DCE: the Rust pass's output on the tested inputs | **checked by a proved checker** | `Fir.Dce.checkModule_sound` via `fir-ref check-dce` in `tests/dce_check.rs`, on one `dce` step and on every step of the `-O` pipeline |
-| DCE: the `-O` binaries the C corpus runs | **checked by a proved checker**, every step | `fai-cc -O --check-dce` in `fai_cc_corpus`; `verify full` requires every program's build checked ([dce.md](dce.md)) |
-| DCE: the Rust pass's output on any input | checked (unproved checker) by default; **by the proved checker on request** | `passes::dce::check`, every run; with `fir compile`/`fai-cc`/`fir opt --check-dce FIR-REF` or `FIR_CHECK_DCE` (`backend::optimize`, `passes::reference`), every step of that run |
+| DCE: the `-O` binaries the C corpus runs | **checked by a proved checker**, every step | `fcc -O --check-dce` in `fcc_corpus`; `verify full` requires every program's build checked ([dce.md](dce.md)) |
+| DCE: the Rust pass's output on any input | checked (unproved checker) by default; **by the proved checker on request** | `passes::dce::check`, every run; with `fir compile`/`fcc`/`fir opt --check-dce FIR-REF` or `FIR_CHECK_DCE` (`backend::optimize`, `passes::reference`), every step of that run |
 | DCE: the Rust checker's rules against the proved checker's | tested | `the_rust_and_lean_checkers_agree_on_random_candidates`; mutation `dce-checker-weaker-than-proved` ([layer-audit.md](layer-audit.md#3-the-dce-checker-lean-and-rust)) |
 | DSE, forwarding, copy propagation | proved relations; Rust passes tested | `Fir.Dse/Fwd/CopyProp.refines`; `tests/opt.rs` |
 | Composing passes, optimizing a whole module | **open** | intermediate programs' `Decided`ness and refinement over calls are not proved |
@@ -376,7 +376,7 @@ assurance itself, each of which let a defect pass silently:
 ## Landing on main with the float round
 
 Main gained floats (`f32`/`f64` through Lean, both interpreters, the passes, and AArch64 with a
-second register class), the `fai-cc` C frontend, and its own fix for the address exemption (a
+second register class), the `fcc` C frontend, and its own fix for the address exemption (a
 taint analysis) while this work was under way. Merging them exercised the checks on new code:
 
 * The ops' contracts made the 20 new float op kinds compile errors in exactly the three `support`

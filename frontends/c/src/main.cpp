@@ -1,9 +1,9 @@
-// fai-cc: a C compiler on FIR. Clang parses and type-checks the C (preprocessor and headers
+// fcc: a C compiler on FIR. Clang parses and type-checks the C (preprocessor and headers
 // included) for AArch64 Linux; the AST is lowered to HFIR through FIR's C API (Lower.cpp), which
 // verifies it and compiles it to AArch64 assembly; the system's AArch64 C compiler assembles and
 // links it, as `fir compile` does.
 //
-//   fai-cc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]
+//   fcc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]
 //          [--emit hfir|mfir|asm] [INPUT...] [-I DIR] [-D NAME[=V]] [-l LIB] [-L DIR]
 //          [-- CLANG-FLAG...]
 //
@@ -43,14 +43,14 @@
 #include <string>
 #include <vector>
 
-#ifndef FAI_CC_RESOURCE_DIR
-#define FAI_CC_RESOURCE_DIR ""
+#ifndef FCC_RESOURCE_DIR
+#define FCC_RESOURCE_DIR ""
 #endif
 
 namespace {
 
 const char *kUsage =
-    "usage: fai-cc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]\n"
+    "usage: fcc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]\n"
     "              [--emit hfir|mfir|asm] [INPUT...] [-I DIR] [-D NAME[=V]] [-l LIB] [-L DIR]\n"
     "              [-- CLANG-FLAG...]\n";
 
@@ -119,7 +119,7 @@ bool parseArgs(int argc, char **argv, Options &o) {
     } else if (a == "-h" || a == "--help") {
       return false;
     } else if (!a.empty() && a[0] == '-') {
-      llvm::errs() << "fai-cc: unknown option '" << a << "'\n";
+      llvm::errs() << "fcc: unknown option '" << a << "'\n";
       return false;
     } else if (o.file.empty() && llvm::StringRef(a).ends_with(".c")) {
       o.file = a;
@@ -129,7 +129,7 @@ bool parseArgs(int argc, char **argv, Options &o) {
   }
   if (!o.checkDce.empty() && !o.optimize && !o.hasPasses) {
     llvm::errs()
-        << "fai-cc: --check-dce checks the dead code elimination of -O or --passes; add one\n";
+        << "fcc: --check-dce checks the dead code elimination of -O or --passes; add one\n";
     return false;
   }
   return !o.file.empty();
@@ -217,7 +217,7 @@ bool writeOut(const std::string &path, const std::string &text) {
   std::error_code ec;
   llvm::raw_fd_ostream os(path, ec);
   if (ec) {
-    llvm::errs() << "fai-cc: " << path << ": " << ec.message() << "\n";
+    llvm::errs() << "fcc: " << path << ": " << ec.message() << "\n";
     return false;
   }
   os << text;
@@ -260,8 +260,8 @@ int compileAndLink(FirModule *m, const Options &o) {
   if (llvm::StringRef(out).ends_with(".s"))
     return writeOut(out, as.str()) ? 0 : 1;
   llvm::SmallString<128> tmp;
-  if (std::error_code ec = llvm::sys::fs::createTemporaryFile("fai-cc", "s", tmp)) {
-    llvm::errs() << "fai-cc: a temporary file: " << ec.message() << "\n";
+  if (std::error_code ec = llvm::sys::fs::createTemporaryFile("fcc", "s", tmp)) {
+    llvm::errs() << "fcc: a temporary file: " << ec.message() << "\n";
     return 1;
   }
   std::string s = tmp.str().str();
@@ -270,7 +270,7 @@ int compileAndLink(FirModule *m, const Options &o) {
     std::string cc = linker();
     auto prog = llvm::sys::findProgramByName(cc);
     if (!prog) {
-      llvm::errs() << "fai-cc: no AArch64 C compiler to link with: '" << cc
+      llvm::errs() << "fcc: no AArch64 C compiler to link with: '" << cc
                    << "' (set FIR_CC, or use the dev shell)\n";
     } else {
       std::vector<std::string> args = {cc, s};
@@ -286,7 +286,7 @@ int compileAndLink(FirModule *m, const Options &o) {
       if (status == 0) {
         rc = 0;
       } else {
-        llvm::errs() << "fai-cc: " << cc << " failed" << (err.empty() ? "" : ": " + err) << "\n";
+        llvm::errs() << "fcc: " << cc << " failed" << (err.empty() ? "" : ": " + err) << "\n";
       }
     }
   }
@@ -306,10 +306,10 @@ int main(int argc, char **argv) {
   if (!o.checkDce.empty())
     setenv("FIR_CHECK_DCE", o.checkDce.c_str(), 1);
   if (o.experimental && o.hasPasses)
-    llvm::errs() << "fai-cc: warning: --experimental: passes that are not proved may run\n";
+    llvm::errs() << "fcc: warning: --experimental: passes that are not proved may run\n";
   std::vector<std::string> args = {"-target", "aarch64-unknown-linux-gnu", "-nostdlibinc"};
-  std::string res = FAI_CC_RESOURCE_DIR;
-  if (const char *r = std::getenv("FAI_CC_RESOURCE_DIR"); r && *r)
+  std::string res = FCC_RESOURCE_DIR;
+  if (const char *r = std::getenv("FCC_RESOURCE_DIR"); r && *r)
     res = r;
   if (!res.empty()) {
     args.push_back("-resource-dir");
@@ -336,7 +336,7 @@ int main(int argc, char **argv) {
                  << ": internal error: the HFIR doesn't verify: " << fir_module_error(mh.m) << "\n";
     FirString text;
     text.s = fir_module_print(mh.m, true);
-    if (std::getenv("FAI_CC_DUMP"))
+    if (std::getenv("FCC_DUMP"))
       llvm::errs() << text.str();
     return 1;
   }

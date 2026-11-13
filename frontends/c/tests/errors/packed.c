@@ -1,4 +1,4 @@
-/* Packed structs: FIR's struct<packed> exists, but fai-cc doesn't map them yet. */
+/* Packed structs: FIR's struct<packed> exists, but fcc doesn't map them yet. */
 struct __attribute__((packed)) header {
   char kind;
   int length;

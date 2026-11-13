@@ -1,4 +1,4 @@
-/* The types and functions shared by struct_extern.c (compiled by fai-cc) and
+/* The types and functions shared by struct_extern.c (compiled by fcc) and
  * extern/struct_extern.c (compiled by the reference compiler): one of each AAPCS64 class. */
 #ifndef STRUCT_EXTERN_H
 #define STRUCT_EXTERN_H
@@ -29,10 +29,10 @@ double ext_many(struct hfa3 a, struct hfa3 b, struct hfa3 c, struct small d, str
                 struct small k, struct pair l);
 /* Reads structs through `...` as the tags say. */
 long ext_va(const char *tags, ...);
-/* Calls back the fai-cc functions below, directly and through the given pointers. */
+/* Calls back the fcc functions below, directly and through the given pointers. */
 long ext_callbacks(struct pair (*f)(struct pair), struct big (*g)(struct big));
 
-/* Defined by fai-cc, called by the reference compiler's code. */
+/* Defined by fcc, called by the reference compiler's code. */
 struct pair fai_pair(struct pair x);
 struct big fai_big(struct big x);
 struct hfa4d fai_hfa4d(struct hfa4d x, struct small s);

@@ -1,4 +1,4 @@
-// fai-cc's lowering: Clang's AST of a C translation unit to HFIR, built through `fir.h` only.
+// fcc's lowering: Clang's AST of a C translation unit to HFIR, built through `fir.h` only.
 //
 // The mapping (decisions.md, row C frontend):
 //
@@ -181,7 +181,7 @@ private:
     failed = true;
   }
   [[noreturn]] void unsupported(SourceLocation loc, const std::string &what) {
-    report(loc, "fai-cc does not support " + what + " yet");
+    report(loc, "fcc does not support " + what + " yet");
     throw Abort{};
   }
   [[noreturn]] void internal(const std::string &what) {
@@ -2871,7 +2871,7 @@ private:
 
   void function(const FunctionDecl *fd) {
     if (!fd->hasWrittenPrototype() && fd->getNumParams() > 0) {
-      report(fd->getLocation(), "fai-cc does not support old-style (K&R) function definitions yet");
+      report(fd->getLocation(), "fcc does not support old-style (K&R) function definitions yet");
       return;
     }
     FirFunc f = funcFor(fd, fd->getLocation());

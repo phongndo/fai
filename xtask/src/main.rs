@@ -52,7 +52,7 @@ const CLEARED: &[&str] = &[
     "FIR_ABI_SEED",
     "FIR_SHOW_ADDRESS_DIFFS",
     "FIR_CHECK_DCE",
-    "FAI_CC_ONLY",
+    "FCC_ONLY",
     "CBINDGEN",
 ];
 
@@ -742,11 +742,11 @@ fn check_evidence(
         "checker objections that failed the compilation",
         Some(4),
     );
-    // The C corpus (it runs Linux binaries, so it is required on Linux): every `fai-cc -O`
+    // The C corpus (it runs Linux binaries, so it is required on Linux): every `fcc -O`
     // binary that runs was built with every step of dce accepted by the proved checker.
     if cfg!(target_os = "linux") {
-        match evs.get("fai_cc_corpus") {
-            None => bad.push("fai_cc_corpus: no evidence (the C corpus didn't run)".into()),
+        match evs.get("fcc_corpus") {
+            None => bad.push("fcc_corpus: no evidence (the C corpus didn't run)".into()),
             Some(ev) => {
                 // Against the corpus on disk, not the suite's own count, so a filtered run
                 // can't pass.
@@ -764,23 +764,23 @@ fn check_evidence(
                     || count(ev, "programs") != corpus
                 {
                     bad.push(format!(
-                        "fai_cc_corpus: {built} -O builds checked by Fir.Dce.checkModule, {ran} \
+                        "fcc_corpus: {built} -O builds checked by Fir.Dce.checkModule, {ran} \
                          of them run natively and matching the reference, and {} programs, of \
                          {corpus} in frontends/c/tests",
                         count(ev, "programs")
                     ));
                 }
                 if count(ev, "failures") > 0 {
-                    bad.push(format!("fai_cc_corpus: {} failures", count(ev, "failures")));
+                    bad.push(format!("fcc_corpus: {} failures", count(ev, "failures")));
                 }
                 for sk in ev["skipped"].as_array().into_iter().flatten() {
-                    bad.push(format!("fai_cc_corpus: skipped {sk}"));
+                    bad.push(format!("fcc_corpus: skipped {sk}"));
                 }
             }
         }
         need(
             &mut bad,
-            "fai_cc_corpus",
+            "fcc_corpus",
             "dce steps accepted by Fir.Dce.checkModule",
             None,
         );
@@ -1211,7 +1211,7 @@ mod evidence_tests {
             .count() as u64;
         let ev = |ran: u64| {
             BTreeMap::from([(
-                "fai_cc_corpus".to_owned(),
+                "fcc_corpus".to_owned(),
                 json!({"counts": {
                     "programs": corpus,
                     "-O builds checked by Fir.Dce.checkModule": corpus,
@@ -1224,7 +1224,7 @@ mod evidence_tests {
             check_evidence(&root, &ev(ran), None, None)
                 .0
                 .into_iter()
-                .filter(|b| b.starts_with("fai_cc_corpus"))
+                .filter(|b| b.starts_with("fcc_corpus"))
                 .collect::<Vec<_>>()
         };
         assert!(

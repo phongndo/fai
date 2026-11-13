@@ -1,6 +1,6 @@
-# Measuring fai-cc's code
+# Measuring fcc's code
 
-Tools to measure what `fai-cc`'s pipelines do to the C corpus (`../tests/*.c`), used for
+Tools to measure what `fcc`'s pipelines do to the C corpus (`../tests/*.c`), used for
 [docs/design/05-optimizing-c.md](../../../docs/design/05-optimizing-c.md). Nothing here is
 built by Cargo or CMake, and no test depends on it.
 
@@ -14,13 +14,13 @@ count, and the same program compiled by GCC `-O1` is the yardstick.
 
 ```sh
 nix develop                                     # qemu-aarch64, the AArch64 cross compiler
-cmake --build build/fai-cc                      # the fai-cc to measure (or set BENCH_FAI)
+cmake --build build/fcc                      # the fcc to measure (or set BENCH_FCC)
 frontends/c/bench/build-plugins.sh /tmp/bench   # libcount.so and libhist.so
 BENCH_HIST=1 python3 -I frontends/c/bench/bench.py "$PWD" /tmp/bench
 python3 frontends/c/bench/summarize.py /tmp/bench/results.json
 ```
 
-Each program is built four ways (GCC `-O1`, `fai-cc`, `fai-cc -O`, and `fai-cc --passes
+Each program is built four ways (GCC `-O1`, `fcc`, `fcc -O`, and `fcc --passes
 $BENCH_PASSES --experimental`, by default the experimental promotion pipeline
 `mem2reg,stackdce,fwd,copyprop,dse,dce`; `BENCH_MORE="p,q;r,s"` adds a build per pipeline),
 run, and checked against GCC's output and exit code: `summarize.py` lists any mismatch first. A

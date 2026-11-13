@@ -1,14 +1,14 @@
 # Dead code elimination: from the Lean theorem to the binary
 
 This is the assurance case for one pass, `dce`, written link by link: what connects the theorem in
-`spec/` to the code `fai-cc -O` and `fir compile -O` produce, and which kind of support each link
+`spec/` to the code `fcc -O` and `fir compile -O` produce, and which kind of support each link
 has. It is the most complete chain in the repository and the template for the others. The table
 of every component is in [README.md](README.md#guarantees); the earlier audit and measurements
 are in [layer-audit.md](layer-audit.md#3-the-dce-checker-lean-and-rust).
 
 ## In one paragraph
 
-Compile with `fai-cc -O --check-dce FIR-REF` (or `fir compile -O --check-dce FIR-REF`, or with
+Compile with `fcc -O --check-dce FIR-REF` (or `fir compile -O --check-dce FIR-REF`, or with
 `FIR_CHECK_DCE=FIR-REF` in the environment), and every step of `dce` in that compilation is
 checked by a checker proved in Lean, on the module the pipeline actually produced. An accepted
 step means that each function after it refines the function of the same name before it, **in the
@@ -32,7 +32,7 @@ proved code runs at compile time: the compiler's own Rust checker is tested agai
 | **Trusted** | Relied on without proof or check: if it is wrong, the conclusions above can be wrong without any check failing. |
 | **Open** | Neither proved nor checked; the property may be true, but nothing here shows it. |
 
-## The chain, for one `fai-cc -O --check-dce` compilation
+## The chain, for one `fcc -O --check-dce` compilation
 
 | # | Link | Status | Backed by |
 |---|---|---|---|
@@ -50,7 +50,7 @@ proved code runs at compile time: the compiler's own Rust checker is tested agai
 | 12 | Per-function refinements compose into module refinement (each target function's calls go to *target* functions) | **Open** | `tests/opt.rs` runs optimized modules against their sources (tested) |
 | 13 | Refinement composes across the steps of the pipeline | **Open** for modules | `Func.Refines.trans` composes steps of one function in a fixed module only |
 | 14 | `fwd`, `copyprop`, `dse` | relations **proved**; passes **tested** | `Fir.Fwd/CopyProp/Dse.refines`; no checker of their outputs |
-| 15 | C to HFIR (`fai-cc`'s lowering) | **Tested** | the C corpus against GCC, natively and in the interpreter |
+| 15 | C to HFIR (`fcc`'s lowering) | **Tested** | the C corpus against GCC, natively and in the interpreter |
 | 16 | HFIR to MFIR | expansion **proved** per function; the rest **tested** | `Fir.Lower.Proof.lowerFunc_refines`; `tests/lower.rs` against `fir-ref lower` |
 | 17 | Instruction selection, allocation, encoding | **Tested**; allocation **checked (unproved)** | native runs; `regcheck::validate` |
 | 18 | The semantics in `spec/` is the meaning we want for FIR | **Assumed** (it is the definition) | the interpreters agree with it on the tests; it is what every theorem is about |
@@ -114,7 +114,7 @@ reaches `resolve`. (Some functions are `Decided` by their code alone, such as on
 turns any pointer into an allocation, but that excludes almost every function with a pointer
 parameter.) A useful sufficient condition for the rest has to restrict the arguments too (for example, to pointers with provenance, which is what a caller
 inside the program passes unless the pointer came from one of the sources above) and the
-world's answers. `fai-cc` emits `ptr.from_exposed` for casts from integers to pointers
+world's answers. `fcc` emits `ptr.from_exposed` for casts from integers to pointers
 (`frontends/c/tests/pointer_int_casts.c`), so within a C program those casts are the likeliest
 place for the assumption to fail. Nothing checks it today.
 
@@ -144,19 +144,19 @@ place for the assumption to fail. Nothing checks it today.
    that both modules parse and verify and print the same outside their functions, can only
    refuse.
 3. **The proved checker on the compiler's own path.** `fir::backend::optimize`, which
-   `fir compile -O`, `fai-cc -O`, and the C API's `fir_module_optimize`/`fir_module_compile` run,
-   checks every `dce` step when `FIR_CHECK_DCE` names a `fir-ref` (`fir opt -O` honours it too); `fir compile` and `fai-cc` take
+   `fir compile -O`, `fcc -O`, and the C API's `fir_module_optimize`/`fir_module_compile` run,
+   checks every `dce` step when `FIR_CHECK_DCE` names a `fir-ref` (`fir opt -O` honours it too); `fir compile` and `fcc` take
    `--check-dce FIR-REF`. A refusal, a receipt for other modules, or a path that isn't a file
    fails the compilation (`the_compiler_runs_the_proved_checker_when_asked`, with stand-in
    `fir-ref`s that refuse or lie).
 4. **The corpus's natively run binaries are checked builds.** The C corpus test builds each
-   program's `fai-cc -O` binary with `--check-dce`, and `verify full` (on Linux) requires every
+   program's `fcc -O` binary with `--check-dce`, and `verify full` (on Linux) requires every
    program's `-O` build to have been checked, run natively, and matched GCC. Outside `verify full`
    the test builds unchecked when there is no `fir-ref` (or `FIR_REF=none`), and says so; the ABI
    torture test's `-O` builds are not checked. On the current corpus: 67 programs, 67 checked `-O` builds, 71
    `dce` steps accepted, 3,462 deletions (as the pass counted them; the checker doesn't count),
    none refused, and all 67 binaries print and exit as
-   GCC's do. The check adds about 15 ms per program to a compilation of about 22 ms (`fai-cc` as
+   GCC's do. The check adds about 15 ms per program to a compilation of about 22 ms (`fcc` as
    the corpus test builds it, `--emit asm`, the whole corpus timed twice), almost all of it
    starting `fir-ref` and the text round trip.
 
@@ -165,9 +165,9 @@ place for the assumption to fail. Nothing checks it today.
 ```sh
 cd spec && lake build && cd ..                      # fir-ref, with the linear checker
 cargo run --bin fir -- compile FILE -O --check-dce spec/.lake/build/bin/fir-ref --emit mfir
-fai-cc FILE.c -O --check-dce spec/.lake/build/bin/fir-ref -o a.out
+fcc FILE.c -O --check-dce spec/.lake/build/bin/fir-ref -o a.out
 cargo test -p fir --test dce_check                  # the checker on fixtures, random programs, -O
-cargo test -p fir-capi --test fai_cc -- fai_cc_corpus --nocapture   # the C corpus, checked
+cargo test -p fir-capi --test fcc -- fcc_corpus --nocapture   # the C corpus, checked
 cd spec && lake exe fir-audit --lock ../docs/assurance/proofs.lock.json   # the claims
 ```
 

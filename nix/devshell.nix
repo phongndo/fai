@@ -32,7 +32,7 @@ in
     llvm.lld
     llvm.clang-tools
 
-    # The C frontend's build tools (frontends/c, fai-cc); its Clang and LLVM libraries are
+    # The C frontend's build tools (frontends/c, fcc); its Clang and LLVM libraries are
     # CMAKE_PREFIX_PATH below
     pkgs.cmake
     pkgs.ninja

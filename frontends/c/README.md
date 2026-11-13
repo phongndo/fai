@@ -1,14 +1,23 @@
-# fai-cc: a C compiler on FIR
+# fcc: a C compiler on FIR
 
-`fai-cc` compiles C to AArch64 Linux binaries through FIR. Clang parses and type-checks the C
+`fcc` compiles C to AArch64 Linux binaries through FIR. Clang parses and type-checks the C
 (preprocessor and system headers included) for `aarch64-unknown-linux-gnu`, so sizes, layouts, and
-`char`'s signedness (unsigned) are the target's. `fai-cc` lowers Clang's AST to HFIR through FIR's
+`char`'s signedness (unsigned) are the target's. `fcc` lowers Clang's AST to HFIR through FIR's
 C API only (`crates/fir-capi/include/fir.h`), verifies it, compiles it with `fir_module_compile`
 (which lowers HFIR to MFIR, and runs the proved passes with `-O`), and links it with the AArch64 C
 compiler, as `fir compile` does.
 
+`fcc` was called `fai-cc` until it was renamed: the binary, the CMake project and target, and the
+usual build directory (`build/fcc`) are now `fcc`; the environment variables `FAI_CC_*` are now
+`FCC_*` (`FCC_TESTS`, `FCC_ONLY`, `FCC_PASSES`, `FCC_ABI`, `FCC_ABI_SEED`, `FCC_DUMP`,
+`FCC_RESOURCE_DIR`, `FCC_BUILD_CAPI`); the tests are `cargo test -p fir-capi --test fcc`
+(`fcc_corpus`, `fcc_abi_torture`, whose evidence `cargo xtask verify` reads as `fcc_corpus`); and
+`bench/bench.py` reads `BENCH_FCC`. Older commits and logs say `fai-cc`. The project-wide `fai_`
+names (the test runtime `fai_runtime.c`, its `fai_put_*` helpers, the C++ `namespace fai`) are
+the project's, not the compiler's, and keep their names.
+
 ```
-fai-cc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]
+fcc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]
        [--emit hfir|mfir|asm] [INPUT...] [-I DIR] [-D NAME[=V]] [-l LIB] [-L DIR]
        [-- CLANG-FLAG...]
 ```
@@ -31,11 +40,11 @@ fai-cc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o O
   torture test's `-O` builds are not checked).
 - The linker is `$FIR_CC`, or `cc` on an AArch64 host and `aarch64-unknown-linux-gnu-cc` (the dev
   shell's cross compiler) elsewhere. Clang gets that compiler's system include directories after
-  its own headers (Clang's resource directory, found when `fai-cc` is built, or
-  `$FAI_CC_RESOURCE_DIR`).
-- Unsupported C is an error with its source location (`file.c:3:7: error: fai-cc does not support
-  variable-length arrays yet`), and nothing is written; `fai-cc` exits with 1. `FAI_CC_DUMP=1` prints
-  the module when the HFIR doesn't verify (a bug in `fai-cc`).
+  its own headers (Clang's resource directory, found when `fcc` is built, or
+  `$FCC_RESOURCE_DIR`).
+- Unsupported C is an error with its source location (`file.c:3:7: error: fcc does not support
+  variable-length arrays yet`), and nothing is written; `fcc` exits with 1. `FCC_DUMP=1` prints
+  the module when the HFIR doesn't verify (a bug in `fcc`).
 
 ## Build
 
@@ -43,26 +52,26 @@ From the repository root, in the dev shell (`nix develop`, which provides CMake,
 and LLVM's libraries on `CMAKE_PREFIX_PATH`):
 
 ```sh
-cmake -S frontends/c -B build/fai-cc -G Ninja
-cmake --build build/fai-cc            # also runs `cargo build --release -p fir-capi`
-build/fai-cc/fai-cc hello.c frontends/c/tests/runtime/fai_runtime.c -I frontends/c/tests/runtime -o hello
+cmake -S frontends/c -B build/fcc -G Ninja
+cmake --build build/fcc            # also runs `cargo build --release -p fir-capi`
+build/fcc/fcc hello.c frontends/c/tests/runtime/fai_runtime.c -I frontends/c/tests/runtime -o hello
 qemu-aarch64 hello                    # natively on AArch64 Linux
 ```
 
-`-DFIR_CAPI_LIB=…/libfir_capi.a -DFAI_CC_BUILD_CAPI=OFF` links a static library built elsewhere.
+`-DFIR_CAPI_LIB=…/libfir_capi.a -DFCC_BUILD_CAPI=OFF` links a static library built elsewhere.
 The C++ is warning-free under `-Wall -Wextra -Werror` and formatted by `clang-format` (`.clang-format`
 here; `clang-format --dry-run -Werror frontends/c/src/*`).
 
 ## Tests
 
 ```sh
-cargo test --release -p fir-capi --test fai_cc -- --nocapture
+cargo test --release -p fir-capi --test fcc -- --nocapture
 ```
 
-builds `fai-cc` with CMake (against the static library of the current sources), then:
+builds `fcc` with CMake (against the static library of the current sources), then:
 
 - compiles every program in `tests/*.c` with the reference compiler (`aarch64-unknown-linux-gnu-cc
-  -O1 -ffp-contract=off`, or `$FIR_CC`), with `fai-cc`, and with `fai-cc -O`, links each with
+  -O1 -ffp-contract=off`, or `$FIR_CC`), with `fcc`, and with `fcc -O`, links each with
   `tests/runtime/fai_runtime.c`, libm (`-lm`), and, if the program has one, `tests/extern/NAME.c`
   compiled by the reference compiler (C functions it calls and that call it back, compiled
   separately), runs them (under `qemu-aarch64` off AArch64), and requires the same output and exit
@@ -74,21 +83,21 @@ builds `fai-cc` with CMake (against the static library of the current sources), 
   listed with the first such function they call;
 - checks that each program in `tests/errors/` gets exactly the diagnostics its `// expect: LINE:COL:
   TEXT` lines name, and exit code 1;
-- runs the ABI torture (`fai_cc_abi_torture`): random signatures of structs and unions (HFAs
+- runs the ABI torture (`fcc_abi_torture`): random signatures of structs and unions (HFAs
   through arrays, nesting, and unions, small and large composites, bitfields, 16-byte aligned
   members and `aligned` attributes, empty structs, pointers, more arguments than registers) as
-  two C files, callers and callees, each compiled by `fai-cc`, `fai-cc -O`, or the reference
+  two C files, callers and callees, each compiled by `fcc`, `fcc -O`, or the reference
   compiler; in every pairing the callees check each member they receive (directly, through a
   function pointer, and through `...` by `va_arg`) and the callers each member of each result.
-  `FAI_CC_ABI=N` sets the number of signatures (240 by default), `FAI_CC_ABI_SEED` the seed.
+  `FCC_ABI=N` sets the number of signatures (240 by default), `FCC_ABI_SEED` the seed.
 
-`FAI_CC_PASSES=p,q,…` adds a fourth build, `fai-cc --passes p,q,… --experimental`, which must
+`FCC_PASSES=p,q,…` adds a fourth build, `fcc --passes p,q,… --experimental`, which must
 match the reference too, and runs the MFIR and allocated LFIR it makes in the interpreter.
 `bench/` measures what each pipeline executes (instructions, loads, stores) against GCC's.
 
-It runs by default on Linux; on macOS (whose binaries aren't Linux ones) only with `FAI_CC_TESTS=1`
-(given a Linux AArch64 toolchain in `FIR_CC` and a way to run its binaries), and `FAI_CC_TESTS=0`
-turns it off. Missing tools are a failure that names them, not a skip. `FAI_CC_ONLY=name` runs only
+It runs by default on Linux; on macOS (whose binaries aren't Linux ones) only with `FCC_TESTS=1`
+(given a Linux AArch64 toolchain in `FIR_CC` and a way to run its binaries), and `FCC_TESTS=0`
+turns it off. Missing tools are a failure that names them, not a skip. `FCC_ONLY=name` runs only
 the programs whose names contain `name`.
 
 Most of the corpus prints through `tests/runtime/fai_test.h` (`fai_put_long`, `fai_put_char`, and
@@ -257,4 +266,4 @@ Each is diagnosed where it appears:
 Also: C's `static` functions and globals become global symbols (FIR has no linkage yet), so a
 program can't define a `static` function with a libc function's name; the generated names (`str.0`,
 `zero.1`, `f.counter` for a static local) contain a `.`, so they can't clash with C names, but they
-clash between two objects `fai-cc` compiled (two files with string literals don't link together).
+clash between two objects `fcc` compiled (two files with string literals don't link together).

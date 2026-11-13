@@ -1,4 +1,4 @@
-/* Calls to C library functions that fai-cc doesn't define: external functions with
+/* Calls to C library functions that fcc doesn't define: external functions with
  * conservative effects (strlen, memcpy, memset, memcmp, abs, putchar, printf). The program's
  * interpreter run can't be compared (the interpreter's world answers external calls with
  * zeros), only its native runs. */
