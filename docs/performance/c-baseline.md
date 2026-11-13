@@ -3,7 +3,8 @@
 This is where fcc stands as a C compiler at the revision named below: whether its programs
 behave like GCC's and Clang's, how its code compares with theirs, how fast it compiles, and what
 costs the most. It is a baseline to measure later work against, not a target. Every number comes
-from `frontends/c/bench/cbench.py`. The commands to reproduce them are below.
+from `benchmarks/c/cbench.py` (measured when it was `frontends/c/bench/cbench.py`; the move
+changed no code). The commands to reproduce them are below.
 
 fcc as of `main` at `55c1751`, renamed from `fai-cc` (which changes no code it generates). The
 behavior checks, instruction counts, and run times were measured on binaries built from
@@ -260,7 +261,7 @@ no difference anywhere.
 
 - **Behavior.** The differential corpus `cargo test --release -p fir-capi --test fcc`
   (`frontends/c/README.md#tests`) is unchanged. On top of it, the twelve programs in
-  `frontends/c/bench/programs/` are small kernels written for this baseline, deterministic and free
+  `benchmarks/c/programs/` are small kernels written for this baseline, deterministic and free
   of undefined behavior, each printing a checksum. Every build of every program must print exactly
   what GCC -O2's build prints and exit the same way. That is checked twice: at the small size under
   qemu-user (`count`, which fails on any difference, or if the reference itself fails) and at the
@@ -309,7 +310,7 @@ usually cheaper than one in GCC -O2's: most are stack loads and stores that hit 
 and L1, plus moves and branches a wide out-of-order core overlaps. The time table and the count
 table disagree for that reason (see below).
 
-The QEMU plugin (`frontends/c/bench/insn_count.c`) counts the executions of every translated block
+The QEMU plugin (`benchmarks/c/insn_count.c`) counts the executions of every translated block
 and, for every memory access, whether its address is in the stack. qemu-user puts a program's
 first `mmap`ed memory directly below the stack mapping, so the window has to stay inside that
 mapping. QEMU runs with a fixed 8 MiB stack (`-s 8M`) and an empty environment, which keeps the
@@ -330,16 +331,16 @@ over all configurations instead of biasing one. The tables give the median wall 
 
 ```sh
 nix develop                                   # Linux, x86-64 or AArch64
-python3 frontends/c/bench/cbench.py build     # fcc (CMake), every config: objects, binaries,
+python3 benchmarks/c/cbench.py build          # fcc (CMake), every config: objects, binaries,
                                               # compile times, fcc's phases, sizes
-python3 frontends/c/bench/cbench.py count     # behavior + instruction counts (qemu-user off AArch64)
-python3 frontends/c/bench/cbench.py scaling   # compile time on generated inputs
-python3 frontends/c/bench/cbench.py time      # natively, on an AArch64 Linux host
-python3 frontends/c/bench/cbench.py time --ssh HOST                  # on an AArch64 Linux host
-python3 frontends/c/bench/cbench.py time --ssh MAC --docker alpine:3.22 \
+python3 benchmarks/c/cbench.py count          # behavior + instruction counts (qemu-user off AArch64)
+python3 benchmarks/c/cbench.py scaling        # compile time on generated inputs
+python3 benchmarks/c/cbench.py time           # natively, on an AArch64 Linux host
+python3 benchmarks/c/cbench.py time --ssh HOST                       # on an AArch64 Linux host
+python3 benchmarks/c/cbench.py time --ssh MAC --docker alpine:3.22 \
     --docker-bin '/usr/local/bin/docker --context desktop-linux'      # in an arm64 Linux VM
-python3 frontends/c/bench/cbench.py report    # target/cbench/report.md
-python3 frontends/c/bench/cbench.py all [time options]
+python3 benchmarks/c/cbench.py report         # target/cbench/report.md
+python3 benchmarks/c/cbench.py all [time options]
 ```
 
 `--only NAME...` restricts the programs, `--reps N` the compile-time repetitions (5), `--rounds N`

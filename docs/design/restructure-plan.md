@@ -16,7 +16,7 @@ because it conflicts with the x86-64 backend, which is committed but not integra
 | Default `-O` pipeline (proved passes only: dse, fwd, copyprop, dce) | yes | `passes/mod.rs` (`DEFAULT`, `Pipeline::default_opt`) |
 | Pass observers, `--print-before/after/changed`, `--dump-dir` | yes | `passes/mod.rs`, `bin/fir.rs` |
 | Differential, fuzz, ABI torture, contract, debug-line, regcheck suites | yes | `tests/rust/`, `sdk/c/tests/`, corpora in `tests/` |
-| C benchmark harness `cbench` and the C baseline (native M4 Max timing vs qemu-user counts) | yes | `frontends/c/bench/`, `docs/performance/c-baseline*.md` |
+| C benchmark harness `cbench` and the C baseline (native M4 Max timing vs qemu-user counts) | yes | `benchmarks/c/`, `docs/performance/c-baseline*.md` |
 | CLI names | `fir`, `fcc` (renamed from `fai-cc` at `753b752`; old name documented, no alias), Lean `fir-ref`, `fir-audit` | |
 | `fcxx` | no, and none is planned here | |
 

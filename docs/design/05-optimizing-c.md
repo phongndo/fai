@@ -174,7 +174,7 @@ the text can't spell.
 
 ## Measurements
 
-Method (`frontends/c/bench/`): each corpus program is built by GCC `-O1`, `fcc`, `fcc -O`,
+Method (`benchmarks/c/`): each corpus program is built by GCC `-O1`, `fcc`, `fcc -O`,
 and `fcc` with the experimental pipeline, linked non-PIE, and run under `qemu-aarch64` with
 TCG plugins that count instructions, loads, and stores executed in the program's own `.text`
 (libc and the GCC-compiled helpers excluded), and a per-instruction histogram. Every build's

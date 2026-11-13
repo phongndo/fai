@@ -13,7 +13,7 @@ usual build directory (`build/fcc`) are now `fcc`; the environment variables `FA
 `FCC_*` (`FCC_TESTS`, `FCC_ONLY`, `FCC_PASSES`, `FCC_ABI`, `FCC_ABI_SEED`, `FCC_DUMP`,
 `FCC_RESOURCE_DIR`, `FCC_BUILD_CAPI`); the tests are `cargo test -p fir-capi --test fcc`
 (`fcc_corpus`, `fcc_abi_torture`, whose evidence `cargo xtask verify` reads as `fcc_corpus`); and
-`bench/bench.py` reads `BENCH_FCC`. Older commits and logs say `fai-cc`. The project-wide `fai_`
+`benchmarks/c/bench.py` reads `BENCH_FCC`. Older commits and logs say `fai-cc`. The project-wide `fai_`
 names (the test runtime `fai_runtime.c`, its `fai_put_*` helpers, the C++ `namespace fai`) are
 the project's, not the compiler's, and keep their names.
 
@@ -99,8 +99,8 @@ builds `fcc` with CMake (against the static library of the current sources), the
 
 `FCC_PASSES=p,q,…` adds a fourth build, `fcc --passes p,q,… --experimental`, which must
 match the reference too, and runs the MFIR and allocated LFIR it makes in the interpreter.
-`bench/` measures what each pipeline executes (instructions, loads, stores) against GCC's, and
-`bench/cbench.py` is the end-to-end baseline against GCC and Clang (behavior, executed
+[`benchmarks/c/`](../../benchmarks/c/) measures what each pipeline executes (instructions, loads,
+stores) against GCC's, and `benchmarks/c/cbench.py` is the end-to-end baseline against GCC and Clang (behavior, executed
 instructions, code size, compile time, and wall time measured on native AArch64 only; results
 in [`docs/performance/c-baseline.md`](../../docs/performance/c-baseline.md)).
 

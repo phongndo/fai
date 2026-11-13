@@ -2,26 +2,26 @@
 
 Two sets of tools; nothing here is built by Cargo or CMake, and no test depends on it.
 
-- `bench.py` and its plugins measure what `fcc`'s pipelines do to the C corpus (`../tests/*.c`),
-  for [docs/design/05-optimizing-c.md](../../../docs/design/05-optimizing-c.md). Below.
+- `bench.py` and its plugins measure what `fcc`'s pipelines do to the C corpus (`frontends/c/tests/*.c`),
+  for [docs/design/05-optimizing-c.md](../../docs/design/05-optimizing-c.md). Below.
 - `cbench.py` is the end-to-end baseline against GCC and Clang on the kernels in `programs/`:
   behavior, executed instructions, code size, compile time, and wall time on native AArch64 only,
-  for [docs/performance/c-baseline.md](../../../docs/performance/c-baseline.md). See the end.
+  for [docs/performance/c-baseline.md](../../docs/performance/c-baseline.md). See the end.
 
 On an x86-64 host the binaries run under `qemu-aarch64`, whose wall time says little about
 AArch64 hardware, so the measure is what the program *executes*: two QEMU TCG plugins count the
 instructions run at guest addresses in a range (`count.c`: instructions, loads, and stores;
 `hist.c`: per instruction, mapped to mnemonics with `objdump`). The range is the program's own
 object's `.text` in a non-PIE link, so libc (`printf`), the output helpers
-(`../tests/runtime/fai_runtime.c`), and the GCC-compiled C helpers (`../tests/extern/`) don't
+(`frontends/c/tests/runtime/fai_runtime.c`), and the GCC-compiled C helpers (`frontends/c/tests/extern/`) don't
 count, and the same program compiled by GCC `-O1` is the yardstick.
 
 ```sh
 nix develop                                     # qemu-aarch64, the AArch64 cross compiler
 cmake --build build/fcc                      # the fcc to measure (or set BENCH_FCC)
-frontends/c/bench/build-plugins.sh /tmp/bench   # libcount.so and libhist.so
-BENCH_HIST=1 python3 -I frontends/c/bench/bench.py "$PWD" /tmp/bench
-python3 frontends/c/bench/summarize.py /tmp/bench/results.json
+benchmarks/c/build-plugins.sh /tmp/bench        # libcount.so and libhist.so
+BENCH_HIST=1 python3 -I benchmarks/c/bench.py "$PWD" /tmp/bench
+python3 benchmarks/c/summarize.py /tmp/bench/results.json
 ```
 
 Each program is built four ways (GCC `-O1`, `fcc`, `fcc -O`, and `fcc --passes
@@ -35,7 +35,7 @@ count the `mem.load`s, `mem.store`s, and stack slots left in each pipeline's MFI
 
 ```sh
 nix develop
-python3 frontends/c/bench/cbench.py all --ssh HOST [--docker IMAGE --docker-bin '…']
+python3 benchmarks/c/cbench.py all --ssh HOST [--docker IMAGE --docker-bin '…']
 ```
 
 builds the 12 programs in `programs/` with `fcc`, `fcc -O`, GCC `-O0`/`-O1`/`-O2`, and Clang
@@ -44,4 +44,4 @@ builds the 12 programs in `programs/` with `fcc`, `fcc -O`, GCC `-O0`/`-O1`/`-O2
 times compilation and scaling on the host, and times the programs natively on `HOST`
 (`benchrun.c`, which refuses to run under qemu-user), then writes `target/cbench/report.md`. Its
 steps (`build`, `count`, `scaling`, `time`, `report`), options, and method are in the script's
-docstring and in [docs/performance/c-baseline.md](../../../docs/performance/c-baseline.md).
+docstring and in [docs/performance/c-baseline.md](../../docs/performance/c-baseline.md).

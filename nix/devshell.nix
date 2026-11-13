@@ -18,7 +18,7 @@ let
   crossX86 = pkgs.pkgsCross.gnu64;
   needsCrossX86 = stdenv.hostPlatform.isLinux && !stdenv.hostPlatform.isx86_64;
 
-  # The C benchmark harness (frontends/c/bench/cbench.py) links every benchmark statically against
+  # The C benchmark harness (benchmarks/c/cbench.py) links every benchmark statically against
   # the AArch64 target's glibc, so the same binary runs under qemu-user and on any AArch64 Linux
   # machine; its QEMU plugin needs glib's headers (qemu-plugin.h includes glib.h). Linux only.
   benchLibc = lib.optionalString stdenv.hostPlatform.isLinux "${

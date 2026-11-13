@@ -3,19 +3,19 @@
 
 Run from the repository root in the dev shell (Linux; `nix develop -c python3 ...`):
 
-  frontends/c/bench/cbench.py build      compile every program with every configuration
+  benchmarks/c/cbench.py build           compile every program with every configuration
                                           (compile time, fcc's phases, code size), link
                                           statically against the target's glibc
-  frontends/c/bench/cbench.py count      run each binary at its small size (under qemu-user off
+  benchmarks/c/cbench.py count           run each binary at its small size (under qemu-user off
                                           AArch64): output and exit code against the reference,
                                           executed instructions and their mix (a QEMU plugin)
-  frontends/c/bench/cbench.py scaling    fcc's compile time on generated inputs of growing size
-  frontends/c/bench/cbench.py time [--ssh HOST [--docker IMAGE]]
+  benchmarks/c/cbench.py scaling         fcc's compile time on generated inputs of growing size
+  benchmarks/c/cbench.py time [--ssh HOST [--docker IMAGE]]
                                           wall time at the large size, on native AArch64 only:
                                           here if this machine is AArch64 Linux, else on HOST
                                           (directly, or in a Docker container there)
-  frontends/c/bench/cbench.py report     target/cbench/report.md from what was measured
-  frontends/c/bench/cbench.py all [time options]
+  benchmarks/c/cbench.py report          target/cbench/report.md from what was measured
+  benchmarks/c/cbench.py all [time options]
 
 Every step writes JSON to target/cbench/ (`--out DIR` elsewhere). Nothing is timed under
 emulation: `benchrun`, the native driver, refuses to run unless the CPU reports a hardware
@@ -37,7 +37,7 @@ import time
 from pathlib import Path
 
 BENCH = Path(__file__).resolve().parent
-ROOT = BENCH.parents[2]
+ROOT = BENCH.parents[1]
 PROGRAMS = BENCH / "programs"
 
 # Each program's argument: (count size, run under qemu for behavior and instruction counts;
