@@ -3,8 +3,8 @@
 
 use std::fmt::Write;
 
-use crate::ir::{Globals, Init, Module, Ty};
-use crate::types::Shape;
+use fai_ir::ir::{Globals, Init, Module, Ty};
+use fai_ir::types::Shape;
 
 /// A symbol as the assembler writes it: quoted unless it is a plain identifier.
 pub fn quote(s: &str) -> String {

@@ -51,7 +51,7 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
-pub mod codegen;
+pub use fai_codegen as codegen;
 mod driver;
 pub use fai_interp as interp;
 pub use fai_transforms as passes;

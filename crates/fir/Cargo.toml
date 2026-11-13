@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+fai-codegen = { path = "../../compiler/codegen" }
 fai-interp = { path = "../../compiler/interp" }
 fai-ir = { path = "../../compiler/ir" }
 fai-lowering = { path = "../../compiler/lowering" }

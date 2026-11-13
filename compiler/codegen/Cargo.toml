@@ -1,0 +1,15 @@
+[package]
+name = "fai-codegen"
+version = "0.1.0"
+description = "What FIR's backends share: global data, the runtime's trap codes, which functions may throw"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fai-ir = { path = "../ir" }
+num-bigint = "0.4"
+rustc-hash = "2"
+
+[lints]
+workspace = true

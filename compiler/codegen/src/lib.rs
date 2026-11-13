@@ -2,11 +2,13 @@
 //! trap handler takes ([`trap_code`]), and which functions may return with an exception pending
 //! ([`may_throw`]).
 
+#![forbid(unsafe_code)]
+
 pub mod data;
 
 use rustc_hash::FxHashMap;
 
-use crate::ir::{Module, OpKind, TrapReason};
+use fai_ir::ir::{Module, OpKind, TrapReason};
 
 /// The reason code `__fir_trap(reason, line, col)` receives for a trap (decision: Traps at run
 /// time).
