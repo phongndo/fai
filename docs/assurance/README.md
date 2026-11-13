@@ -273,6 +273,7 @@ under AddressSanitizer in the full one. No noisy lint groups were enabled.
 | Assembly text and encoding | tested | native runs under qemu |
 | Data layout at the backend | checked on every compile: AAPCS64's or refused | `isel::check_module` |
 | Native addresses → source locations (`fir compile -g`) | tested | `tests/debug_lines.rs` |
+| x86-64 backend: selection, allocation, assembly | tested; the allocation's assignment checked on every compile (unproved check; not the rewritten code) | native runs only (`tests/x86_64.rs`, `fcc_x86_64_corpus`): no LFIR dialect or semantics yet (decision: x86-64 target) |
 | Effects and tiers in the op declarations | declared only | not read by anything that relies on them; `freeze_changes_core` shows one is incomplete |
 
 **Trusted base** (beyond Lean's kernel and the three standard axioms): the Lean compiler that

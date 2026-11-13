@@ -639,6 +639,50 @@ Decisions: C frontend (by-value mapping), C struct layout (empty structs), C fro
 - **Not yet:** the rejections above; `long double`, `_Complex`, and the other gaps track F2a
   and F2b list.
 
+### Track X: x86-64, a second target, for integers (done)
+
+Goal: compile and run integer C functions on x86-64 Linux through `fcc`, branches and calls
+included, tested against a reference compiler. Decisions: x86-64 target, x86-64 backend testing.
+
+- **Backend** (`crates/fir/src/backend/x86_64/`, about 3,700 lines): instruction selection from
+  MFIR for integers up to 64 bits (and wider ones where only their low bits matter), pointers,
+  memory, every control-flow op, direct, indirect, and variadic calls, traps, and exceptions;
+  System V's integer convention (six argument registers, stack slots, `rax`/`rdx` results, results
+  in memory through `rdi`); linear-scan allocation with spilling, its assignment checked on every
+  function; GNU assembly for ELF, PIC (external calls through the PLT, their addresses through the
+  GOT). Global data is emitted by code now shared with AArch64 (`backend/data.rs`).
+- **Drivers:** `fir compile --target x86_64`, `fir_module_compile(m, "x86_64", …)` (C API 1.6),
+  `fcc --target x86_64` (Clang parses for `x86_64-unknown-linux-gnu`, so `char` is signed and
+  `long double` is x87's, which is refused; links with `cc` on an x86-64 host).
+- **Refused, with an error naming it:** floats, variadic functions defined in C or FIR (x86-64's
+  `va_list` too), structs and unions by value, `char`/`short`/`_Bool` arguments to C functions
+  (C expects them extended by a signedness FIR's types don't carry), data layouts other than
+  System V's (as AArch64 refuses all but AAPCS64's), and macOS.
+- **Tests:** `crates/fir/tests/x86_64.rs`: every fixture's comparable runs natively against
+  `fir run` (265 runs match, 106 more with `-O`, traps and exceptions included, none differ), and
+  random integer programs (100 by default; 3,000 on each of seeds 1 to 4: no differences, and
+  one program's runs not comparable); `cargo xtask verify full` passes, every op constructor the
+  selection claims exercised (50 of 50). `fcc_x86_64_corpus`: 49 of the 69
+  corpus programs compile for x86-64 and match the dev shell's Clang (`-O1`) natively, with and
+  without `-O`, 43 of them in `fir run` too; the other 20 are refused for the limitations above
+  (17 only because they print floats). Two new corpus programs, run for both targets: `many_args`
+  (ten-argument calls of every integer width between `fcc` code, a separately compiled C
+  file, and back, and narrow results returned to C) and `pressure` (more values live than
+  registers, across calls).
+- **Found on the way, shared with AArch64:** the taint analysis didn't follow values into
+  `cf.blocks` block parameters (it compared label string ids, which differ for one name), so
+  address-dependent results passed through jumps weren't excused; and the native runners
+  stalled on output larger than a pipe.
+- **Review fixes:** frames beyond 1 GiB are refused (their size was truncated to 32 bits); the
+  assignment check also follows physical registers, so a virtual register written over an
+  argument or result register still to be read by name is refused; the native comparison no
+  longer lets a reference's address-dependent trap excuse any ending (a native run that finishes
+  must answer to a layout that finished; crashes and time limits are never excused), and, when
+  layouts are left out as undefined, doesn't hold the low bits the rest happen to share (seed 42
+  at 20,000 programs: 15 false differences before, none now). Each has a regression test.
+- **Not yet:** the LFIR dialect with Lean semantics (open item 7), floats, varargs, structs by
+  value, signedness-aware narrow arguments.
+
 ## Round status
 
 Against "Done when", item by item:
