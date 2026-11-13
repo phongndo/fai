@@ -21,7 +21,7 @@ op load (align : Align)
 From the declarations, the `fir_ops` macro generates the `OpKind` inductive, `OpKind.isTerminator`, the op
 table `opDecls`, the name table `opNames`, and the functions that read and write an op's
 immediates. The parser, printer, and verifier interpret the tables; `lake exe gen-rust` writes the
-same tables, and the Rust `OpKind`, to `crates/fir/src/generated/ops.rs`.
+same tables, and the Rust `OpKind`, to `compiler/ir/src/generated/ops.rs`.
 
 **Fields.** `(zero ovf : Edge)` declares fields of the constructor. Fields of these types are
 *immediates*, written in the op's format: `Int`, `Nat` (Rust `u64`), `Align` (a `Nat`; Rust

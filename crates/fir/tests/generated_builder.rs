@@ -1,6 +1,6 @@
 //! `src/generated/builder.rs` is what `lake exe gen-builder rust` prints from the op declarations
 //! in `spec/Fir/Syntax.lean`. Regenerate it with
-//! `cd spec && lake exe gen-builder rust > ../crates/fir/src/generated/builder.rs`.
+//! `cd spec && lake exe gen-builder rust > ../compiler/ir/src/generated/builder.rs`.
 //!
 //! The generator is `spec/.lake/build/bin/gen-builder` (built by `lake build` in `spec/`), or the
 //! path in `FIR_GEN_BUILDER`. `FIR_REF=none` skips this test with the other Lean comparisons.
@@ -36,9 +36,9 @@ fn generated_builder_is_up_to_date() {
         String::from_utf8_lossy(&out.stderr)
     );
     let want = String::from_utf8(out.stdout).unwrap();
-    let have = std::fs::read_to_string(repo.join("crates/fir/src/generated/builder.rs")).unwrap();
+    let have = std::fs::read_to_string(repo.join("compiler/ir/src/generated/builder.rs")).unwrap();
     assert!(
         have == want,
-        "crates/fir/src/generated/builder.rs is stale: run `cd spec && lake exe gen-builder rust > ../crates/fir/src/generated/builder.rs`"
+        "compiler/ir/src/generated/builder.rs is stale: run `cd spec && lake exe gen-builder rust > ../compiler/ir/src/generated/builder.rs`"
     );
 }

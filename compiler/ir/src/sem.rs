@@ -11,7 +11,7 @@ use crate::ir::{ArithOp, BitOp, DivOp, Edge, Ovf, Pred, ShiftEdge, ShiftOp, Trun
 
 /// A defined integer's bits: `Small` exactly when the width is at most 64.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) enum Bits {
+pub enum Bits {
     Small(u64),
     Big(BigUint),
 }
@@ -104,14 +104,14 @@ impl UbKind {
 
 /// The outcome of one integer op (Lean's `OpOut`); `Val(None)` is `poison`.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) enum Out {
+pub enum Out {
     Val(Option<Bits>),
     Trap(TrapReason),
     Ub(UbKind),
 }
 
 /// The low `w` bits set, for `w ≤ 64`.
-pub(crate) fn mask(w: u32) -> u64 {
+pub fn mask(w: u32) -> u64 {
     if w >= 64 { u64::MAX } else { (1u64 << w) - 1 }
 }
 
@@ -121,13 +121,13 @@ fn pow2(w: u32) -> BigInt {
 }
 
 /// Sign-extend the low `w` bits (`0 < w ≤ 64`).
-pub(crate) fn sext64(w: u32, x: u64) -> i64 {
+pub fn sext64(w: u32, x: u64) -> i64 {
     let s = 64 - w;
     ((x << s) as i64) >> s
 }
 
 /// `n` wrapped to a signed `w`-bit integer (`0 < w ≤ 64`).
-pub(crate) fn wrap_signed(w: u32, n: i128) -> i128 {
+pub fn wrap_signed(w: u32, n: i128) -> i128 {
     let m = 1i128 << w;
     let r = n.rem_euclid(m);
     if r >= m / 2 { r - m } else { r }
@@ -156,7 +156,7 @@ impl Bits {
         }
     }
 
-    pub(crate) fn of_i128(w: u32, n: i128) -> Bits {
+    pub fn of_i128(w: u32, n: i128) -> Bits {
         if w <= 64 {
             Bits::Small((n as u64) & mask(w))
         } else {
@@ -175,12 +175,12 @@ impl Bits {
         }
     }
 
-    pub(crate) fn zero(w: u32) -> Bits {
+    pub fn zero(w: u32) -> Bits {
         Bits::of_i128(w, 0)
     }
 
     /// The unsigned value (`BitVec.toNat`).
-    pub(crate) fn to_nat(&self) -> BigUint {
+    pub fn to_nat(&self) -> BigUint {
         match self {
             Bits::Small(x) => BigUint::from(*x),
             Bits::Big(x) => x.clone(),
@@ -188,7 +188,7 @@ impl Bits {
     }
 
     /// The signed value (`BitVec.toInt`).
-    pub(crate) fn to_int(&self, w: u32) -> BigInt {
+    pub fn to_int(&self, w: u32) -> BigInt {
         match self {
             Bits::Small(x) => BigInt::from(sext64(w, *x)),
             Bits::Big(x) => {
@@ -201,7 +201,7 @@ impl Bits {
         }
     }
 
-    pub(crate) fn is_zero(&self) -> bool {
+    pub fn is_zero(&self) -> bool {
         match self {
             Bits::Small(x) => *x == 0,
             Bits::Big(x) => x.bits() == 0,
@@ -209,7 +209,7 @@ impl Bits {
     }
 
     /// The unsigned value if it fits in 64 bits.
-    pub(crate) fn to_u64(&self) -> Option<u64> {
+    pub fn to_u64(&self) -> Option<u64> {
         match self {
             Bits::Small(x) => Some(*x),
             Bits::Big(x) => u64::try_from(x).ok(),
@@ -232,7 +232,7 @@ impl Bits {
 }
 
 /// `int.const n`: `n` wrapped to `w` bits.
-pub(crate) fn konst(w: u32, n: &BigInt) -> Bits {
+pub fn konst(w: u32, n: &BigInt) -> Bits {
     Bits::of_int(w, n)
 }
 
@@ -316,13 +316,13 @@ fn ovf_needs_defined(o: Ovf) -> bool {
 
 /// `int.add.overflow.s` and friends on defined operands: the wrapped result and whether the
 /// operation overflowed, signed or unsigned.
-pub(crate) fn overflow_pair(op: ArithOp, signed: bool, w: u32, a: &Bits, b: &Bits) -> (Bits, bool) {
+pub fn overflow_pair(op: ArithOp, signed: bool, w: u32, a: &Bits, b: &Bits) -> (Bits, bool) {
     let f = arith_facts(op, w, a, b);
     (f.wrapped, if signed { f.ovf_s } else { f.ovf_u })
 }
 
 /// `int.add`, `int.sub`, `int.mul` (Lean's `Sem.arith`).
-pub(crate) fn arith(op: ArithOp, ovf: Ovf, w: u32, a: Option<&Bits>, b: Option<&Bits>) -> Out {
+pub fn arith(op: ArithOp, ovf: Ovf, w: u32, a: Option<&Bits>, b: Option<&Bits>) -> Out {
     let (Some(a), Some(b)) = (a, b) else {
         return if ovf_needs_defined(ovf) {
             Out::Ub(UbKind::Poison)
@@ -363,7 +363,7 @@ pub(crate) fn arith(op: ArithOp, ovf: Ovf, w: u32, a: Option<&Bits>, b: Option<&
 }
 
 /// `int.and`, `int.or`, `int.xor`.
-pub(crate) fn bit(op: BitOp, a: Option<&Bits>, b: Option<&Bits>) -> Option<Bits> {
+pub fn bit(op: BitOp, a: Option<&Bits>, b: Option<&Bits>) -> Option<Bits> {
     Some(match (a?, b?) {
         (Bits::Small(x), Bits::Small(y)) => Bits::Small(match op {
             BitOp::And => x & y,
@@ -446,14 +446,7 @@ fn is_all_ones(w: u32, x: &Bits) -> bool {
 
 /// Division and remainder (Lean's `Sem.div`): `zero` applies to a zero divisor, `ovf` to signed
 /// `MIN / -1`.
-pub(crate) fn div(
-    op: DivOp,
-    zero: Edge,
-    ovf: Edge,
-    w: u32,
-    a: Option<&Bits>,
-    b: Option<&Bits>,
-) -> Out {
+pub fn div(op: DivOp, zero: Edge, ovf: Edge, w: u32, a: Option<&Bits>, b: Option<&Bits>) -> Out {
     let Some(b) = b else {
         return if edge_needs_defined(zero) {
             Out::Ub(UbKind::Poison)
@@ -527,13 +520,7 @@ fn shift_edge_needs_defined(e: ShiftEdge) -> bool {
 }
 
 /// Shifts (Lean's `Sem.shift`). The amount is read as unsigned.
-pub(crate) fn shift(
-    op: ShiftOp,
-    edge: ShiftEdge,
-    w: u32,
-    a: Option<&Bits>,
-    n: Option<&Bits>,
-) -> Out {
+pub fn shift(op: ShiftOp, edge: ShiftEdge, w: u32, a: Option<&Bits>, n: Option<&Bits>) -> Out {
     let Some(n) = n else {
         return if shift_edge_needs_defined(edge) {
             Out::Ub(UbKind::Poison)
@@ -565,7 +552,7 @@ pub(crate) fn shift(
 }
 
 /// Integer comparison (Lean's `Sem.cmpBits`).
-pub(crate) fn cmp_bits(p: Pred, w: u32, a: &Bits, b: &Bits) -> bool {
+pub fn cmp_bits(p: Pred, w: u32, a: &Bits, b: &Bits) -> bool {
     use std::cmp::Ordering;
     let (u, s) = match (a, b) {
         (Bits::Small(x), Bits::Small(y)) => (x.cmp(y), sext64(w, *x).cmp(&sext64(w, *y))),
@@ -586,12 +573,12 @@ pub(crate) fn cmp_bits(p: Pred, w: u32, a: &Bits, b: &Bits) -> bool {
 }
 
 /// `int.zext` to `v` bits (Lean's `setWidth`).
-pub(crate) fn zext(v: u32, x: &Bits) -> Bits {
+pub fn zext(v: u32, x: &Bits) -> Bits {
     Bits::of_nat(v, &x.to_nat())
 }
 
 /// `int.sext` from `w` to `v` bits.
-pub(crate) fn sext(w: u32, v: u32, x: &Bits) -> Bits {
+pub fn sext(w: u32, v: u32, x: &Bits) -> Bits {
     match x {
         Bits::Small(x) if v <= 64 => Bits::Small(sext64(w, *x) as u64 & mask(v)),
         _ => Bits::of_int(v, &x.to_int(w)),
@@ -599,7 +586,7 @@ pub(crate) fn sext(w: u32, v: u32, x: &Bits) -> Bits {
 }
 
 /// `int.trunc` from `w` to `v` bits.
-pub(crate) fn trunc(mode: TruncMode, w: u32, v: u32, x: &Bits) -> Option<Bits> {
+pub fn trunc(mode: TruncMode, w: u32, v: u32, x: &Bits) -> Option<Bits> {
     let r = Bits::of_nat(v, &x.to_nat());
     let ok = match mode {
         TruncMode::Wrap => true,
@@ -610,7 +597,7 @@ pub(crate) fn trunc(mode: TruncMode, w: u32, v: u32, x: &Bits) -> Option<Bits> {
 }
 
 /// Bytes, least significant first, of a defined `w`-bit value (`w` a multiple of 8).
-pub(crate) fn to_le_bytes(w: u32, x: &Bits, out: &mut Vec<u8>) {
+pub fn to_le_bytes(w: u32, x: &Bits, out: &mut Vec<u8>) {
     let n = (w / 8) as usize;
     match x {
         Bits::Small(x) => out.extend((0..n).map(|i| if i < 8 { (x >> (8 * i)) as u8 } else { 0 })),
@@ -622,7 +609,7 @@ pub(crate) fn to_le_bytes(w: u32, x: &Bits, out: &mut Vec<u8>) {
 }
 
 /// The `w`-bit value with these bytes, least significant first.
-pub(crate) fn from_le_bytes(w: u32, bytes: &[u8]) -> Bits {
+pub fn from_le_bytes(w: u32, bytes: &[u8]) -> Bits {
     if w <= 64 {
         let x = bytes
             .iter()

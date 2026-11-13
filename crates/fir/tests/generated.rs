@@ -54,8 +54,8 @@ fn generated_files_are_up_to_date() {
         ev.write();
         return;
     }
-    generated("ops", "crates/fir/src/generated/ops.rs", &ev);
-    generated("contracts", "crates/fir/src/generated/contracts.rs", &ev);
+    generated("ops", "compiler/ir/src/generated/ops.rs", &ev);
+    generated("contracts", "compiler/ir/src/generated/contracts.rs", &ev);
     generated("manifest", "docs/assurance/op-contracts.json", &ev);
     ev.write();
 }

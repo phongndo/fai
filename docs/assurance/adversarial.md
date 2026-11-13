@@ -4,7 +4,7 @@ The last run of `cargo xtask mutate` (`xtask/src/mutate.rs`) at a1df440: each mu
 
 | Mutation | Defect | Result | Diagnostic |
 |---|---|---|---|
-| `stale-generated-contract` | a generated contract edited by hand (a trapping add made deletable); the freshness check refuses it | caught for the intended reason | `crates/fir/src/generated/contracts.rs is stale: run `cd spec && lake exe gen-rust contracts > ../crates/fir/src/generated/contracts.rs`` |
+| `stale-generated-contract` | a generated contract edited by hand (a trapping add made deletable); the freshness check refuses it | caught for the intended reason | `compiler/ir/src/generated/contracts.rs is stale: run `cd spec && lake exe gen-rust contracts > ../compiler/ir/src/generated/contracts.rs`` |
 | `new-op-without-rust-support` | a new op declared in Lean and regenerated; the Rust components' support declarations no longer match every variant | caught for the intended reason | `error[E0004]: non-exhaustive patterns: `ops::OpKind::Popcount` not covered` |
 | `unprovable-permission` | DCE's classification made to delete a trapping add (a modifier whose trap is observable); the purity proof fails | caught for the intended reason | `error: Fir/DceKinds.lean:167:28: `dsimp` made no progress` |
 | `contradictory-permission` | a call marked deletable on trust; the contract generator finds the contradiction with the declaration | caught for the intended reason | `func.call: dead code elimination may delete it, but it calls` |

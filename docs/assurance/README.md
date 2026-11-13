@@ -85,7 +85,7 @@ can't represent) is counted per reason, and any other compile failure fails the 
 ### Op contracts, generated from Lean (`fir::contract`)
 
 The op declarations in `spec/Fir/Syntax.lean` already generate `OpKind` and the tables.
-`lake exe gen-rust contracts` adds `crates/fir/src/generated/contracts.rs`: `OpKind::contract()`,
+`lake exe gen-rust contracts` adds `compiler/ir/src/generated/contracts.rs`: `OpKind::contract()`,
 an exhaustive match over every variant *and modifier* (no wildcard, so a kind the Lean name
 table doesn't spell is a Rust compile error), and `KINDS`, one representative per op name.
 Each `OpContract` carries the printed name, whether the kind calls (Lean's `callee?`), and its

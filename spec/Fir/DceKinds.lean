@@ -8,7 +8,7 @@ terminator, operands that are variables, and a computation that only reads the c
 only by UB or getting stuck (`ReadOnly`), for every operand value. Everything in that list but
 the computation is a property of the op's kind or syntax; `PureKind` collects the kind's part.
 
-`dcePerm` is the classification the Rust pass uses: `crates/fir/src/generated/contracts.rs` is
+`dcePerm` is the classification the Rust pass uses: `compiler/ir/src/generated/contracts.rs` is
 generated from it (`lake exe gen-contracts`), so the pass deletes exactly the kinds this file
 proves pure. `dcePerm_sound` is the binding: every kind it lets the pass delete is `PureKind`, and
 `Pure.of_kind` makes any op of such a kind, with variable operands and no regions, `Pure`. The

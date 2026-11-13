@@ -12,9 +12,9 @@
 //! is [`Evidence::Trusted`], and the [`Policy::VerifiedOnly`] policy refuses it.
 //!
 //! **Declared half.** Each component that dispatches on op kinds declares what it does with each
-//! ([`Support`]) in a function next to its code: [`crate::interp::support`],
-//! [`crate::lower_support`], [`crate::backend::aarch64::isel::support`], and
-//! [`crate::backend::x86_64::isel::support`]. They match every
+//! ([`Support`]) in a function next to its code: `fir::interp::support`, `fir::lower_support`,
+//! `fir::backend::aarch64::isel::support`, and `fir::backend::x86_64::isel::support` (the list
+//! is `fir::contract::components`). They match every
 //! variant without a wildcard (`clippy::wildcard_enum_match_arm` is denied there), so a new op
 //! is a compile error until each component decides. `tests/contracts.rs` checks the declarations
 //! against the generated contracts and the op declarations (an HFIR-only op the lowering doesn't
@@ -120,5 +120,3 @@ pub enum Lowering {
 
 /// A component's declaration of what it does with each kind.
 pub type SupportFn = fn(OpKind) -> Support;
-
-pub use crate::driver::components;

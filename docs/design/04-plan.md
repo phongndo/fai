@@ -173,7 +173,7 @@ Decisions: Floats, Float ops, NaN choice, Float text.
   `truncInt_ofInt` (integers of at most `m + 1` bits; `f32` and `f64` instances).
   `Dce.float_pure` proves the float ops that can't trap pure. The existing proofs were
   extended for the new value (`RVal.float`: refinement, `Dse`, `Fwd.Exact` with floats, `Space`).
-- Rust: `crates/fir/src/float.rs` (software arithmetic with NaN canonicalization, exact
+- Rust: `compiler/ir/src/float.rs` (software arithmetic with NaN canonicalization, exact
   rounding for wide integers and decimals, the same shortest-decimal algorithm as Lean), the parser,
   printer, verifier, interpreter, builder (`float_const` and friends, generated), C API
   (`FIR_TYPE_F32`/`F64`, the `FirFBinOp`, `FirFUnOp`, `FirFPred`, `FirCvtEdge` constants,

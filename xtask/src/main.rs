@@ -391,11 +391,11 @@ impl Verify {
         let spec = self.root.join("spec");
         let bin = spec.join(".lake/build/bin");
         let files: &[(&str, &[&str], &str)] = &[
-            ("gen-rust", &[], "crates/fir/src/generated/ops.rs"),
+            ("gen-rust", &[], "compiler/ir/src/generated/ops.rs"),
             (
                 "gen-rust",
                 &["contracts"],
-                "crates/fir/src/generated/contracts.rs",
+                "compiler/ir/src/generated/contracts.rs",
             ),
             (
                 "gen-rust",
@@ -405,7 +405,7 @@ impl Verify {
             (
                 "gen-builder",
                 &["rust"],
-                "crates/fir/src/generated/builder.rs",
+                "compiler/ir/src/generated/builder.rs",
             ),
             (
                 "gen-builder",
@@ -695,7 +695,7 @@ fn check_evidence(
     need(
         &mut bad,
         "generated_rust",
-        "fresh: crates/fir/src/generated/contracts.rs",
+        "fresh: compiler/ir/src/generated/contracts.rs",
         Some(1),
     );
     need(&mut bad, "contracts", "kinds", None);

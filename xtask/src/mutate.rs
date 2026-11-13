@@ -101,7 +101,7 @@ fn regen_ops() -> Cmd {
         "sh",
         &[
             "-c",
-            "lake build gen-rust gen-builder && lake exe gen-rust > ../crates/fir/src/generated/ops.rs && lake exe gen-rust contracts > ../crates/fir/src/generated/contracts.rs && lake exe gen-builder rust > ../crates/fir/src/generated/builder.rs && lake exe gen-builder capi > ../crates/fir-capi/src/generated/ops.rs",
+            "lake build gen-rust gen-builder && lake exe gen-rust > ../compiler/ir/src/generated/ops.rs && lake exe gen-rust contracts > ../compiler/ir/src/generated/contracts.rs && lake exe gen-builder rust > ../compiler/ir/src/generated/builder.rs && lake exe gen-builder capi > ../crates/fir-capi/src/generated/ops.rs",
         ],
     )
 }
@@ -118,12 +118,12 @@ fn mutations() -> Vec<Mutation> {
             name: "stale-generated-contract",
             what: "a generated contract edited by hand (a trapping add made deletable); the freshness check refuses it",
             edits: vec![edit(
-                "crates/fir/src/generated/contracts.rs",
+                "compiler/ir/src/generated/contracts.rs",
                 "name: \"int.add.s.trap\", calls: false, dce: Dce::Keep }",
                 "name: \"int.add.s.trap\", calls: false, dce: Dce::Delete(Evidence::Proved(DCE_THEOREM)) }",
             )],
             steps: vec![test(&["-p", "fir", "--test", "generated"])],
-            expect: vec!["crates/fir/src/generated/contracts.rs is stale"],
+            expect: vec!["compiler/ir/src/generated/contracts.rs is stale"],
             in_decl: None,
         },
         Mutation {

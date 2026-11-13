@@ -51,59 +51,41 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
-mod body;
-pub mod builder;
 pub mod codegen;
-pub mod contract;
-#[path = "generated/builder.rs"]
-#[rustfmt::skip]
-mod builder_ops;
-mod decl;
-/// What the one op table needs from the `aarch64` LFIR dialect: its registers and the modifiers
-/// its op names spell ([`dialect::aarch64::syntax`]), and AAPCS64's placement of values
-/// ([`dialect::aarch64::abi`]), by which the machine model runs calls. Both mirror Lean
-/// (`spec/Fir/AArch64Syntax.lean`, `spec/Fir/AArch64Abi.lean`); the compiler for the target is
-/// [`backend::aarch64`].
-pub mod dialect {
-    pub mod aarch64 {
-        pub mod abi;
-        pub mod syntax;
-    }
-}
 mod driver;
-#[path = "generated/contracts.rs"]
-#[rustfmt::skip]
-mod generated_contracts;
-pub mod float;
-mod globals;
 pub mod interp;
-mod ir;
-mod lex;
 mod lower;
-#[path = "generated/ops.rs"]
-#[rustfmt::skip]
-mod ops;
-mod parse;
 pub mod passes;
-mod print;
-mod sem;
-mod types;
-mod verify;
 
-pub use body::{
+pub use fai_ir::{builder, dialect, float};
+
+/// Op contracts: what the Lean proofs let the Rust code do with each op kind
+/// ([`fai_ir::contract`]), and which components declare what they do with each
+/// ([`contract::components`]).
+pub mod contract {
+    pub use crate::driver::components;
+    pub use fai_ir::contract::*;
+}
+
+// The IR's modules, under the names this crate's own modules use.
+use fai_ir::{body, decl, ir, sem, types, verify};
+
+pub use fai_ir::body::{
     Body, Case, CasesId, HoleId, Int, IntId, OpId, Operand, OperandKind, Ops, RegionId, StrId,
     Succ, SuccId, UseId, Uses, ValueDef, ValueId, ValueSpec,
 };
-pub use builder::{
+pub use fai_ir::builder::{
     BuildError, FactArg, FuncBuilder, FuncRef, GlobalRef, InsertPoint, IntImm, ModuleBuilder,
     Results, SwitchCase, Target, Values,
 };
-pub use decl::{Check, Effect, Field, FieldTy, Imm, Item, Layer, Layers, OpDecl, Tier, TyE};
-pub use globals::Run;
-pub use ir::*;
+pub use fai_ir::decl::{
+    Check, Effect, Field, FieldTy, Imm, Item, Layer, Layers, OpDecl, Tier, TyE,
+};
+pub use fai_ir::globals::Run;
+pub use fai_ir::ir::*;
+pub use fai_ir::ops::{TARGETS, op_kind};
+pub use fai_ir::parse::parse_module;
+pub use fai_ir::sem::TrapReason;
+pub use fai_ir::types::align_up;
+pub use fai_ir::verify::{Hole, render_loc, verify_module};
 pub use lower::{lower_checked, lower_module, support as lower_support};
-pub use ops::{TARGETS, op_kind};
-pub use parse::parse_module;
-pub use sem::TrapReason;
-pub use types::align_up;
-pub use verify::{Hole, render_loc, verify_module};

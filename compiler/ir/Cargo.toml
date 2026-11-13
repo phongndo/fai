@@ -1,0 +1,19 @@
+[package]
+name = "fai-ir"
+version = "0.1.0"
+description = "FIR's representation: types, ops (generated from spec/), text, verifier, builder, op contracts"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+num-bigint = "0.4"
+rustc-hash = "2"
+rustc_apfloat = "0.2.3"
+
+[lints]
+workspace = true
+
+# The examples in the docs are written against the supported interface, the `fir` crate.
+[dev-dependencies]
+fir = { path = "../../crates/fir" }

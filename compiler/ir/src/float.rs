@@ -383,7 +383,7 @@ fn from_int_sw<T: Float>(g: FloatTy, signed: bool, w: u32, raw: u128) -> u64 {
 }
 
 /// `int.to_float`: the `w`-bit integer `x`, signed or unsigned, rounded to a `g`.
-pub(crate) fn from_int(g: FloatTy, signed: bool, w: u32, x: &Bits) -> u64 {
+pub fn from_int(g: FloatTy, signed: bool, w: u32, x: &Bits) -> u64 {
     if w <= 128 {
         let raw: u128 = match x {
             Bits::Small(v) => u128::from(*v),
@@ -409,7 +409,7 @@ pub(crate) fn from_int(g: FloatTy, signed: bool, w: u32, x: &Bits) -> u64 {
 }
 
 /// `float.to_int`: the integer part of `a` (a `f`) as a `w`-bit integer.
-pub(crate) fn to_int(f: FloatTy, signed: bool, edge: CvtEdge, w: u32, a: u64) -> Out {
+pub fn to_int(f: FloatTy, signed: bool, edge: CvtEdge, w: u32, a: u64) -> Out {
     let s = fmt(f);
     let (lo, hi) = if signed {
         (

@@ -27,7 +27,7 @@ structure Claim where
 
 namespace Bindings
 
-/-- What `crates/fir/src/generated/contracts.rs` cites as `DCE_THEOREM`: every kind the
+/-- What `compiler/ir/src/generated/contracts.rs` cites as `DCE_THEOREM`: every kind the
 classification deletes is pure. -/
 theorem dce_classification : ∀ k, Fir.Dce.dcePerm k = .delete → Fir.Dce.PureKind k :=
   Fir.Dce.dcePerm_sound
