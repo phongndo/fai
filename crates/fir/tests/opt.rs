@@ -15,6 +15,7 @@
 //! on, and the lowering is optimized and compared the same way (with 16 times the fuel); the
 //! statistics count the programs with exceptions and their runs.
 //!
+//! `FIR_PASSES=p,q` tests that pipeline instead of `-O` (experimental passes included).
 //! By default 200 programs run; `FIR_FUZZ=N` runs N, `FIR_FUZZ_SEED=S` picks another seed (as in
 //! `fuzz.rs`). The test prints how often each pass fired and how the runs compared. Failing
 //! programs are written to `target/tmp/opt/`, with their optimized form. `FIR_REF=none` skips
@@ -94,11 +95,26 @@ fn refines(t: &Result<String, String>, s: &Result<String, String>) -> Result<Cmp
     }
 }
 
-/// Optimize a verified module with the default pipeline, verifying after every pass. Gives the
+/// The pipeline under test: the default `-O` one, or `FIR_PASSES=p,q,…` (run once each, in
+/// order; experimental passes allowed), so a new or experimental pass gets this whole
+/// differential suite without editing it. A full verification clears `FIR_PASSES`.
+fn pipeline() -> Pipeline {
+    match std::env::var("FIR_PASSES") {
+        Ok(spec) if !spec.is_empty() => Pipeline::parse_experimental(&spec).expect("FIR_PASSES"),
+        _ => Pipeline::default_opt(),
+    }
+}
+
+/// Whether the pipeline under test runs this pass.
+fn in_pipeline(name: &str) -> bool {
+    pipeline().passes.iter().any(|p| p.name == name)
+}
+
+/// Optimize a verified module with [`pipeline`], verifying after every pass. Gives the
 /// optimized module and the changes per pass, or what went wrong.
 fn optimize(m: &fir::Module) -> Result<(fir::Module, Vec<u64>), String> {
     let mut opt = m.clone();
-    let mut p = Pipeline::default_opt();
+    let mut p = pipeline();
     p.verify_each = true;
     let report = p
         .run(&mut opt, &mut Remarks::new(false))
@@ -346,7 +362,11 @@ fn optimized_random_programs_refine_the_originals() {
         fails.join("\n")
     );
     if count >= 200 {
-        for (p, (n, _)) in PASSES.iter().zip(&fired) {
+        for (p, (n, _)) in PASSES
+            .iter()
+            .zip(&fired)
+            .filter(|(p, _)| in_pipeline(p.name))
+        {
             assert!(*n > 0, "pass {} never fired on {count} programs", p.name);
         }
     }
@@ -586,7 +606,11 @@ fn optimized_memory_programs_refine_the_originals() {
         fails.len(),
         fails.join("\n")
     );
-    for (p, n) in PASSES.iter().zip(&fired) {
+    for (p, n) in PASSES
+        .iter()
+        .zip(&fired)
+        .filter(|(p, _)| in_pipeline(p.name))
+    {
         assert!(*n > 0, "pass {} never fired on the memory programs", p.name);
     }
 }

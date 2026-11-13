@@ -46,6 +46,7 @@ const CLEARED: &[&str] = &[
     "FIR_FUZZ",
     "FIR_FUZZ_SEED",
     "FIR_FUZZ_LEAN",
+    "FIR_PASSES",
     "FIR_ABI",
     "FIR_ABI_SEED",
     "FIR_SHOW_ADDRESS_DIFFS",

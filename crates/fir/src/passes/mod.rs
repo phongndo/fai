@@ -84,7 +84,35 @@ pub struct Pass {
     pub name: &'static str,
     /// One line on what it does, for `--help`-style listings.
     pub summary: &'static str,
+    /// What backs the rewrite. Only [`Assurance::Proved`] passes may be in [`DEFAULT`].
+    pub assurance: Assurance,
     pub run: PassFn,
+}
+
+/// What backs a pass's rewrite, shown by `fir opt --list-passes` and checked by pipelines.
+///
+/// `Proved` names the Lean theorem that proves the *relation* the pass's rewrites are instances
+/// of (per function, in a fixed module, for a `Decided` source; see the module docs for what
+/// composing them still assumes). It says nothing about the Rust code, which is tested.
+///
+/// `Experimental` passes are for trying ideas: unproved, tested at most, never in the default
+/// pipeline, and refused by [`Pipeline::parse`] unless the caller opts in
+/// ([`Pipeline::parse_experimental`], `fir opt --experimental`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Assurance {
+    /// The Lean theorem proving the rewrite relation.
+    Proved(&'static str),
+    /// Unproved: why it exists and how it is tested.
+    Experimental(&'static str),
+}
+
+impl fmt::Display for Assurance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Assurance::Proved(t) => write!(f, "proved relation ({t})"),
+            Assurance::Experimental(why) => write!(f, "EXPERIMENTAL, unproved ({why})"),
+        }
+    }
 }
 
 /// Every pass, by name.
@@ -92,21 +120,25 @@ pub const PASSES: &[Pass] = &[
     Pass {
         name: "dse",
         summary: "delete a store overwritten at once by a same-size store through the same pointer",
+        assurance: Assurance::Proved("Fir.Dse.refines"),
         run: PassFn::Func(|b, r, _| Ok(dse::run(b, r))),
     },
     Pass {
         name: "fwd",
         summary: "turn a load right after a store of its type through the same pointer into a copy",
+        assurance: Assurance::Proved("Fir.Fwd.refines"),
         run: PassFn::Func(|b, r, _| Ok(fwd::run(b, r))),
     },
     Pass {
         name: "copyprop",
         summary: "read %x for %y after %y = copy %x, up to the first op with regions or a call",
+        assurance: Assurance::Proved("Fir.CopyProp.refines"),
         run: PassFn::Func(|b, r, _| Ok(copyprop::run(b, r))),
     },
     Pass {
         name: "dce",
         summary: "delete pure ops whose results nothing reads",
+        assurance: Assurance::Proved("Fir.Dce.refines"),
         run: PassFn::Func(dce::run),
     },
 ];
@@ -329,11 +361,27 @@ impl Pipeline {
         p
     }
 
-    /// Passes by name, separated by commas: `dse,fwd,copyprop,dce`, run once each.
+    /// Passes by name, separated by commas: `dse,fwd,copyprop,dce`, run once each. Experimental
+    /// passes are refused: see [`Pipeline::parse_experimental`].
     pub fn parse(spec: &str) -> Result<Pipeline, String> {
+        Pipeline::parse_with(spec, false)
+    }
+
+    /// Like [`Pipeline::parse`], but experimental (unproved) passes are allowed too.
+    pub fn parse_experimental(spec: &str) -> Result<Pipeline, String> {
+        Pipeline::parse_with(spec, true)
+    }
+
+    fn parse_with(spec: &str, experimental: bool) -> Result<Pipeline, String> {
         let mut passes = Vec::new();
         for name in spec.split(',').map(str::trim).filter(|n| !n.is_empty()) {
             match pass(name) {
+                Some(p) if !experimental && matches!(p.assurance, Assurance::Experimental(_)) => {
+                    return Err(format!(
+                        "pass {name:?} is experimental (unproved); opt in to run it \
+                         (`fir opt --experimental`)"
+                    ));
+                }
                 Some(p) => passes.push(p),
                 None => {
                     let known: Vec<&str> = PASSES.iter().map(|p| p.name).collect();
@@ -347,8 +395,27 @@ impl Pipeline {
         Ok(Pipeline::new(passes))
     }
 
+    /// Whether any of the pipeline's passes is experimental.
+    pub fn is_experimental(&self) -> bool {
+        self.passes
+            .iter()
+            .any(|p| matches!(p.assurance, Assurance::Experimental(_)))
+    }
+
     /// Run the pipeline on a verified module.
     pub fn run(&self, m: &mut Module, remarks: &mut Remarks) -> Result<Report, PassError> {
+        self.run_observed(m, remarks, &mut ())
+    }
+
+    /// Run the pipeline, showing `observer` the module before and after every pass run (after
+    /// verification, when that is on). An observer's objection stops the pipeline with a
+    /// rejected [`PassError`]; the module then holds the step it objected to.
+    pub fn run_observed(
+        &self,
+        m: &mut Module,
+        remarks: &mut Remarks,
+        observer: &mut dyn Observer,
+    ) -> Result<Report, PassError> {
         let mut report = Report {
             rounds: 0,
             passes: self
@@ -370,6 +437,7 @@ impl Pipeline {
             report.rounds = round;
             let mut changed = 0;
             for (i, p) in self.passes.iter().enumerate() {
+                observer.before(p, round, m);
                 let start = Instant::now();
                 let n = run_pass(p, m, remarks, self.policy).map_err(|message| PassError {
                     pass: p.name,
@@ -385,6 +453,14 @@ impl Pipeline {
                 if self.verify_each {
                     check(m, p.name, round, &mut report.verify_time)?;
                 }
+                observer
+                    .after(p, round, n, m)
+                    .map_err(|message| PassError {
+                        pass: p.name,
+                        round,
+                        message,
+                        rejected: true,
+                    })?;
             }
             if !self.fixpoint || changed == 0 {
                 break;
@@ -393,6 +469,27 @@ impl Pipeline {
         Ok(report)
     }
 }
+
+/// Watches a [`Pipeline::run_observed`]: IR dumps before and after chosen passes, and external
+/// validation of each step (`fir opt --print-after`). Both methods see the whole
+/// module; an observer that needs the module before a pass clones it in [`Observer::before`].
+pub trait Observer {
+    /// `pass` is about to run in `round` (rounds count from 1).
+    fn before(&mut self, _pass: &Pass, _round: u32, _m: &Module) {}
+    /// `pass` ran in `round` and made `changes` changes; an error rejects the step.
+    fn after(
+        &mut self,
+        _pass: &Pass,
+        _round: u32,
+        _changes: u32,
+        _m: &Module,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Observes nothing.
+impl Observer for () {}
 
 /// Run one pass over the module; how many changes it made, or its checker's objection (naming
 /// the function).
@@ -545,8 +642,75 @@ mod tests {
     static BROKEN: Pass = Pass {
         name: "broken",
         summary: "deletes the function's func.ret",
+        assurance: Assurance::Experimental("a test of the verifier"),
         run: PassFn::Func(breaks),
     };
+
+    #[test]
+    fn experimental_passes_are_labeled_and_kept_out_of_the_default() {
+        let mut p = Pipeline::parse("dse").unwrap();
+        assert!(!p.is_experimental());
+        p.passes.push(&BROKEN);
+        assert!(p.is_experimental());
+        assert!(!Pipeline::default_opt().is_experimental());
+        for name in DEFAULT {
+            assert!(
+                matches!(pass(name).unwrap().assurance, Assurance::Proved(_)),
+                "{name}"
+            );
+        }
+        assert!(BROKEN.assurance.to_string().starts_with("EXPERIMENTAL"));
+    }
+
+    /// Records what it saw, and objects to the first run of `objects_to`.
+    struct Seen {
+        log: Vec<String>,
+        objects_to: &'static str,
+    }
+
+    impl Observer for Seen {
+        fn before(&mut self, pass: &Pass, round: u32, m: &Module) {
+            self.log
+                .push(format!("before {} {round} {}", pass.name, m.funcs.len()));
+        }
+        fn after(&mut self, pass: &Pass, round: u32, n: u32, _: &Module) -> Result<(), String> {
+            self.log.push(format!("after {} {round} {n}", pass.name));
+            if pass.name == self.objects_to {
+                return Err("no".to_owned());
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn observers_see_every_run_and_can_reject_a_step() {
+        let mut m = crate::parse_module(SRC).unwrap();
+        let mut seen = Seen {
+            log: Vec::new(),
+            objects_to: "",
+        };
+        Pipeline::parse("dse,dce")
+            .unwrap()
+            .run_observed(&mut m, &mut Remarks::new(false), &mut seen)
+            .unwrap();
+        assert_eq!(seen.log.len(), 4);
+        assert!(seen.log[0].starts_with("before dse 1"), "{:?}", seen.log);
+        assert!(seen.log[3].starts_with("after dce 1"), "{:?}", seen.log);
+        let mut m = crate::parse_module(SRC).unwrap();
+        let mut seen = Seen {
+            log: Vec::new(),
+            objects_to: "dse",
+        };
+        let e = Pipeline::parse("dse,dce")
+            .unwrap()
+            .run_observed(&mut m, &mut Remarks::new(false), &mut seen)
+            .unwrap_err();
+        assert_eq!(
+            (e.pass, e.rejected, e.message.as_str()),
+            ("dse", true, "no")
+        );
+        assert_eq!(seen.log.len(), 2, "dce never ran: {:?}", seen.log);
+    }
 
     #[test]
     fn names_the_pass_that_broke_the_module() {

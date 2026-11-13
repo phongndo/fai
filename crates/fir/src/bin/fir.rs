@@ -4,8 +4,11 @@
 //! fir run FILE [@FUNC] [ARG...] [--fuel N]   run a function (default @main)
 //! fir check FILE                             verify; list holes
 //! fir fmt FILE [--no-locs] [--unverified]     print canonical text (--unverified: parse only)
-//! fir opt FILE [-O | --passes P,...] [--remarks] [--stats] [--verify-each] [--no-locs]
+//! fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each]
+//!              [--no-locs] [--print-before P,...] [--print-after P,...] [--print-changed]
+//!              [--dump-dir DIR]
 //!                                            optimize, print canonical text
+//! fir opt --list-passes                      the passes, with what backs each
 //! fir compile FILE [-O] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]
 //!                                            compile to AArch64 (see `compile`)
 //! fir lower FILE [--no-locs]                  lower an HFIR module to MFIR and print it
@@ -23,10 +26,28 @@
 //! and `--stats` how often each pass fired and how long it took. Debug builds, or
 //! `--verify-each`, verify after every pass and name the pass that broke the module; the output
 //! is always verified.
+//!
+//! Observing a run: `--print-before P` and `--print-after P` print the module (to stderr, each
+//! after a `// ---- after P (round R): N changes ----` line) around every run of the passes named
+//! (`all` for every pass); `--print-changed` prints only after runs that changed something (all
+//! passes, unless `--print-after` names some). `--dump-dir DIR` writes the input and the module
+//! after every pass run to numbered files (`000-input.fir`, `001-r1-fwd.fir`, …; with
+//! `--print-changed`, only runs that changed something), to diff.
+//! Experimental passes (unproved; `--list-passes` labels each pass) run only with
+//! `--experimental`, and are never in `-O`. A FILE of `-` is standard input.
 
 use std::process::ExitCode;
 
 fn read(file: &str) -> Result<String, ExitCode> {
+    if file == "-" {
+        let mut s = String::new();
+        return std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)
+            .map(|_| s)
+            .map_err(|e| {
+                eprintln!("stdin: {e}");
+                ExitCode::FAILURE
+            });
+    }
     std::fs::read_to_string(file).map_err(|e| {
         eprintln!("{file}: {e}");
         ExitCode::FAILURE
@@ -96,44 +117,155 @@ fn run(args: &[&str]) -> Result<(), ExitCode> {
         }
         _ => {
             eprintln!(
-                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--remarks] [--stats] [--verify-each] [--no-locs]\n  fir compile FILE [-O] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]\n  fir lower FILE [--no-locs]"
+                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each] [--no-locs]\n         [--print-before P,...] [--print-after P,...] [--print-changed] [--dump-dir DIR]\n  fir opt --list-passes\n  fir compile FILE [-O] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]\n  fir lower FILE [--no-locs]"
             );
             Err(ExitCode::from(2))
         }
     }
 }
 
+/// IR dumps around chosen passes, for `fir opt --print-before/--print-after/--dump-dir`.
+struct Dumps {
+    before: Vec<String>,
+    after: Vec<String>,
+    changed_only: bool,
+    locs: bool,
+    dir: Option<std::path::PathBuf>,
+    seq: u32,
+}
+
+impl Dumps {
+    fn wants(list: &[String], pass: &str) -> bool {
+        list.iter().any(|p| p == "all" || p == pass)
+    }
+
+    fn write(&mut self, label: &str, m: &fir::Module) -> Result<(), String> {
+        if let Some(dir) = &self.dir {
+            let f = dir.join(format!("{:03}-{label}.fir", self.seq));
+            self.seq += 1;
+            std::fs::write(&f, m.render(self.locs)).map_err(|e| format!("{}: {e}", f.display()))?;
+        }
+        Ok(())
+    }
+}
+
+impl fir::passes::Observer for Dumps {
+    fn before(&mut self, pass: &fir::passes::Pass, round: u32, m: &fir::Module) {
+        if Dumps::wants(&self.before, pass.name) {
+            eprint!(
+                "// ---- before {} (round {round}) ----\n{}",
+                pass.name,
+                m.render(self.locs)
+            );
+        }
+    }
+
+    fn after(
+        &mut self,
+        pass: &fir::passes::Pass,
+        round: u32,
+        changes: u32,
+        m: &fir::Module,
+    ) -> Result<(), String> {
+        if Dumps::wants(&self.after, pass.name) && (changes > 0 || !self.changed_only) {
+            eprint!(
+                "// ---- after {} (round {round}): {changes} changes ----\n{}",
+                pass.name,
+                m.render(self.locs)
+            );
+        }
+        if changes > 0 || !self.changed_only {
+            self.write(&format!("r{round}-{}", pass.name), m)?;
+        }
+        Ok(())
+    }
+}
+
+fn list_passes() {
+    for p in fir::passes::PASSES {
+        let default = if fir::passes::DEFAULT.contains(&p.name) {
+            " [-O]"
+        } else {
+            ""
+        };
+        println!(
+            "{:<10}{default} {}\n           {}",
+            p.name, p.summary, p.assurance
+        );
+    }
+}
+
 fn opt(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     use fir::passes::{Pipeline, Remarks};
+    if file == "--list-passes" {
+        list_passes();
+        return Ok(());
+    }
     let fail = |e: String| {
         eprintln!("{file}: {e}");
         ExitCode::FAILURE
     };
-    let mut pipeline = Pipeline::default_opt();
-    let (mut remarks, mut stats, mut locs) = (false, false, true);
+    let (mut remarks, mut stats, mut locs, mut experimental) = (false, false, true, false);
+    let mut spec: Option<&str> = None;
+    let mut dumps = Dumps {
+        before: Vec::new(),
+        after: Vec::new(),
+        changed_only: false,
+        locs: true,
+        dir: None,
+        seq: 0,
+    };
     let mut it = opts.iter();
+    fn value<'a>(it: &mut std::slice::Iter<'_, &'a str>, o: &str) -> Result<&'a str, ExitCode> {
+        it.next().copied().ok_or_else(|| {
+            eprintln!("fir opt: {o} needs a value");
+            ExitCode::from(2)
+        })
+    }
     while let Some(&o) = it.next() {
         match o {
-            "-O" => pipeline = Pipeline::default_opt(),
-            "--passes" => {
-                let spec = it
-                    .next()
-                    .ok_or_else(|| fail("--passes needs a list".into()))?;
-                pipeline = Pipeline::parse(spec).map_err(fail)?;
-            }
+            "-O" => spec = None,
+            "--passes" => spec = Some(value(&mut it, o)?),
+            "--experimental" => experimental = true,
             "--remarks" => remarks = true,
             "--stats" => stats = true,
             "--verify-each" => {}
             "--no-locs" => locs = false,
+            "--print-before" => dumps
+                .before
+                .extend(value(&mut it, o)?.split(',').map(str::to_owned)),
+            "--print-after" => dumps
+                .after
+                .extend(value(&mut it, o)?.split(',').map(str::to_owned)),
+            "--print-changed" => dumps.changed_only = true,
+            "--dump-dir" => dumps.dir = Some(value(&mut it, o)?.into()),
             _ => return Err(fail(format!("unknown option {o}"))),
         }
+    }
+    dumps.locs = locs;
+    if dumps.changed_only && dumps.after.is_empty() && dumps.dir.is_none() {
+        dumps.after.push("all".to_owned());
+    }
+    let mut pipeline = match spec {
+        None => Pipeline::default_opt(),
+        Some(s) if experimental => Pipeline::parse_experimental(s).map_err(fail)?,
+        Some(s) => Pipeline::parse(s).map_err(fail)?,
+    };
+    if pipeline.is_experimental() {
+        eprintln!(
+            "{file}: warning: running experimental (unproved) passes; see `fir opt --list-passes`"
+        );
     }
     pipeline.verify_each = cfg!(debug_assertions) || opts.contains(&"--verify-each");
     let mut m = fir::parse_module(&read(file)?).map_err(fail)?;
     fir::verify_module(&m).map_err(fail)?;
+    if let Some(dir) = &dumps.dir {
+        std::fs::create_dir_all(dir).map_err(|e| fail(format!("{}: {e}", dir.display())))?;
+        dumps.write("input", &m).map_err(fail)?;
+    }
     let mut log = Remarks::new(remarks);
     let report = pipeline
-        .run(&mut m, &mut log)
+        .run_observed(&mut m, &mut log, &mut dumps)
         .map_err(|e| fail(e.to_string()))?;
     fir::verify_module(&m)
         .map_err(|e| fail(format!("the optimized module doesn't verify: {e}")))?;
