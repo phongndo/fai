@@ -88,7 +88,7 @@ addresses become offsets (MFIR computes offsets, per the Layout decision). Each 
 differential testing against the reference interpreter. Matching each Rust pass to its Lean proof
 by construction (certificates or generated matchers) comes after this round.
 
-**Progress:** the pass manager and the four passes are in `sdk/rust/src/passes/` (decision:
+**Progress:** the pass manager and the four passes are in `compiler/transforms/src/` (decision:
 Passes): `fir opt FILE [-O | --passes dse,fwd,copyprop,dce] [--remarks] [--stats]`, verifying
 after every pass in development builds. Optimized fixtures and random programs (including
 programs made to exercise the memory passes) refine the originals in `fir run` and still verify

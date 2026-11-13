@@ -1,4 +1,4 @@
-# cbindgen settings for include/fir.h; sdk/c/tests/header.rs regenerates the header
+# cbindgen settings for include/fir.h; sdk/c/tests/generated.rs regenerates the header
 # and fails if the checked-in one differs.
 language = "C"
 cpp_compat = true

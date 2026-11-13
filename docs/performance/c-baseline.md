@@ -352,7 +352,7 @@ The backend profile behind bottleneck 3 is outside the harness. To reproduce it 
 available on the build host, so callgrind):
 
 ```sh
-python3 -c 'import sys; sys.path.insert(0, "frontends/c/bench"); import cbench
+python3 -c 'import sys; sys.path.insert(0, "benchmarks/c"); import cbench
 for n in (400, 1600, 6400): open(f"one{n}.c", "w").write(cbench.synth(1, n))'
 for n in 400 1600 6400; do
   build/fcc/fcc one$n.c --emit hfir -o one$n.hfir && target/release/fir lower one$n.hfir > one$n.mfir
