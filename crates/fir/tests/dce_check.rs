@@ -8,6 +8,10 @@
 //! module. The receipt binds this evidence to both complete snapshots; this does not prove
 //! refinement when composing the changed functions into a different module.
 //!
+//! The same modules also go through the default `-O` pipeline, run to its fixed point, with
+//! every step of `dce` checked as it happens (`fir::passes::reference::CheckDce`, which
+//! `fir opt --check-dce` uses), so the configuration the compiler runs is checked too.
+//!
 //! Then the checkers themselves: candidates that delete an op whose result is read, or an unread
 //! op the contracts keep (a trapping add, `freeze`, a load, a store, `ptr.addr`, a call), must be
 //! refused by the Rust checker for that reason; the same deletions written out as modules must
@@ -157,6 +161,18 @@ fn check_one(tool: &Path, m: &fir::Module, name: &str, ev: &Evidence, fails: &Mu
                     .push(format!("{name}: fir-ref check-dce: {e}")),
             }
         }
+    }
+    // The production configuration: the `-O` pipeline to its fixed point, with every step of
+    // `dce` checked as it happens (`fir opt -O --check-dce`).
+    let mut m = m.clone();
+    let mut checker =
+        fir::passes::reference::CheckDce::new(tool, scratch().join(format!("{name}-pipeline")));
+    match Pipeline::default_opt().run_observed(&mut m, &mut Remarks::new(false), &mut checker) {
+        Ok(_) => {
+            ev.count("-O dce steps accepted by Fir.Dce.checkFunc", checker.steps);
+            ev.count("-O deletions accepted", checker.deletions);
+        }
+        Err(e) => fails.lock().unwrap().push(format!("{name}: -O: {e}")),
     }
 }
 
@@ -367,4 +383,50 @@ fn lean_receipts_cannot_be_reused_for_other_code_or_context() {
         let err = lean_check(&tool, &m, &other_file, "changed-file").unwrap_err();
         assert!(err.contains("source file changed"), "{err}");
     }
+}
+
+/// A `dce` that changes the module but says it changed nothing. It moves the function to
+/// another source file, which the verifier allows and the proved checker refuses.
+fn lies(m: &mut fir::Module, _: &mut Remarks, _: Policy) -> Result<u32, String> {
+    m.funcs[0].file = Some("elsewhere.fir".to_owned());
+    Ok(0)
+}
+
+static LYING_DCE: fir::passes::Pass = fir::passes::Pass {
+    name: "dce",
+    summary: "changes the module and reports no changes",
+    assurance: fir::passes::Assurance::Experimental("a test of CheckDce"),
+    run: fir::passes::PassFn::Module(lies),
+};
+
+/// `CheckDce` doesn't take a pass's word that a step changed nothing (found by review: it
+/// skipped any step reporting zero changes, so this one went unchecked).
+#[test]
+fn check_dce_checks_steps_that_report_no_changes_but_change_the_module() {
+    let Some(tool) = common::reference() else {
+        return;
+    };
+    let mut m = fir::parse_module(KEPT).unwrap();
+    let mut p = Pipeline::parse("dse").unwrap();
+    p.passes = vec![&LYING_DCE];
+    let mut checker = fir::passes::reference::CheckDce::new(tool, scratch().join("lying-dce"));
+    let err = p
+        .run_observed(&mut m, &mut Remarks::new(false), &mut checker)
+        .unwrap_err();
+    assert!(err.rejected, "{err}");
+    assert!(err.to_string().contains("source file changed"), "{err}");
+    assert_eq!(checker.unchanged, 0);
+    // An honest step that changes nothing is still not sent to the checker.
+    let mut m = fir::parse_module(KEPT).unwrap();
+    let mut p = Pipeline::parse("dce").unwrap();
+    p.fixpoint = false;
+    let mut checker = fir::passes::reference::CheckDce::new(
+        common::reference().unwrap(),
+        scratch().join("honest-dce"),
+    );
+    p.run_observed(&mut m, &mut Remarks::new(false), &mut checker)
+        .unwrap();
+    p.run_observed(&mut m, &mut Remarks::new(false), &mut checker)
+        .unwrap();
+    assert_eq!((checker.steps, checker.unchanged), (1, 1));
 }

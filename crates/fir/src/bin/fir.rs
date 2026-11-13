@@ -6,7 +6,7 @@
 //! fir fmt FILE [--no-locs] [--unverified]     print canonical text (--unverified: parse only)
 //! fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each]
 //!              [--no-locs] [--print-before P,...] [--print-after P,...] [--print-changed]
-//!              [--dump-dir DIR]
+//!              [--dump-dir DIR] [--check-dce FIR-REF]
 //!                                            optimize, print canonical text
 //! fir opt --list-passes                      the passes, with what backs each
 //! fir compile FILE [-O] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]
@@ -32,7 +32,9 @@
 //! (`all` for every pass); `--print-changed` prints only after runs that changed something (all
 //! passes, unless `--print-after` names some). `--dump-dir DIR` writes the input and the module
 //! after every pass run to numbered files (`000-input.fir`, `001-r1-fwd.fir`, …; with
-//! `--print-changed`, only runs that changed something), to diff.
+//! `--print-changed`, only runs that changed something), to diff. `--check-dce FIR-REF` runs the
+//! proved Lean checker (`fir-ref check-dce`) on every step of `dce` in this run and fails if it
+//! refuses one (`fir::passes::reference`); `--stats` then says how many it checked and the time.
 //! Experimental passes (unproved; `--list-passes` labels each pass) run only with
 //! `--experimental`, and are never in `-O`. A FILE of `-` is standard input.
 
@@ -117,7 +119,7 @@ fn run(args: &[&str]) -> Result<(), ExitCode> {
         }
         _ => {
             eprintln!(
-                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each] [--no-locs]\n         [--print-before P,...] [--print-after P,...] [--print-changed] [--dump-dir DIR]\n  fir opt --list-passes\n  fir compile FILE [-O] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]\n  fir lower FILE [--no-locs]"
+                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each] [--no-locs]\n         [--print-before P,...] [--print-after P,...] [--print-changed] [--dump-dir DIR] [--check-dce FIR-REF]\n  fir opt --list-passes\n  fir compile FILE [-O] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin]\n  fir lower FILE [--no-locs]"
             );
             Err(ExitCode::from(2))
         }
@@ -181,6 +183,30 @@ impl fir::passes::Observer for Dumps {
     }
 }
 
+/// Both observers in turn.
+struct Both<'a>(
+    &'a mut dyn fir::passes::Observer,
+    &'a mut dyn fir::passes::Observer,
+);
+
+impl fir::passes::Observer for Both<'_> {
+    fn before(&mut self, pass: &fir::passes::Pass, round: u32, m: &fir::Module) {
+        self.0.before(pass, round, m);
+        self.1.before(pass, round, m);
+    }
+
+    fn after(
+        &mut self,
+        pass: &fir::passes::Pass,
+        round: u32,
+        changes: u32,
+        m: &fir::Module,
+    ) -> Result<(), String> {
+        self.0.after(pass, round, changes, m)?;
+        self.1.after(pass, round, changes, m)
+    }
+}
+
 fn list_passes() {
     for p in fir::passes::PASSES {
         let default = if fir::passes::DEFAULT.contains(&p.name) {
@@ -196,7 +222,7 @@ fn list_passes() {
 }
 
 fn opt(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
-    use fir::passes::{Pipeline, Remarks};
+    use fir::passes::{Pipeline, Remarks, reference::CheckDce};
     if file == "--list-passes" {
         list_passes();
         return Ok(());
@@ -215,6 +241,7 @@ fn opt(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
         dir: None,
         seq: 0,
     };
+    let mut check_dce: Option<CheckDce> = None;
     let mut it = opts.iter();
     fn value<'a>(it: &mut std::slice::Iter<'_, &'a str>, o: &str) -> Result<&'a str, ExitCode> {
         it.next().copied().ok_or_else(|| {
@@ -239,6 +266,12 @@ fn opt(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
                 .extend(value(&mut it, o)?.split(',').map(str::to_owned)),
             "--print-changed" => dumps.changed_only = true,
             "--dump-dir" => dumps.dir = Some(value(&mut it, o)?.into()),
+            "--check-dce" => {
+                let tool = value(&mut it, o)?;
+                let dir =
+                    std::env::temp_dir().join(format!("fir-check-dce-{}", std::process::id()));
+                check_dce = Some(CheckDce::new(tool, dir));
+            }
             _ => return Err(fail(format!("unknown option {o}"))),
         }
     }
@@ -264,8 +297,13 @@ fn opt(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
         dumps.write("input", &m).map_err(fail)?;
     }
     let mut log = Remarks::new(remarks);
+    let mut none = ();
+    let checker: &mut dyn fir::passes::Observer = match &mut check_dce {
+        Some(c) => c,
+        None => &mut none,
+    };
     let report = pipeline
-        .run_observed(&mut m, &mut log, &mut dumps)
+        .run_observed(&mut m, &mut log, &mut Both(&mut dumps, checker))
         .map_err(|e| fail(e.to_string()))?;
     fir::verify_module(&m)
         .map_err(|e| fail(format!("the optimized module doesn't verify: {e}")))?;
@@ -274,6 +312,9 @@ fn opt(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     }
     if stats {
         eprint!("{report}");
+        if let Some(c) = &check_dce {
+            eprintln!("{}", c.summary());
+        }
     }
     print!("{}", m.render(locs));
     Ok(())

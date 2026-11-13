@@ -57,6 +57,7 @@ pub mod copyprop;
 pub mod dce;
 pub mod dse;
 pub mod fwd;
+pub mod reference;
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -93,7 +94,8 @@ pub struct Pass {
 ///
 /// `Proved` names the Lean theorem that proves the *relation* the pass's rewrites are instances
 /// of (per function, in a fixed module, for a `Decided` source; see the module docs for what
-/// composing them still assumes). It says nothing about the Rust code, which is tested.
+/// composing them still assumes). It says nothing about the Rust code: that is tested, and for
+/// `dce`, its outputs can also be checked by the proved checker (`fir opt --check-dce`).
 ///
 /// `Experimental` passes are for trying ideas: unproved, tested at most, never in the default
 /// pipeline, and refused by [`Pipeline::parse`] unless the caller opts in
@@ -471,7 +473,7 @@ impl Pipeline {
 }
 
 /// Watches a [`Pipeline::run_observed`]: IR dumps before and after chosen passes, and external
-/// validation of each step (`fir opt --print-after`). Both methods see the whole
+/// validation of each step (`fir opt --print-after`, `--check-dce`). Both methods see the whole
 /// module; an observer that needs the module before a pass clones it in [`Observer::before`].
 pub trait Observer {
     /// `pass` is about to run in `round` (rounds count from 1).

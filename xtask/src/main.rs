@@ -703,6 +703,12 @@ fn check_evidence(
     need(&mut bad, "dce_check", "random programs", Some(fuzz));
     need(
         &mut bad,
+        "dce_check",
+        "-O dce steps accepted by Fir.Dce.checkFunc",
+        None,
+    );
+    need(
+        &mut bad,
         "dce_adversarial",
         "refused by Fir.Dce.checkFunc",
         None,
