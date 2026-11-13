@@ -215,6 +215,7 @@ fn run_native(tc: &Toolchain, exe: &Path) -> Result<Behavior, String> {
 }
 
 /// What the interpreter's run of `main` gives.
+#[derive(Debug)]
 enum FirRun {
     /// The output helpers' events spelled out, and the returned value as an exit code.
     Ran(Behavior),
@@ -222,12 +223,35 @@ enum FirRun {
     Calls(String),
 }
 
-/// The interpreter's run of `main`, as a native run's behavior.
+/// The interpreter's run of `main` in the HFIR `fai-cc` printed, as a native run's behavior.
 fn run_fir(hfir: &str) -> Result<FirRun, String> {
     let m = fir::parse_module(hfir).map_err(|e| format!("the HFIR doesn't parse: {e}"))?;
     fir::verify_module(&m).map_err(|e| format!("the HFIR doesn't verify: {e}"))?;
+    run_module(&m)
+}
+
+/// The program at every layer below HFIR, as `fir compile` makes them: MFIR as lowered, MFIR
+/// after `-O`, and LFIR for AArch64 before and after register allocation.
+fn layers(hfir: &fir::Module) -> Result<Vec<(&'static str, fir::Module)>, String> {
+    use fir::backend::aarch64 as a64;
+    let mfir = fir::backend::prepare(hfir, false)?;
+    let opt = fir::backend::prepare(hfir, true)?;
+    let mut mm = a64::select(&opt)?;
+    let vregs = a64::lfir::to_module(&opt, &mm);
+    a64::allocate(&opt, &mut mm)?;
+    let lfir = a64::lfir::to_module(&opt, &mm);
+    Ok(vec![
+        ("mfir", mfir),
+        ("mfir -O", opt),
+        ("lfir-vregs", vregs),
+        ("lfir", lfir),
+    ])
+}
+
+/// The interpreter's run of `main` in `m` (any layer), as a native run's behavior.
+fn run_module(m: &fir::Module) -> Result<FirRun, String> {
     let r = fir::interp::run_detail_with(
-        &m,
+        m,
         "main",
         &[],
         2_000_000_000,
@@ -286,6 +310,8 @@ struct Tally {
     native: usize,
     native_opt: usize,
     fir_match: usize,
+    /// Programs whose run also matched at MFIR, MFIR -O, and LFIR before and after allocation.
+    layers_match: usize,
     fir_other_externs: Vec<String>,
     failures: Vec<String>,
 }
@@ -402,7 +428,31 @@ fn one(file: &Path, fai: &Path, tc: &Toolchain, rt: &Path, out: &Path, tally: &M
         false
     } else {
         match run_fir(&String::from_utf8_lossy(&hfir.stdout)) {
-            Ok(FirRun::Ran(got)) if got == want => true,
+            Ok(FirRun::Ran(got)) if got == want => {
+                // The same run at every layer below: the vertical slice through lowering,
+                // the passes, instruction selection, and register allocation, each layer run
+                // by the interpreter (LFIR on the AArch64 machine), under the same NaN rule.
+                let m = fir::parse_module(&String::from_utf8_lossy(&hfir.stdout)).unwrap();
+                match layers(&m) {
+                    Err(e) => fail(format!("lowering or compiling for the layer runs: {e}")),
+                    Ok(ls) => {
+                        let mut all = true;
+                        for (layer, lm) in &ls {
+                            match run_module(lm) {
+                                Ok(FirRun::Ran(got)) if got == want => {}
+                                other => {
+                                    all = false;
+                                    fail(format!(
+                                        "{layer}: fir run gives {other:?}, the reference {want:?}"
+                                    ));
+                                }
+                            }
+                        }
+                        tally.lock().unwrap().layers_match += usize::from(all);
+                    }
+                }
+                true
+            }
             Ok(FirRun::Ran(got)) => {
                 fail(format!("fir run gives {got:?}, the reference {want:?}"));
                 false
@@ -530,12 +580,13 @@ fn fai_cc_corpus() {
     t.fir_other_externs.sort();
     eprintln!(
         "fai-cc corpus: {} programs; native runs matching the reference: {} without -O, {} with \
-         -O; fir run matching: {}, not comparable: {} (calling other external functions: {}); \
+         -O; fir run matching: {} (and at every lower layer: {}), not comparable: {} (calling other external functions: {}); \
          error tests: {}",
         t.programs,
         t.native,
         t.native_opt,
         t.fir_match,
+        t.layers_match,
         t.fir_other_externs.len(),
         t.fir_other_externs.join(", "),
         errors
