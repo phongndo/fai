@@ -42,6 +42,7 @@ const CLEARED: &[&str] = &[
     "FIR_GEN_RUST",
     "FIR_GEN_BUILDER",
     "FIR_CC",
+    "FIR_CC_X86_64",
     "FIR_CAPI_SANITIZE",
     "FIR_FUZZ",
     "FIR_FUZZ_SEED",
@@ -803,6 +804,56 @@ fn check_evidence(
             "dce steps accepted by Fir.Dce.checkModule",
             None,
         );
+        // The same corpus for x86-64: every program run or refused for a declared limitation
+        // (the suite fails on any other refusal, and on a required program that didn't run),
+        // and every one that ran matched natively, without and with -O, its -O build checked.
+        match evs.get("fcc_x86_64_corpus") {
+            None => {
+                bad.push("fcc_x86_64_corpus: no evidence (the x86-64 C corpus didn't run)".into())
+            }
+            Some(ev) => {
+                let corpus = std::fs::read_dir(root.join("frontends/c/tests"))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "c"))
+                    .count() as u64;
+                let ran = count(ev, "programs run");
+                let built = count(ev, "-O builds checked by Fir.Dce.checkModule");
+                let native = count(ev, "native runs matching the reference");
+                let native_opt = count(ev, "native -O runs matching the reference");
+                if corpus == 0
+                    || count(ev, "programs") != corpus
+                    || ran == 0
+                    || built != ran
+                    || native != ran
+                    || native_opt != ran
+                {
+                    bad.push(format!(
+                        "fcc_x86_64_corpus: {} programs of {corpus} in frontends/c/tests \
+                         accounted for; of the {ran} run, {native} matching natively, \
+                         {native_opt} with -O, and {built} -O builds checked by \
+                         Fir.Dce.checkModule",
+                        count(ev, "programs")
+                    ));
+                }
+                if count(ev, "failures") > 0 {
+                    bad.push(format!(
+                        "fcc_x86_64_corpus: {} failures",
+                        count(ev, "failures")
+                    ));
+                }
+                for sk in ev["skipped"].as_array().into_iter().flatten() {
+                    bad.push(format!("fcc_x86_64_corpus: skipped {sk}"));
+                }
+            }
+        }
+        need(
+            &mut bad,
+            "fcc_x86_64_corpus",
+            "dce steps accepted by Fir.Dce.checkModule",
+            None,
+        );
     }
     need(&mut bad, "dce_agreement", "both accepted", None);
     need(&mut bad, "dce_agreement", "both refused", None);
@@ -1270,6 +1321,52 @@ mod evidence_tests {
             "{:?}",
             corpus_problems(0)
         );
+    }
+
+    /// Found in review: the x86-64 corpus could be skipped (no toolchain, or `FIR_CC_X86_64`
+    /// naming none) without the gate noticing. Its evidence is required, against the corpus on
+    /// disk, with every program that ran also checked, run natively, and matching.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_x86_64_corpus_is_required_and_checked() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let corpus = std::fs::read_dir(root.join("frontends/c/tests"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "c"))
+            .count() as u64;
+        let x86_problems = |ev: Option<Value>| {
+            let evs = ev
+                .map(|ev| BTreeMap::from([("fcc_x86_64_corpus".to_owned(), ev)]))
+                .unwrap_or_default();
+            check_evidence(&root, &evs, None, None)
+                .0
+                .into_iter()
+                .filter(|b| b.starts_with("fcc_x86_64_corpus"))
+                .collect::<Vec<_>>()
+        };
+        let ev = |programs: u64, checked: u64| {
+            json!({"counts": {
+                "programs": programs,
+                "programs run": 10,
+                "native runs matching the reference": 10,
+                "native -O runs matching the reference": 10,
+                "-O builds checked by Fir.Dce.checkModule": checked,
+                "dce steps accepted by Fir.Dce.checkModule": 1,
+            }})
+        };
+        assert!(
+            x86_problems(Some(ev(corpus, 10))).is_empty(),
+            "{:?}",
+            x86_problems(Some(ev(corpus, 10)))
+        );
+        assert!(
+            x86_problems(None).iter().any(|b| b.contains("no evidence")),
+            "{:?}",
+            x86_problems(None)
+        );
+        assert!(!x86_problems(Some(ev(corpus, 9))).is_empty());
+        assert!(!x86_problems(Some(ev(corpus - 1, 10))).is_empty());
     }
 
     /// Found in review: evidence a previous run left behind satisfied the check when the suite

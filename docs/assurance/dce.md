@@ -168,6 +168,7 @@ cargo run --bin fir -- compile FILE -O --check-dce spec/.lake/build/bin/fir-ref 
 fcc FILE.c -O --check-dce spec/.lake/build/bin/fir-ref -o a.out
 cargo test -p fir --test dce_check                  # the checker on fixtures, random programs, -O
 cargo test -p fir-capi --test fcc -- fcc_corpus --nocapture   # the C corpus, checked
+cargo test -p fir-capi --test fcc -- fcc_x86_64_corpus --nocapture   # the same on x86-64
 cd spec && lake exe fir-audit --lock ../docs/assurance/proofs.lock.json   # the claims
 ```
 

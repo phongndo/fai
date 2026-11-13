@@ -6,7 +6,8 @@
 //! (`Fir.Dce.checkModule`; `docs/assurance/dce.md` says what that does and doesn't establish).
 //! Without a reference (or with `FIR_REF=none`) they build unchecked, which `FIR_REQUIRE_FULL=1`
 //! refuses. The evidence (`fcc_corpus`) counts the checked builds and steps. The x86-64 corpus
-//! (`fcc_x86_64_corpus`, below) checks its `-O` builds the same way. The ABI torture test below
+//! (`fcc_x86_64_corpus`, below) checks its `-O` builds the same way, and its evidence
+//! (`fcc_x86_64_corpus`) counts them too. The ABI torture test below
 //! doesn't check its `-O` builds.
 //!
 //! Builds `fcc` with CMake against this crate's static library, then compiles every program
@@ -1059,9 +1060,10 @@ fn fcc_x86_64_corpus() {
         return;
     }
     let Some(tc) = x86_toolchain() else {
-        eprintln!(
+        // `FIR_REQUIRE_FULL=1` refuses to skip it, as for AArch64's toolchain.
+        evidence::require(
             "fcc x86-64: no x86-64 Linux C compiler and runner (an x86-64 Linux host, or \
-             x86_64-unknown-linux-gnu-cc and qemu-x86_64), so the x86-64 corpus doesn't run"
+             x86_64-unknown-linux-gnu-cc and qemu-x86_64), so the x86-64 corpus doesn't run",
         );
         return;
     };
@@ -1129,6 +1131,22 @@ fn fcc_x86_64_corpus() {
         t.dce_steps,
         t.dce_deletions
     );
+    // Every program is accounted for, run or refused for a declared limitation (a program that
+    // failed is neither), so `cargo xtask verify` can compare with the corpus on disk.
+    let ev = evidence::Evidence::new("fcc_x86_64_corpus");
+    ev.count("programs", (t.ran.len() + t.refused.len()) as u64);
+    ev.count("programs run", t.ran.len() as u64);
+    ev.count("refused for declared limitations", t.refused.len() as u64);
+    ev.count("native runs matching the reference", t.native as u64);
+    ev.count("native -O runs matching the reference", t.native_opt as u64);
+    ev.count(
+        "-O builds checked by Fir.Dce.checkModule",
+        t.dce_checked_builds as u64,
+    );
+    ev.count("dce steps accepted by Fir.Dce.checkModule", t.dce_steps);
+    ev.count("dce deletions (the pass's count)", t.dce_deletions);
+    ev.count("failures", t.failures.len() as u64);
+    ev.write();
     assert!(
         t.failures.is_empty(),
         "{} failures:\n{}",
