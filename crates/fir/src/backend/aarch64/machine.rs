@@ -11,9 +11,9 @@
 //! caller-saved registers zero (the oracle's choice).
 
 use super::*;
-use crate::backend::aarch64::abi::{self, ArgLoc, PassKind};
 use crate::body::StrId;
 use crate::decl::Imm;
+use crate::dialect::aarch64::abi::{self, ArgLoc, PassKind};
 use crate::float::NanRule;
 
 /// The callee-saved registers, as Lean's `calleeSaved` lists them.

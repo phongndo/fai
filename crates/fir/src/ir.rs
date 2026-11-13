@@ -7,10 +7,10 @@
 
 use std::fmt;
 
-pub use crate::backend::aarch64::syntax::{
+use crate::body::IntId;
+pub use crate::dialect::aarch64::syntax::{
     AluImmOp, AluOp, Cond, CselOp, FAluOp, FSize, FUnaryOp, MemSize, MovOp, Reg, Sf, ShiftImmOp,
 };
-use crate::body::IntId;
 pub use crate::globals::{Globals, Init};
 pub use crate::ops::OpKind;
 pub use crate::sem::TrapReason;

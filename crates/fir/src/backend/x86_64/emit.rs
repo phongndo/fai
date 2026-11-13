@@ -11,14 +11,14 @@
 //! the output links into position-independent executables. Every output defines a weak
 //! `__fir_trap` that executes `ud2` (a program or the test harness defines its own, which gets
 //! `__fir_trap(reason, line, col)` with the reason codes of
-//! `crate::backend::aarch64::emit::trap_code`), and a weak, zeroed `__fir_exn` when its code uses
+//! `crate::codegen::trap_code`), and a weak, zeroed `__fir_exn` when its code uses
 //! the exception slot.
 
 use std::fmt::Write;
 
 use super::mir::*;
-use crate::backend::aarch64::emit::trap_code;
-use crate::backend::data::quote;
+use crate::codegen::data::quote;
+use crate::codegen::trap_code;
 use crate::ir::Module;
 
 /// How to emit a module.
@@ -378,7 +378,7 @@ pub fn emit(m: &Module, mm: &MModule, o: &Options) -> String {
         e.line(format_args!(".quad 0, 0"));
     }
     let data =
-        crate::backend::data::globals(m, &|name, own| e.sym(name, own), &o.extern_prefix, false);
+        crate::codegen::data::globals(m, &|name, own| e.sym(name, own), &o.extern_prefix, false);
     e.out.push_str(&data);
     e.out
         .push_str("\n\t.section .note.GNU-stack,\"\",@progbits\n");

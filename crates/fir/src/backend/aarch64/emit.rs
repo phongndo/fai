@@ -78,18 +78,6 @@ impl Default for Options {
     }
 }
 
-pub fn trap_code(r: TrapReason) -> u32 {
-    match r {
-        TrapReason::Div0 => 0,
-        TrapReason::Overflow => 1,
-        TrapReason::Shift => 2,
-        TrapReason::Oom => 3,
-        TrapReason::Bounds => 4,
-        TrapReason::Tag => 5,
-        TrapReason::Convert => 6,
-    }
-}
-
 /// The `.file` that instructions without a source location are attributed to, with
 /// [`Options::debug_lines`].
 pub const NO_SOURCE: &str = "<fir: no source>";
@@ -104,7 +92,8 @@ struct Emitter<'a> {
     at: Option<(usize, u32, u32)>,
 }
 
-use crate::backend::data::quote;
+use crate::codegen::data::quote;
+pub use crate::codegen::trap_code;
 
 const XREGS: [&str; 31] = [
     "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14",
@@ -649,7 +638,7 @@ impl Emitter<'_> {
 
     fn globals(&mut self) {
         let darwin = self.o.os == Os::Darwin;
-        let text = crate::backend::data::globals(
+        let text = crate::codegen::data::globals(
             self.m,
             &|name, own| self.sym(name, own),
             &self.o.extern_prefix,

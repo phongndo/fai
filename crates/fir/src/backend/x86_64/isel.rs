@@ -164,7 +164,7 @@ impl<'a> ModuleCx<'a> {
             m,
             funcs,
             globals,
-            throws: crate::backend::aarch64::isel::may_throw(m),
+            throws: crate::codegen::may_throw(m),
         }
     }
 

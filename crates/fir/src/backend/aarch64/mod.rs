@@ -11,14 +11,14 @@
 //! see the decision log (LFIR for AArch64, Calling convention, C ABI for aggregates), [`abi`] and
 //! its twin in Lean, `Fir.AArch64Abi`, and [`machine`]'s, `Fir.AArch64Machine`.
 
-pub mod abi;
+pub use crate::dialect::aarch64::abi;
 pub mod emit;
 pub mod isel;
 pub mod lfir;
 pub mod mir;
 pub mod regalloc;
 pub mod regcheck;
-pub mod syntax;
+pub use crate::dialect::aarch64::syntax;
 
 pub use emit::{Options, Os};
 

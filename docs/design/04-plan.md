@@ -650,7 +650,7 @@ included, tested against a reference compiler. Decisions: x86-64 target, x86-64 
   System V's integer convention (six argument registers, stack slots, `rax`/`rdx` results, results
   in memory through `rdi`); linear-scan allocation with spilling, its assignment checked on every
   function; GNU assembly for ELF, PIC (external calls through the PLT, their addresses through the
-  GOT). Global data is emitted by code now shared with AArch64 (`backend/data.rs`).
+  GOT). Global data is emitted by code now shared with AArch64 (`codegen/data.rs`).
 - **Drivers:** `fir compile --target x86_64`, `fir_module_compile(m, "x86_64", …)` (C API 1.6),
   `fcc --target x86_64` (Clang parses for `x86_64-unknown-linux-gnu`, so `char` is signed and
   `long double` is x87's, which is refused; links with `cc` on an x86-64 host).

@@ -121,11 +121,4 @@ pub enum Lowering {
 /// A component's declaration of what it does with each kind.
 pub type SupportFn = fn(OpKind) -> Support;
 
-/// The components that declare their support, by name, for reports and `tests/contracts.rs`.
-pub fn components() -> [(&'static str, SupportFn); 3] {
-    [
-        ("interp", crate::interp::support),
-        ("isel.aarch64", crate::backend::aarch64::isel::support),
-        ("isel.x86_64", crate::backend::x86_64::isel::support),
-    ]
-}
+pub use crate::driver::components;

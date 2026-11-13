@@ -61,6 +61,7 @@
 //! pending exception: a plain call then returns at once, leaving it pending for its own caller,
 //! and a `func.invoke` takes it (`aarch64.exn.take`) and jumps to its handler block with it.
 
+pub use crate::codegen::may_throw;
 use rustc_hash::FxHashMap;
 
 use super::abi::{self, ArgLoc};
@@ -103,55 +104,6 @@ pub struct ModuleCx<'a> {
     /// Which of the module's functions may return with an exception pending
     /// ([`may_throw`]); external functions never do.
     pub throws: Vec<bool>,
-}
-
-/// Which functions of a module may throw out of themselves: those with an `exn.throw`, a plain
-/// call to one that may, or an indirect call when any function may (a `func.invoke` catches
-/// what its callee throws). The least fixed point, so code without throws gets no checks.
-pub fn may_throw(m: &Module) -> Vec<bool> {
-    let names: FxHashMap<&str, usize> = m
-        .funcs
-        .iter()
-        .enumerate()
-        .map(|(i, f)| (f.name.as_str(), i))
-        .collect();
-    // Each function's own throws, direct callees (plain calls), and whether it calls indirectly.
-    let mut own = vec![false; m.funcs.len()];
-    let mut callees: Vec<Vec<usize>> = vec![Vec::new(); m.funcs.len()];
-    let mut indirect = vec![false; m.funcs.len()];
-    for (i, f) in m.funcs.iter().enumerate() {
-        let b = &f.body;
-        let mut stack = vec![b.entry()];
-        while let Some(r) = stack.pop() {
-            for op in b.ops(r) {
-                match b.kind(op) {
-                    OpKind::Throw => own[i] = true,
-                    OpKind::Call { callee } => {
-                        if let Some(&g) = names.get(b.str(callee)) {
-                            callees[i].push(g);
-                        }
-                    }
-                    OpKind::CallIndirect(_) => indirect[i] = true,
-                    _ => {}
-                }
-                stack.extend_from_slice(b.regions(op));
-            }
-        }
-    }
-    let mut throws = own;
-    loop {
-        let any = throws.iter().any(|&t| t);
-        let mut changed = false;
-        for i in 0..throws.len() {
-            if !throws[i] && ((indirect[i] && any) || callees[i].iter().any(|&g| throws[g])) {
-                throws[i] = true;
-                changed = true;
-            }
-        }
-        if !changed {
-            return throws;
-        }
-    }
 }
 
 impl<'a> ModuleCx<'a> {

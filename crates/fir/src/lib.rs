@@ -53,11 +53,24 @@
 pub mod backend;
 mod body;
 pub mod builder;
+pub mod codegen;
 pub mod contract;
 #[path = "generated/builder.rs"]
 #[rustfmt::skip]
 mod builder_ops;
 mod decl;
+/// What the one op table needs from the `aarch64` LFIR dialect: its registers and the modifiers
+/// its op names spell ([`dialect::aarch64::syntax`]), and AAPCS64's placement of values
+/// ([`dialect::aarch64::abi`]), by which the machine model runs calls. Both mirror Lean
+/// (`spec/Fir/AArch64Syntax.lean`, `spec/Fir/AArch64Abi.lean`); the compiler for the target is
+/// [`backend::aarch64`].
+pub mod dialect {
+    pub mod aarch64 {
+        pub mod abi;
+        pub mod syntax;
+    }
+}
+mod driver;
 #[path = "generated/contracts.rs"]
 #[rustfmt::skip]
 mod generated_contracts;
