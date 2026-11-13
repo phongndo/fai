@@ -262,6 +262,8 @@ under AddressSanitizer in the full one. No noisy lint groups were enabled.
 | HFIR lowering: scalarization, `cf.try`, the module | **open**; tested | `tests/lower.rs` against `fir-ref lower` and runs |
 | Interpreter (Rust) vs Lean semantics | tested | `tests/run.rs`, `tests/fuzz.rs`, LFIR runs in `tests/aarch64.rs` |
 | Instruction selection | tested | LFIR runs in both interpreters, native runs |
+| What "LFIR refines MFIR" means | **not defined in Lean**: `Fir.AArch64Machine` has no behaviors or refinement; the tests' comparison is the only statement | `tests/aarch64.rs` ([layers-as-built.md](../design/layers-as-built.md#4-mfir--lfir-what-selection-and-allocation-keep-change-and-lose)) |
+| Stack exhaustion | **not modeled as a limit**: HFIR and MFIR stacks are unbounded; the LFIR machine's is 1 MiB, and running past it is `ub out-of-bounds`; native code's is the OS's | none ([layers-as-built.md](../design/layers-as-built.md#6-gaps), G8) |
 | C ABI: structs and arrays by value (AAPCS64) | registers carry a composite's defined bytes exactly: **proved** (`Fir.AArch64.roundTrip`, `pieces_flatten`); the classification against C: tested | `tests/abi.rs` (random signatures against GCC, both directions and `...`), `tests/capi/e2e.c`, native fixture runs |
 | Register allocation and frame lowering | checked on every compile (unproved validator, ABI assumptions) | `regcheck::validate` |
 | Assembly text and encoding | tested | native runs under qemu |

@@ -70,10 +70,16 @@ AArch64) and can be reproduced with the commands given.
 | G2 | With `valist 8:8`, `va.start` wrote AAPCS64's 32 bytes into an 8-byte `va_list`, over the frame: 42 in HFIR and MFIR, `stuck: @first doesn't preserve x29` in LFIR, a segfault natively; the allocation validator's assumption (program accesses never reach the save area) hid it | **fixed**, same check |
 | G3 | An MFIR `cf.if` yielding a struct passes both verifiers, then selection refuses it with "HFIR only: lower the module to MFIR first" though it is MFIR | open: MFIR has no written legality contract per target |
 | G4 | `int.add.overflow.s` on `i64` lowers to `i65` ops that verify, then selection refuses them | open |
-| G5 | A source value named like a lowering temporary (`%.e0`) makes the lowering fail to verify (Rust and Lean alike) | open (refused, not miscompiled) |
+| G5 | A source value named like a lowering temporary (`%.e0`), or like a scalarized part (`%s.1` beside an aggregate `%s`), makes the lowering fail to verify (Rust and Lean alike) | open (refused, not miscompiled) |
 | G6 | Facts are dropped by selection, so `check` facts never become checks | open; the design says they become instructions |
 | G7 | `tests/lower.rs` skips runs whose arguments don't parse at both layers, so functions whose signatures scalarization changes are never compared there | open |
 | — | `docs/design/01-layers.md` describes the target (proved lowering, SMT-checked selection, a proved allocation checker, scheduling, MFIR without building blocks), not what exists | a note there now points to `README.md#guarantees`, which is accurate |
+
+Later work found G8 (HFIR and MFIR stacks are unbounded, LFIR's and native code's are not), G9
+(MFIR's verifier accepts composite region state and holes, the cause of G3), G10, G11 (the
+lowering drops holes of empty composites), and G12 (`fir compile --os darwin` skips the macOS
+checks). They, what each layer means, and proposed shared-IR changes are in
+[layers-as-built.md](../design/layers-as-built.md#6-gaps).
 
 The real programs (`unions`, `struct_calls`, `switches`, `float_aggregates`, `linked_list`,
 `goto` from `frontends/c/tests`) found none of these: their Rust and Lean lowerings are
