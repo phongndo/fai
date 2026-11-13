@@ -40,7 +40,6 @@ name = "fai-interp"
 version = "0.1.0"
 dependencies = [
  "fai-ir",
- "fir",
  "num-bigint",
  "rustc-hash",
 ]
@@ -81,7 +80,6 @@ version = "0.1.0"
 dependencies = [
  "fai-codegen",
  "fai-ir",
- "fir",
  "num-bigint",
  "rustc-hash",
 ]

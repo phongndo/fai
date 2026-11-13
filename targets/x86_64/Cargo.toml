@@ -12,9 +12,5 @@ fai-ir = { path = "../../compiler/ir" }
 num-bigint = "0.4"
 rustc-hash = "2"
 
-# The examples in the docs are written against the supported interface, the `fir` crate.
-[dev-dependencies]
-fir = { path = "../../sdk/rust" }
-
 [lints]
 workspace = true
