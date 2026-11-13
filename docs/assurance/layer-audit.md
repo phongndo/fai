@@ -331,7 +331,7 @@ right about.
 
 - `compiler/transforms/src/lib.rs`: `Assurance`, `Observer`, `run_observed`,
   `parse_experimental`; `passes/reference.rs`: `CheckDce`.
-- `crates/fir/src/bin/fir.rs`: `fir opt` observation flags, `--list-passes`, `--check-dce`,
+- `tools/fir/main.rs`: `fir opt` observation flags, `--list-passes`, `--check-dce`,
   `fir compile -g`, `-` for standard input.
 - `targets/aarch64/src/isel.rs`: the data layout check (G1, G2);
   `emit.rs`: line info.

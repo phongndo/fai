@@ -4,7 +4,7 @@
 Linux binaries (`--target x86_64`, below). Clang parses and type-checks the C (preprocessor and
 system headers included) for `aarch64-unknown-linux-gnu` (or `x86_64-unknown-linux-gnu`), so
 sizes, layouts, and `char`'s signedness (unsigned on AArch64, signed on x86-64) are the target's.
-`fcc` lowers Clang's AST to HFIR through FIR's C API only (`crates/fir-capi/include/fir.h`),
+`fcc` lowers Clang's AST to HFIR through FIR's C API only (`sdk/c/include/fir.h`),
 verifies it, compiles it with `fir_module_compile` (which lowers HFIR to MFIR, and runs the proved
 passes with `-O`), and links it with the target's C compiler, as `fir compile` does.
 

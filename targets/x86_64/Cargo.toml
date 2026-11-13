@@ -14,7 +14,7 @@ rustc-hash = "2"
 
 # The examples in the docs are written against the supported interface, the `fir` crate.
 [dev-dependencies]
-fir = { path = "../../crates/fir" }
+fir = { path = "../../sdk/rust" }
 
 [lints]
 workspace = true

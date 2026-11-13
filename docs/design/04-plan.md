@@ -62,7 +62,7 @@ M and F run in parallel; then N; then V and A one after the other (both change t
 ## C frontend (tracks F and F2)
 
 - `frontends/c/`: `fcc` in C++ against Clang's LibTooling, built with CMake from the dev shell
-  (which adds the LLVM/Clang libraries), linking `crates/fir-capi`'s static library. It builds
+  (which adds the LLVM/Clang libraries), linking `sdk/c`'s static library. It builds
   modules only through `fir.h`; if the C API is missing something, the track adds it to the API.
 - `fcc FILE.c [-O] [-o OUT] [--emit hfir|mfir|asm] [clang flags…]`: parse and type-check with
   Clang (preprocessor and headers included), lower the AST to HFIR, verify, then compile through
@@ -492,7 +492,7 @@ Instruction selection, Backend testing, Builder API, API.
   and UB for a wrong type; an MFIR module making, inserting into, and passing composites: 23 run
   lines); `fir-ref test`, `fir run`, the lowering, and native
   runs under qemu (with and without `-O`, and the LFIR before and after allocation in both
-  machines) agree. `crates/fir/tests/abi.rs` is the ABI torture test: random signatures (up to
+  machines) agree. `tests/rust/abi.rs` is the ABI torture test: random signatures (up to
   12 arguments, structs of `i8`…`i64`, `f32`, `f64`, `ptr`, arrays, nested, packed, and 16-byte
   aligned structs, HFAs of 1 to 4 members) compiled by the cross GCC and FIR, each side calling
   the other directly and through `...`, every leaf reported and compared; 25 seeds of 1,000
@@ -612,7 +612,7 @@ Decisions: C frontend (by-value mapping), C struct layout (empty structs), C fro
   (`struct_extern` joins the 9 that call other external functions); 13 error tests. A one-off
   run of the corpus compiled by Clang 23 (`-O1 -ffp-contract=off` for AArch64, glibc's headers,
   GCC's linker) printed what GCC's binaries print for all 67.
-- **ABI torture** (`fcc_abi_torture` in `crates/fir-capi/tests/fcc.rs`): random C
+- **ABI torture** (`fcc_abi_torture` in `sdk/c/tests/fcc.rs`): random C
   signatures (up to 14 parameters and a result; structs and unions of every scalar type, arrays,
   nesting, bitfields with zero-width ones, HFA candidates through arrays, nesting, and unions,
   `_Alignas(16)` members, `aligned(8)` and `aligned(16)` attributes, empty structs, pointers)
@@ -658,7 +658,7 @@ included, tested against a reference compiler. Decisions: x86-64 target, x86-64 
   `va_list` too), structs and unions by value, `char`/`short`/`_Bool` arguments to C functions
   (C expects them extended by a signedness FIR's types don't carry), data layouts other than
   System V's (as AArch64 refuses all but AAPCS64's), and macOS.
-- **Tests:** `crates/fir/tests/x86_64.rs`: every fixture's comparable runs natively against
+- **Tests:** `tests/rust/x86_64.rs`: every fixture's comparable runs natively against
   `fir run` (265 runs match, 106 more with `-O`, traps and exceptions included, none differ), and
   random integer programs (100 by default; 3,000 on each of seeds 1 to 4: no differences, and
   one program's runs not comparable); `cargo xtask verify full` passes, every op constructor the

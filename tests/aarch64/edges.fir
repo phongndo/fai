@@ -1,6 +1,6 @@
 // The AArch64 backend's edge cases: every run here is also compiled and run natively, and its
 // LFIR before and after register allocation is run in the interpreter (see
-// crates/fir/tests/aarch64.rs).
+// tests/rust/aarch64.rs).
 // run: @add8_trap(100, 100) -> trap overflow @1:1
 // run: @add8_trap(100, -100) -> returned i8 0
 // run: @add8_usat(200, 100) -> returned i8 -1

@@ -1,10 +1,11 @@
 # The layers as built: what HFIR, MFIR, and LFIR mean today
 
 [01-layers.md](01-layers.md) describes the layers FIR is aiming for. This file describes what the
-code implements, read from the Lean spec (`spec/Fir`), the Rust implementation (`crates/fir`),
-and the tests, as of `1ac29a2`. Each claim names where it comes from. What is proved, checked, or
-only tested is in [the assurance report](../assurance/README.md#guarantees); the measured audit
-of the boundaries is [layer-audit.md](../assurance/layer-audit.md).
+code implements, read from the Lean spec (`spec/Fir`), the Rust implementation (the crates under
+`compiler/` and `targets/`, which `sdk/rust` re-exports as `fir`), and the tests, as of `1ac29a2`.
+Each claim names where it comes from. What is proved, checked, or only tested is in
+[the assurance report](../assurance/README.md#guarantees); the measured audit of the boundaries is
+[layer-audit.md](../assurance/layer-audit.md).
 
 In short: HFIR and MFIR are two subsets of one language with one semantics. LFIR is a different
 language that runs on a different machine over the same memory, events, and outcomes. Lean
@@ -152,7 +153,7 @@ else as its scalars (`Lower.lowerValue`). **Proved:** the expansion step only
 the Rust text equals Lean's (`tests/lower.rs`, `tests/fuzz.rs`), and each fixture run of the
 lowering gives the same outcome as the HFIR run, or the same events before HFIR UB
 (`RunOutput::lowers_to`). The C corpus is also run at every layer
-(`crates/fir-capi/tests/fcc.rs`).
+(`sdk/c/tests/fcc.rs`).
 
 | Item | What happens | Semantic loss? |
 |---|---|---|

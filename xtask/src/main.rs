@@ -407,11 +407,7 @@ impl Verify {
                 &["rust"],
                 "compiler/ir/src/generated/builder.rs",
             ),
-            (
-                "gen-builder",
-                &["capi"],
-                "crates/fir-capi/src/generated/ops.rs",
-            ),
+            ("gen-builder", &["capi"], "sdk/c/src/generated/ops.rs"),
         ];
         let start = Instant::now();
         let mut stale = Vec::new();
@@ -438,7 +434,7 @@ impl Verify {
         let header = Command::new("cbindgen")
             .args([
                 "--config",
-                "crates/fir-capi/cbindgen.toml",
+                "sdk/c/cbindgen.toml",
                 "--crate",
                 "fir-capi",
                 "--quiet",
@@ -447,14 +443,11 @@ impl Verify {
             .output();
         match header {
             Ok(o) if o.status.success() => {
-                let have = std::fs::read(self.root.join("crates/fir-capi/include/fir.h"))
-                    .unwrap_or_default();
+                let have = std::fs::read(self.root.join("sdk/c/include/fir.h")).unwrap_or_default();
                 if have != o.stdout {
-                    stale.push(
-                        "crates/fir-capi/include/fir.h: stale; regenerate with cbindgen".into(),
-                    );
+                    stale.push("sdk/c/include/fir.h: stale; regenerate with cbindgen".into());
                 } else {
-                    checked.push("crates/fir-capi/include/fir.h: fresh".into());
+                    checked.push("sdk/c/include/fir.h: fresh".into());
                 }
             }
             Ok(o) => stale.push(format!(

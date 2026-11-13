@@ -10,7 +10,7 @@ name = "fir_capi"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
-fir = { path = "../fir" }
+fir = { path = "../rust" }
 
 [lints]
 workspace = true

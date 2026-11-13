@@ -88,7 +88,7 @@ addresses become offsets (MFIR computes offsets, per the Layout decision). Each 
 differential testing against the reference interpreter. Matching each Rust pass to its Lean proof
 by construction (certificates or generated matchers) comes after this round.
 
-**Progress:** the pass manager and the four passes are in `crates/fir/src/passes/` (decision:
+**Progress:** the pass manager and the four passes are in `sdk/rust/src/passes/` (decision:
 Passes): `fir opt FILE [-O | --passes dse,fwd,copyprop,dce] [--remarks] [--stats]`, verifying
 after every pass in development builds. Optimized fixtures and random programs (including
 programs made to exercise the memory passes) refine the originals in `fir run` and still verify
@@ -119,7 +119,7 @@ Instruction selection, Register allocation, Traps at run time, AOT driver, Backe
   integers up to 64 bits), `regalloc.rs` (linear scan with spilling, the frame, and the
   certificate check), `emit.rs` (ELF and Mach-O), `lfir.rs` (the LFIR module at either stage).
   `fir compile` drives them.
-- Tests (`crates/fir/tests/aarch64.rs`): every fixture's comparable runs and random programs,
+- Tests (`tests/rust/aarch64.rs`): every fixture's comparable runs and random programs,
   natively under `qemu-aarch64` and in LFIR before and after allocation, with no differences;
   `FIR_FUZZ=3000` on seeds 1 and 2 included.
 - HFIR compiles through its lowering (`fir::backend::prepare`), so aggregates, unions, and slices
@@ -164,7 +164,7 @@ Instruction selection, Register allocation, Traps at run time, AOT driver, Backe
   `tests/aarch64.rs`, exceptions included.
 - **Builder API (Rust, C):** done. `lake exe gen-builder` generates the op methods and C functions;
   `ModuleBuilder` covers memory spaces, types, functions, external functions, and globals;
-  `crates/fir-capi` exports it with a cbindgen header. Every verified test file and 300 fuzzer
+  `sdk/c` exports it with a cbindgen header. Every verified test file and 300 fuzzer
   programs rebuild through the builder byte for byte, and `tests/capi/modules.c` builds,
   verifies, prints, and runs modules through the C API in `cargo test` (clean under ASan and
   valgrind). Building is about 2.4 times as fast as parsing (`examples/build_bench.rs`). The

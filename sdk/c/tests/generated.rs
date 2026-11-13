@@ -1,13 +1,13 @@
 //! The C API's generated files are current:
 //!
 //! * `src/generated/ops.rs` is what `lake exe gen-builder capi` prints from the op declarations
-//!   (regenerate with `cd spec && lake exe gen-builder capi > ../crates/fir-capi/src/generated/ops.rs`).
+//!   (regenerate with `cd spec && lake exe gen-builder capi > ../sdk/c/src/generated/ops.rs`).
 //!   The generator is `spec/.lake/build/bin/gen-builder` (built by `lake build` in `spec/`), or
 //!   the path in `FIR_GEN_BUILDER`; `FIR_REF=none` skips this check.
 //! * `include/fir.h` is what cbindgen makes of this crate (regenerate with the command in its
 //!   first lines). cbindgen is the dev shell's, or the path in `CBINDGEN`.
 
-#[path = "../../fir/tests/common/evidence.rs"]
+#[path = "../../../tests/rust/common/evidence.rs"]
 mod evidence;
 
 use std::path::{Path, PathBuf};
@@ -47,11 +47,10 @@ fn generated_ops_are_up_to_date() {
         "the builder generator is missing: run `lake build` in spec/, or set FIR_REF=none to skip"
     );
     let want = output(Command::new(&tool).arg("capi"), "gen-builder capi");
-    let have =
-        std::fs::read_to_string(repo().join("crates/fir-capi/src/generated/ops.rs")).unwrap();
+    let have = std::fs::read_to_string(repo().join("sdk/c/src/generated/ops.rs")).unwrap();
     assert!(
         have == want,
-        "crates/fir-capi/src/generated/ops.rs is stale: run `cd spec && lake exe gen-builder capi > ../crates/fir-capi/src/generated/ops.rs`"
+        "sdk/c/src/generated/ops.rs is stale: run `cd spec && lake exe gen-builder capi > ../sdk/c/src/generated/ops.rs`"
     );
 }
 
@@ -59,7 +58,7 @@ fn generated_ops_are_up_to_date() {
 fn header_is_up_to_date() {
     let cbindgen = std::env::var("CBINDGEN").unwrap_or_else(|_| "cbindgen".into());
     let tmp = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fir.h");
-    let crate_dir = repo().join("crates/fir-capi");
+    let crate_dir = repo().join("sdk/c");
     output(
         Command::new(&cbindgen)
             .current_dir(repo())
@@ -75,7 +74,7 @@ fn header_is_up_to_date() {
     let have = std::fs::read_to_string(crate_dir.join("include/fir.h")).unwrap();
     assert!(
         have == want,
-        "crates/fir-capi/include/fir.h is stale: run `cbindgen --config crates/fir-capi/cbindgen.toml --crate fir-capi --output crates/fir-capi/include/fir.h`"
+        "sdk/c/include/fir.h is stale: run `cbindgen --config sdk/c/cbindgen.toml --crate fir-capi --output sdk/c/include/fir.h`"
     );
 }
 

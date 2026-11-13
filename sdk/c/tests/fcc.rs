@@ -46,7 +46,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-#[path = "../../fir/tests/common/evidence.rs"]
+#[path = "../../../tests/rust/common/evidence.rs"]
 mod evidence;
 
 fn repo() -> PathBuf {
@@ -1163,7 +1163,7 @@ fn fcc_x86_64_corpus() {
 // pointer, and through `...` read by `va_arg`) and the callers every member of every result.
 // `FCC_ABI=N` sets the number of signatures (default 240), `FCC_ABI_SEED` the seed.
 
-/// A deterministic random source (xorshift64*), as `crates/fir/tests/abi.rs`'s.
+/// A deterministic random source (xorshift64*), as `tests/rust/abi.rs`'s.
 struct Rng(u64);
 
 impl Rng {

@@ -1,6 +1,6 @@
 /* Builds FIR modules through the C API, then verifies, prints, and runs them.
  *
- * crates/fir-capi/tests/c.rs compiles this file against include/fir.h and the static library,
+ * sdk/c/tests/c.rs compiles this file against include/fir.h and the static library,
  * runs it, and checks that it calls every function the header declares. It prints "ok" and
  * exits 0 when every check passes. */
 

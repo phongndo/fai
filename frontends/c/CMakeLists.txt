@@ -37,7 +37,7 @@ execute_process(
   OUTPUT_STRIP_TRAILING_WHITESPACE)
 
 add_executable(fcc src/main.cpp src/Lower.cpp)
-target_include_directories(fcc PRIVATE "${REPO}/crates/fir-capi/include")
+target_include_directories(fcc PRIVATE "${REPO}/sdk/c/include")
 target_include_directories(fcc SYSTEM PRIVATE ${CLANG_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS})
 separate_arguments(LLVM_DEFINITIONS_LIST NATIVE_COMMAND "${LLVM_DEFINITIONS}")
 target_compile_options(fcc PRIVATE ${LLVM_DEFINITIONS_LIST})

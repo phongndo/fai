@@ -1,0 +1,127 @@
+[package]
+name = "fir"
+version = "0.1.0"
+description = "FIR: the compiler IR, checked against the Lean semantics in spec/"
+edition.workspace = true
+license.workspace = true
+# The package's other targets live where the repository keeps them: the `fir` command in
+# tools/fir, the cross-component test suites in tests/rust (with the .fir corpora they read),
+# and the timing examples in benchmarks/rust. They stay targets of this package so
+# `cargo test -p fir --test NAME`, `cargo run --bin fir`, and `cargo run --example NAME` keep
+# working, and so the suites can run the binary (CARGO_BIN_EXE_fir is only given to tests of
+# the package that builds it).
+autobins = false
+autoexamples = false
+autotests = false
+
+[dependencies]
+fai-codegen = { path = "../../compiler/codegen" }
+fai-driver = { path = "../../compiler/driver" }
+fai-interp = { path = "../../compiler/interp" }
+fai-ir = { path = "../../compiler/ir" }
+fai-lowering = { path = "../../compiler/lowering" }
+fai-target-aarch64 = { path = "../../targets/aarch64" }
+fai-target-x86_64 = { path = "../../targets/x86_64" }
+fai-transforms = { path = "../../compiler/transforms" }
+
+[dev-dependencies]
+num-bigint = "0.4"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "fir"
+path = "../../tools/fir/main.rs"
+
+[[test]]
+name = "aarch64"
+path = "../../tests/rust/aarch64.rs"
+
+[[test]]
+name = "abi"
+path = "../../tests/rust/abi.rs"
+
+[[test]]
+name = "builder"
+path = "../../tests/rust/builder.rs"
+
+[[test]]
+name = "contracts"
+path = "../../tests/rust/contracts.rs"
+
+[[test]]
+name = "dce_check"
+path = "../../tests/rust/dce_check.rs"
+
+[[test]]
+name = "debug_lines"
+path = "../../tests/rust/debug_lines.rs"
+
+[[test]]
+name = "execution_profile"
+path = "../../tests/rust/execution_profile.rs"
+
+[[test]]
+name = "float_env"
+path = "../../tests/rust/float_env.rs"
+
+[[test]]
+name = "fuzz"
+path = "../../tests/rust/fuzz.rs"
+
+[[test]]
+name = "generated"
+path = "../../tests/rust/generated.rs"
+
+[[test]]
+name = "generated_builder"
+path = "../../tests/rust/generated_builder.rs"
+
+[[test]]
+name = "lower"
+path = "../../tests/rust/lower.rs"
+
+[[test]]
+name = "mem2reg"
+path = "../../tests/rust/mem2reg.rs"
+
+[[test]]
+name = "opt"
+path = "../../tests/rust/opt.rs"
+
+[[test]]
+name = "regcheck"
+path = "../../tests/rust/regcheck.rs"
+
+[[test]]
+name = "review_regcheck"
+path = "../../tests/rust/review_regcheck.rs"
+
+[[test]]
+name = "run"
+path = "../../tests/rust/run.rs"
+
+[[test]]
+name = "text"
+path = "../../tests/rust/text.rs"
+
+[[test]]
+name = "verify"
+path = "../../tests/rust/verify.rs"
+
+[[test]]
+name = "x86_64"
+path = "../../tests/rust/x86_64.rs"
+
+[[example]]
+name = "bench"
+path = "../../benchmarks/rust/bench.rs"
+
+[[example]]
+name = "bench_aarch64"
+path = "../../benchmarks/rust/bench_aarch64.rs"
+
+[[example]]
+name = "build_bench"
+path = "../../benchmarks/rust/build_bench.rs"

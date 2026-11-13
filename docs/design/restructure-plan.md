@@ -8,14 +8,14 @@ because it conflicts with the x86-64 backend, which is committed but not integra
 
 | Work | Present here? | Where |
 |---|---|---|
-| AArch64 backend (HFIR → MFIR → LFIR `aarch64` dialect → GNU asm, Linux ELF and Darwin) | yes | `crates/fir/src/backend/aarch64/` |
+| AArch64 backend (HFIR → MFIR → LFIR `aarch64` dialect → GNU asm, Linux ELF and Darwin) | yes | `sdk/rust/src/backend/aarch64/` |
 | x86-64 backend (integer subset of MFIR, Linux only) | **no** | local `main` / `feat/x86-backend` at `31b13e7`, 6 commits from merge-base `1ac29a2`, not on `origin/main` |
 | Shared global-data emission between backends (`backend/data.rs`) | **no** | same x86 line (`1316bde`) |
 | Proof-backed DCE checking (`CheckDce`, `FIR_CHECK_DCE`, `--check-dce`, required by `verify full`) | yes | `passes/reference.rs`, `backend/mod.rs`, `docs/assurance/dce.md` |
 | Promotion passes `mem2reg`, `stackdce` (labelled `Assurance::Experimental`, opt-in only) | yes | `passes/mem2reg.rs`, `passes/stackdce.rs` |
 | Default `-O` pipeline (proved passes only: dse, fwd, copyprop, dce) | yes | `passes/mod.rs` (`DEFAULT`, `Pipeline::default_opt`) |
 | Pass observers, `--print-before/after/changed`, `--dump-dir` | yes | `passes/mod.rs`, `bin/fir.rs` |
-| Differential, fuzz, ABI torture, contract, debug-line, regcheck suites | yes | `crates/fir/tests/`, `crates/fir-capi/tests/`, corpora in `tests/` |
+| Differential, fuzz, ABI torture, contract, debug-line, regcheck suites | yes | `tests/rust/`, `sdk/c/tests/`, corpora in `tests/` |
 | C benchmark harness `cbench` and the C baseline (native M4 Max timing vs qemu-user counts) | yes | `frontends/c/bench/`, `docs/performance/c-baseline*.md` |
 | CLI names | `fir`, `fcc` (renamed from `fai-cc` at `753b752`; old name documented, no alias), Lean `fir-ref`, `fir-audit` | |
 | `fcxx` | no, and none is planned here | |
@@ -23,7 +23,7 @@ because it conflicts with the x86-64 backend, which is committed but not integra
 ## Current dependency map
 
 Three Cargo packages (`fir`, `fir-capi`, `xtask`), one CMake project (`frontends/c`, which links
-`libfir_capi.a` and includes `crates/fir-capi/include/fir.h`), one Lake project (`spec/`).
+`libfir_capi.a` and includes `sdk/c/include/fir.h`), one Lake project (`spec/`).
 
 Inside `fir` (module → modules it uses):
 
@@ -158,7 +158,7 @@ listed run before the next step. "verify full" is `nix develop -c cargo xtask ve
 
 0. **Integrate the x86 line** (separately, as a feature merge): decide the C API version and the
    flag composition above, update the x86 text to `fcc`, then verify full on x86-64 Linux plus the
-   native x86-64 suites (`crates/fir/tests/x86_64.rs`, fcc's corpus with `--target x86_64`), and
+   native x86-64 suites (`tests/rust/x86_64.rs`, fcc's corpus with `--target x86_64`), and
    verify full on Apple silicon. Only after this does the restructure start.
 1. **Workspace skeleton.** Root `Cargo.toml` members list instead of `crates/*`; shared
    `[workspace.dependencies]`. No code moves. Check: `cargo build --workspace`, verify fast.

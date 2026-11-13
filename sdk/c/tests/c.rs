@@ -12,7 +12,7 @@
 //! The compiler is `$CC`, or `clang` (the dev shell's). `FIR_CAPI_SANITIZE=address` (or another
 //! `-fsanitize=` value) builds the programs with that sanitizer.
 
-#[path = "../../fir/tests/common/evidence.rs"]
+#[path = "../../../tests/rust/common/evidence.rs"]
 mod evidence;
 
 use std::path::{Path, PathBuf};
@@ -71,7 +71,7 @@ fn c_files() -> Vec<PathBuf> {
 /// Compile a C test program against the header and the static library.
 fn build_c(file: &Path, exe: &Path) {
     let cc = std::env::var("CC").unwrap_or_else(|_| "clang".into());
-    let include = repo().join("crates/fir-capi/include");
+    let include = repo().join("sdk/c/include");
     let mut cmd = Command::new(&cc);
     cmd.args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-g"])
         .arg("-I")
@@ -199,7 +199,7 @@ fn end_to_end_through_the_c_api() {
 /// Every function in the header is called by some C test.
 #[test]
 fn c_programs_call_every_function() {
-    let header = std::fs::read_to_string(repo().join("crates/fir-capi/include/fir.h")).unwrap();
+    let header = std::fs::read_to_string(repo().join("sdk/c/include/fir.h")).unwrap();
     let mut sources = String::new();
     for file in c_files() {
         sources += &std::fs::read_to_string(file).unwrap();

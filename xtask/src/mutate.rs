@@ -101,7 +101,7 @@ fn regen_ops() -> Cmd {
         "sh",
         &[
             "-c",
-            "lake build gen-rust gen-builder && lake exe gen-rust > ../compiler/ir/src/generated/ops.rs && lake exe gen-rust contracts > ../compiler/ir/src/generated/contracts.rs && lake exe gen-builder rust > ../compiler/ir/src/generated/builder.rs && lake exe gen-builder capi > ../crates/fir-capi/src/generated/ops.rs",
+            "lake build gen-rust gen-builder && lake exe gen-rust > ../compiler/ir/src/generated/ops.rs && lake exe gen-rust contracts > ../compiler/ir/src/generated/contracts.rs && lake exe gen-builder rust > ../compiler/ir/src/generated/builder.rs && lake exe gen-builder capi > ../sdk/c/src/generated/ops.rs",
         ],
     )
 }

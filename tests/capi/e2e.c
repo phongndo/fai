@@ -21,7 +21,7 @@
  * twelve ints and twelve doubles (beyond eight of each class) with va.arg. The native output must
  * be exactly what the host's snprintf makes of the same formats and arguments.
  *
- * crates/fir-capi/tests/c.rs builds and runs it, with the toolchain in the environment:
+ * sdk/c/tests/c.rs builds and runs it, with the toolchain in the environment:
  * FIR_E2E_CC (an AArch64 C compiler), FIR_E2E_RUN (the emulator, empty to run natively), and
  * FIR_E2E_DIR (a scratch directory). Without FIR_E2E_CC the native half is skipped. It prints
  * what it compared and "ok" when every check passes. */

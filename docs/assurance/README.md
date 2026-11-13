@@ -51,7 +51,7 @@ toolchain's version):
    fuzz counts set explicitly (200 programs, seed 1).
 7. **The C API tests under AddressSanitizer.**
 8. **Evidence.** Each suite writes what it actually did to `FIR_EVIDENCE`
-   (`crates/fir/tests/common/evidence.rs`). The run fails if a required suite (21 of them, the ABI torture test included, and on Linux the C corpus, every one of whose `-O` builds must have been checked by the proved DCE checker) wrote
+   (`tests/rust/common/evidence.rs`). The run fails if a required suite (21 of them, the ABI torture test included, and on Linux the C corpus, every one of whose `-O` builds must have been checked by the proved DCE checker) wrote
    nothing, recorded a skip or a failure, ran fewer programs than configured, compared fewer
    runs with `fir-ref` than it had run lines, or if any op constructor that a component claims
    to support was never exercised by that component's differential comparison. The coverage is
@@ -427,7 +427,7 @@ Main's varargs round (`va.start`, `va.arg`, `va.end`, variadic functions) follow
 
 A Codex review (GPT-6.1 Sol) of this branch at `326b0d4` reported eight defects, each with a
 reproduction; all are fixed, and the reproductions run as regression tests
-(`crates/fir/tests/review_regcheck.rs`, and tests in `tests/aarch64.rs` and `xtask`):
+(`tests/rust/review_regcheck.rs`, and tests in `tests/aarch64.rs` and `xtask`):
 
 1. **Full verification accepted stale evidence**: the AddressSanitizer phase didn't clear its
    evidence directory, so with an inherited test runner that skipped the ASan tests, last run's
