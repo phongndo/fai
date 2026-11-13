@@ -183,6 +183,10 @@ fn trap_reasons(k: K) -> &'static [&'static str] {
 #[derive(Debug, Default)]
 pub struct Taint {
     rets: HashMap<String, Vec<bool>>,
+    /// The functions whose control flow may depend on addresses (a branch on a tainted value).
+    // Only the x86-64 test reads it.
+    #[allow(dead_code)]
+    control: HashSet<String>,
     events: HashMap<String, Vec<bool>>,
     /// The traps, by location and reason, that may depend on addresses.
     traps: HashSet<(Loc, &'static str)>,
@@ -451,20 +455,20 @@ impl<'m> Analysis<'m> {
         out
     }
 
-    /// Jump to the block `label` of the nearest enclosing `cf.blocks` that has it.
+    /// Jump to the block `label` of the nearest enclosing `cf.blocks` that has it. Labels are
+    /// compared as text: a jump's label and its block's are separate strings of the body (found
+    /// when the x86-64 tests landed: comparing their ids found no block, so nothing flowed into
+    /// block parameters).
     fn jump(&mut self, fi: usize, op: OpId, label: fir::StrId, args: &[Abs], c: bool) {
         let b = &self.m.funcs[fi].body;
+        let label = b.str(label);
+        let is = |r: fir::RegionId| b.label(r).is_some_and(|l| b.str(l) == label);
         let Some(blocks) = enclosing(b, op, |o| {
-            matches!(b.kind(o), K::Blocks { .. })
-                && b.regions(o).iter().any(|&r| b.label(r) == Some(label))
+            matches!(b.kind(o), K::Blocks { .. }) && b.regions(o).iter().any(|&r| is(r))
         }) else {
             return;
         };
-        let r = *b
-            .regions(blocks)
-            .iter()
-            .find(|&&r| b.label(r) == Some(label))
-            .unwrap();
+        let r = *b.regions(blocks).iter().find(|&&r| is(r)).unwrap();
         let params: Vec<ValueId> = b.params(r).collect();
         for (p, a) in params.iter().zip(args) {
             let a = a.clone().tainted(c);
@@ -795,6 +799,13 @@ impl Taint {
                     )
                 })
                 .collect(),
+            control: m
+                .funcs
+                .iter()
+                .zip(&a.fns)
+                .filter(|(_, s)| s.ctl)
+                .map(|(f, _)| f.name.clone())
+                .collect(),
             events: m
                 .externs
                 .iter()
@@ -813,6 +824,14 @@ impl Taint {
                 by.into_iter().filter(|e| e.1).map(|e| e.0).collect()
             },
         }
+    }
+
+    /// Whether `func`'s control flow may depend on addresses: it branches on a tainted value,
+    /// or a function that does calls it.
+    // Only the x86-64 test uses it.
+    #[allow(dead_code)]
+    pub fn control(&self, func: &str) -> bool {
+        self.control.contains(func)
     }
 
     /// Whether any outcome may depend on addresses.
