@@ -1,8 +1,12 @@
 # Measuring fcc's code
 
-Tools to measure what `fcc`'s pipelines do to the C corpus (`../tests/*.c`), used for
-[docs/design/05-optimizing-c.md](../../../docs/design/05-optimizing-c.md). Nothing here is
-built by Cargo or CMake, and no test depends on it.
+Two sets of tools; nothing here is built by Cargo or CMake, and no test depends on it.
+
+- `bench.py` and its plugins measure what `fcc`'s pipelines do to the C corpus (`../tests/*.c`),
+  for [docs/design/05-optimizing-c.md](../../../docs/design/05-optimizing-c.md). Below.
+- `cbench.py` is the end-to-end baseline against GCC and Clang on the kernels in `programs/`:
+  behavior, executed instructions, code size, compile time, and wall time on native AArch64 only,
+  for [docs/performance/c-baseline.md](../../../docs/performance/c-baseline.md). See the end.
 
 On an x86-64 host the binaries run under `qemu-aarch64`, whose wall time says little about
 AArch64 hardware, so the measure is what the program *executes*: two QEMU TCG plugins count the
@@ -26,3 +30,18 @@ $BENCH_PASSES --experimental`, by default the experimental promotion pipeline
 run, and checked against GCC's output and exit code: `summarize.py` lists any mismatch first. A
 third argument to `bench.py` keeps only the programs whose names contain it. The results also
 count the `mem.load`s, `mem.store`s, and stack slots left in each pipeline's MFIR (`--emit mfir`).
+
+## The end-to-end baseline: `cbench.py`
+
+```sh
+nix develop
+python3 frontends/c/bench/cbench.py all --ssh HOST [--docker IMAGE --docker-bin '…']
+```
+
+builds the 12 programs in `programs/` with `fcc`, `fcc -O`, GCC `-O0`/`-O1`/`-O2`, and Clang
+`-O0`/`-O2` (static, against the target's glibc), checks every build's output against GCC
+`-O2`'s, counts executed instructions and stack traffic under `qemu-aarch64` (`insn_count.c`),
+times compilation and scaling on the host, and times the programs natively on `HOST`
+(`benchrun.c`, which refuses to run under qemu-user), then writes `target/cbench/report.md`. Its
+steps (`build`, `count`, `scaling`, `time`, `report`), options, and method are in the script's
+docstring and in [docs/performance/c-baseline.md](../../../docs/performance/c-baseline.md).

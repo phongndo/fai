@@ -12,6 +12,21 @@ let
   # and run under qemu-user.
   cross = pkgs.pkgsCross.aarch64-multiplatform;
   needsCross = stdenv.hostPlatform.isLinux && !stdenv.hostPlatform.isAarch64;
+
+  # The C benchmark harness (frontends/c/bench/cbench.py) links every benchmark statically against
+  # the AArch64 target's glibc, so the same binary runs under qemu-user and on any AArch64 Linux
+  # machine; its QEMU plugin needs glib's headers (qemu-plugin.h includes glib.h). Linux only.
+  benchLibc = lib.optionalString stdenv.hostPlatform.isLinux "${
+    (if needsCross then cross else pkgs).glibc.static
+  }/lib";
+  benchGlib = "-I${pkgs.glib.dev}/include/glib-2.0 -I${pkgs.glib.out}/lib/glib-2.0/include";
+  # Its reference GCC: the cross GCC off AArch64, and GCC itself on AArch64 Linux, where the
+  # shell's `cc` is Clang (the stdenv is LLVM's).
+  benchGcc =
+    if needsCross then
+      "aarch64-unknown-linux-gnu-cc"
+    else
+      lib.optionalString stdenv.hostPlatform.isLinux "${pkgs.gcc}/bin/gcc";
 in
 (pkgs.mkShell.override { stdenv = llvm.stdenv; }) {
   name = "fir-dev";
@@ -83,6 +98,10 @@ in
     llvm.libclang.dev
     llvm.llvm.dev
   ];
+
+  FCC_BENCH_LIBC_STATIC = benchLibc;
+  FCC_BENCH_GLIB_CFLAGS = benchGlib;
+  FCC_BENCH_GCC = benchGcc;
 
   # Nix's default _FORTIFY_SOURCE flag warns on every -O0 debug build of C code.
   hardeningDisable = [ "fortify" ];
