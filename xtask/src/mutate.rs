@@ -134,13 +134,22 @@ fn mutations() -> Vec<Mutation> {
                 "  /-- `int.zext %a`: the result type is the wider type. -/\n",
                 "  /-- `int.popcount %x` -/\n  op popcount\n    name \"int.popcount\"\n    format \"%\"\n    rule\n      operands t \"int.popcount takes one operand\"\n      ints t\n      results [t]\n  /-- `int.zext %a`: the result type is the wider type. -/\n",
             )],
-            steps: vec![regen_ops(), cmd("cargo", &["build", "-p", "fir"])],
+            // Each component that declares its support is its own crate, and none depends on
+            // another's, so with --keep-going every one of them reports the new op.
+            steps: vec![
+                regen_ops(),
+                cmd("cargo", &["build", "--keep-going", "-p", "fir"]),
+            ],
             expect: vec![
-                "non-exhaustive patterns: `ops::OpKind::Popcount` not covered",
+                "OpKind::Popcount` not covered",
                 "--> compiler/lowering/src/lib.rs:",
                 "--> compiler/interp/src/lib.rs:",
                 "--> targets/aarch64/src/isel.rs:",
-                "could not compile `fir` (lib) due to 3 previous errors",
+                "--> targets/x86_64/src/isel.rs:",
+                "could not compile `fai-lowering` (lib) due to 1 previous error",
+                "could not compile `fai-interp` (lib) due to 1 previous error",
+                "could not compile `fai-target-aarch64` (lib) due to 1 previous error",
+                "could not compile `fai-target-x86_64` (lib) due to 1 previous error",
             ],
             in_decl: None,
         },
