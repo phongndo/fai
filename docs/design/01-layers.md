@@ -83,6 +83,13 @@ All frontends, MFIR optimizations, and tools then work on the new chip.
 
 ## Proof chain
 
+This is the design's target. What is proved, checked, or only tested today is in
+[the assurance report](../assurance/README.md#guarantees), and the boundaries as built are audited
+in [layer-audit.md](../assurance/layer-audit.md). In particular, only the expansion step of the
+lowering is proved, instruction selection is tested rather than checked against ISA semantics,
+the allocation validator is not proved, there is no scheduler, facts are dropped by instruction
+selection, and MFIR still has `agg.*` ops and composite values.
+
 | Step | How it is justified |
 |---|---|
 | Source → HFIR | The frontend's responsibility; optional proofs through the Lean SDK |

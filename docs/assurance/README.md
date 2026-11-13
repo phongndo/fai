@@ -14,6 +14,7 @@ Files here:
 
 | File | What | Made by |
 |---|---|---|
+| `layer-audit.md` | The HFIR → MFIR → LFIR boundaries audited, a vertical slice, the DCE checkers compared and measured, the observation tooling, and source lines in native code | by hand |
 | `op-contracts.json` | Per op kind (534 kinds, modifiers included): identity, fields, modifiers, layers, typing, declared effects, and the DCE permission with its evidence | `lake exe gen-rust manifest` |
 | `proofs.lock.json` | Reviewed fingerprints of the 35 registered claims: statement, hypothesis count, axioms, and fingerprints of the `Fir` definitions they depend on | `lake exe fir-audit --update` |
 | `proofs.md` | The claims as Lean prints them, with axioms and dependency counts | `lake exe fir-audit --report` |
@@ -252,8 +253,9 @@ under AddressSanitizer in the full one. No noisy lint groups were enabled.
 | Op declarations → Rust `OpKind`, tables, builders, C API, contracts | generated, checked fresh | gen-rust, gen-builder, cbindgen; `verify` compares bytes |
 | DCE: which kinds may be deleted | **proved** | `Fir.Dce.dcePerm_sound` (+ `Pure.of_kind`, `dcePerm_erase`) |
 | DCE: a deletion is a refinement | **proved** (per function, fixed module, `Decided` source) | `Fir.Dce.refines` |
-| DCE: the Rust pass's output on the tested inputs | **checked by a proved checker** | `Fir.Dce.checkFunc_sound` via `fir-ref check-dce` in `tests/dce_check.rs` |
-| DCE: the Rust pass's output on any input | checked (unproved checker) | `passes::dce::check`, every run |
+| DCE: the Rust pass's output on the tested inputs | **checked by a proved checker** | `Fir.Dce.checkFunc_sound` via `fir-ref check-dce` in `tests/dce_check.rs`, on one `dce` step and on every step of the `-O` pipeline |
+| DCE: the Rust pass's output on any input | checked (unproved checker); **by the proved checker on request** | `passes::dce::check`, every run; `fir opt --check-dce FIR-REF` (`passes::reference`), every step of that run |
+| DCE: the Rust checker's rules against the proved checker's | tested | `the_rust_and_lean_checkers_agree_on_random_candidates`; mutation `dce-checker-weaker-than-proved` ([layer-audit.md](layer-audit.md#3-the-dce-checker-lean-and-rust)) |
 | DSE, forwarding, copy propagation | proved relations; Rust passes tested | `Fir.Dse/Fwd/CopyProp.refines`; `tests/opt.rs` |
 | Composing passes, optimizing a whole module | **open** | intermediate programs' `Decided`ness and refinement over calls are not proved |
 | HFIR lowering: expansion | proved (per function) | `Fir.Lower.Proof.Expand.refines`, `lowerFunc_refines` |
@@ -263,6 +265,8 @@ under AddressSanitizer in the full one. No noisy lint groups were enabled.
 | C ABI: structs and arrays by value (AAPCS64) | registers carry a composite's defined bytes exactly: **proved** (`Fir.AArch64.roundTrip`, `pieces_flatten`); the classification against C: tested | `tests/abi.rs` (random signatures against GCC, both directions and `...`), `tests/capi/e2e.c`, native fixture runs |
 | Register allocation and frame lowering | checked on every compile (unproved validator, ABI assumptions) | `regcheck::validate` |
 | Assembly text and encoding | tested | native runs under qemu |
+| Data layout at the backend | checked on every compile: AAPCS64's or refused | `isel::check_module` |
+| Native addresses → source locations (`fir compile -g`) | tested | `tests/debug_lines.rs` |
 | Effects and tiers in the op declarations | declared only | not read by anything that relies on them; `freeze_changes_core` shows one is incomplete |
 
 **Trusted base** (beyond Lean's kernel and the three standard axioms): the Lean compiler that
@@ -280,8 +284,12 @@ the assembler.
    two programs), but the proof needs a simulation between machines with different register
    files and a frame, and the ABI assumptions as hypotheses about callees.
 2. **Extract or port the DCE checker with a proof of correspondence.** Today the proved checker
-   runs in the tests, and the Rust `check` runs in the compiler; they state the same conditions
-   but nothing proves the Rust one equal to the Lean one.
+   runs in the tests and on request (`fir opt --check-dce`), and the Rust `check` runs in the
+   compiler; a differential test holds them to the same verdicts on random candidates, but
+   nothing proves the Rust one equal to the Lean one, and the Rust one checks a candidate, not
+   the output (`erase_many` is trusted). The proved checker is quadratic in a function's size
+   (21 s for one function of 128,000 ops); a linear variant is needed before it runs always.
+   Options and costs: [layer-audit.md](layer-audit.md#options-for-closing-the-gap-by-cost).
 3. **Module composition and `Decided`.** Every pass theorem is about one function in a fixed
    module with a `Decided` source; optimizing every function of a module, and running passes in
    sequence, needs refinement to compose over calls and `Decided` to be preserved or replaced.
