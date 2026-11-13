@@ -124,7 +124,8 @@ LFIR before and after allocation in `fir run` (and in `fir-ref run`, which runs 
   load forwarded from the store before it). `fai-cc` keeps every local in memory, and the passes
   match only adjacent accesses, so the loop loads and stores `i`, `a.sum`, and `a.count` every
   iteration. Promotion of non-escaping slots (mem2reg/SROA) is the missing piece, in the frontend
-  or as an MFIR pass.
+  or as an MFIR pass. (Since prototyped as the experimental MFIR pass `mem2reg`:
+  [05-optimizing-c.md](../design/05-optimizing-c.md).)
 - **Locations reach LFIR but not the assembly** (73–89% of LFIR instructions carry one): see
   section 5.
 - **Each lowering step is visible and small**: `ptr.field.inbounds struct<C>{i32, i32} %a, 1`
@@ -261,7 +262,9 @@ print), `bench_aarch64.rs` (the backend), `build_bench.rs` (the builder).
 - Every pass carries its assurance, `Proved("Fir.Dse.refines")` or `Experimental(why)`;
   `fir opt --list-passes` prints them. Experimental passes run only with `fir opt
   --experimental` (or `Pipeline::parse_experimental`), print a warning, and can't be in `-O`
-  (a unit test checks the default pipeline). None exists yet; the gate is ready for the first.
+  (a unit test checks the default pipeline). The first are `mem2reg` and `stackdce`
+  ([05-optimizing-c.md](../design/05-optimizing-c.md)); `fai-cc` and `fir compile` take them with
+  `--passes … --experimental`.
 - `Pipeline::run_observed` shows an observer the module before and after every pass run, and
   lets it reject a step. `fir opt` uses it for `--print-before P`, `--print-after P` (`all`
   for every pass), `--print-changed`, and `--dump-dir DIR` (numbered files to diff:

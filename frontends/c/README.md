@@ -8,18 +8,23 @@ C API only (`crates/fir-capi/include/fir.h`), verifies it, compiles it with `fir
 compiler, as `fir compile` does.
 
 ```
-fai-cc FILE.c [-O [--check-dce FIR-REF]] [-o OUT] [--emit hfir|mfir|asm] [INPUT...]
-       [-I DIR] [-D NAME[=V]] [-l LIB] [-L DIR] [-- CLANG-FLAG...]
+fai-cc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]
+       [--emit hfir|mfir|asm] [INPUT...] [-I DIR] [-D NAME[=V]] [-l LIB] [-L DIR]
+       [-- CLANG-FLAG...]
 ```
 
 - Without `--emit`, `OUT` (default `a.out`) is an executable; an object file if it ends in `.o`;
   assembly if it ends in `.s`. More `INPUT`s (objects, archives, C or assembly files) and `-l`/`-L`
   go to the linker.
-- `--emit hfir` prints the HFIR as lowered, `--emit mfir` the MFIR (optimized with `-O`), and
-  `--emit asm` the assembly, to `OUT` or standard output.
+- `--emit hfir` prints the HFIR as lowered, `--emit mfir` the MFIR (optimized with `-O` or
+  `--passes`), and `--emit asm` the assembly, to `OUT` or standard output.
+- `--passes P,...` runs the named passes on the MFIR, in order to a fixed point, instead of `-O`'s.
+  Experimental (unproved) passes run only with `--experimental`, which prints a warning: the
+  promotion pipeline is `--passes mem2reg,stackdce,fwd,copyprop,dse,dce --experimental` (see
+  [docs/design/05-optimizing-c.md](../../docs/design/05-optimizing-c.md)).
 - `-I`, `-D`, `-U`, and `-std=` go to Clang, and so does everything after `--`.
-- `--check-dce FIR-REF` (with `-O`) has every step of dead code elimination checked by the proved
-  Lean checker (`FIR-REF` is `spec/.lake/build/bin/fir-ref`; see
+- `--check-dce FIR-REF` (with `-O`, or `--passes`) has every step of dead code elimination
+  checked by the proved Lean checker (`FIR-REF` is `spec/.lake/build/bin/fir-ref`; see
   `docs/assurance/dce.md`): a refusal fails the compilation, and one line
   (`fir: check-dce: N steps accepted by Fir.Dce.checkModule (…)`) goes to stderr. The corpus test
   builds each program's `-O` binary this way (required in `cargo xtask verify full`; the ABI
@@ -76,6 +81,10 @@ builds `fai-cc` with CMake (against the static library of the current sources), 
   compiler; in every pairing the callees check each member they receive (directly, through a
   function pointer, and through `...` by `va_arg`) and the callers each member of each result.
   `FAI_CC_ABI=N` sets the number of signatures (240 by default), `FAI_CC_ABI_SEED` the seed.
+
+`FAI_CC_PASSES=p,q,…` adds a fourth build, `fai-cc --passes p,q,… --experimental`, which must
+match the reference too, and runs the MFIR and allocated LFIR it makes in the interpreter.
+`bench/` measures what each pipeline executes (instructions, loads, stores) against GCC's.
 
 It runs by default on Linux; on macOS (whose binaries aren't Linux ones) only with `FAI_CC_TESTS=1`
 (given a Linux AArch64 toolchain in `FIR_CC` and a way to run its binaries), and `FAI_CC_TESTS=0`
@@ -172,8 +181,8 @@ composite larger than 16 bytes as the address of a copy the caller makes and the
 call copies the argument into a `mem.stack.of va_list` of its own and passes that, and the callee
 uses the pointer as its parameter's object; this is the ABI libc's `vprintf` expects.
 
-Every local and parameter is a `mem.stack.of` slot made at the function's entry (mem2reg comes
-later), so values never cross blocks. Statements are structured where C's are (`cf.if`, `cf.loop`;
+Every local and parameter is a `mem.stack.of` slot made at the function's entry (the
+experimental `mem2reg` pass promotes the ones that don't escape, with `--passes`), so values never cross blocks. Statements are structured where C's are (`cf.if`, `cf.loop`;
 `continue` repeats a `for` loop's step or a `do` loop's test); a `switch` is a `cf.blocks` whose entry
 `cf.switch`es to one block per case group, with fall-through as `cf.br`; a function with `goto` or
 labels, or with a `switch` whose cases are inside other statements, is one `cf.blocks` of basic
