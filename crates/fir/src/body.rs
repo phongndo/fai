@@ -806,6 +806,75 @@ impl Body {
         }
     }
 
+    /// Put a new op of this kind, with these operands and results, where `old` is, and erase
+    /// `old`: the new op takes over `old`'s regions (with their parameters and ops) and its
+    /// location, and the uses of `old`'s results become uses of the new op's first results, in
+    /// order. This is how a pass widens an op's signature, which ops can't change in place: more
+    /// results for a `cf.if`, more operands for a branch. Needs the use lists built.
+    pub fn replace_op<'s>(
+        &mut self,
+        old: OpId,
+        kind: OpKind,
+        operands: impl IntoIterator<Item = Operand>,
+        results: impl IntoIterator<Item = ValueSpec<'s>>,
+    ) -> OpId {
+        self.need_uses();
+        let loc = self.loc(old);
+        let new = self.insert_before(old, kind, operands, results, Vec::new(), loc);
+        let regions = std::mem::take(&mut self.op_shape[old.index()].regions);
+        self.op_shape[new.index()].regions = regions;
+        for i in regions.range() {
+            let r = self.region_ids[i];
+            self.regions[r.index()].parent = new.0;
+        }
+        let (olds, news) = (self.results(old), self.results(new));
+        assert!(
+            news.len() >= olds.len(),
+            "replace_op: the new op has fewer results"
+        );
+        for (o, n) in olds.zip(news) {
+            self.replace_all_uses(o, n);
+        }
+        self.erase(old);
+        new
+    }
+
+    /// Give `region` more parameters after its own. The region gets new values for all its
+    /// parameters (a region's parameters are one run of values), and the uses of the old ones
+    /// become uses of the new ones; returns the added ones. Needs the use lists built.
+    pub fn append_params<'s>(
+        &mut self,
+        region: RegionId,
+        extra: impl IntoIterator<Item = ValueSpec<'s>>,
+    ) -> Vec<ValueId> {
+        self.need_uses();
+        let old: Vec<ValueId> = self.params(region).collect();
+        let kept: Vec<(String, Ty, Vec<TrustedFact>)> = old
+            .iter()
+            .map(|&v| (self.name(v).to_owned(), self.ty(v), self.facts(v).to_vec()))
+            .chain(
+                extra
+                    .into_iter()
+                    .map(|s| (s.name.to_owned(), s.ty, s.facts)),
+            )
+            .collect();
+        let specs: Vec<ValueSpec<'_>> = kept
+            .iter()
+            .map(|(name, ty, facts)| ValueSpec {
+                name,
+                ty: *ty,
+                facts: facts.clone(),
+            })
+            .collect();
+        let span = self.new_values(specs, |index| ValueDef::Param { region, index });
+        self.regions[region.index()].params = span;
+        let new: Vec<ValueId> = self.params(region).collect();
+        for (&o, &n) in old.iter().zip(&new) {
+            self.replace_all_uses(o, n);
+        }
+        new[old.len()..].to_vec()
+    }
+
     /// Remove an op from its region. Its id stays valid but no longer appears in any region; its
     /// operands are still uses (see [`Body::erase`] to drop them). Unlinking an op that is
     /// already unlinked does nothing.
