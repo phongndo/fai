@@ -10,6 +10,7 @@ fai-codegen = { path = "../../compiler/codegen" }
 fai-interp = { path = "../../compiler/interp" }
 fai-ir = { path = "../../compiler/ir" }
 fai-lowering = { path = "../../compiler/lowering" }
+fai-target-aarch64 = { path = "../../targets/aarch64" }
 fai-transforms = { path = "../../compiler/transforms" }
 num-bigint = "0.4"
 rustc-hash = "2"

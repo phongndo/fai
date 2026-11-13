@@ -10,8 +10,8 @@
 //! HFIR ──lower──▶ MFIR ──-O (optional)──▶ MFIR ──isel──▶ LFIR ──regalloc──▶ .s
 //! ```
 
-pub mod aarch64;
 pub use crate::codegen::data;
+pub use fai_target_aarch64 as aarch64;
 pub mod x86_64;
 
 pub use crate::driver::{

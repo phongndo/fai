@@ -61,15 +61,15 @@
 //! pending exception: a plain call then returns at once, leaving it pending for its own caller,
 //! and a `func.invoke` takes it (`aarch64.exn.take`) and jumps to its handler block with it.
 
-pub use crate::codegen::may_throw;
+pub use fai_codegen::may_throw;
 use rustc_hash::FxHashMap;
 
 use super::abi::{self, ArgLoc};
 use super::mir::{Frame, Inst, MFunc};
-use crate::body::{Body, OpId, OperandKind, RegionId, ValueId};
-use crate::contract::Support;
-use crate::ir::*;
-use crate::types::align_up;
+use fai_ir::body::{Body, OpId, OperandKind, RegionId, ValueId};
+use fai_ir::contract::Support;
+use fai_ir::ir::*;
+use fai_ir::types::align_up;
 
 const NONE: u32 = u32::MAX;
 
@@ -164,8 +164,8 @@ pub fn check_module(m: &Module) -> Result<()> {
             m.space.ptr_bits, m.space.addr_bits
         ));
     }
-    let aapcs = crate::ir::SpaceCfg::default();
-    let ints = |s: &crate::ir::SpaceCfg| {
+    let aapcs = fai_ir::ir::SpaceCfg::default();
+    let ints = |s: &fai_ir::ir::SpaceCfg| {
         s.ints
             .iter()
             .map(|(w, a)| format!("{w}:{a}"))
@@ -186,7 +186,7 @@ pub fn check_module(m: &Module) -> Result<()> {
             m.space.va_align
         ));
     }
-    if let crate::Layer::Lfir(_) = m.layer {
+    if let fai_ir::Layer::Lfir(_) = m.layer {
         return Err("the module is already LFIR".to_owned());
     }
     for x in &m.externs {
@@ -197,7 +197,7 @@ pub fn check_module(m: &Module) -> Result<()> {
     Ok(())
 }
 
-/// What instruction selection does with ops of a kind ([`crate::contract`]): every MFIR op is
+/// What instruction selection does with ops of a kind ([`fai_ir::contract`]): every MFIR op is
 /// selected, `agg.make`, `agg.extract`, and `agg.insert` included (they regroup the leaves of a
 /// struct or array calls pass whole), and so are `ptr.field` and `ptr.index` (HFIR ops over
 /// scalars, so that core-op HFIR compiles without lowering); the other HFIR building blocks need
@@ -511,7 +511,7 @@ fn fmov_imm8(fs: FSize, bits: u64) -> Option<u8> {
 
 /// The bits of the float of format `fs` nearest to `v` (exact for the bounds used here).
 fn float_bits(fs: FSize, v: i128) -> u64 {
-    crate::float::from_int(fs.fty(), true, 128, &crate::sem::Bits::of_i128(128, v))
+    fai_ir::float::from_int(fs.fty(), true, 128, &fai_ir::sem::Bits::of_i128(128, v))
 }
 
 /// Whether `off` can address a `size`-byte access directly: a scaled unsigned 12-bit offset,
@@ -3286,10 +3286,10 @@ fn sext(w: u32, x: u64) -> i64 {
 }
 
 /// An integer's low 64 bits (two's complement).
-fn int_low_bits(n: crate::body::Int<'_>) -> u64 {
+fn int_low_bits(n: fai_ir::body::Int<'_>) -> u64 {
     match n {
-        crate::body::Int::Small(n) => n as u64,
-        crate::body::Int::Big(n) => {
+        fai_ir::body::Int::Small(n) => n as u64,
+        fai_ir::body::Int::Big(n) => {
             let m = num_bigint::BigInt::from(1) << 64;
             let r = ((n % &m) + &m) % &m;
             u64::try_from(r).unwrap_or(0)

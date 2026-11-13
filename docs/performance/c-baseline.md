@@ -215,7 +215,7 @@ C (big `switch` interpreters, unrolled tables) will hit this first.
 ### 4. Globals are written byte by byte, and zeros go to `.data` (compile time, binary size)
 
 The backend writes every global's image as `.byte` lists, and a writable global always goes to
-`.data` (`crates/fir/src/backend/aarch64/emit.rs:743-781`). There is no `.bss` and no `.zero`.
+`.data` (`targets/aarch64/src/emit.rs:743-781`). There is no `.bss` and no `.zero`.
 `sieve`'s `static unsigned char flags[1 << 20]` becomes 65,536 lines of `.byte 0, …` (3.5 MB of
 assembly) and 1 MiB of `.data` in the object and the binary, where GCC puts it in `.bss`. It costs
 13 ms in `fir compile` (against 1.3-2.8 ms for every other program) and 79 ms per compile

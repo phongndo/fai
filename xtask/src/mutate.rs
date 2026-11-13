@@ -139,7 +139,7 @@ fn mutations() -> Vec<Mutation> {
                 "non-exhaustive patterns: `ops::OpKind::Popcount` not covered",
                 "--> compiler/lowering/src/lib.rs:",
                 "--> compiler/interp/src/lib.rs:",
-                "--> crates/fir/src/backend/aarch64/isel.rs:",
+                "--> targets/aarch64/src/isel.rs:",
                 "could not compile `fir` (lib) due to 3 previous errors",
             ],
             in_decl: None,
@@ -400,7 +400,7 @@ fn mutations() -> Vec<Mutation> {
             name: "corrupted-allocation",
             what: "the rewriter puts every value assigned x9 in x10 when it is written; the allocation validator refuses the code",
             edits: vec![edit(
-                "crates/fir/src/backend/aarch64/regalloc.rs",
+                "targets/aarch64/src/regalloc.rs",
                 "                match a.homes[r.virt_index() as usize] {\n                    Home::Reg(p) => p,",
                 "                match a.homes[r.virt_index() as usize] {\n                    Home::Reg(p) if is_def && p == Reg::x(9) => Reg::x(10),\n                    Home::Reg(p) => p,",
             )],
@@ -412,7 +412,7 @@ fn mutations() -> Vec<Mutation> {
             name: "spill-store-dropped",
             what: "spill stores dropped from the rewritten code; the allocation validator refuses the reloads",
             edits: vec![edit(
-                "crates/fir/src/backend/aarch64/regalloc.rs",
+                "targets/aarch64/src/regalloc.rs",
                 "            for (t, s) in stores {\n                out.slot_access(false, t, spill_base + 8 * i64::from(s), loc);\n            }",
                 "            for (t, s) in stores {\n                let _ = (t, s, loc);\n            }",
             )],
@@ -424,7 +424,7 @@ fn mutations() -> Vec<Mutation> {
             name: "bad-output-code",
             what: "the emitter prints `sub` for every three-register `add`; the native comparison refuses it (the validator checks LFIR, not text)",
             edits: vec![edit(
-                "crates/fir/src/backend/aarch64/emit.rs",
+                "targets/aarch64/src/emit.rs",
                 "AluOp::Add => \"add\",",
                 "AluOp::Add => \"sub\",",
             )],
@@ -460,7 +460,7 @@ fn mutations() -> Vec<Mutation> {
             name: "miscompile-next-to-an-address",
             what: "multiplication by a constant miscompiled; a fixture that observes an unrelated address must still fail (the previous rule excused it)",
             edits: vec![edit(
-                "crates/fir/src/backend/aarch64/emit.rs",
+                "targets/aarch64/src/emit.rs",
                 "AluOp::Mul => \"mul\",",
                 "AluOp::Mul => \"add\",",
             )],

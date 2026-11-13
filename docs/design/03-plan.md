@@ -115,7 +115,7 @@ Instruction selection, Register allocation, Traps at run time, AOT driver, Backe
   `aarch64.code`. `spec/Fir/AArch64.lean` has the instructions' bits in ASL's shape;
   `spec/Fir/AArch64Machine.lean` runs LFIR over FIR's memory, and `fir-ref run` and `fir run`
   (`compiler/interp/src/aarch64_machine.rs`) agree on it.
-- `crates/fir/src/backend/aarch64/`: `isel.rs` (all MFIR core ops, every edge-case modifier,
+- `targets/aarch64/src/`: `isel.rs` (all MFIR core ops, every edge-case modifier,
   integers up to 64 bits), `regalloc.rs` (linear scan with spilling, the frame, and the
   certificate check), `emit.rs` (ELF and Mach-O), `lfir.rs` (the LFIR module at either stage).
   `fir compile` drives them.

@@ -39,7 +39,7 @@ use std::collections::BTreeMap;
 use super::abi::{CallShape, FP_CALLER_SAVED};
 use super::mir::{CALLER_SAVED, Inst, MFunc};
 use super::regalloc::{Effects, Shapes, effects};
-use crate::ir::{AluImmOp, AluOp, FSize, FUnaryOp, MemSize, MovOp, Reg, Sf};
+use fai_ir::ir::{AluImmOp, AluOp, FSize, FUnaryOp, MemSize, MovOp, Reg, Sf};
 
 /// An input value a location may hold.
 type Val = u32;

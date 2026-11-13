@@ -333,7 +333,7 @@ right about.
   `parse_experimental`; `passes/reference.rs`: `CheckDce`.
 - `crates/fir/src/bin/fir.rs`: `fir opt` observation flags, `--list-passes`, `--check-dce`,
   `fir compile -g`, `-` for standard input.
-- `crates/fir/src/backend/aarch64/isel.rs`: the data layout check (G1, G2);
+- `targets/aarch64/src/isel.rs`: the data layout check (G1, G2);
   `emit.rs`: line info.
 - Tests: `tests/dce_check.rs` (the `-O` pipeline, the agreement test), `tests/debug_lines.rs`,
   `tests/aarch64.rs` (`layer_audit_foreign_data_layouts_are_refused`), `tests/opt.rs`

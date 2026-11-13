@@ -11,23 +11,25 @@
 //! see the decision log (LFIR for AArch64, Calling convention, C ABI for aggregates), [`abi`] and
 //! its twin in Lean, `Fir.AArch64Abi`, and [`machine`]'s, `Fir.AArch64Machine`.
 
-pub use crate::dialect::aarch64::abi;
+#![forbid(unsafe_code)]
+
+pub use fai_ir::dialect::aarch64::abi;
 pub mod emit;
 pub mod isel;
 pub mod lfir;
 pub mod mir;
 pub mod regalloc;
 pub mod regcheck;
-pub use crate::dialect::aarch64::syntax;
+pub use fai_ir::dialect::aarch64::syntax;
 
 pub use emit::{Options, Os};
 
 /// The bits of the float an `fmov` immediate encodes (ASL's `VFPExpandImm`).
-pub fn machine_imm(fs: crate::ir::FSize, imm: u8) -> u64 {
-    crate::interp::vfp_expand_imm(fs, u32::from(imm))
+pub fn machine_imm(fs: fai_ir::ir::FSize, imm: u8) -> u64 {
+    fai_interp::vfp_expand_imm(fs, u32::from(imm))
 }
 
-use crate::ir::Module;
+use fai_ir::ir::Module;
 use mir::MModule;
 
 /// Each callee's argument and result registers, by callee index (functions, then external
@@ -38,7 +40,7 @@ pub fn shapes(m: &Module) -> Vec<abi::CallShape> {
         .iter()
         .map(|f| {
             let b = &f.body;
-            let ps: Vec<crate::ir::Ty> = b.params(b.entry()).map(|v| b.ty(v)).collect();
+            let ps: Vec<fai_ir::ir::Ty> = b.params(b.entry()).map(|v| b.ty(v)).collect();
             abi::CallShape::of(b.types(), &m.space, &ps, &f.rets)
         })
         .collect();
@@ -108,9 +110,9 @@ fn uses_varargs(m: &Module) -> Option<String> {
         let mut stack = vec![b.entry()];
         while let Some(r) = stack.pop() {
             for op in b.ops(r) {
-                if let crate::OpKind::CallIndirect(sig) | crate::OpKind::InvokeIndirect { sig, .. } =
-                    b.kind(op)
-                    && let Some(crate::Shape::Func(_, _, true)) = b.types().shape_of(sig)
+                if let fai_ir::OpKind::CallIndirect(sig)
+                | fai_ir::OpKind::InvokeIndirect { sig, .. } = b.kind(op)
+                    && let Some(fai_ir::Shape::Func(_, _, true)) = b.types().shape_of(sig)
                 {
                     return Some(format!("a call in @{}", f.name));
                 }
@@ -125,7 +127,7 @@ fn uses_varargs(m: &Module) -> Option<String> {
 /// stack, if it has one, for the message: Apple's AArch64 ABI packs stack arguments, which FIR
 /// doesn't follow yet (open item 4).
 fn stack_composites(m: &Module) -> Option<String> {
-    let on_stack = |types: &crate::types::Types, ps: &[crate::ir::Ty]| {
+    let on_stack = |types: &fai_ir::types::Types, ps: &[fai_ir::ir::Ty]| {
         abi::arg_locs(types, &m.space, ps)
             .0
             .iter()
@@ -133,7 +135,7 @@ fn stack_composites(m: &Module) -> Option<String> {
     };
     for f in &m.funcs {
         let b = &f.body;
-        let ps: Vec<crate::ir::Ty> = b.params(b.entry()).map(|v| b.ty(v)).collect();
+        let ps: Vec<fai_ir::ir::Ty> = b.params(b.entry()).map(|v| b.ty(v)).collect();
         if on_stack(b.types(), &ps) {
             return Some(format!("@{}", f.name));
         }
@@ -141,18 +143,18 @@ fn stack_composites(m: &Module) -> Option<String> {
         while let Some(r) = stack.pop() {
             for op in b.ops(r) {
                 let skip = match b.kind(op) {
-                    crate::OpKind::Call { .. } | crate::OpKind::Invoke { .. } => 0,
-                    crate::OpKind::CallIndirect(_) | crate::OpKind::InvokeIndirect { .. } => 1,
+                    fai_ir::OpKind::Call { .. } | fai_ir::OpKind::Invoke { .. } => 0,
+                    fai_ir::OpKind::CallIndirect(_) | fai_ir::OpKind::InvokeIndirect { .. } => 1,
                     _ => {
                         stack.extend_from_slice(b.regions(op));
                         continue;
                     }
                 };
-                let ps: Vec<crate::ir::Ty> = b.operands(op)[skip..]
+                let ps: Vec<fai_ir::ir::Ty> = b.operands(op)[skip..]
                     .iter()
                     .map(|o| match o.get() {
-                        crate::body::OperandKind::Value(v) => b.ty(v),
-                        crate::body::OperandKind::Hole(h) => b.hole_ty(h),
+                        fai_ir::body::OperandKind::Value(v) => b.ty(v),
+                        fai_ir::body::OperandKind::Hole(h) => b.hole_ty(h),
                     })
                     .collect();
                 if on_stack(b.types(), &ps) {

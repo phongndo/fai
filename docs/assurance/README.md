@@ -157,7 +157,7 @@ and the checkers are for.
 
 ### Register allocation and frame lowering: a validator on the real output
 
-`crates/fir/src/backend/aarch64/regcheck.rs`, `validate(input, output, shapes, nrets)`, runs on
+`targets/aarch64/src/regcheck.rs`, `validate(input, output, shapes, nrets)`, runs on
 every allocation in every build (`regalloc::allocate` returns its error; `compile` propagates
 it). It is given the code before allocation and after rewriting, spilling, and frame lowering,
 and nothing from the allocator. Its approval owns the output and exclusively borrows the input

@@ -23,7 +23,7 @@
 use std::fmt::Write;
 
 use super::mir::{Inst, MFunc, MModule};
-use crate::ir::*;
+use fai_ir::ir::*;
 
 /// The object format and its assembler conventions.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -92,8 +92,8 @@ struct Emitter<'a> {
     at: Option<(usize, u32, u32)>,
 }
 
-use crate::codegen::data::quote;
-pub use crate::codegen::trap_code;
+use fai_codegen::data::quote;
+pub use fai_codegen::trap_code;
 
 const XREGS: [&str; 31] = [
     "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14",
@@ -588,7 +588,7 @@ impl Emitter<'_> {
 
     /// With line info on: a `.loc` for the next instruction, at `loc` in this function's file
     /// (or [`NO_SOURCE`]'s line 1 without one), if it differs from the last.
-    fn loc(&mut self, file: Option<&str>, loc: Option<crate::ir::Loc>) {
+    fn loc(&mut self, file: Option<&str>, loc: Option<fai_ir::ir::Loc>) {
         if !self.o.debug_lines || self.files.is_empty() {
             return;
         }
@@ -638,7 +638,7 @@ impl Emitter<'_> {
 
     fn globals(&mut self) {
         let darwin = self.o.os == Os::Darwin;
-        let text = crate::codegen::data::globals(
+        let text = fai_codegen::data::globals(
             self.m,
             &|name, own| self.sym(name, own),
             &self.o.extern_prefix,

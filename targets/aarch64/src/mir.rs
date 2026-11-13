@@ -2,11 +2,11 @@
 //!
 //! Each [`Inst`] is one `aarch64.*` op with its immediates inline (block indices instead of
 //! labels, symbol indices instead of names), so instruction selection, register allocation,
-//! and the emitter work on `Copy` values in a `Vec` without a [`crate::Body`]'s side tables.
+//! and the emitter work on `Copy` values in a `Vec` without a [`fai_ir::Body`]'s side tables.
 //! [`super::lfir`] turns it into an LFIR module (text, the interpreters), and
 //! [`super::emit`] into assembly. A function's blocks are runs of `insts`, in layout order.
 
-use crate::ir::{
+use fai_ir::ir::{
     AluImmOp, AluOp, Cond, CselOp, FAluOp, FSize, FUnaryOp, Loc, MemSize, MovOp, Reg, Sf,
     ShiftImmOp, TrapReason, Ty,
 };

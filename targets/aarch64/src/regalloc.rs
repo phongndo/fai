@@ -46,7 +46,7 @@
 
 use super::abi::{CallShape, FP_CALLER_SAVED};
 use super::mir::{CALLER_SAVED, Inst, MFunc};
-use crate::ir::{AluImmOp, AluOp, FSize, FUnaryOp, MemSize, MovOp, Reg, Sf};
+use fai_ir::ir::{AluImmOp, AluOp, FSize, FUnaryOp, MemSize, MovOp, Reg, Sf};
 
 /// The general-purpose registers allocation may use, caller-saved first.
 const ALLOCATABLE: [u32; 25] = [
@@ -830,7 +830,7 @@ fn rewrite(f: &mut MFunc, a: &Assignment) {
 /// A rebuilt instruction list.
 struct Out {
     insts: Vec<Inst>,
-    locs: Vec<Option<crate::ir::Loc>>,
+    locs: Vec<Option<fai_ir::ir::Loc>>,
     blocks: Vec<u32>,
 }
 
@@ -847,7 +847,7 @@ impl Out {
         self.blocks.push(self.insts.len() as u32);
     }
 
-    fn push(&mut self, i: Inst, loc: Option<crate::ir::Loc>) {
+    fn push(&mut self, i: Inst, loc: Option<fai_ir::ir::Loc>) {
         self.insts.push(i);
         self.locs.push(loc);
     }
@@ -876,7 +876,7 @@ impl Out {
 
     /// Load (`load`) or store register `t` at `sp + off`, through `x16` when the offset doesn't
     /// fit the instruction.
-    fn slot_access(&mut self, load: bool, t: Reg, off: i64, loc: Option<crate::ir::Loc>) {
+    fn slot_access(&mut self, load: bool, t: Reg, off: i64, loc: Option<fai_ir::ir::Loc>) {
         let (base, off) = if super::isel::is_mem_off(off, MemSize::X) {
             (Reg::SP, off)
         } else {

@@ -3,14 +3,14 @@
 //! allocation against the source program.
 
 use super::mir::{Inst, MFunc, MModule};
-use crate::body::{Body, Succ, ValueSpec};
-use crate::ir::*;
+use fai_ir::body::{Body, Succ, ValueSpec};
+use fai_ir::ir::*;
 
 /// The LFIR module for `m`'s functions as `mm` has them: the same globals and external
 /// functions, and each function's code as one `aarch64.code` op.
 pub fn to_module(m: &Module, mm: &MModule) -> Module {
     let mut out = Module {
-        layer: crate::Layer::Lfir("aarch64"),
+        layer: fai_ir::Layer::Lfir("aarch64"),
         space: m.space.clone(),
         globals: m.globals.clone(),
         externs: m.externs.clone(),
