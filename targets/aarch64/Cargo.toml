@@ -8,7 +8,6 @@ publish = false
 
 [dependencies]
 fai-codegen = { path = "../../compiler/codegen" }
-fai-interp = { path = "../../compiler/interp" }
 fai-ir = { path = "../../compiler/ir" }
 num-bigint = "0.4"
 rustc-hash = "2"

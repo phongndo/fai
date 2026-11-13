@@ -52,7 +52,7 @@ fai-lowering         → fai-ir
 fai-transforms       → fai-ir
 fai-codegen          → fai-ir
 fai-target-x86_64    → fai-codegen, fai-ir
-fai-target-aarch64   → fai-codegen, fai-interp, fai-ir
+fai-target-aarch64   → fai-codegen, fai-ir
 fai-driver           → fai-target-aarch64, fai-target-x86_64, fai-transforms, fai-lowering,
                        fai-interp, fai-ir
 fir (sdk/rust)       → every crate above (it re-exports them); its targets are the `fir`
@@ -64,7 +64,9 @@ xtask                → nothing in the workspace (it runs cargo, lake, clang, c
 
 `fai-ir`, `fai-transforms`, and `fai-target-aarch64` have one dev-dependency on `fir`. Their doc
 examples are written against the supported interface, and Cargo allows this cycle because it
-only applies to doctests. The two targets do not depend on each other.
+only applies to doctests. The two targets depend on neither each other nor the interpreter, so
+each component that declares its op support (`fai-interp`, `fai-lowering`, and both targets)
+compiles on its own.
 
 ## The layers in the code
 

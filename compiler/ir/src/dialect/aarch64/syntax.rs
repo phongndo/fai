@@ -361,3 +361,20 @@ pub enum FUnaryOp {
     Fneg,
     Fsqrt,
 }
+
+/// ASL's `VFPExpandImm` (Lean's `vfpExpandImm`, in `spec/Fir/AArch64.lean`): the float an 8-bit `fmov` immediate encodes.
+pub fn vfp_expand_imm(fs: FSize, imm8: u32) -> u64 {
+    let (e, m) = match fs {
+        FSize::S => (8, 23),
+        FSize::D => (11, 52),
+    };
+    let imm8 = u64::from(imm8);
+    let b6 = (imm8 >> 6) & 1;
+    let ones = if b6 == 1 {
+        ((1u64 << (e - 3)) - 1) << 2
+    } else {
+        0
+    };
+    let exp = ((1 - b6) << (e - 1)) | ones | ((imm8 >> 4) & 3);
+    ((imm8 >> 7) << (e + m)) | (exp << m) | ((imm8 & 15) << (m - 4))
+}

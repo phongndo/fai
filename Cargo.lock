@@ -67,7 +67,6 @@ name = "fai-target-aarch64"
 version = "0.1.0"
 dependencies = [
  "fai-codegen",
- "fai-interp",
  "fai-ir",
  "fir",
  "num-bigint",

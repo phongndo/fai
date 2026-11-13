@@ -48,7 +48,7 @@ use fai_ir::types::{Policy, Shape};
 // The machine that runs LFIR modules for AArch64; a child module, so it shares the memory model.
 #[path = "aarch64_machine.rs"]
 mod lfir;
-pub use lfir::vfp_expand_imm;
+pub use fai_ir::dialect::aarch64::syntax::vfp_expand_imm;
 
 /// The alignment a leaf at offset `off` of an access aligned to `align` keeps (Lean's
 /// `Nat.gcd align off`).

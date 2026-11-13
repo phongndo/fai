@@ -26,7 +26,7 @@ pub use emit::{Options, Os};
 
 /// The bits of the float an `fmov` immediate encodes (ASL's `VFPExpandImm`).
 pub fn machine_imm(fs: fai_ir::ir::FSize, imm: u8) -> u64 {
-    fai_interp::vfp_expand_imm(fs, u32::from(imm))
+    fai_ir::dialect::aarch64::syntax::vfp_expand_imm(fs, u32::from(imm))
 }
 
 use fai_ir::ir::Module;
