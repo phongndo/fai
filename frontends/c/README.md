@@ -1,11 +1,12 @@
 # fcc: a C compiler on FIR
 
-`fcc` compiles C to AArch64 Linux binaries through FIR. Clang parses and type-checks the C
-(preprocessor and system headers included) for `aarch64-unknown-linux-gnu`, so sizes, layouts, and
-`char`'s signedness (unsigned) are the target's. `fcc` lowers Clang's AST to HFIR through FIR's
-C API only (`crates/fir-capi/include/fir.h`), verifies it, compiles it with `fir_module_compile`
-(which lowers HFIR to MFIR, and runs the proved passes with `-O`), and links it with the AArch64 C
-compiler, as `fir compile` does.
+`fcc` compiles C to AArch64 Linux binaries through FIR, and, for the integer subset, to x86-64
+Linux binaries (`--target x86_64`, below). Clang parses and type-checks the C (preprocessor and
+system headers included) for `aarch64-unknown-linux-gnu` (or `x86_64-unknown-linux-gnu`), so
+sizes, layouts, and `char`'s signedness (unsigned on AArch64, signed on x86-64) are the target's.
+`fcc` lowers Clang's AST to HFIR through FIR's C API only (`crates/fir-capi/include/fir.h`),
+verifies it, compiles it with `fir_module_compile` (which lowers HFIR to MFIR, and runs the proved
+passes with `-O`), and links it with the target's C compiler, as `fir compile` does.
 
 `fcc` was called `fai-cc` until it was renamed: the binary, the CMake project and target, and the
 usual build directory (`build/fcc`) are now `fcc`; the environment variables `FAI_CC_*` are now
@@ -18,8 +19,8 @@ the project's, not the compiler's, and keep their names.
 
 ```
 fcc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]
-       [--emit hfir|mfir|asm] [INPUT...] [-I DIR] [-D NAME[=V]] [-l LIB] [-L DIR]
-       [-- CLANG-FLAG...]
+       [--emit hfir|mfir|asm] [--target aarch64|x86_64] [INPUT...] [-I DIR] [-D NAME[=V]]
+       [-l LIB] [-L DIR] [-- CLANG-FLAG...]
 ```
 
 - Without `--emit`, `OUT` (default `a.out`) is an executable; an object file if it ends in `.o`;
@@ -38,10 +39,13 @@ fcc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]
   (`fir: check-dce: N steps accepted by Fir.Dce.checkModule (…)`) goes to stderr. The corpus test
   builds each program's `-O` binary this way (required in `cargo xtask verify full`; the ABI
   torture test's `-O` builds are not checked).
-- The linker is `$FIR_CC`, or `cc` on an AArch64 host and `aarch64-unknown-linux-gnu-cc` (the dev
-  shell's cross compiler) elsewhere. Clang gets that compiler's system include directories after
-  its own headers (Clang's resource directory, found when `fcc` is built, or
-  `$FCC_RESOURCE_DIR`).
+- `--target` picks the target: `aarch64` (the default) or `x86_64`. `-O`, `--passes`, and
+  `--check-dce` run on the MFIR, before the target is involved, so they mean the same for both.
+- The linker is `$FIR_CC`, or `cc` when the host is the target, else the target's cross compiler
+  (`aarch64-unknown-linux-gnu-cc`, which the dev shell has on x86-64 Linux, or
+  `x86_64-unknown-linux-gnu-cc`, which it has on other Linux hosts). Clang gets that compiler's
+  system include directories after its own headers (Clang's resource directory, found when
+  `fcc` is built, or `$FCC_RESOURCE_DIR`).
 - Unsupported C is an error with its source location (`file.c:3:7: error: fcc does not support
   variable-length arrays yet`), and nothing is written; `fcc` exits with 1. `FCC_DUMP=1` prints
   the module when the HFIR doesn't verify (a bug in `fcc`).
@@ -114,6 +118,30 @@ NaN's payload an operation on two different NaNs keeps (the reference compiler c
 `*`), or whether a signaling NaN is quieted by an operation the reference compiler folds away
 (`x * 1.0`). Float inputs live in non-constant globals, so the reference compiler can't fold libm
 calls with its own correctly rounded arithmetic.
+
+## x86-64
+
+`fcc --target x86_64` compiles the integer subset for x86-64 Linux, through FIR's x86-64 backend
+(decision: x86-64 target): everything above except floats, variadic functions defined in C (calls
+of `printf` and other variadic functions work), and structs and unions by value, which are
+errors at the program level, as is passing a `char`, `short`, or `_Bool` to a function defined
+elsewhere (C callees on x86-64 expect such arguments extended by their signedness, which FIR's
+signatures don't record yet; pass an `int`). `long double` is x87's 80-bit format there, and
+rejected.
+
+```sh
+build/fcc/fcc --target x86_64 prog.c frontends/c/tests/runtime/fai_runtime.c \
+  -I frontends/c/tests/runtime -D FAI_TEST_INTEGERS_ONLY -o prog
+./prog
+```
+
+`-D FAI_TEST_INTEGERS_ONLY` leaves `fai_test.h`'s float helpers out: `fcc` compiles every
+function a file defines, used or not. `cargo test -p fir-capi --test fcc fcc_x86_64_corpus`
+compiles the corpus this way and checks each program against the x86-64 reference compiler (the
+dev shell's Clang at `-O1`, or `$FIR_CC_X86_64`), natively, with and without `-O`, and its x86-64
+HFIR in `fir run`; a program the backend refuses must be refused for one of the limitations
+above. It runs on x86-64 Linux, or elsewhere with `x86_64-unknown-linux-gnu-cc` and
+`qemu-x86_64`.
 
 ## What is supported
 

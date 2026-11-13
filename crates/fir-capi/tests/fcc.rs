@@ -178,17 +178,30 @@ fn toolchain() -> Toolchain {
     Toolchain { cc, runner }
 }
 
-/// Run a command with a time limit; its output, or why it didn't finish.
+/// Run a command with a time limit; its output, or why it didn't finish. Both pipes are
+/// drained while it runs, so output larger than a pipe holds can't stall it.
 fn run_limited(cmd: &mut Command, limit: Duration) -> Result<Output, String> {
+    use std::io::Read as _;
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| e.to_string())?;
+    let drain = |p: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = p {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = drain(child.stdout.take().map(|p| Box::new(p) as _));
+    let err = drain(child.stderr.take().map(|p| Box::new(p) as _));
     let start = Instant::now();
-    loop {
-        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-            return child.wait_with_output().map_err(|e| e.to_string());
+    let status = loop {
+        if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
+            break st;
         }
         if start.elapsed() > limit {
             let _ = child.kill();
@@ -196,7 +209,12 @@ fn run_limited(cmd: &mut Command, limit: Duration) -> Result<Output, String> {
             return Err(format!("timed out after {limit:?}"));
         }
         std::thread::sleep(Duration::from_millis(5));
-    }
+    };
+    Ok(Output {
+        status,
+        stdout: out.join().unwrap(),
+        stderr: err.join().unwrap(),
+    })
 }
 
 /// What a run printed and its exit code.
@@ -729,6 +747,345 @@ fn fcc_corpus() {
         t.failures.join("\n")
     );
     assert!(!files.is_empty(), "no programs in {}", tests.display());
+}
+
+// x86-64: the same corpus compiled for x86-64 Linux (`fcc --target x86_64`), against the
+// reference compiler for that target, natively on an x86-64 Linux host (elsewhere with
+// `x86_64-unknown-linux-gnu-cc` and `qemu-x86_64`, or not at all, with a note).
+
+/// The x86-64 C compiler and runner: `$FIR_CC_X86_64` or `cc` on an x86-64 Linux host, else
+/// `x86_64-unknown-linux-gnu-cc` under `qemu-x86_64`; `None` if there are none.
+fn x86_toolchain() -> Option<Toolchain> {
+    let native = cfg!(all(target_arch = "x86_64", target_os = "linux"));
+    let cc = match std::env::var("FIR_CC_X86_64") {
+        Ok(cc) => cc,
+        Err(_) if native => "cc".to_owned(),
+        Err(_) => "x86_64-unknown-linux-gnu-cc".to_owned(),
+    };
+    if !(on_path(&cc) || Path::new(&cc).is_file()) {
+        return None;
+    }
+    let runner = if native {
+        None
+    } else if on_path("qemu-x86_64") {
+        Some("qemu-x86_64".to_owned())
+    } else {
+        return None;
+    };
+    Some(Toolchain { cc, runner })
+}
+
+/// Why `fcc --target x86_64` refused a program, if it is something declared unsupported on
+/// x86-64: floats (in the program, or in `fai_test.h`'s float helpers, which
+/// `FAI_TEST_INTEGERS_ONLY` leaves out), structs and unions by value, variadic functions
+/// defined in C (x86-64's `va_list`), and narrow integer arguments to C functions.
+fn x86_limit(src: &str, stderr: &str) -> Option<&'static str> {
+    let helpers = [
+        "show_d",
+        "show_f",
+        "print_fixed",
+        "double_bits",
+        "float_bits",
+    ];
+    if stderr.contains("call to undeclared function")
+        && helpers
+            .iter()
+            .any(|h| src.contains(h) && stderr.contains(&format!("'{h}'")))
+    {
+        return Some("fai_test.h's float helpers");
+    }
+    [
+        ("floats aren't supported by the x86-64 backend", "floats"),
+        ("'long double' (x87's", "floats"),
+        (
+            "structs and arrays by value aren't supported by the x86-64 backend",
+            "structs and unions by value",
+        ),
+        ("this target's 'va_list'", "variadic functions defined in C"),
+        (
+            "needs its C signedness",
+            "char or short arguments to C functions",
+        ),
+    ]
+    .into_iter()
+    .find(|(k, _)| stderr.contains(k))
+    .map(|(_, why)| why)
+}
+
+#[derive(Default)]
+struct X86Tally {
+    native: usize,
+    native_opt: usize,
+    fir_match: usize,
+    ran: Vec<String>,
+    refused: Vec<String>,
+    fir_other_externs: Vec<String>,
+    failures: Vec<String>,
+}
+
+/// One corpus program on x86-64: refused for a declared limitation, or built by the reference
+/// compiler, `fcc --target x86_64`, and `fcc --target x86_64 -O`, run, and compared, with
+/// its x86-64 HFIR run in the interpreter too.
+fn one_x86(
+    file: &Path,
+    fcc_exe: &Path,
+    tc: &Toolchain,
+    rt: &Path,
+    out: &Path,
+    tally: &Mutex<X86Tally>,
+) {
+    let name = file.file_stem().unwrap().to_string_lossy().into_owned();
+    let inc = repo().join("frontends/c/tests/runtime");
+    let fail = |msg: String| {
+        tally
+            .lock()
+            .unwrap()
+            .failures
+            .push(format!("{name}: {msg}"))
+    };
+    let fai_cmd = || {
+        let mut c = Command::new(fcc_exe);
+        c.env("FIR_CC", &tc.cc)
+            .args(["--target", "x86_64"])
+            .arg(file)
+            .arg("-I")
+            .arg(&inc)
+            .args(["-D", "FAI_TEST_INTEGERS_ONLY"]);
+        c
+    };
+    let hfir = match run_limited(fai_cmd().args(["--emit", "hfir"]), Duration::from_secs(120)) {
+        Ok(o) => o,
+        Err(e) => return fail(format!("fcc --emit hfir: {e}")),
+    };
+    let src = std::fs::read_to_string(file).unwrap();
+    if !hfir.status.success() {
+        let stderr = String::from_utf8_lossy(&hfir.stderr);
+        return match x86_limit(&src, &stderr) {
+            Some(why) => tally
+                .lock()
+                .unwrap()
+                .refused
+                .push(format!("{name} ({why})")),
+            None => fail(format!("fcc --emit hfir failed:\n{stderr}")),
+        };
+    }
+    // The backend's refusals show when compiling.
+    let asm = match run_limited(
+        fai_cmd().args(["--emit", "asm", "-o", "-"]),
+        Duration::from_secs(120),
+    ) {
+        Ok(o) => o,
+        Err(e) => return fail(format!("fcc --emit asm: {e}")),
+    };
+    if !asm.status.success() {
+        let stderr = String::from_utf8_lossy(&asm.stderr);
+        return match x86_limit(&src, &stderr) {
+            Some(why) => tally
+                .lock()
+                .unwrap()
+                .refused
+                .push(format!("{name} ({why})")),
+            None => fail(format!("fcc failed:\n{stderr}")),
+        };
+    }
+    let helper = file
+        .parent()
+        .unwrap()
+        .join("extern")
+        .join(format!("{name}.c"));
+    let mut objs = vec![rt.to_path_buf()];
+    if helper.is_file() {
+        let obj = out.join(format!("{name}.extern.o"));
+        let built = Command::new(&tc.cc)
+            .args([
+                "-O1",
+                "-w",
+                "-std=gnu17",
+                "-c",
+                "-DFAI_TEST_INTEGERS_ONLY",
+                "-I",
+            ])
+            .arg(&inc)
+            .arg(&helper)
+            .arg("-o")
+            .arg(&obj)
+            .output()
+            .unwrap();
+        if !built.status.success() {
+            return fail(format!(
+                "the reference compiler failed on {}:\n{}",
+                helper.display(),
+                String::from_utf8_lossy(&built.stderr)
+            ));
+        }
+        objs.push(obj);
+    }
+    let reference = out.join(format!("{name}.ref"));
+    let built = Command::new(&tc.cc)
+        .args(["-O1", "-w", "-std=gnu17", "-DFAI_TEST_INTEGERS_ONLY", "-I"])
+        .arg(&inc)
+        .arg(file)
+        .args(&objs)
+        .arg("-lm")
+        .arg("-o")
+        .arg(&reference)
+        .output()
+        .unwrap();
+    if !built.status.success() {
+        return fail(format!(
+            "the reference compiler failed:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        ));
+    }
+    let want = match run_native(tc, &reference) {
+        Ok(b) => b,
+        Err(e) => return fail(format!("the reference binary: {e}")),
+    };
+    let mut ok = [false; 2];
+    for (i, opt) in [false, true].into_iter().enumerate() {
+        let exe = out.join(format!("{name}{}", if opt { ".O" } else { "" }));
+        let mut cmd = fai_cmd();
+        cmd.args(&objs).arg("-lm").arg("-o").arg(&exe);
+        if opt {
+            cmd.arg("-O");
+        }
+        let o = if opt { " -O" } else { "" };
+        match run_limited(&mut cmd, Duration::from_secs(120)) {
+            Ok(b) if b.status.success() => {}
+            Ok(b) => {
+                fail(format!(
+                    "fcc{o} failed:\n{}",
+                    String::from_utf8_lossy(&b.stderr)
+                ));
+                continue;
+            }
+            Err(e) => {
+                fail(format!("fcc{o}: {e}"));
+                continue;
+            }
+        }
+        match run_native(tc, &exe) {
+            Ok(got) if got == want => ok[i] = true,
+            Ok(got) => fail(format!("fcc{o} gives {got:?}, the reference {want:?}")),
+            Err(e) => fail(format!("fcc{o}: {e}")),
+        }
+    }
+    let fir_ok = match run_fir(&String::from_utf8_lossy(&hfir.stdout)) {
+        Ok(FirRun::Ran(got)) if got == want => true,
+        Ok(FirRun::Ran(got)) => {
+            fail(format!("fir run gives {got:?}, the reference {want:?}"));
+            false
+        }
+        Ok(FirRun::Calls(callee)) => {
+            tally
+                .lock()
+                .unwrap()
+                .fir_other_externs
+                .push(format!("{name} ({callee})"));
+            false
+        }
+        Err(e) => {
+            fail(e);
+            false
+        }
+    };
+    let mut t = tally.lock().unwrap();
+    t.ran.push(name);
+    t.native += usize::from(ok[0]);
+    t.native_opt += usize::from(ok[1]);
+    t.fir_match += usize::from(fir_ok);
+}
+
+/// Programs that must compile for x86-64 and match: the integer ones written for it, and a
+/// sample of the corpus's integer programs with branches, loops, and calls, so that a change
+/// that refused them all couldn't pass as a list of declared limitations.
+const X86_REQUIRED: &[&str] = &[
+    "many_args",
+    "pressure",
+    "recursion",
+    "loops",
+    "switches",
+    "goto",
+    "function_pointers",
+    "sorting",
+    "hash_table",
+    "bst",
+    "chars_strings",
+    "arith_signed",
+    "arith_unsigned",
+];
+
+#[test]
+fn fcc_x86_64_corpus() {
+    if !enabled() {
+        return;
+    }
+    let Some(tc) = x86_toolchain() else {
+        eprintln!(
+            "fcc x86-64: no x86-64 Linux C compiler and runner (an x86-64 Linux host, or \
+             x86_64-unknown-linux-gnu-cc and qemu-x86_64), so the x86-64 corpus doesn't run"
+        );
+        return;
+    };
+    let fcc_exe = fcc();
+    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fcc-x86_64");
+    std::fs::create_dir_all(&out).unwrap();
+    let rt = out.join("fai_runtime.o");
+    check(
+        Command::new(&tc.cc)
+            .arg("-c")
+            .arg(repo().join("frontends/c/tests/runtime/fai_runtime.c"))
+            .arg("-o")
+            .arg(&rt),
+        "compiling fai_runtime.c for x86-64",
+    );
+    let tests = repo().join("frontends/c/tests");
+    let files = corpus(&tests);
+    let tally = Mutex::new(X86Tally::default());
+    let next = Mutex::new(files.iter());
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                loop {
+                    let Some(file) = next.lock().unwrap().next() else {
+                        break;
+                    };
+                    one_x86(file, fcc_exe, &tc, &rt, &out, &tally);
+                }
+            });
+        }
+    });
+    let mut t = tally.into_inner().unwrap();
+    let only = std::env::var("FCC_ONLY").unwrap_or_default();
+    for &r in X86_REQUIRED {
+        if r.contains(&only) && !t.ran.iter().any(|n| n == r) {
+            t.failures.push(format!(
+                "{r}: required on x86-64, but it didn't compile and run"
+            ));
+        }
+    }
+    t.refused.sort();
+    t.fir_other_externs.sort();
+    eprintln!(
+        "fcc x86-64 corpus: {} programs ran; native runs matching the reference: {} without \
+         -O, {} with -O; fir run matching: {}, not comparable: {} (calling other external \
+         functions: {}); refused for declared limitations: {} ({})",
+        t.ran.len(),
+        t.native,
+        t.native_opt,
+        t.fir_match,
+        t.fir_other_externs.len(),
+        t.fir_other_externs.join(", "),
+        t.refused.len(),
+        t.refused.join(", ")
+    );
+    assert!(
+        t.failures.is_empty(),
+        "{} failures:\n{}",
+        t.failures.len(),
+        t.failures.join("\n")
+    );
 }
 
 // Interop torture: random signatures of structs and unions (every AAPCS64 class, bitfields,

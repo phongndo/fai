@@ -53,6 +53,7 @@
 #include "clang/Basic/Builtins.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/SourceManager.h"
+#include "clang/Basic/TargetInfo.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -287,7 +288,9 @@ private:
       if (bt->getKind() == BuiltinType::Double)
         return FIR_TYPE_F64;
       if (bt->getKind() == BuiltinType::LongDouble)
-        unsupported(loc, "'long double' (binary128 on AArch64)");
+        unsupported(loc, ctx.getTargetInfo().getTriple().isX86()
+                             ? "'long double' (x87's 80-bit format on x86-64)"
+                             : "'long double' (binary128 on AArch64)");
     }
     if (c->isRealFloatingType())
       unsupported(loc, "the floating-point type '" + t.getAsString() + "'");
@@ -1985,6 +1988,8 @@ private:
   FirValue vaArg(const VAArgExpr *va) {
     SourceLocation loc = va->getExprLoc();
     QualType t = va->getType();
+    // The target's `va_list` first: a parameter of x86-64's, an array, arrives as a pointer.
+    vaListTy(loc);
     if (isVaList(t))
       unsupported(loc, "'va_arg' of a 'va_list'");
     if (t->isRecordType())

@@ -28,6 +28,17 @@ static inline void show(const char *label, long v) {
   print_long(v);
 }
 
+/* `v` in hexadecimal, `digits` digits, after "0x". */
+static inline void print_hex(unsigned long v, int digits) {
+  fai_put_char('0');
+  fai_put_char('x');
+  for (int i = digits - 1; i >= 0; i--) fai_put_char("0123456789abcdef"[(v >> (4 * i)) & 15]);
+}
+
+/* The float helpers, left out with -DFAI_TEST_INTEGERS_ONLY for backends without floats
+ * (x86-64 so far): fcc compiles every function a file defines, used or not. */
+#ifndef FAI_TEST_INTEGERS_ONLY
+
 /* The bits of a double or a float. */
 static inline unsigned long double_bits(double d) {
   union {
@@ -46,12 +57,6 @@ static inline unsigned float_bits(float f) {
   return x.u;
 }
 
-/* `v` in hexadecimal, `digits` digits, after "0x". */
-static inline void print_hex(unsigned long v, int digits) {
-  fai_put_char('0');
-  fai_put_char('x');
-  for (int i = digits - 1; i >= 0; i--) fai_put_char("0123456789abcdef"[(v >> (4 * i)) & 15]);
-}
 
 /* A double in decimal with six digits after the point (rounded half up from the exact
  * remainder), "inf", "nan", or "big" beyond 1e15; a negative sign for negative zero too. */
@@ -96,5 +101,7 @@ static inline void show_f(const char *label, float x) {
   print_fixed(x);
   fai_put_char('\n');
 }
+
+#endif /* FAI_TEST_INTEGERS_ONLY */
 
 #endif

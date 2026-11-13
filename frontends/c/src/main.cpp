@@ -1,11 +1,11 @@
 // fcc: a C compiler on FIR. Clang parses and type-checks the C (preprocessor and headers
-// included) for AArch64 Linux; the AST is lowered to HFIR through FIR's C API (Lower.cpp), which
-// verifies it and compiles it to AArch64 assembly; the system's AArch64 C compiler assembles and
-// links it, as `fir compile` does.
+// included) for AArch64 Linux, or x86-64 Linux with `--target x86_64`; the AST is lowered to HFIR
+// through FIR's C API (Lower.cpp), which verifies it and compiles it to the target's assembly; the
+// system's C compiler for the target assembles and links it, as `fir compile` does.
 //
 //   fcc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]
-//          [--emit hfir|mfir|asm] [INPUT...] [-I DIR] [-D NAME[=V]] [-l LIB] [-L DIR]
-//          [-- CLANG-FLAG...]
+//          [--emit hfir|mfir|asm] [--target aarch64|x86_64] [INPUT...] [-I DIR] [-D NAME[=V]]
+//          [-l LIB] [-L DIR] [-- CLANG-FLAG...]
 //
 // Without --emit, OUT (default a.out) is an executable, or an object file when it ends in `.o`
 // (or assembly when it ends in `.s`); further INPUTs (objects, archives, C or assembly files)
@@ -18,8 +18,9 @@
 // checker (`fir-ref check-dce`, run by the library: FIR_CHECK_DCE), fails if it refuses one, and
 // prints one summary line on stderr.
 //
-// The linker is $FIR_CC, or `cc` on an AArch64 host and `aarch64-unknown-linux-gnu-cc` (the dev
-// shell's cross compiler) elsewhere. Its system include directories are given to Clang (after
+// The linker is $FIR_CC, or `cc` when the host is the target, else the target's cross compiler
+// (`aarch64-unknown-linux-gnu-cc`, which the dev shell has on x86-64 Linux, or
+// `x86_64-unknown-linux-gnu-cc`). Its system include directories are given to Clang (after
 // Clang's own headers), so <stdint.h> and friends are the target's.
 
 #include "Lower.h"
@@ -51,14 +52,16 @@ namespace {
 
 const char *kUsage =
     "usage: fcc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]\n"
-    "              [--emit hfir|mfir|asm] [INPUT...] [-I DIR] [-D NAME[=V]] [-l LIB] [-L DIR]\n"
-    "              [-- CLANG-FLAG...]\n";
+    "              [--emit hfir|mfir|asm] [--target aarch64|x86_64] [INPUT...] [-I DIR]\n"
+    "              [-D NAME[=V]] [-l LIB] [-L DIR] [-- CLANG-FLAG...]\n";
 
 struct Options {
   std::string file;
   std::string out;
   std::string emit;
   std::string checkDce;
+  // FIR's name for the target: `aarch64` or `x86_64`.
+  std::string target = "aarch64";
   bool optimize = false;
   // --passes: run these instead of -O's pipeline; `experimental` allows unproved ones.
   bool hasPasses = false;
@@ -101,6 +104,11 @@ bool parseArgs(int argc, char **argv, Options &o) {
         return false;
       if (o.emit != "hfir" && o.emit != "mfir" && o.emit != "asm")
         return false;
+    } else if (a == "--target") {
+      if (!value(o.target))
+        return false;
+      if (o.target != "aarch64" && o.target != "x86_64")
+        return false;
     } else if (a == "-I" || a == "-D" || a == "-U") {
       std::string v;
       if (!value(v))
@@ -135,21 +143,34 @@ bool parseArgs(int argc, char **argv, Options &o) {
   return !o.file.empty();
 }
 
-std::string linker() {
+bool x86(const Options &o) { return o.target == "x86_64"; }
+
+// The target's name in messages, and Clang's triple for it.
+const char *targetName(const Options &o) { return x86(o) ? "x86-64" : "AArch64"; }
+const char *triple(const Options &o) {
+  return x86(o) ? "x86_64-unknown-linux-gnu" : "aarch64-unknown-linux-gnu";
+}
+
+std::string linker(const Options &o) {
   if (const char *cc = std::getenv("FIR_CC"); cc && *cc)
     return cc;
 #if defined(__aarch64__)
-  return "cc";
+  bool native = !x86(o);
+#elif defined(__x86_64__)
+  bool native = x86(o);
 #else
-  return "aarch64-unknown-linux-gnu-cc";
+  bool native = false;
 #endif
+  if (native)
+    return "cc";
+  return std::string(triple(o)) + "-cc";
 }
 
-// The AArch64 C compiler's system include directories, without its compiler-specific ones
+// The target C compiler's system include directories, without its compiler-specific ones
 // (Clang brings its own).
-std::vector<std::string> systemIncludes() {
+std::vector<std::string> systemIncludes(const Options &o) {
   std::vector<std::string> dirs;
-  std::string cmd = linker() + " -E -Wp,-v -x c /dev/null 2>&1";
+  std::string cmd = linker(o) + " -E -Wp,-v -x c /dev/null 2>&1";
   FILE *p = popen(cmd.c_str(), "r");
   if (!p)
     return dirs;
@@ -242,16 +263,18 @@ struct ModuleHandle {
 
 int compileAndLink(FirModule *m, const Options &o) {
   FirString as;
-  FirStatus st = o.hasPasses ? fir_module_compile_passes(m, "aarch64", o.passes.c_str(),
-                                                         o.experimental, FIR_OS_LINUX, &as.s)
-                             : fir_module_compile(m, "aarch64", o.optimize, FIR_OS_LINUX, &as.s);
+  FirStatus st = o.hasPasses
+                     ? fir_module_compile_passes(m, o.target.c_str(), o.passes.c_str(),
+                                                 o.experimental, FIR_OS_LINUX, &as.s)
+                     : fir_module_compile(m, o.target.c_str(), o.optimize, FIR_OS_LINUX, &as.s);
   if (st != FIR_OK) {
     std::string err = fir_module_error(m);
     if (!o.checkDce.empty() && err.find("check-dce") != std::string::npos)
       llvm::errs() << o.file << ": the proved DCE checker refused the optimized output: " << err
                    << "\n";
     else
-      llvm::errs() << o.file << ": the AArch64 backend can't compile this program: " << err << "\n";
+      llvm::errs() << o.file << ": the " << targetName(o)
+                   << " backend can't compile this program: " << err << "\n";
     return 1;
   }
   if (o.emit == "asm")
@@ -267,10 +290,10 @@ int compileAndLink(FirModule *m, const Options &o) {
   std::string s = tmp.str().str();
   int rc = 1;
   if (writeOut(s, as.str())) {
-    std::string cc = linker();
+    std::string cc = linker(o);
     auto prog = llvm::sys::findProgramByName(cc);
     if (!prog) {
-      llvm::errs() << "fcc: no AArch64 C compiler to link with: '" << cc
+      llvm::errs() << "fcc: no " << targetName(o) << " C compiler to link with: '" << cc
                    << "' (set FIR_CC, or use the dev shell)\n";
     } else {
       std::vector<std::string> args = {cc, s};
@@ -307,7 +330,7 @@ int main(int argc, char **argv) {
     setenv("FIR_CHECK_DCE", o.checkDce.c_str(), 1);
   if (o.experimental && o.hasPasses)
     llvm::errs() << "fcc: warning: --experimental: passes that are not proved may run\n";
-  std::vector<std::string> args = {"-target", "aarch64-unknown-linux-gnu", "-nostdlibinc"};
+  std::vector<std::string> args = {"-target", triple(o), "-nostdlibinc"};
   std::string res = FCC_RESOURCE_DIR;
   if (const char *r = std::getenv("FCC_RESOURCE_DIR"); r && *r)
     res = r;
@@ -315,7 +338,7 @@ int main(int argc, char **argv) {
     args.push_back("-resource-dir");
     args.push_back(res);
   }
-  for (const std::string &d : systemIncludes()) {
+  for (const std::string &d : systemIncludes(o)) {
     args.push_back("-idirafter");
     args.push_back(d);
   }
