@@ -5,7 +5,7 @@ of the Lean development, with its statement as Lean prints it, its transitive ax
 many `Fir` definitions its meaning depends on. A claim is only as strong as its statement:
 read the hypotheses. Open obligations are listed in `docs/assurance/README.md`.
 
-38 claims; 25 supporting lemmas registered; 0 errors; 0 changes needing review.
+40 claims; 26 supporting lemmas registered; 0 errors; 0 changes needing review.
 
 ## `Fir.Dce.dcePerm_sound` (binding: Rust permissions)
 
@@ -31,6 +31,34 @@ If the DCE checker run by fir-ref check-dce accepts a target function for a Deci
 - axioms: propext, Classical.choice, Quot.sound
 - hypotheses: 2; `Fir` definitions depended on: 2225
 - bound for the Rust side by `Fir.Audit.Bindings.dce_checker`
+
+## `Fir.Dce.checkFuncL_eq` (binding: proved checker (counting))
+
+The DCE checker fir-ref check-dce runs (checkFuncL: read counts instead of a scan of the rest of the region per deleted op) gives the same verdict as checkFunc on every pair of functions, so checkFunc_sound holds for it.
+
+```lean
+∀ (tgt src : Fir.Func), Fir.Dce.checkFuncL tgt src = Fir.Dce.checkFunc tgt src
+```
+
+- axioms: propext, Classical.choice, Quot.sound
+- hypotheses: 0; `Fir` definitions depended on: 1189
+- bound for the Rust side by `Fir.Audit.Bindings.dce_checker_linear`
+
+## `Fir.Dce.checkModule_sound` (binding: proved checker (modules))
+
+If checkModule (what fir-ref check-dce accepts on) accepts, then for every name the target module has a function by that name exactly when the source does, and the target's refines the source's in the source module if the source's is Decided there. Not module refinement: each target function's calls go to the source's functions.
+
+```lean
+∀ {tgt src : Fir.Module},
+  Fir.Dce.checkModule tgt src = true →
+    ∀ (name : String),
+      Option.Rel (fun t s => Fir.Func.Decided src s → Fir.Func.Refines src t s) (tgt.find? name)
+        (src.find? name)
+```
+
+- axioms: propext, Classical.choice, Quot.sound
+- hypotheses: 1; `Fir` definitions depended on: 2238
+- bound for the Rust side by `Fir.Audit.Bindings.dce_module_checker`
 
 ## `Fir.Dce.refines` (pass correctness)
 

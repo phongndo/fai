@@ -26,6 +26,7 @@ import Fir.CopyProp
 import Fir.Dce
 import Fir.DceKinds
 import Fir.DceCheck
+import Fir.DceCheckLinear
 import Fir.AArch64Syntax
 import Fir.AArch64
 import Fir.AArch64Proofs

@@ -12,13 +12,19 @@ fir-ref lower FILE [--no-locs]                 lower an HFIR module to MFIR and 
 fir-ref check-dce SRC TGT                      check that TGT is a dead code elimination of SRC
 ```
 
-`check-dce` runs the proved checker `Fir.Dce.checkFunc` (`Fir.Dce.checkFunc_sound`: acceptance
-implies that each target function refines its source function in the source module) on each
-pair of functions, which must come in the same order with the same names; everything outside the
-functions must print the same. It prints `ok N` for N checked functions, followed by canonical
-source and target snapshots. Callers must match this receipt to their immutable inputs; `ok N`
-alone is not an approval of whatever module a caller subsequently chooses. This remains a
-per-function theorem in a fixed module, conditional on `Decided`, not a module composition proof.
+`check-dce` accepts only if the proved module checker `Fir.Dce.checkModule` accepts; its other
+checks (both modules parse and verify, and print the same outside their functions) can only
+refuse. `Fir.Dce.checkModule_sound`: for every name, the target has a function by that name
+exactly when the source does, and the target's refines the source's in the source module if the
+source's is `Decided` there. It checks each pair of functions with `Fir.Dce.checkFuncL`, which is
+linear in a function's size times its nesting depth and proved equal to the checker `Fir.Dce.checkFunc_sound` is about
+(`Fir.Dce.checkFuncL_eq`). Before that, and outside the proof, `check-dce` also requires
+everything outside the functions (layer, memory space, globals, externs) to print the same: the
+theorem doesn't need it, but composing the functions into the target module would. It prints
+`ok N` for N checked functions, followed by canonical source and target snapshots. Callers must
+match this receipt to their immutable inputs; `ok N` alone is not an approval of whatever module
+a caller subsequently chooses. This remains a per-function theorem in a fixed module, conditional
+on `Decided`, not a module composition proof.
 
 Arguments are integers, floats (`1.5`, `-inf`, `nan(0x1)`; see `Fir.FloatText`), `null` (for
 pointers), or `poison`; a variadic function's variadic arguments carry their types (`i32 5`,
@@ -260,19 +266,22 @@ def withModule (file : String) (k : Module → Array Hole → IO UInt32) : IO UI
   | .error e => IO.eprintln s!"{file}: {e}"; pure 1
   | .ok (m, holes) => k m holes
 
-/-- Check that `tgt` is `src` with dead code eliminated, function by function, with the proved
-checker. The rest of the modules must be the same; that comparison is by printed text. -/
+/-- Check that `tgt` is `src` with dead code eliminated, with the proved module checker
+`Dce.checkModule` (`Dce.checkModule_sound`). The rest of the modules must be the same, compared
+by printed text: unproved, and not needed by the theorem. On a refusal, the first pair of
+functions the checker refuses is named; nothing but `checkModule` can accept. -/
 def checkDce (src tgt : Module) : Except String Nat := do
   let outside (m : Module) := ({ m with funcs := [] } : Module).render (showLocs := true)
   unless outside src == outside tgt do throw "the modules differ outside their functions"
+  if Dce.checkModule tgt src then return src.funcs.length
   unless src.funcs.length == tgt.funcs.length do
     throw s!"the source has {src.funcs.length} functions, the target {tgt.funcs.length}"
   for s in src.funcs, t in tgt.funcs do
     unless s.name == t.name do throw s!"function @{t.name} is where the source has @{s.name}"
     unless s.file == t.file do throw s!"@{s.name}: the function's source file changed"
-    unless Dce.checkFunc t s do
+    unless Dce.checkFuncL t s do
       throw s!"@{s.name}: rejected: not the source with deletable unread ops removed"
-  pure src.funcs.length
+  throw "rejected"
 
 def usage : String := "usage:
   fir-ref run FILE [@FUNC] [ARG...] [--fuel N]

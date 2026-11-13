@@ -37,6 +37,18 @@ theorem dce_checker : ∀ {mod : Module} {tgt src : Func}, Fir.Dce.checkFunc tgt
     src.Decided mod → tgt.Refines mod src :=
   Fir.Dce.checkFunc_sound
 
+/-- What `fir-ref check-dce`'s counting checker relies on: it is the proved checker. -/
+theorem dce_checker_linear : ∀ (tgt src : Func), Fir.Dce.checkFuncL tgt src = Fir.Dce.checkFunc tgt src :=
+  Fir.Dce.checkFuncL_eq
+
+/-- What `fir-ref check-dce` accepts on, and what an acceptance gives: for every name, both modules
+have a function by that name or neither does, and the target's refines the source's in the
+source module if the source's is `Decided` there. -/
+theorem dce_module_checker : ∀ {tgt src : Module}, Fir.Dce.checkModule tgt src = true →
+    ∀ name, Option.Rel (fun t s => s.Decided src → t.Refines src s) (tgt.find? name)
+      (src.find? name) :=
+  Fir.Dce.checkModule_sound
+
 end Bindings
 
 def claims : List Claim := [
@@ -46,6 +58,12 @@ def claims : List Claim := [
   { name := ``Fir.Dce.checkFunc_sound, role := "binding: proved checker",
     summary := "If the DCE checker run by fir-ref check-dce accepts a target function for a Decided source function, the target refines the source in the source module.",
     binding := some ``Bindings.dce_checker },
+  { name := ``Fir.Dce.checkFuncL_eq, role := "binding: proved checker (counting)",
+    summary := "The DCE checker fir-ref check-dce runs (checkFuncL: read counts instead of a scan of the rest of the region per deleted op) gives the same verdict as checkFunc on every pair of functions, so checkFunc_sound holds for it.",
+    binding := some ``Bindings.dce_checker_linear },
+  { name := ``Fir.Dce.checkModule_sound, role := "binding: proved checker (modules)",
+    summary := "If checkModule (what fir-ref check-dce accepts on) accepts, then for every name the target module has a function by that name exactly when the source does, and the target's refines the source's in the source module if the source's is Decided there. Not module refinement: each target function's calls go to the source's functions.",
+    binding := some ``Bindings.dce_module_checker },
   { name := ``Fir.Dce.refines, role := "pass correctness",
     summary := "DCE: deleting pure ops whose results no later op of their region reads, anywhere in a function, gives a function that refines it in the module, if the source is Decided." },
   { name := ``Fir.Dce.freeze_changes_core, role := "counterexample",
@@ -132,6 +150,7 @@ def supporting : List Lean.Name := [
   ``Fir.Func.Refines.refl, ``Fir.Func.Refines.trans,
   ``Fir.OpOut.Refines.refl, ``Fir.OpOut.Refines.trans,
   ``Fir.Lower.Proof.ovf_runs, ``Fir.Lower.Proof.refines_of_rel, ``Fir.Dce.floatPure_kind,
+  ``Fir.Dce.checkFuncL_sound,
   ``Fir.AArch64.Word.bytes_ofBytes]
 
 end Fir.Audit
