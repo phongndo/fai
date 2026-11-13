@@ -15,7 +15,7 @@ Files here:
 | File | What | Made by |
 |---|---|---|
 | `layer-audit.md` | The HFIR → MFIR → LFIR boundaries audited, a vertical slice, the DCE checkers compared and measured, the observation tooling, and source lines in native code | by hand |
-| `op-contracts.json` | Per op kind (534 kinds, modifiers included): identity, fields, modifiers, layers, typing, declared effects, and the DCE permission with its evidence | `lake exe gen-rust manifest` |
+| `op-contracts.json` | Per op kind (536 kinds, modifiers included): identity, fields, modifiers, layers, typing, declared effects, and the DCE permission with its evidence | `lake exe gen-rust manifest` |
 | `proofs.lock.json` | Reviewed fingerprints of the 35 registered claims: statement, hypothesis count, axioms, and fingerprints of the `Fir` definitions they depend on | `lake exe fir-audit --update` |
 | `proofs.md` | The claims as Lean prints them, with axioms and dependency counts | `lake exe fir-audit --report` |
 | `adversarial.md` | The last `cargo xtask mutate` run: each planted defect and the diagnostic that caught it | `cargo xtask mutate` |

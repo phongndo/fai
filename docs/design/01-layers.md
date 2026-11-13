@@ -2,6 +2,8 @@
 
 FIR has one structure (ops, regions, typed values, one text grammar, one Lean semantics) used at three layers. Each layer has one audience, and each boundary between layers is both an API contract and a proof boundary.
 
+This file is the design target, except [Layers in the op table](#layers-in-the-op-table), which describes what is built. What each layer means today, what each boundary keeps and loses, and what is still unknown are in [layers-as-built.md](layers-as-built.md).
+
 ```
  languages ──Builder API──▶ HFIR ──proved lowering──▶ MFIR ──checked isel──▶ LFIR ──validated regalloc──▶ code
                          (frontends)               (optimizer)            (backends)
@@ -31,17 +33,19 @@ memspace default ptr 32 addr 32
 | | HFIR | MFIR | LFIR for target `T` |
 |---|---|---|---|
 | Core ops | All | All but `ptr.field` and `ptr.index` | `func.ret` |
-| Building blocks (`agg`, `union`, `slice`, `int.*.overflow`, `cf.try`) | All | None | None |
+| Building blocks (`union`, `slice`, `int.*.overflow`, `cf.try`) | All | None | None |
+| `agg.make`, `agg.extract`, `agg.insert` | All | For the structs and arrays calls pass whole | None |
 | Exceptions (`exn.throw`; `func.invoke`) | `exn.throw` | `exn.throw`, `func.invoke` | The exception slot (`aarch64.exn.*`, `aarch64.b.exn`) |
-| Value types | Scalars, structs, arrays, unions, slices | Scalars (`iN`, `ptr`, `bN`) | Scalars |
+| Value types | Scalars (`iN`, `bN`, `ptr`, `f32`, `f64`), structs, arrays, unions, slices | Scalars; structs and arrays only to pass whole across calls | None in function bodies (registers); signatures as MFIR's |
 | Target dialects | None | None yet | `T`'s |
 
-- The building blocks are HFIR only, and so are values of aggregate, union, and slice types; `fir lower` turns an HFIR module into MFIR (decision: HFIR lowering). `cf.check`, which their checks lower to, is a core op.
+- The building blocks are HFIR only, and so are values of union and slice types. Structs and arrays stay in MFIR as values only so calls can pass them whole as the C ABI's unit: `agg.make` builds one where it is passed, and `agg.extract` takes it apart where it arrives (decisions: Aggregates, C ABI for aggregates). The MFIR verifier enforces this for loads, stores, and `select`, but not yet for region state and holes ([layers-as-built.md](layers-as-built.md#6-gaps), G9). `fir lower` turns an HFIR module into MFIR (decision: HFIR lowering). `cf.check`, which their checks lower to, is a core op.
 - Exceptions (decisions: Exception values, Exceptions in MFIR): HFIR catches with `cf.try`; MFIR has no `cf.try`, and a call that may throw names its handler, a block of the nearest `cf.blocks` (`func.invoke`). `exn.throw` is in both: in MFIR it unwinds out of the function. LFIR for AArch64 passes exceptions back through the exception slot (decision: Exceptions at run time).
 - `ptr.field` and `ptr.index` address by type, so they are HFIR only. MFIR addresses with `ptr.offset` by an offset: `ty.offset`, or the index times the stride (decision: Layout). `ty.size`, `ty.align`, and `ty.offset` stay in MFIR as layout queries the optimizer can fold.
 - LFIR keeps `func.ret` because every layer has functions; globals and external functions are module structure, not ops. LFIR for AArch64 doesn't keep `cf.blocks`: a function's code is `aarch64.code`, labeled blocks of machine instructions on registers with explicit branches (decision: LFIR for AArch64). A function whose body is a plain `func.ret` of its parameters returns them where the calling convention puts results.
 - The targets are listed in `Fir.targets` (`aarch64`). Adding one means naming it there and declaring its ops in its dialect with `layers lfir`. An unknown target is a parse error, like an unknown op.
-- The interpreter runs every layer the same way: an op means the same wherever it is allowed. LFIR modules run on their target's machine (`Fir.AArch64Machine`: registers, flags, and FIR's memory), since target ops read and write registers, not SSA values.
+- The interpreter runs HFIR and MFIR the same way. It never reads the layer, so an op means the same wherever it is allowed. LFIR modules run on their target's machine (`Fir.AArch64Machine`: registers, flags, and FIR's memory), since target ops read and write registers, not SSA values. Lean defines behaviors and refinement only for the first machine.
+- Every layer depends on the module's data layout (its `memspace` line), which is chosen in HFIR and never changes. As built, HFIR is therefore not hardware-neutral: the AArch64 backend accepts only AAPCS64's layout.
 
 ## HFIR
 

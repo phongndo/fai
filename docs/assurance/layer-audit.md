@@ -29,13 +29,14 @@ AArch64) and can be reproduced with the commands given.
   **Proved:** the expansion step only (`Lower.Proof.Expand.refines`, `lowerFunc_refines`, for a
   `Decided` source without holes or temporary-looking names). Scalarization, `cf.try` lowering,
   and the whole module are open.
-- **Lost:** field identity (`ptr.field … %a, 1` becomes `ptr.offset.inbounds %a, 4`); index
-  types (`ptr.index` becomes `i128` arithmetic); `inbounds` and the padding bytes of aggregate
-  loads and stores, which become one `ptr.offset.wrap` access per field with alignment narrowed;
-  FIR unions, which become a tag plus every variant (signatures change arity: `@get(%u)` becomes
-  `@get(%u.0, %u.1, %u.2)`); which `cf.blocks` was a `cf.try`. Kept: locations (all ops but the
-  extracts that take struct parameters apart, which have no source op), names, facts on scalars,
-  UB modifiers.
+- **Lost:** field identity (`ptr.field … %a, 1` becomes `ptr.offset.inbounds %a, 4`); index types
+  (`ptr.index` becomes `i128` arithmetic); the grouping of an aggregate load or store, which
+  becomes one `ptr.offset.wrap` access per leaf with alignment `gcd(align, offset)` (not a
+  semantic loss: HFIR defines aggregate accesses exactly so, padding untouched, decision:
+  Aggregate values); FIR unions, which become a tag plus every variant (signatures change arity:
+  `@get(%u)` becomes `@get(%u.0, %u.1, %u.2)`); which `cf.blocks` was a `cf.try`. Kept: locations
+  (all ops but the extracts that take struct parameters apart, which have no source op), names,
+  facts on scalars, UB modifiers.
 - **Unclear:** the same op is typed differently by layer (a composite `cf.if` verifies in MFIR,
   and no backend takes it); Lean scalarizes, lowers exceptions, then expands, while Rust fuses
   scalarizing and expanding and lowers exceptions after, which only text equality on the tested
