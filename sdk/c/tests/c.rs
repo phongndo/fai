@@ -166,7 +166,7 @@ fn end_to_end_through_the_c_api() {
     build_c(&repo().join("tests/capi/e2e.c"), &exe);
     let mut cmd = Command::new(&exe);
     // `tests/capi/e2e.c` builds its native half as Linux ELF (`FIR_OS_LINUX`), which macOS's
-    // `cc` can't link: a host gap there (`cargo xtask verify` declares it), not a skip.
+    // `cc` can't link: a host gap there (`fai verify` declares it), not a skip.
     let tc = if cfg!(target_os = "macos") {
         evidence::host_gap(
             &ev,

@@ -140,7 +140,7 @@ fn refines_exactly(t: &Result<String, String>, s: &Result<String, String>) -> Re
 /// The pipeline under test: the default `-O` one, or `FIR_PASSES=p,q,…` (in order, to a fixed
 /// point, as `fir compile --passes`, `fir measure`, and the backend suites run it; experimental
 /// passes allowed), so a new or experimental pass gets this whole differential suite without
-/// editing it, in the same configuration `cargo xtask experiment` measures. A full verification
+/// editing it, in the same configuration `fai experiment` measures. A full verification
 /// clears `FIR_PASSES`.
 fn pipeline() -> Pipeline {
     match std::env::var("FIR_PASSES") {

@@ -12,7 +12,7 @@ passes with `-O`), and links it with the target's C compiler, as `fir compile` d
 usual build directory (`build/fcc`) are now `fcc`; the environment variables `FAI_CC_*` are now
 `FCC_*` (`FCC_TESTS`, `FCC_ONLY`, `FCC_PASSES`, `FCC_ABI`, `FCC_ABI_SEED`, `FCC_DUMP`,
 `FCC_RESOURCE_DIR`, `FCC_BUILD_CAPI`); the tests are `cargo test -p fir-capi --test fcc`
-(`fcc_corpus`, `fcc_abi_torture`, whose evidence `cargo xtask verify` reads as `fcc_corpus`); and
+(`fcc_corpus`, `fcc_abi_torture`, whose evidence `fai verify` reads as `fcc_corpus`); and
 `benchmarks/c/bench.py` reads `BENCH_FCC`. Older commits and logs say `fai-cc`. The project-wide `fai_`
 names (the test runtime `fai_runtime.c`, its `fai_put_*` helpers, the C++ `namespace fai`) are
 the project's, not the compiler's, and keep their names.
@@ -38,7 +38,7 @@ fcc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]
   `docs/assurance/dce.md`): a refusal fails the compilation, and one line
   (`fir: check-dce: N steps accepted by Fir.Dce.checkModule (…)`) goes to stderr. The corpus tests
   build each program's `-O` binary this way, for AArch64 and for x86-64 (both corpora are
-  required in `cargo xtask verify full` on Linux; the ABI torture test's `-O` builds are not
+  required in `fai verify full` on Linux; the ABI torture test's `-O` builds are not
   checked), and the `FCC_PASSES` build too when it is set. Without the flag, every step's
   output is still checked, by an unproved Rust transcription of the same checker.
 - `--target` picks the target: `aarch64` (the default) or `x86_64`. `-O`, `--passes`, and

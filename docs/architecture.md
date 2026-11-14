@@ -32,12 +32,13 @@ frontends/
   c/            fcc             C via Clang's AST, through the C API only (C++, CMake)
 tools/
   fir/main.rs                   the `fir` command (a binary target of package fir)
+  fai/          fai-tools       the `fai` command: verify, mutate, evidence, experiment, matrix
 spec/                           Lean: Fir (semantics, proofs, op DSL), Audit, fir-ref, generators
 tests/                          .fir and C API corpora; rust/: the cross-component Rust suites
 benchmarks/
   c/                            cbench and bench.py: fcc against GCC and Clang
   rust/                         timing examples for the library
-docs/  xtask/  nix/
+docs/  nix/
 ```
 
 ## Dependency direction
@@ -59,7 +60,7 @@ fir (sdk/rust)       → every crate above (it re-exports them); its targets are
                        binary (tools/fir), the suites (tests/rust), the examples (benchmarks/rust)
 fir-capi (sdk/c)     → fir
 fcc (frontends/c)    links fir-capi's static library through CMake; no Rust dependency
-xtask                → nothing in the workspace (it runs cargo, lake, clang, cbindgen)
+fai-tools (tools/fai) → nothing in the workspace (it runs cargo, lake, clang, cbindgen, uv)
 ```
 
 `fai-ir`, `fai-transforms`, and `fai-target-aarch64` have one dev-dependency on `fir`. Their doc
@@ -85,7 +86,7 @@ the layers are values and table entries, not crates:
 
 | Lean (`spec/`) | Generated or checked Rust | What keeps them together |
 |---|---|---|
-| `Fir/Syntax.lean`, `Fir/AArch64Syntax.lean`, `Fir/OpDSL.lean` (op declarations) | `compiler/ir/src/generated/ops.rs` (`lake exe gen-rust`), `builder.rs` (`gen-builder rust`), `sdk/c/src/generated/ops.rs` (`gen-builder capi`) | `cargo xtask verify` regenerates each one and fails on any difference |
+| `Fir/Syntax.lean`, `Fir/AArch64Syntax.lean`, `Fir/OpDSL.lean` (op declarations) | `compiler/ir/src/generated/ops.rs` (`lake exe gen-rust`), `builder.rs` (`gen-builder rust`), `sdk/c/src/generated/ops.rs` (`gen-builder capi`) | `fai verify` regenerates each one and fails on any difference |
 | `Fir/DceKinds.lean` (`dcePerm`) and the op declarations | `compiler/ir/src/generated/contracts.rs` and `docs/assurance/op-contracts.json` | the same freshness check; `tests/rust/contracts.rs` checks the components' declarations against them |
 | the registered claims (`Audit/Claims.lean`) | — | `lake exe fir-audit` against `docs/assurance/proofs.lock.json` |
 | `Fir/Dce*.lean`, `fir-ref check-dce` (the proved checker) | `compiler/transforms/src/reference.rs` (the bridge to it), `--check-dce`, `FIR_CHECK_DCE` | `verify full` requires the C corpora's `-O` builds to be checked on both targets |
@@ -115,7 +116,7 @@ label.
 | `fir` (run, check, fmt, opt, compile, lower) | `tools/fir/main.rs` | `cargo build` (package `fir`) |
 | `fcc` (C compiler) | `frontends/c` | CMake, linking `libfir_capi.a` |
 | `fir-ref`, `fir-audit`, `gen-rust`, `gen-builder` | `spec/` | `lake build` |
-| `cargo xtask verify [fast\|full]`, `cargo xtask mutate` | `xtask/` | cargo |
+| `fai` (verify, mutate, evidence, experiment, matrix) | `tools/fai` | `cargo fai …` (package `fai-tools`), or `fai …` in the dev shell; `cargo xtask …` is its old name |
 | `cbench.py`, `bench.py` | `benchmarks/c` | python3 in the dev shell |
 
 There is no `fcxx`. A C++ driver would be a frontend in `frontends/`, and its command would sit
@@ -158,7 +159,7 @@ as emulated). They never count as timing: cbench `time` refuses to run under emu
 ## How this layout was reached
 
 These commits move code and nothing else. Every step was built and passed clippy. Each one
-also passed `cargo xtask verify fast`, except the `fai-codegen` and `fai-target-aarch64` steps,
+also passed `fai verify fast`, except the `fai-codegen` and `fai-target-aarch64` steps,
 which ran the suites that exercise them (both native backends, the register check, ABI, and
 debug lines); `verify fast` passed on the next step. `verify full` ran on the result:
 
@@ -172,5 +173,5 @@ debug lines); `verify fast` passed on the next step. `verify full` ran on the re
    harness moved to `benchmarks/c`.
 
 Paths changed in the Cargo manifests, the Lean generators' header lines, cbindgen's settings,
-CMake's include path, xtask's freshness checks and mutation anchors, and the docs. Regenerating
+CMake's include path, xtask's (now `fai`'s) freshness checks and mutation anchors, and the docs. Regenerating
 every generated file gives the same bytes, and the proof audit's fingerprints did not change.

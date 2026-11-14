@@ -14,13 +14,13 @@ nix develop                                       # or prefix each command with 
 cargo run --release --bin fir -- measure tests/fir1/noalias.fir --passes mem2reg,dce --experimental
 
 # 2. Run the experiment: measure the whole corpus against a baseline, then gate it.
-cargo xtask experiment promo --passes mem2reg,stackdce,fwd,copyprop,dse,dce --experimental
-cargo xtask experiment my-fwd-change --baseline-rev main        # a code change: this tree vs main
+fai experiment promo --passes mem2reg,stackdce,fwd,copyprop,dse,dce --experimental
+fai experiment my-fwd-change --baseline-rev main        # a code change: this tree vs main
 
 # 3. Read target/experiments/NAME/report.md (or report.json). Exit 1 means REJECTED.
 
 # 4. Before anything lands: the required check, which knows nothing of experiments.
-cargo xtask verify full
+fai verify full
 ```
 
 A quick look without the gate (seconds instead of minutes) is `--gate none`; its verdict says
@@ -28,7 +28,7 @@ A quick look without the gate (seconds instead of minutes) is `--gate none`; its
 
 ## What an experiment does
 
-`cargo xtask experiment NAME` (`xtask/src/experiment.rs`) compares a **candidate** (this working
+`fai experiment NAME` (`tools/fai/src/experiment.rs`) compares a **candidate** (this working
 tree, committed or not, with `--passes …`, `-O` by default) with a **baseline** (this tree, or
 the tree at `--baseline-rev REV` in a temporary git worktree with its own target directory, with
 `--baseline-passes …`, `-O` by default).
@@ -98,7 +98,7 @@ proof, and nothing here connects a measurement to the Lean theorems.
   of the same experiment (`git worktree add -f` on that path only). No other worktree's
   registration is touched.
 * The variables that weaken checks (`FIR_REF`, `FIR_FUZZ`, `FIR_CC`, …: `CLEARED` in
-  `xtask/src/main.rs`) are cleared for every child; the gate sets only what it means to.
+  `tools/fai/src/main.rs`) are cleared for every child; the gate sets only what it means to.
 * The candidate's tree is identified by revision, whether it is dirty, and a hash of its diff
   and of every untracked file's name and contents (an unreadable one is an error), so a report
   can't be mistaken for one of another tree. Each binary measured is the one cargo reports
@@ -116,7 +116,7 @@ proof, and nothing here connects a measurement to the Lean theorems.
   side can *prepare* (LFIR inputs, lowering limits) is listed as unmeasured.
 * The gate tests exactly the pipeline measured: every suite runs `FIR_PASSES` to a fixed point,
   as `fir measure` does, and records it; `--none` (no passes) can only be measured.
-* `cargo xtask mutate experiment-rejects-a-miscompile` plants a miscompile (forwarding a store to
+* `fai mutate experiment-rejects-a-miscompile` plants a miscompile (forwarding a store to
   a load through a *different* pointer) and requires the experiment to reject it, so the harness
   is itself tested the way the other checkers are (`docs/assurance/adversarial.md`).
 
@@ -134,8 +134,8 @@ is the gate, which runs what each host can (below).
 
 ## What runs where
 
-`cargo xtask verify full` runs on both hosts in CI (`.github/workflows/verify.yml`), and
-`cargo xtask matrix REPORT.json…` puts their reports side by side.
+`fai verify full` runs on both hosts in CI (`.github/workflows/verify.yml`), and
+`fai matrix REPORT.json…` puts their reports side by side.
 
 | | x86-64 Linux | Apple-silicon macOS |
 |---|---|---|

@@ -1169,7 +1169,7 @@ fn fcc_x86_64_corpus() {
         t.dce_deletions
     );
     // Every program is accounted for, run or refused for a declared limitation (a program that
-    // failed is neither), so `cargo xtask verify` can compare with the corpus on disk.
+    // failed is neither), so `fai verify` can compare with the corpus on disk.
     let ev = evidence::Evidence::new("fcc_x86_64_corpus");
     ev.count("programs", (t.ran.len() + t.refused.len()) as u64);
     ev.count("programs run", t.ran.len() as u64);

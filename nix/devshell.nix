@@ -18,6 +18,16 @@ let
   crossX86 = pkgs.pkgsCross.gnu64;
   needsCrossX86 = stdenv.hostPlatform.isLinux && !stdenv.hostPlatform.isx86_64;
 
+  # `fai …`: the repository's command (tools/fai), built and run from the checkout the shell is
+  # in, from any directory of it; the same as `cargo fai …` at its root.
+  fai = pkgs.writeShellScriptBin "fai" ''
+    root=$(${pkgs.git}/bin/git rev-parse --show-toplevel 2>/dev/null) || {
+      echo "fai: not inside a checkout of the fai repository" >&2
+      exit 2
+    }
+    exec cargo run --quiet --manifest-path "$root/Cargo.toml" --package fai-tools --bin fai -- "$@"
+  '';
+
   # The C benchmark harness (benchmarks/c/cbench.py) links every benchmark statically against
   # the AArch64 target's glibc, so the same binary runs under qemu-user and on any AArch64 Linux
   # machine; its QEMU plugin needs glib's headers (qemu-plugin.h includes glib.h). Linux only.
@@ -37,6 +47,9 @@ in
   name = "fir-dev";
 
   packages = [
+    # `fai verify`, `fai experiment`, …: the repository's own command (above)
+    fai
+
     # Rust: the FIR compiler
     pkgs.rustc
     pkgs.cargo

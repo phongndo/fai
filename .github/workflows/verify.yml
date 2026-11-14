@@ -1,18 +1,18 @@
 # The required checks, on two native hosts:
 #
 # * x86-64 Linux (ubuntu-24.04): the dev shell builds (`nix flake check`), and the full
-#   verification passes (`cargo xtask verify full`: Lean from scratch, generated files, the proof
+#   verification passes (`fai verify full`: Lean from scratch, generated files, the proof
 #   audit, formatting and lints, every Rust suite in debug and release with the Lean reference
 #   and qemu required, the C API under AddressSanitizer, and the evidence that the work ran).
 #   x86-64 code runs natively here; AArch64 Linux code runs under qemu-user.
 # * Apple-silicon macOS (macos-15, arm64): the same command, natively. AArch64 code runs natively
 #   as Mach-O. What macOS can't run by construction (x86-64 and AArch64 Linux binaries, the
 #   Linux ABI torture test, fcc's corpus, the C API's Linux native half) is declared in
-#   `HOST_GAPS` (xtask/src/main.rs); the run must report host verification with exactly those
+#   `HOST_GAPS` (tools/fai/src/main.rs); the run must report host verification with exactly those
 #   gaps unverified, and never reports full verification.
 #
 # Each host's report is uploaded whether it passes or not, and the last job puts both side by
-# side (`cargo xtask matrix`) in the run's summary: what ran natively, under an emulator, or not
+# side (`fai matrix`, run as `cargo fai matrix`) in the run's summary: what ran natively, under an emulator, or not
 # at all.
 name: verify
 
@@ -44,7 +44,7 @@ jobs:
       - name: Dev shell builds
         run: nix flake check
       - name: Verification
-        run: nix develop -c cargo xtask verify full
+        run: nix develop -c fai verify full
       - name: Required verdict
         run: |
           nix develop -c uv run python - <<'EOF'
@@ -85,14 +85,15 @@ jobs:
           pattern: verify-report-*
           path: reports
       - name: Cross-host matrix
-        # Only xtask and serde_json build: the runner's own Rust is enough. `shell: bash` sets
-        # pipefail, so a failing `cargo xtask matrix` fails the step despite `tee`.
+        # Only `fai` (tools/fai) and serde_json build: the runner's own Rust is enough, through
+        # the checkout's `cargo fai` alias. `shell: bash` sets
+        # pipefail, so a failing `fai matrix` fails the step despite `tee`.
         shell: bash
         run: |
           shopt -s nullglob
           files=(reports/*/report.json)
           if [ ${#files[@]} -eq 0 ]; then echo "no reports" >> "$GITHUB_STEP_SUMMARY"; exit 1; fi
-          cargo xtask matrix "${files[@]}" | tee matrix.md >> "$GITHUB_STEP_SUMMARY"
+          cargo fai matrix "${files[@]}" | tee matrix.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: verify-matrix

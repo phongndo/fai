@@ -31,7 +31,7 @@ would never produce.
 | **Proved** | A Lean theorem, registered with the proof audit (`fir-audit`: standard axioms only, no `sorry`, statement and dependencies locked in `proofs.lock.json`). |
 | **Checked** | Decided at compile time, on this input, by code whose acceptance a *proved* theorem says implies the property. A checked result inherits the theorem's hypotheses and the checker's trusted base. |
 | **Checked (unproved)** | Decided at compile time by code nobody has proved; it can still be wrong in the same way the pass is. |
-| **Tested** | Shown on the inputs the test suites run (fixtures, random programs, the C corpus), and by planted defects the tests must catch (`cargo xtask mutate`). Says nothing about other inputs. |
+| **Tested** | Shown on the inputs the test suites run (fixtures, random programs, the C corpus), and by planted defects the tests must catch (`fai mutate`). Says nothing about other inputs. |
 | **Assumed** | A hypothesis of a theorem that nothing establishes for the programs compiled. |
 | **Trusted** | Relied on without proof or check: if it is wrong, the conclusions above can be wrong without any check failing. |
 | **Open** | Neither proved nor checked; the property may be true, but nothing here shows it. |
@@ -252,7 +252,7 @@ cargo test -p fir-capi --test fcc -- fcc_x86_64_corpus --nocapture   # the same 
 FCC_PASSES=mem2reg,stackdce,fwd,copyprop,dse,dce \
   cargo test -p fir-capi --test fcc -- fcc_corpus fcc_x86_64_corpus --nocapture   # and the promotion pipeline's builds
 cargo test -p fai-transforms --lib dce::tests       # the default output check, unit tests
-cargo xtask mutate dce-apply-deletes-more dce-output-check-weaker-than-proved   # its planted defects
+fai mutate dce-apply-deletes-more dce-output-check-weaker-than-proved   # its planted defects
 cd spec && lake exe fir-audit --lock ../docs/assurance/proofs.lock.json   # the claims
 ```
 

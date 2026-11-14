@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 
-//! What a test actually checked, for `cargo xtask verify`.
+//! What a test actually checked, for `fai verify`.
 //!
 //! A test that skips part of its work (no Lean reference, no AArch64 toolchain, no C compiler)
 //! passes, which is right for a quick local run and wrong for a release gate. So tests record
-//! their counts here, and with `FIR_EVIDENCE=DIR` each writes `DIR/<name>.json`; `cargo xtask
-//! verify full` reads the files and refuses a run whose counts show missing work, whatever the
+//! their counts here, and with `FIR_EVIDENCE=DIR` each writes `DIR/<name>.json`; `fai verify
+//! full` reads the files and refuses a run whose counts show missing work, whatever the
 //! exit status was. With `FIR_REQUIRE_FULL=1` a test also fails at once instead of skipping
 //! ([`require`]).
 //!
@@ -32,8 +32,8 @@ pub fn require(why: &str) {
 }
 
 /// Record that this host can't run `ev`'s check by construction (Linux binaries on macOS, say),
-/// with why, instead of skipping it: not a failure under `FIR_REQUIRE_FULL`, because `cargo xtask
-/// verify` accepts it only where its `HOST_GAPS` table declares that gap for this host, and then
+/// with why, instead of skipping it: not a failure under `FIR_REQUIRE_FULL`, because `fai verify`
+/// accepts it only where its `HOST_GAPS` table declares that gap for this host, and then
 /// reports the check as unverified there and the run as host verification, never full. Call it
 /// only on a condition fixed at compile time (`cfg!`), never on a missing tool.
 pub fn host_gap(ev: &Evidence, why: &str) {
@@ -46,7 +46,7 @@ pub fn host_gap(ev: &Evidence, why: &str) {
 }
 
 /// The pipeline the optimizing suites test: `FIR_PASSES`, or `-O` (recorded as the `pipeline`
-/// fact, so `cargo xtask experiment` can check its gate tested the candidate's).
+/// fact, so `fai experiment` can check its gate tested the candidate's).
 pub fn pipeline() -> String {
     match std::env::var("FIR_PASSES") {
         Ok(s) if !s.is_empty() => s,

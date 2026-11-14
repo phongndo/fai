@@ -15,7 +15,7 @@
 //!   the prepared MFIR (AArch64 as Linux ELF on every host, so the count is the same everywhere),
 //!   or the backend's refusal;
 //! * `prepare.us`: how long preparing took, in microseconds. The only number that depends on the
-//!   machine; reported, never compared by `cargo xtask experiment`.
+//!   machine; reported, never compared by `fai experiment`.
 //!
 //! Each run is also checked: the source module's run (the original, in this crate's interpreter)
 //! must print what the `// run:` line expects (an error line counts as what `fir run` prints on
@@ -26,7 +26,7 @@
 //! refines its source and matches its expectation, 1 when one doesn't (the JSON says which) or
 //! the module can't be prepared, and 2 for bad usage. This checks only the runs the file names,
 //! in the interpreter: it is evidence about this module, not a proof, and no substitute for the
-//! differential suites (`cargo xtask experiment` runs both).
+//! differential suites (`fai experiment` runs both).
 
 use std::fmt::Write as _;
 use std::process::ExitCode;

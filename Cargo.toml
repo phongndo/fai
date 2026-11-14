@@ -1,12 +1,12 @@
 [workspace]
-members = ["compiler/*", "sdk/*", "targets/*", "xtask"]
+members = ["compiler/*", "sdk/*", "targets/*", "tools/fai"]
 resolver = "3"
 
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
 
-# Lints every crate inherits (`[lints] workspace = true`), checked by `cargo xtask verify` with
+# Lints every crate inherits (`[lints] workspace = true`), checked by `fai verify` with
 # `-D warnings`. The C API is the only crate with `unsafe` (`fir` forbids it): each unsafe block
 # says why it is sound, each unsafe function says what its caller must guarantee.
 [workspace.lints.rust]

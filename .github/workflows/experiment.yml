@@ -1,4 +1,4 @@
-# On demand: run `cargo xtask experiment` (xtask/src/experiment.rs) on both native hosts, for a
+# On demand: run `fai experiment` (tools/fai/src/experiment.rs) on both native hosts, for a
 # branch, and upload each host's report. Not a required check: an experiment's verdict is
 # evidence for a proposal, and `verify` stays the gate for anything that lands.
 #
@@ -63,7 +63,7 @@ jobs:
           if [ -n "$PASSES" ]; then args+=(--passes "$PASSES"); fi
           if [ "$EXPERIMENTAL" = "true" ]; then args+=(--experimental); fi
           if [ -n "$BASELINE_REV" ]; then args+=(--baseline-rev "$BASELINE_REV"); fi
-          nix develop -c cargo xtask experiment "${args[@]}"
+          nix develop -c fai experiment "${args[@]}"
       - name: Summary
         if: always()
         run: cat "target/experiments/$NAME/report.md" >> "$GITHUB_STEP_SUMMARY" || true

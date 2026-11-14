@@ -19,7 +19,7 @@
 //! is a compile error until each component decides. `tests/contracts.rs` checks the declarations
 //! against the generated contracts and the op declarations (an HFIR-only op the lowering doesn't
 //! handle, or one instruction selection claims, is a contradiction), and the differential tests
-//! record which kinds they exercised, so `cargo xtask verify` can refuse a claimed support that
+//! record which kinds they exercised, so `fai verify` can refuse a claimed support that
 //! no test runs.
 //!
 //! None of this shows that the Rust implementation of an op means what the Lean one does: that

@@ -1,10 +1,10 @@
-//! `cargo xtask experiment`: propose a compiler change, test it, and measure it, without changing
+//! `fai experiment`: propose a compiler change, test it, and measure it, without changing
 //! any tracked file: it writes build outputs, its report under `target/experiments/NAME/`, the
 //! suites' scratch files, `spec/.lake/` (through `lake build`), and, for `--baseline-rev`, a
 //! temporary git worktree's registration (see docs/experiments.md, Safety).
 //!
 //! ```text
-//! cargo xtask experiment NAME [--passes P,... [--experimental] | --none]
+//! fai experiment NAME [--passes P,... [--experimental] | --none]
 //!                             [--baseline-passes P,... | --baseline-none] [--baseline-rev REV]
 //!                             [--gate quick|none] [--fuzz N] [--seed S] [--jobs N]
 //! ```
@@ -111,7 +111,7 @@ struct Opts {
     jobs: usize,
 }
 
-const USAGE: &str = "usage: cargo xtask experiment NAME [--passes P,... [--experimental] | --none]\n                              [--baseline-passes P,... | --baseline-none] [--baseline-rev REV]\n                              [--gate quick|none] [--fuzz N] [--seed S] [--jobs N]";
+const USAGE: &str = "usage: fai experiment NAME [--passes P,... [--experimental] | --none]\n                              [--baseline-passes P,... | --baseline-none] [--baseline-rev REV]\n                              [--gate quick|none] [--fuzz N] [--seed S] [--jobs N]";
 
 fn parse(args: &[String]) -> Result<Opts, String> {
     let mut it = args.iter();
@@ -898,7 +898,7 @@ pub fn main(root: &Path, args: &[String]) -> i32 {
             .map_or(0, |d| d.as_nanos())
     );
     eprintln!(
-        "cargo xtask experiment {}: candidate {} vs baseline {}{}",
+        "fai experiment {}: candidate {} vs baseline {}{}",
         o.name,
         o.cand.show(),
         o.base.show(),
@@ -917,7 +917,7 @@ pub fn main(root: &Path, args: &[String]) -> i32 {
     };
 
     // The two `fir`s.
-    // The candidate builds where cargo would put it (`cargo xtask mutate` sets its own).
+    // The candidate builds where cargo would put it (`fai mutate` sets its own).
     let cand_target = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("target"));
@@ -1110,7 +1110,7 @@ pub fn main(root: &Path, args: &[String]) -> i32 {
         "metrics": metrics,
         "gate": gate.as_ref().map(|g| json!({"fuzz": o.fuzz, "seed": o.seed, "checks": g.checks})),
         "unverified on this host": host_gaps,
-        "what this shows": "Deterministic counts on the tests/ corpus (interpreter-executed ops are a proxy for run time, not a timing), each candidate run checked against its source run in the interpreter, and, when gated, the differential suites with the candidate pipeline. Not a proof of the candidate; not a timing. `cargo xtask verify full` remains the required check.",
+        "what this shows": "Deterministic counts on the tests/ corpus (interpreter-executed ops are a proxy for run time, not a timing), each candidate run checked against its source run in the interpreter, and, when gated, the differential suites with the candidate pipeline. Not a proof of the candidate; not a timing. `fai verify full` remains the required check.",
     });
     std::fs::write(
         out.join("report.json"),

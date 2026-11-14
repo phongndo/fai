@@ -91,7 +91,7 @@ fn toolchain(dir: &Path) -> Result<Toolchain, String> {
 fn native(dir: &Path, ev: &common::evidence::Evidence) -> Option<Toolchain> {
     ev.fact("pipeline", common::evidence::pipeline());
     // The output is Linux ELF: on macOS nothing can run it (qemu-user is Linux-only), which
-    // `cargo xtask verify` declares as a host gap there.
+    // `fai verify` declares as a host gap there.
     if cfg!(target_os = "macos") {
         common::evidence::host_gap(
             ev,

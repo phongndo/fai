@@ -15,7 +15,7 @@
 //! fir lower FILE [--no-locs]                  lower an HFIR module to MFIR and print it
 //! fir measure FILE [-O | --none | --passes P,... [--experimental]] [--fuel N]
 //!                                            what a pipeline does to a module, as JSON
-//!                                            (see `measure.rs`; `cargo xtask experiment`)
+//!                                            (see `measure.rs`; `fai experiment`)
 //! ```
 //!
 //! `check` prints what `fir-ref check` prints: `ok`, or one `hole ?NAME: TYPE @LOC` line per

@@ -1,6 +1,6 @@
 # FIR's Python: the C benchmark harnesses in benchmarks/c (standard library only). uv runs them
 # with the dev shell's Python (`uv run benchmarks/c/cbench.py ...`) and installs ruff and ty (the
-# dev group, pinned in uv.lock), which check them in `cargo xtask verify`
+# dev group, pinned in uv.lock), which check them in `fai verify`
 # (`uv run ruff format --check`, `uv run ruff check`, `uv run ty check`).
 [project]
 name = "fai-benchmarks"

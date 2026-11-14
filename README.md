@@ -35,12 +35,12 @@ None of this is a stable interface yet.
 | `targets/` | backends: `aarch64`, `x86_64` |
 | `sdk/` | interfaces: `rust` (the `fir` crate), `c` (`fir-capi`, header `sdk/c/include/fir.h`) |
 | `frontends/c/` | fcc |
-| `tools/fir/` | the `fir` command |
+| `tools/` | commands: `fir/`, the `fir` command (FIR); `fai/`, the `fai` command (`fai verify`, `fai experiment`, …) |
 | `spec/` | Lean: semantics, proofs, op declarations, the reference tool, generators, the proof audit |
 | `tests/` | `.fir` and C API corpora; `tests/rust/`, the cross-component suites |
 | `benchmarks/` | `c/`: fcc against GCC and Clang; `rust/`: library timing |
 | `docs/` | [architecture](docs/architecture.md), [design](docs/design/), [assurance](docs/assurance/), [performance](docs/performance/) |
-| `xtask/`, `nix/` | verification and development environment |
+| `nix/` | the development environment |
 
 [docs/architecture.md](docs/architecture.md) has the crates, what depends on what, and where
 each layer and each generated file lives.
@@ -56,10 +56,15 @@ cargo run --bin fir -- run tests/fir0/loops.fir @countdown 5   # interpret a fun
 cargo run --bin fir -- compile FILE.fir -O -o out              # --target x86_64 for x86-64
 cmake -S frontends/c -B build/fcc -G Ninja                     # fcc: configure,
 cmake --build build/fcc                                        # and build
-cargo xtask verify fast                                        # local; says what it skipped
-cargo xtask verify full                                        # the required check (CI)
-cargo xtask experiment NAME --passes P,Q [--experimental]      # propose, test, and measure a change
+fai verify fast                                                # local; says what it skipped
+fai verify full                                                # the required check (CI)
+fai experiment NAME --passes P,Q [--experimental]              # propose, test, and measure a change
+fai help                                                       # every `fai` command
 ```
+
+`fai` is the repository's own command (`tools/fai`): the dev shell builds and runs it from the
+checkout you're in, and `cargo fai …` does the same anywhere cargo runs. `cargo xtask …`, its
+old name, still works.
 
 [frontends/c/README.md](frontends/c/README.md) covers fcc,
 [docs/assurance/README.md](docs/assurance/README.md) covers what `verify full` requires, and

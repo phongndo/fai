@@ -1,0 +1,17 @@
+[package]
+name = "fai-tools"
+version = "0.1.0"
+description = "The `fai` command: the repository's verification (`fai verify`), its adversarial checks, and compiler experiments"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "fai"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

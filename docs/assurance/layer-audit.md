@@ -213,7 +213,7 @@ op. A Rust acceptance the proved checker refuses, or the reverse, fails the test
 
 Planted weakenings of the Rust checker alone (the planner left correct, so no pass output shows
 them) are caught at the default size: letting `freeze` go (19 disagreements), `func.call` (89),
-`mem.load` (141). The first is now `cargo xtask mutate dce-checker-weaker-than-proved`. Before
+`mem.load` (141). The first is now `fai mutate dce-checker-weaker-than-proved`. Before
 this test the same defect passed every suite: the existing mutation `dce-checker-also-wrong`
 needs the planner to be wrong too.
 
@@ -338,5 +338,5 @@ right about.
 - Tests: `tests/dce_check.rs` (the `-O` pipeline, the agreement test), `tests/debug_lines.rs`,
   `tests/aarch64.rs` (`layer_audit_foreign_data_layouts_are_refused`), `tests/opt.rs`
   (`FIR_PASSES`), `fir-capi/tests/fcc.rs` (every layer).
-- `xtask`: `dce_agreement` and `debug_lines` evidence required; the mutation
+- `xtask` (now `tools/fai`): `dce_agreement` and `debug_lines` evidence required; the mutation
   `dce-checker-weaker-than-proved`; `FIR_PASSES` and `FIR_DEBUG_LINES_DIR` cleared.

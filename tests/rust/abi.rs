@@ -38,7 +38,7 @@
 //! The expected output is computed here from the values. `FIR_ABI=N` sets how many signatures
 //! (default 240), `FIR_ABI_SEED` the seed (default 1); `FIR_CC` the C compiler. Without a C
 //! compiler or a way to run AArch64 binaries it skips, unless `FIR_REQUIRE_FULL=1`; it records
-//! its counts for `cargo xtask verify` (`abi_torture`).
+//! its counts for `fai verify` (`abi_torture`).
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -1327,7 +1327,7 @@ fn reordered_hfa(t: &T) -> bool {
 fn structs_cross_the_c_abi_both_ways() {
     // The signatures are checked against AAPCS64 as Linux defines it, built for Linux; macOS's
     // C compiler follows Apple's variant (variadic arguments on the stack), and the macOS dev
-    // shell has no Linux toolchain or qemu-user, so `cargo xtask verify` declares a host gap.
+    // shell has no Linux toolchain or qemu-user, so `fai verify` declares a host gap.
     if cfg!(target_os = "macos") {
         let ev = Evidence::new("abi_torture");
         common::evidence::host_gap(

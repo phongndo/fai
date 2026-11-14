@@ -1,4 +1,19 @@
-//! `cargo xtask verify [fast|full]`: the repository's one required verification command.
+//! `fai`: the repository's command for verifying it and for experimenting on its compiler.
+//!
+//! ```text
+//! fai verify [fast|full] [--no-lean-clean] [--report-dir DIR]   the required check (below)
+//! fai mutate [NAME...]           the checkers' adversarial tests (mutate.rs)
+//! fai evidence DIR               check one evidence directory as `verify full` would
+//! fai experiment NAME [OPTIONS]  propose, test, and measure a compiler change (experiment.rs)
+//! fai matrix REPORT.json...      what each host's verification ran, side by side
+//! fai help                       this list
+//! ```
+//!
+//! In a checkout, `cargo fai …` builds and runs it (`.cargo/config.toml`), and so does `fai …` in
+//! the dev shell; `cargo xtask …`, its old name, is the same binary. Exit codes: 0 for success,
+//! 1 for a failed check (or a rejected experiment), 2 for bad usage.
+//!
+//! `fai verify [fast|full]`: the repository's one required verification command.
 //!
 //! **full** builds the Lean development from the current sources, checks every generated file,
 //! audits the proofs (`fir-audit` against the reviewed lock), checks formatting and lints, runs
@@ -1170,22 +1185,66 @@ fn check_evidence(
     (bad, Value::Object(table))
 }
 
+const USAGE: &str = "usage: fai verify [fast|full] [--no-lean-clean] [--report-dir DIR]
+       fai mutate [NAME...]
+       fai evidence DIR
+       fai experiment NAME [OPTIONS]   (see tools/fai/src/experiment.rs)
+       fai matrix REPORT.json...
+       fai help
+In a checkout, `cargo fai ...` (or `fai ...` in the dev shell) builds and runs it; `cargo xtask ...` is its old name.";
+
+/// The repository this binary was built from: `tools/fai/../..`.
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap()
+}
+
+/// A command line, parsed.
+#[derive(Debug, PartialEq)]
+enum Cli<'a> {
+    /// `verify`, with the rest of the line (the mode and options are read where it runs).
+    Verify,
+    Mutate(&'a [String]),
+    Evidence(&'a str),
+    Experiment(&'a [String]),
+    Matrix(&'a [String]),
+    /// `help`, `--help`, `-h`: the usage on stdout, exit 0.
+    Help,
+    /// Anything else: the usage on stderr, exit 2.
+    Usage,
+}
+
+fn command(args: &[String]) -> Cli<'_> {
+    match args.first().map(String::as_str) {
+        Some("verify") => Cli::Verify,
+        Some("mutate") => Cli::Mutate(&args[1..]),
+        Some("experiment") => Cli::Experiment(&args[1..]),
+        Some("matrix") if args.len() > 1 => Cli::Matrix(&args[1..]),
+        Some("evidence") if args.len() == 2 => Cli::Evidence(&args[1]),
+        Some("help" | "--help" | "-h") => Cli::Help,
+        _ => Cli::Usage,
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: cargo xtask verify [fast|full] [--no-lean-clean] [--report-dir DIR]\n       cargo xtask mutate [NAME...]\n       cargo xtask evidence DIR\n       cargo xtask experiment NAME [OPTIONS] (see xtask/src/experiment.rs)\n       cargo xtask matrix REPORT.json...";
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .canonicalize()
-        .unwrap();
-    match args.first().map(String::as_str) {
-        Some("verify") => {}
-        Some("mutate") => std::process::exit(mutate::main(&root, &args[1..])),
-        Some("experiment") => std::process::exit(experiment::main(&root, &args[1..])),
-        Some("matrix") if args.len() > 1 => std::process::exit(matrix(&args[1..])),
-        Some("evidence") if args.len() == 2 => {
+    let usage = USAGE;
+    let root = repo_root();
+    match command(&args) {
+        Cli::Verify => {}
+        Cli::Mutate(names) => std::process::exit(mutate::main(&root, names)),
+        Cli::Experiment(rest) => std::process::exit(experiment::main(&root, rest)),
+        Cli::Matrix(paths) => std::process::exit(matrix(paths)),
+        Cli::Help => {
+            println!("{usage}");
+            std::process::exit(0);
+        }
+        Cli::Evidence(dir) => {
             // Check one evidence directory as a full verification would (without the sanitizer
             // runs): used by `mutate` to show the check refuses incomplete evidence.
-            let evs = load_evidence(Path::new(&args[1]));
+            let evs = load_evidence(Path::new(dir));
             let (bad, _) = check_evidence(&root, &evs, None, None);
             let (bad, _) = excuse_host_gaps(bad, &evs, None);
             for b in &bad {
@@ -1193,7 +1252,7 @@ fn main() {
             }
             std::process::exit(if bad.is_empty() { 0 } else { 1 });
         }
-        _ => {
+        Cli::Usage => {
             eprintln!("{usage}");
             std::process::exit(2);
         }
@@ -1207,12 +1266,14 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .canonicalize()
-        .unwrap();
     let out_dir = match args.iter().position(|a| a == "--report-dir") {
-        Some(i) => PathBuf::from(&args[i + 1]),
+        Some(i) => match args.get(i + 1) {
+            Some(dir) => PathBuf::from(dir),
+            None => {
+                eprintln!("--report-dir needs a directory\n{usage}");
+                std::process::exit(2);
+            }
+        },
         None => root.join("target/verify"),
     };
     std::fs::create_dir_all(&out_dir).unwrap();
@@ -1236,7 +1297,7 @@ fn main() {
         unverified: Vec::new(),
     };
     let start = Instant::now();
-    eprintln!("cargo xtask verify {}", if full { "full" } else { "fast" });
+    eprintln!("fai verify {}", if full { "full" } else { "fast" });
     v.identity();
     let tools = v.tools();
     v.env_guard();
@@ -1513,7 +1574,7 @@ fn execution(evs: &BTreeMap<String, Value>) -> serde_json::Map<String, Value> {
     out
 }
 
-/// `cargo xtask matrix REPORT.json...`: one table of what each host's verification ran, from the
+/// `fai matrix REPORT.json...`: one table of what each host's verification ran, from the
 /// reports `verify` wrote on each (CI uploads one per host): each check's status per host, how
 /// each native suite ran there, and what each host couldn't run. Prints Markdown.
 fn matrix(paths: &[String]) -> i32 {
@@ -1642,6 +1703,40 @@ fn matrix(paths: &[String]) -> i32 {
 mod evidence_tests {
     use super::*;
 
+    #[test]
+    fn command_dispatch() {
+        let a = |s: &str| s.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+        let (verify, mutate, ev) = (a("verify full"), a("mutate x y"), a("evidence d"));
+        assert_eq!(command(&verify), Cli::Verify);
+        assert_eq!(command(&a("verify")), Cli::Verify);
+        assert_eq!(command(&mutate), Cli::Mutate(&mutate[1..]));
+        assert_eq!(command(&a("mutate")), Cli::Mutate(&[]));
+        assert_eq!(command(&ev), Cli::Evidence("d"));
+        let (exp, mx) = (a("experiment n --gate none"), a("matrix a.json b.json"));
+        assert_eq!(command(&exp), Cli::Experiment(&exp[1..]));
+        assert_eq!(command(&mx), Cli::Matrix(&mx[1..]));
+        for h in ["help", "--help", "-h"] {
+            assert_eq!(command(&a(h)), Cli::Help);
+        }
+        // Usage errors: nothing, an unknown command, and the wrong number of operands.
+        for bad in [
+            "",
+            "frobnicate",
+            "evidence",
+            "evidence a b",
+            "matrix",
+            "Verify",
+        ] {
+            assert_eq!(command(&a(bad)), Cli::Usage, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_root_is_the_repository() {
+        let root = repo_root();
+        assert!(root.join("Cargo.toml").is_file() && root.join("tools/fai/Cargo.toml").is_file());
+    }
+
     /// Found in review: a declared gap excused everything about its suite, including stale
     /// evidence, skips, and failures, and a suite with no evidence at all.
     #[test]
@@ -1686,7 +1781,7 @@ mod evidence_tests {
             ),
             ("run_fixtures".to_owned(), static_only),
         ]);
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let root = repo_root();
         let (bad, _) = check_evidence(&root, &evs, None, None);
         assert!(
             bad.iter()
@@ -1704,7 +1799,7 @@ mod evidence_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn checked_corpus_builds_must_also_have_run() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let root = repo_root();
         let corpus = std::fs::read_dir(root.join("frontends/c/tests"))
             .unwrap()
             .flatten()
@@ -1748,7 +1843,7 @@ mod evidence_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_x86_64_corpus_is_required_and_checked() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let root = repo_root();
         let corpus = std::fs::read_dir(root.join("frontends/c/tests"))
             .unwrap()
             .flatten()
@@ -1792,7 +1887,7 @@ mod evidence_tests {
     /// didn't run. Evidence from another run is refused, and so is a run with filtered tests.
     #[test]
     fn evidence_from_another_run_and_filtered_tests_are_refused() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let root = repo_root();
         let evs = BTreeMap::from([("capi_e2e".to_owned(), json!({"run": "old-run"}))]);
         let (bad, _) = check_evidence(&root, &evs, None, Some("this-run"));
         assert!(

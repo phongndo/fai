@@ -1,4 +1,4 @@
-//! `cargo xtask mutate [NAME…]`: adversarial checks of the checkers themselves.
+//! `fai mutate [NAME…]`: adversarial checks of the checkers themselves.
 //!
 //! Each mutation plants one defect a checker exists to catch (a stale generated file, an op the
 //! Rust side doesn't handle, an unprovable or contradictory permission, `sorry`, a custom
@@ -322,7 +322,7 @@ fn mutations() -> Vec<Mutation> {
                 "sh",
                 &[
                     "-c",
-                    "rm -rf ../ev && cp -r ../../verify/evidence/debug ../ev && rm ../ev/aarch64_fuzz.json && sed -i 's/\"skipped\": \\[\\]/\"skipped\": [\"no qemu\"]/' ../ev/capi_e2e.json && sed -i 's/\"programs\": 200/\"programs\": 3/' ../ev/interp_fuzz.json && cargo run -q -p xtask -- evidence ../ev",
+                    "rm -rf ../ev && cp -r ../../verify/evidence/debug ../ev && rm ../ev/aarch64_fuzz.json && sed -i 's/\"skipped\": \\[\\]/\"skipped\": [\"no qemu\"]/' ../ev/capi_e2e.json && sed -i 's/\"programs\": 200/\"programs\": 3/' ../ev/interp_fuzz.json && cargo run -q -p fai-tools --bin fai -- evidence ../ev",
                 ],
             )],
             expect: vec![
@@ -512,7 +512,7 @@ fn mutations() -> Vec<Mutation> {
         },
         Mutation {
             name: "experiment-rejects-a-miscompile",
-            what: "store-to-load forwarding ignores the pointer, so a load through another pointer gets the stored value; `cargo xtask experiment` must reject the change from its measurements alone",
+            what: "store-to-load forwarding ignores the pointer, so a load through another pointer gets the stored value; `fai experiment` must reject the change from its measurements alone",
             edits: vec![edit(
                 "compiler/transforms/src/fwd.rs",
                 "|| lp != p || body.ty(r) != ty",
@@ -520,7 +520,7 @@ fn mutations() -> Vec<Mutation> {
             )],
             steps: vec![cmd(
                 "cargo",
-                &["xtask", "experiment", "mutate-fwd", "--gate", "none"],
+                &["fai", "experiment", "mutate-fwd", "--gate", "none"],
             )],
             expect: vec![
                 "REJECTED",
@@ -630,7 +630,7 @@ pub fn main(root: &Path, names: &[String]) -> i32 {
         let key = format!("{} {} {:?}", last.prog, last.args.join(" "), last.env);
         let baseline_ok = *baselines.entry(key.clone()).or_insert_with(|| {
             if m.name == "evidence-suite-missing" {
-                // Its baseline is the real evidence, which `cargo xtask verify` checks.
+                // Its baseline is the real evidence, which `fai verify` checks.
                 return true;
             }
             let control = Cmd {
@@ -783,7 +783,7 @@ mod review_tests {
     /// running when code moves (found in review: the generated contracts gained a field).
     #[test]
     fn mutation_anchors_match_current_sources() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let root = crate::repo_root();
         let mut missing = Vec::new();
         for mutation in mutations() {
             for edit in mutation.edits {

@@ -21,19 +21,19 @@ Files here:
 | `op-contracts.json` | Per op kind (536 kinds, modifiers included): identity, fields, modifiers, layers, typing, declared effects, and the DCE permission with its evidence | `lake exe gen-rust manifest` |
 | `proofs.lock.json` | Reviewed fingerprints of the 40 registered claims: statement, hypothesis count, axioms, and fingerprints of the `Fir` definitions they depend on | `lake exe fir-audit --update` |
 | `proofs.md` | The claims as Lean prints them, with axioms and dependency counts | `lake exe fir-audit --report` |
-| `adversarial.md` | The last `cargo xtask mutate` run: each planted defect and the diagnostic that caught it | `cargo xtask mutate` |
+| `adversarial.md` | The last `fai mutate` run: each planted defect and the diagnostic that caught it | `fai mutate` |
 
 ## The one command
 
 ```sh
-nix develop -c cargo xtask verify full     # the required check (CI runs it: .github/workflows/verify.yml)
-nix develop -c cargo xtask verify fast     # local, partial: says what it skipped, never claims "full"
-nix develop -c cargo xtask mutate [NAME…]  # the checkers' own adversarial tests
+nix develop -c fai verify full     # the required check (CI runs it: .github/workflows/verify.yml)
+nix develop -c fai verify fast     # local, partial: says what it skipped, never claims "full"
+nix develop -c fai mutate [NAME…]  # the checkers' own adversarial tests
 ```
 
 CI runs `verify full` on x86-64 Linux and natively on Apple-silicon macOS. A host that can't
 run some check by construction (macOS can't run Linux binaries) declares it in `HOST_GAPS`
-(`xtask/src/main.rs`); its tests record the gap in their evidence (decided by `cfg!`, never by a
+(`tools/fai/src/main.rs`); its tests record the gap in their evidence (decided by `cfg!`, never by a
 missing tool), and that host's verdict is **host verification**, with every gap listed as
 unverified there, never full verification. Only x86-64 Linux, which declares no gaps, reports
 full verification. [../experiments.md](../experiments.md#what-runs-where) has the table of what
@@ -333,7 +333,7 @@ the assembler.
 
 Measured on the development machine (x86-64 Linux, qemu-user for AArch64):
 
-* **`cargo xtask verify full`: about 2 min 40 s** with Cargo's caches warm: 80 s rebuilding Lean
+* **`fai verify full`: about 2 min 40 s** with Cargo's caches warm: 80 s rebuilding Lean
   from scratch, 2 s for the proof audit, about 40 s for each of the debug and release test runs
   (which include 200 random programs per fuzzing suite, the native runs under qemu, and about 400
   `fir-ref check-dce` calls), 1 s for the C tests under ASan. The verification before this work
@@ -359,7 +359,7 @@ Measured on the development machine (x86-64 Linux, qemu-user for AArch64):
 * **New ops** now need a decision in three `support` functions (the compiler says where), a
   contract regeneration, and at least one differential comparison per claimed constructor.
   That is the intended friction: the float round's ops can't be half-integrated silently.
-* **`cargo xtask mutate`** takes about 18 minutes (most mutations rebuild part of the Lean
+* **`fai mutate`** takes about 18 minutes (most mutations rebuild part of the Lean
   development and relink the generators); it is a periodic check of the checkers, not part of
   every verification.
 
@@ -387,7 +387,7 @@ assurance itself, each of which let a defect pass silently:
    that starts to would be wrong.
 6. **33 assurance theorems were unregistered** (no report existed), and the allocation check ran
    only in debug builds, on the assignment rather than the code.
-7. **The audit's own bug**, found by `cargo xtask mutate`: in Lean 4.35 `ConstantInfo.value?` is
+7. **The audit's own bug**, found by `fai mutate`: in Lean 4.35 `ConstantInfo.value?` is
    `none` for theorems, so the first version's scan for `sorry` never looked at a proof (claims
    were still covered by `collectAxioms`). Five of the harness's own mutations were also wrong
    on the first run (a malformed op declaration, a docstring split, too-loose expectations); the
@@ -446,7 +446,7 @@ Main's varargs round (`va.start`, `va.arg`, `va.end`, variadic functions) follow
 
 A Codex review (GPT-6.1 Sol) of this branch at `326b0d4` reported eight defects, each with a
 reproduction; all are fixed, and the reproductions run as regression tests
-(`tests/rust/review_regcheck.rs`, and tests in `tests/aarch64.rs` and `xtask`):
+(`tests/rust/review_regcheck.rs`, and tests in `tests/aarch64.rs` and `xtask`, now `tools/fai`):
 
 1. **Full verification accepted stale evidence**: the AddressSanitizer phase didn't clear its
    evidence directory, so with an inherited test runner that skipped the ASan tests, last run's
@@ -481,7 +481,7 @@ The architecture improves AI-assisted development where it turns a claim into so
 machine refuses when false, and the experiment found real gaps that way within hours. In order
 of value per cost:
 
-1. **Adopt `cargo xtask verify full` with evidence.** It is the piece that caught the most: an
+1. **Adopt `fai verify full` with evidence.** It is the piece that caught the most: an
    untested backend path, a silent-skip path, and the possibility of passing with the reference
    or the emulator missing. An agent can't declare success on a run that skipped work. Cheap to
    keep: the suites only append counts.
@@ -502,7 +502,7 @@ of value per cost:
    unregistered theorems is high value and quiet. The dependency fingerprints are noisy (any
    interpreter change asks for review of every claim); keep them, but expect `--update` to be
    routine and review the statement diffs, which are the part that matters.
-6. **Keep `cargo xtask mutate` as a periodic check** (18 minutes), not a gate. Its value was
+6. **Keep `fai mutate` as a periodic check** (18 minutes), not a gate. Its value was
    finding the audit's bug and keeping the checkers honest; its mutations need maintenance when
    code moves (anchors must exist, or the mutation reports itself broken).
 

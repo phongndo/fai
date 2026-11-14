@@ -1,7 +1,7 @@
 # Measuring fcc's code
 
 Two sets of tools; nothing here is built by Cargo or CMake, and no test depends on it. The
-scripts are standard-library Python run by uv (`pyproject.toml` at the root), and `cargo xtask
+scripts are standard-library Python run by uv (`pyproject.toml` at the root), and `fai
 verify` checks them with `ruff format --check`, `ruff check`, and `ty check`, which uv installs
 (`uv run ruff format` applies the formatting).
 

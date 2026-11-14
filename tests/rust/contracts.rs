@@ -8,8 +8,8 @@
 //! contradict the declarations. Each contradiction is reported with the kind and the rule it
 //! breaks; the test fails on any.
 //!
-//! It also writes the support table to the evidence (see `common::evidence`), so `cargo xtask
-//! verify` can match each claimed support against the kinds the differential tests exercised.
+//! It also writes the support table to the evidence (see `common::evidence`), so `fai verify`
+//! can match each claimed support against the kinds the differential tests exercised.
 
 #[allow(dead_code)]
 mod common;
@@ -156,7 +156,7 @@ fn trusted_permissions_need_the_permissive_policy() {
 }
 
 /// The repository's policy is verified-only: a permission without a proof fails this test
-/// (and so `cargo xtask verify`) unless `FIR_ALLOW_TRUSTED=1` says it is accepted on purpose.
+/// (and so `fai verify`) unless `FIR_ALLOW_TRUSTED=1` says it is accepted on purpose.
 #[test]
 fn no_trusted_permissions_under_the_verified_only_policy() {
     let trusted: Vec<&str> = CONTRACTS
