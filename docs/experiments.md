@@ -139,7 +139,7 @@ is the gate, which runs what each host can (below).
 
 | | x86-64 Linux | Apple-silicon macOS |
 |---|---|---|
-| Lean build, generated files, proof audit, fmt, clippy | yes | yes |
+| Lean build, generated files, proof audit, fmt, clippy, ruff, ty | yes | yes |
 | interpreter, optimizer, lowering, text, contracts, DCE checkers (all suites without native code) | yes | yes |
 | AArch64 backend: fixtures and random programs | under qemu-user (Linux ELF) | **natively** (Mach-O), except what the backend declares unsupported on macOS (variadic functions, composites passed on the stack), counted per reason |
 | x86-64 backend: fixtures and random programs | **natively** | no: host gap (Linux ELF; qemu-user is Linux-only) |

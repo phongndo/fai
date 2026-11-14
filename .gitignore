@@ -8,3 +8,7 @@
 # Lean
 .lake/
 /target/
+
+# Python (uv)
+/.venv/
+__pycache__/

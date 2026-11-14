@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
 """cbench: fcc's end-to-end C baseline against GCC and Clang.
 
-Run from the repository root in the dev shell (Linux; `nix develop -c python3 ...`):
+Run from the repository root in the dev shell (Linux; `nix develop -c uv run ...`):
 
   benchmarks/c/cbench.py build           compile every program with every configuration
                                           (compile time, fcc's phases, code size), link
@@ -35,6 +35,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any, NoReturn
 
 BENCH = Path(__file__).resolve().parent
 ROOT = BENCH.parents[1]
@@ -62,7 +63,7 @@ REFERENCE = "gcc-O2"
 SCALING_SIZES = [25, 100, 400, 1600]
 
 
-def die(msg):
+def die(msg) -> NoReturn:
     print(f"cbench: {msg}", file=sys.stderr)
     sys.exit(1)
 
@@ -78,7 +79,9 @@ def run(cmd, env=None, cwd=None, check=True, capture=True, timeout=None):
         timeout=timeout,
     )
     if check and p.returncode != 0:
-        die(f"failed ({p.returncode}): {shlex.join(map(str, cmd))}\n{p.stdout or ''}{p.stderr or ''}")
+        die(
+            f"failed ({p.returncode}): {shlex.join(map(str, cmd))}\n{p.stdout or ''}{p.stderr or ''}"
+        )
     return p
 
 
@@ -96,7 +99,7 @@ def timed(cmd, env, reps):
 def first_line(cmd):
     try:
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        return next((l.strip() for l in p.stdout.splitlines() if l.strip()), "?")
+        return next((ln.strip() for ln in p.stdout.splitlines() if ln.strip()), "?")
     except OSError:
         return None
 
@@ -120,8 +123,10 @@ class Tools:
             if not shutil.which(t):
                 die(f"{t} is not on PATH: run in the dev shell (nix develop)")
         if "(GCC)" not in (first_line([self.cc, "--version"]) or ""):
-            die(f"{self.cc} is not GCC ({first_line([self.cc, '--version'])}): set FCC_BENCH_GCC "
-                "to an AArch64 GCC (the dev shell sets it)")
+            die(
+                f"{self.cc} is not GCC ({first_line([self.cc, '--version'])}): set FCC_BENCH_GCC "
+                "to an AArch64 GCC (the dev shell sets it)"
+            )
         # The reference compilers' flags must be only what is written here: Nix's compiler
         # wrapper otherwise adds hardening (-fstack-protector-strong, -fzero-call-used-regs, ...)
         # to GCC's code and not to fcc's.
@@ -135,7 +140,7 @@ class Tools:
         host includes, Clang's resource directory, and the AArch64 compiler's system include
         directories after it. Nix's x86 wrapper would add the host's glibc headers, so its
         unwrapped compiler is used."""
-        wrapper = Path(shutil.which("clang")).resolve().parent.parent
+        wrapper = Path(shutil.which("clang") or die("clang is not on PATH")).resolve().parent.parent
         clang, resource = "clang", None
         orig = wrapper / "nix-support/orig-cc"
         if orig.exists():
@@ -148,20 +153,33 @@ class Tools:
         out = run([self.cc, "-E", "-Wp,-v", "-x", "c", "/dev/null"], env=self.env).stderr
         inside = False
         for line in out.splitlines():
-            l = line.strip()
-            if l.startswith("#include <...>"):
+            ln = line.strip()
+            if ln.startswith("#include <...>"):
                 inside = True
-            elif l.startswith("End of search list"):
+            elif ln.startswith("End of search list"):
                 inside = False
-            elif inside and not any(s in l for s in ("/lib/gcc/", "/lib/clang/", "/include-fixed")):
-                flags += ["-idirafter", l]
+            elif inside and not any(
+                s in ln for s in ("/lib/gcc/", "/lib/clang/", "/include-fixed")
+            ):
+                flags += ["-idirafter", ln]
         return clang, flags
 
     def build_fcc(self):
         build = ROOT / "build/fcc"
         if not (build / "build.ninja").exists():
-            run(["cmake", "-S", ROOT / "frontends/c", "-B", build, "-G", "Ninja",
-                 "-DCMAKE_BUILD_TYPE=Release"], capture=False)
+            run(
+                [
+                    "cmake",
+                    "-S",
+                    ROOT / "frontends/c",
+                    "-B",
+                    build,
+                    "-G",
+                    "Ninja",
+                    "-DCMAKE_BUILD_TYPE=Release",
+                ],
+                capture=False,
+            )
         run(["cmake", "--build", build], capture=False)
         run(["cargo", "build", "--release", "-q", "-p", "fir"], cwd=ROOT, capture=False)
 
@@ -179,16 +197,16 @@ class Tools:
 
     def text_size(self, obj):
         out = run([self.size, "-A", obj]).stdout
-        return sum(int(l.split()[1]) for l in out.splitlines() if l.startswith(".text"))
+        return sum(int(ln.split()[1]) for ln in out.splitlines() if ln.startswith(".text"))
 
     def identity(self):
         rev = run(["git", "rev-parse", "HEAD"], cwd=ROOT).stdout.strip()
         dirty = run(["git", "status", "--porcelain"], cwd=ROOT).stdout.strip() != ""
         cpu = "?"
         try:
-            for l in Path("/proc/cpuinfo").read_text().splitlines():
-                if l.startswith("model name"):
-                    cpu = l.split(":", 1)[1].strip()
+            for ln in Path("/proc/cpuinfo").read_text().splitlines():
+                if ln.startswith("model name"):
+                    cpu = ln.split(":", 1)[1].strip()
                     break
         except OSError:
             pass
@@ -246,8 +264,12 @@ def cmd_build(args, tools):
     # (`cc -E -Wp,-v`) it runs on every invocation.
     empty = out / "empty.c"
     empty.write_text("")
-    result["fcc_startup"] = timed([tools.fcc, empty, "--emit", "hfir", "-o", "/dev/null"], env, args.reps)
-    result["include_probe"] = timed([tools.cc, "-E", "-Wp,-v", "-x", "c", "/dev/null"], env, args.reps)
+    result["fcc_startup"] = timed(
+        [tools.fcc, empty, "--emit", "hfir", "-o", "/dev/null"], env, args.reps
+    )
+    result["include_probe"] = timed(
+        [tools.cc, "-E", "-Wp,-v", "-x", "c", "/dev/null"], env, args.reps
+    )
 
     for name in programs(args.only):
         src = PROGRAMS / f"{name}.c"
@@ -257,16 +279,21 @@ def cmd_build(args, tools):
             exe = bins / f"{name}.{config}"
             t = timed(tools.compile_cmd(config, src, obj), env, args.reps)
             run(tools.link_cmd(obj, exe, objs / f"{name}.{config}.map"), env=env)
-            entry["configs"][config] = {"compile": t, "text_bytes": tools.text_size(obj),
-                                        "binary": fingerprint(exe)}
+            entry["configs"][config] = {
+                "compile": t,
+                "text_bytes": tools.text_size(obj),
+                "binary": fingerprint(exe),
+            }
         # Where fcc's time goes: each stage is the one before plus one more step.
         for opt in ([], ["-O"]):
             key = "O" if opt else "O0"
             phases = {}
-            for stage, emit in (("hfir", ["--emit", "hfir", "-o", "/dev/null"]),
-                                ("mfir", ["--emit", "mfir", "-o", "/dev/null"]),
-                                ("asm", ["--emit", "asm", "-o", "/dev/null"]),
-                                ("obj", ["-o", str(out / "phase.o")])):
+            for stage, emit in (
+                ("hfir", ["--emit", "hfir", "-o", "/dev/null"]),
+                ("mfir", ["--emit", "mfir", "-o", "/dev/null"]),
+                ("asm", ["--emit", "asm", "-o", "/dev/null"]),
+                ("obj", ["-o", str(out / "phase.o")]),
+            ):
                 phases[stage] = timed([tools.fcc, src, *opt, *emit], env, args.reps)["min"]
             entry["fcc_phases"][key] = phases
         # FIR's own steps on the same module, in process (`fir` CLI): lower, -O, backend.
@@ -278,7 +305,9 @@ def cmd_build(args, tools):
         entry["fir_steps"] = {
             "lower": timed([tools.fir, "lower", hfir], env, args.reps)["min"],
             "opt": timed([tools.fir, "opt", mfir, "-O"], env, args.reps)["min"],
-            "compile": timed([tools.fir, "compile", mfir_o, "--emit", "asm", "-o", "/dev/null"], env, args.reps)["min"],
+            "compile": timed(
+                [tools.fir, "compile", mfir_o, "--emit", "asm", "-o", "/dev/null"], env, args.reps
+            )["min"],
             "hfir_lines": len(hfir.read_text().splitlines()),
             "mfir_lines": len(mfir.read_text().splitlines()),
         }
@@ -315,8 +344,23 @@ def plugin(tools, out):
     glib = shlex.split(os.environ.get("FCC_BENCH_GLIB_CFLAGS", ""))
     if not glib:
         die("FCC_BENCH_GLIB_CFLAGS must give glib's include flags (the dev shell sets it)")
-    run(["cc", "-shared", "-fPIC", "-O2", "-Wall", "-Wextra", "-Werror", *glib, f"-I{include}",
-         BENCH / "insn_count.c", "-o", so], env=tools.env)
+    run(
+        [
+            "cc",
+            "-shared",
+            "-fPIC",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            *glib,
+            f"-I{include}",
+            BENCH / "insn_count.c",
+            "-o",
+            so,
+        ],
+        env=tools.env,
+    )
     return so
 
 
@@ -327,13 +371,13 @@ def program_ranges(mapfile, obj):
     for line in lines:
         m = re.match(r"^ (\.text[\w.$]*)\s+0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+(\S+)$", line)
         if m:
-            sec, addr, size, path = m.groups()
+            _, addr, size, path = m.groups()
         elif pending:
             m = re.match(r"^\s+0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+(\S+)$", line)
-            pending, prev = None, pending
+            pending = None
             if not m:
                 continue
-            sec, (addr, size, path) = prev, m.groups()
+            addr, size, path = m.groups()
         else:
             m = re.match(r"^ (\.text[\w.$]*)$", line)
             if m:
@@ -350,8 +394,16 @@ def disassemble(tools, exe, ranges):
     """addr -> (mnemonic, operands), and function symbols, for the given ranges."""
     insns = {}
     for lo, hi in ranges:
-        out = run([tools.objdump, "-d", "--no-show-raw-insn", f"--start-address={lo:#x}",
-                   f"--stop-address={hi:#x}", exe]).stdout
+        out = run(
+            [
+                tools.objdump,
+                "-d",
+                "--no-show-raw-insn",
+                f"--start-address={lo:#x}",
+                f"--stop-address={hi:#x}",
+                exe,
+            ]
+        ).stdout
         for line in out.splitlines():
             m = re.match(r"^\s+([0-9a-f]+):\s+(\S+)\s*(.*)$", line)
             if m:
@@ -371,7 +423,9 @@ BRANCH = re.compile(r"^(b|b\..*|bc\..*|cbz|cbnz|tbz|tbnz|br|ret)$")
 CALL = re.compile(r"^(bl|blr)$")
 MOVE = re.compile(r"^(mov|movz|movk|movn|fmov)$")
 MULDIV = re.compile(r"^(mul|madd|msub|smull|umull|smulh|umulh|sdiv|udiv|mneg|smaddl|umaddl)$")
-COMPARE = re.compile(r"^(cmp|cmn|tst|ccmp|ccmn|fcmp|fcmpe|cset|csetm|csel|csinc|csinv|csneg|cinc|cneg)$")
+COMPARE = re.compile(
+    r"^(cmp|cmn|tst|ccmp|ccmn|fcmp|fcmpe|cset|csetm|csel|csinc|csinv|csneg|cinc|cneg)$"
+)
 FP = re.compile(r"^f[a-z0-9]+$|^(scvtf|ucvtf)$")
 
 
@@ -380,8 +434,14 @@ def classify(mnemonic, ops):
         return "load"
     if STORE.match(mnemonic) and "[" in ops:
         return "store"
-    for name, pat in (("call", CALL), ("branch", BRANCH), ("move", MOVE), ("muldiv", MULDIV),
-                      ("compare", COMPARE), ("fp", FP)):
+    for name, pat in (
+        ("call", CALL),
+        ("branch", BRANCH),
+        ("move", MOVE),
+        ("muldiv", MULDIV),
+        ("compare", COMPARE),
+        ("fp", FP),
+    ):
         if pat.match(mnemonic):
             return name
     return "alu"
@@ -394,7 +454,10 @@ def analyze(tools, exe, mapfile, obj, trace):
 
     ranges = program_ranges(mapfile, obj)
     insns, syms = disassemble(tools, exe, ranges)
-    inside = lambda a: any(lo <= a < hi for lo, hi in ranges)
+
+    def inside(a):
+        return any(lo <= a < hi for lo, hi in ranges)
+
     starts = [s[0] for s in syms]
     total = program = 0
     mix, mnem, funcs = {}, {}, {}
@@ -408,7 +471,7 @@ def analyze(tools, exe, mapfile, obj, trace):
         if kind == "M":
             a = int(f[0], 16)
             if inside(a):
-                for key, v in zip(mem, f[1:]):
+                for key, v in zip(mem, f[1:], strict=False):
                     mem[key] += int(v)
             continue
         if kind != "B":
@@ -429,7 +492,10 @@ def analyze(tools, exe, mapfile, obj, trace):
             funcs[fn] = funcs.get(fn, 0) + count
     if not sp0:
         die(f"{trace}: the plugin never read the stack pointer")
-    top = lambda d, k: dict(sorted(d.items(), key=lambda kv: -kv[1])[:k])
+
+    def top(d, k):
+        return dict(sorted(d.items(), key=lambda kv: -kv[1])[:k])
+
     return {
         "window": (lo, hi),
         "deep_accesses": deep,
@@ -500,8 +566,18 @@ def cmd_count(args, tools):
                 cmd = [exe, arg]
             else:
                 plug = f"{so},outfile={trace},below={STACK_BELOW},above={STACK_ABOVE},deep={STACK_DEEP}"
-                cmd = ["env", "-i", shutil.which("qemu-aarch64"), "-s", QEMU_STACK, "-strace",
-                       "-plugin", plug, exe, arg]
+                cmd = [
+                    "env",
+                    "-i",
+                    shutil.which("qemu-aarch64"),
+                    "-s",
+                    QEMU_STACK,
+                    "-strace",
+                    "-plugin",
+                    plug,
+                    exe,
+                    arg,
+                ]
             p = run(cmd, check=False, timeout=3600)
             outputs[config] = (p.stdout, p.returncode)
             c = {"exit": p.returncode, "stdout": p.stdout, "binary": fingerprint(exe)}
@@ -510,11 +586,15 @@ def cmd_count(args, tools):
                 lo, hi = c.pop("window")
                 meets = [f"{a:#x}-{b:#x}" for a, b in mappings(p.stderr) if a < hi and lo < b]
                 if meets:
-                    failures.append(f"{name} {config}: mappings {meets} meet the stack window "
-                                    f"{lo:#x}-{hi:#x}, so heap would count as stack")
+                    failures.append(
+                        f"{name} {config}: mappings {meets} meet the stack window "
+                        f"{lo:#x}-{hi:#x}, so heap would count as stack"
+                    )
                 if c["deep_accesses"]:
-                    failures.append(f"{name} {config}: {c['deep_accesses']} stack accesses below "
-                                    "the window (more than 7 MiB of stack)")
+                    failures.append(
+                        f"{name} {config}: {c['deep_accesses']} stack accesses below "
+                        "the window (more than 7 MiB of stack)"
+                    )
             entry["configs"][config] = c
         ref = outputs[REFERENCE]
         if ref[1] != 0:
@@ -524,7 +604,10 @@ def cmd_count(args, tools):
         bad = [c for c in CONFIGS if not entry["configs"][c]["matches_reference"]]
         if bad:
             failures.append(f"{name}: output or exit code differs from {REFERENCE}'s: {bad}")
-        print(f"counted {name}" + (f": DIFFERS from {REFERENCE}: {bad}" if bad else ""), file=sys.stderr)
+        print(
+            f"counted {name}" + (f": DIFFERS from {REFERENCE}: {bad}" if bad else ""),
+            file=sys.stderr,
+        )
         result["programs"][name] = entry
     result["failures"] = failures
     save(out, "count", result)
@@ -550,7 +633,9 @@ def synth(n_funcs, stmts_per_func):
             elif k == 1:
                 lines.append(f"  if (x > y) x -= y + {s}; else y -= x - {s};")
             elif k == 2:
-                lines.append(f"  switch ((x + {s}) & 3) {{ case 0: y++; break; case 1: x ^= y; break; default: x += {s}; }}")
+                lines.append(
+                    f"  switch ((x + {s}) & 3) {{ case 0: y++; break; case 1: x ^= y; break; default: x += {s}; }}"
+                )
             elif k == 3:
                 lines.append(f"  sink[{s % 64}] = x + y + t[{s % 8}];")
             elif k == 4 and f > 0:
@@ -566,24 +651,44 @@ def cmd_scaling(args, tools):
     out = args.out / "scaling"
     out.mkdir(parents=True, exist_ok=True)
     env = tools.env
-    result = {"identity": tools.identity(), "many_functions": [], "one_function": []}
-    for kind, shapes in (("many_functions", [(n, 10) for n in SCALING_SIZES]),
-                         ("one_function", [(1, n) for n in SCALING_SIZES])):
+    result: dict[str, Any] = {
+        "identity": tools.identity(),
+        "many_functions": [],
+        "one_function": [],
+    }
+    for kind, shapes in (
+        ("many_functions", [(n, 10) for n in SCALING_SIZES]),
+        ("one_function", [(1, n) for n in SCALING_SIZES]),
+    ):
         for funcs, stmts in shapes:
             src = out / f"{kind}-{funcs}x{stmts}.c"
             src.write_text(synth(funcs, stmts))
-            row = {"functions": funcs, "statements": stmts, "lines": len(src.read_text().splitlines())}
+            row = {
+                "functions": funcs,
+                "statements": stmts,
+                "lines": len(src.read_text().splitlines()),
+            }
             for config in ("fcc", "fcc-O", "gcc-O0", "gcc-O2", "clang-O0"):
-                row[config] = timed(tools.compile_cmd(config, src, out / "s.o"), env, args.reps)["min"]
+                row[config] = timed(tools.compile_cmd(config, src, out / "s.o"), env, args.reps)[
+                    "min"
+                ]
             hfir = out / "s.hfir"
             run([tools.fcc, src, "--emit", "hfir", "-o", hfir], env=env)
-            row["fcc_hfir"] = timed([tools.fcc, src, "--emit", "hfir", "-o", "/dev/null"], env, args.reps)["min"]
-            row["fcc_asm"] = timed([tools.fcc, src, "--emit", "asm", "-o", "/dev/null"], env, args.reps)["min"]
-            row["fcc_O_asm"] = timed([tools.fcc, src, "-O", "--emit", "asm", "-o", "/dev/null"], env, args.reps)["min"]
+            row["fcc_hfir"] = timed(
+                [tools.fcc, src, "--emit", "hfir", "-o", "/dev/null"], env, args.reps
+            )["min"]
+            row["fcc_asm"] = timed(
+                [tools.fcc, src, "--emit", "asm", "-o", "/dev/null"], env, args.reps
+            )["min"]
+            row["fcc_O_asm"] = timed(
+                [tools.fcc, src, "-O", "--emit", "asm", "-o", "/dev/null"], env, args.reps
+            )["min"]
             row["hfir_lines"] = len(hfir.read_text().splitlines())
             result[kind].append(row)
-            print(f"scaling {kind} {funcs}x{stmts}: fcc-O {row['fcc-O']:.3f}s gcc-O2 {row['gcc-O2']:.3f}s",
-                  file=sys.stderr)
+            print(
+                f"scaling {kind} {funcs}x{stmts}: fcc-O {row['fcc-O']:.3f}s gcc-O2 {row['gcc-O2']:.3f}s",
+                file=sys.stderr,
+            )
     result["loadavg_end"] = Path("/proc/loadavg").read_text().split()[:3]
     save(args.out, "scaling", result)
 
@@ -633,8 +738,21 @@ def make_bundle(args, tools, names):
     for name in names:
         for config in CONFIGS:
             shutil.copy2(args.out / "bin" / f"{name}.{config}", bundle / "bin")
-    run([tools.cc, "-static", "-O2", "-Wall", "-Wextra", "-Werror", BENCH / "benchrun.c", "-o",
-         bundle / "benchrun", f"-L{tools.libc}"], env=tools.env)
+    run(
+        [
+            tools.cc,
+            "-static",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            BENCH / "benchrun.c",
+            "-o",
+            bundle / "benchrun",
+            f"-L{tools.libc}",
+        ],
+        env=tools.env,
+    )
     header = f"PROGRAMS='{' '.join(names)}'\nCONFIGS='{' '.join(CONFIGS)}'\n"
     header += "".join(f"ARG_{n}={SIZES[n][1]}\n" for n in names)
     script = RUN_SH.replace("set -eu\n", "set -eu\n" + header, 1).replace("REFERENCE", REFERENCE)
@@ -648,8 +766,10 @@ def cmd_time(args, tools):
     if not load(args.out, "build"):
         die("run `cbench.py build` first")
     if not args.ssh and not tools.native:
-        die("refusing to time under emulation: run on AArch64 Linux, or pass --ssh HOST "
-            "(with --docker IMAGE for a Linux container on, say, an Apple silicon Mac)")
+        die(
+            "refusing to time under emulation: run on AArch64 Linux, or pass --ssh HOST "
+            "(with --docker IMAGE for a Linux container on, say, an Apple silicon Mac)"
+        )
     bundle = make_bundle(args, tools, names)
     info = {"rounds": args.rounds, "sizes": {n: SIZES[n][1] for n in names}}
     if not args.ssh:
@@ -661,35 +781,62 @@ def cmd_time(args, tools):
             run(["scp", "-q", "-r", f"{bundle}/.", f"{args.ssh}:{remote}/"])
             if args.docker:
                 docker = args.docker_bin
-                digest = run(["ssh", args.ssh, f"{docker} pull -q {shlex.quote(args.docker)} >/dev/null && "
-                              f"{docker} image inspect --format '{{{{index .RepoDigests 0}}}}' {shlex.quote(args.docker)}"]).stdout.strip()
-                server = run(["ssh", args.ssh, f"{docker} version --format '{{{{.Server.Version}}}} {{{{.Server.Os}}}}/{{{{.Server.Arch}}}}'"]).stdout.strip()
+                digest = run(
+                    [
+                        "ssh",
+                        args.ssh,
+                        f"{docker} pull -q {shlex.quote(args.docker)} >/dev/null && "
+                        f"{docker} image inspect --format '{{{{index .RepoDigests 0}}}}' {shlex.quote(args.docker)}",
+                    ]
+                ).stdout.strip()
+                server = run(
+                    [
+                        "ssh",
+                        args.ssh,
+                        f"{docker} version --format '{{{{.Server.Version}}}} {{{{.Server.Os}}}}/{{{{.Server.Arch}}}}'",
+                    ]
+                ).stdout.strip()
                 inner = f"{docker} run --rm --platform linux/arm64 -v {remote}:/b {shlex.quote(args.docker)} /b/run.sh {args.rounds}"
                 info.update(where=f"ssh {args.ssh}, docker", image=digest, docker_server=server)
             else:
                 inner = f"{remote}/run.sh {args.rounds}"
                 info["where"] = f"ssh {args.ssh}"
-            info["remote_host"] = run(["ssh", args.ssh, "uname -a; (sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize 2>/dev/null || true)"]).stdout.strip()
+            info["remote_host"] = run(
+                [
+                    "ssh",
+                    args.ssh,
+                    "uname -a; (sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize 2>/dev/null || true)",
+                ]
+            ).stdout.strip()
             run(["ssh", args.ssh, inner], capture=False)
             run(["scp", "-q", "-r", f"{args.ssh}:{remote}/results/.", f"{bundle}/results/"])
         finally:
             run(["ssh", args.ssh, f"rm -rf {shlex.quote(remote)}"], check=False)
-    rows = [json.loads(l) for l in (bundle / "results/times.jsonl").read_text().splitlines() if l.strip()]
+    rows = [
+        json.loads(ln)
+        for ln in (bundle / "results/times.jsonl").read_text().splitlines()
+        if ln.strip()
+    ]
     info["env"] = (bundle / "results/env.txt").read_text()
     times = {}
     for r in rows:
         if r["round"] == 0:  # warmup
             continue
-        t = times.setdefault(r["program"], {}).setdefault(r["config"], {"wall": [], "user": [], "maxrss_kib": 0})
+        t = times.setdefault(r["program"], {}).setdefault(
+            r["config"], {"wall": [], "user": [], "maxrss_kib": 0}
+        )
         t["wall"] += r["result"]["wall"]
         t["user"] += r["result"]["user"]
         t["maxrss_kib"] = max(t["maxrss_kib"], r["result"]["maxrss_kib"])
         info["cpu_implementer"] = r["result"]["cpu_implementer"]
         info["cpu_part"] = r["result"]["cpu_part"]
     # Every program under every configuration, once per round: anything less is not saved.
-    missing = [f"{n} {c}: {len(times.get(n, {}).get(c, {}).get('wall', []))} of {args.rounds} runs"
-               for n in names for c in CONFIGS
-               if len(times.get(n, {}).get(c, {}).get("wall", [])) != args.rounds]
+    missing = [
+        f"{n} {c}: {len(times.get(n, {}).get(c, {}).get('wall', []))} of {args.rounds} runs"
+        for n in names
+        for c in CONFIGS
+        if len(times.get(n, {}).get(c, {}).get("wall", [])) != args.rounds
+    ]
     if missing:
         die(f"incomplete timing in {bundle}:\n  " + "\n  ".join(missing))
     for n in names:
@@ -719,7 +866,10 @@ def geomean(xs):
 
 
 def table(header, rows):
-    out = ["| " + " | ".join(header) + " |", "|" + "|".join("---" if i == 0 else "---:" for i in range(len(header))) + "|"]
+    out = [
+        "| " + " | ".join(header) + " |",
+        "|" + "|".join("---" if i == 0 else "---:" for i in range(len(header))) + "|",
+    ]
     out += ["| " + " | ".join(str(c) for c in r) + " |" for r in rows]
     return "\n".join(out)
 
@@ -735,7 +885,7 @@ def ratio_table(metric_of, names, fmt, ref=REFERENCE):
                 ratios[c].append(v / r)
         rows.append(row)
     rows.append([f"**geomean vs {ref}**"] + [f"**{geomean(ratios[c]):.2f}×**" for c in CONFIGS])
-    return table(["program"] + CONFIGS, rows)
+    return table(["program", *CONFIGS], rows)
 
 
 def cmd_report(args, tools=None):
@@ -761,31 +911,62 @@ def cmd_report(args, tools=None):
                 elif cell["binary"] != build["programs"][n]["configs"][c]["binary"]:
                     stale.append(f"{n} {c}: another binary")
         if stale:
-            die(f"{step}.json doesn't match build.json (rerun `cbench.py {step}`):\n  "
-                + "\n  ".join(stale[:10]))
+            die(
+                f"{step}.json doesn't match build.json (rerun `cbench.py {step}`):\n  "
+                + "\n  ".join(stale[:10])
+            )
     if count and count.get("failures"):
         die("count.json records failures:\n  " + "\n  ".join(count["failures"]))
     md = ["# fcc C baseline: measured results", ""]
     ident = build["identity"]
-    md += [f"Revision `{ident['revision'][:12]}`{' (with uncommitted changes)' if ident['dirty'] else ''}; "
-           f"host {ident['host']}, {ident['host_cpu']} ({ident['host_cpus']} CPUs). "
-           f"{ident['gcc']}; {ident['clang']}; {ident['qemu'] or 'native'}.", ""]
+    md += [
+        f"Revision `{ident['revision'][:12]}`{' (with uncommitted changes)' if ident['dirty'] else ''}; "
+        f"host {ident['host']}, {ident['host_cpu']} ({ident['host_cpus']} CPUs). "
+        f"{ident['gcc']}; {ident['clang']}; {ident['qemu'] or 'native'}.",
+        "",
+    ]
     if count:
-        md += ["## Behavior (small size, " + ("qemu-user" if count["emulated"] else "native") + f"): output and exit code equal to {REFERENCE}'s", ""]
-        rows = [[n] + ["✓" if count["programs"][n]["configs"][c]["matches_reference"] else "✗" for c in CONFIGS]
-                for n in names if n in count["programs"]]
-        md += [table(["program"] + CONFIGS, rows), ""]
+        md += [
+            "## Behavior (small size, "
+            + ("qemu-user" if count["emulated"] else "native")
+            + f"): output and exit code equal to {REFERENCE}'s",
+            "",
+        ]
+        rows = [
+            [n]
+            + [
+                "✓" if count["programs"][n]["configs"][c]["matches_reference"] else "✗"
+                for c in CONFIGS
+            ]
+            for n in names
+            if n in count["programs"]
+        ]
+        md += [table(["program", *CONFIGS], rows), ""]
     if timing:
-        md += [f"## Native wall time (median of {timing['rounds']} interleaved rounds, seconds)", "",
-               f"Where: {timing['where']}; CPU implementer {timing.get('cpu_implementer', 0):#x}, "
-               f"part {timing.get('cpu_part', 0):#x}"
-               + (f"; Docker server {timing['docker_server']}, image `{timing['image']}`" if timing.get("image") else "")
-               + ".", ""]
+        md += [
+            f"## Native wall time (median of {timing['rounds']} interleaved rounds, seconds)",
+            "",
+            f"Where: {timing['where']}; CPU implementer {timing.get('cpu_implementer', 0):#x}, "
+            f"part {timing.get('cpu_part', 0):#x}"
+            + (
+                f"; Docker server {timing['docker_server']}, image `{timing['image']}`"
+                if timing.get("image")
+                else ""
+            )
+            + ".",
+            "",
+        ]
         if timing.get("remote_host"):
             md += ["The SSH host: " + "; ".join(timing["remote_host"].splitlines()) + ".", ""]
         md += ["The machine as Linux saw it:", "", "```", timing["env"].strip(), "```", ""]
-        md += [ratio_table(lambda n, c: timing["programs"].get(n, {}).get(c, {}).get("median"), names,
-                           lambda v: f"{v:.3f}" if v else "—"), ""]
+        md += [
+            ratio_table(
+                lambda n, c: timing["programs"].get(n, {}).get(c, {}).get("median"),
+                names,
+                lambda v: f"{v:.3f}" if v else "—",
+            ),
+            "",
+        ]
         spread = []
         for n in names:
             for c in CONFIGS:
@@ -793,21 +974,50 @@ def cmd_report(args, tools=None):
                 if t:
                     spread.append((t["max"] - t["min"]) / t["median"])
         if spread:
-            md += [f"Spread (max − min) / median across rounds: median {statistics.median(spread) * 100:.1f}%, "
-                   f"worst {max(spread) * 100:.1f}%.", ""]
-            noisy = [f"{n} {c} ({', '.join(f'{w:.3f}' for w in t['wall'])})"
-                     for n in names for c, t in timing["programs"].get(n, {}).items()
-                     if (t["max"] - t["min"]) / t["median"] > 0.15]
+            md += [
+                f"Spread (max − min) / median across rounds: median {statistics.median(spread) * 100:.1f}%, "
+                f"worst {max(spread) * 100:.1f}%.",
+                "",
+            ]
+            noisy = [
+                f"{n} {c} ({', '.join(f'{w:.3f}' for w in t['wall'])})"
+                for n in names
+                for c, t in timing["programs"].get(n, {}).items()
+                if (t["max"] - t["min"]) / t["median"] > 0.15
+            ]
             if noisy:
-                md += ["Cells whose runs spread by more than 15% (all runs, seconds): " + "; ".join(noisy) + ".", ""]
+                md += [
+                    "Cells whose runs spread by more than 15% (all runs, seconds): "
+                    + "; ".join(noisy)
+                    + ".",
+                    "",
+                ]
     if count and count["emulated"]:
-        md += [f"## Executed instructions in the program's own code (small size, millions; exact, counted under qemu)", ""]
-        md += [ratio_table(lambda n, c: count["programs"][n]["configs"][c].get("program", 0) / 1e6, names,
-                           lambda v: f"{v:.1f}"), ""]
+        md += [
+            "## Executed instructions in the program's own code (small size, millions; exact, counted under qemu)",
+            "",
+        ]
+        md += [
+            ratio_table(
+                lambda n, c: count["programs"][n]["configs"][c].get("program", 0) / 1e6,
+                names,
+                lambda v: f"{v:.1f}",
+            ),
+            "",
+        ]
         md += ["## Executed instructions including libc (millions)", ""]
-        md += [ratio_table(lambda n, c: count["programs"][n]["configs"][c].get("total", 0) / 1e6, names,
-                           lambda v: f"{v:.1f}"), ""]
-        md += ["## Instruction mix in the program's own code (all programs, share of executed instructions)", ""]
+        md += [
+            ratio_table(
+                lambda n, c: count["programs"][n]["configs"][c].get("total", 0) / 1e6,
+                names,
+                lambda v: f"{v:.1f}",
+            ),
+            "",
+        ]
+        md += [
+            "## Instruction mix in the program's own code (all programs, share of executed instructions)",
+            "",
+        ]
         classes = ["load", "store", "move", "alu", "compare", "branch", "call", "muldiv", "fp"]
         rows = []
         for c in CONFIGS:
@@ -821,62 +1031,155 @@ def cmd_report(args, tools=None):
                     acc[k] = acc.get(k, 0) + v
             accesses = sum(acc.values())
             stack = acc["stack_loads"] + acc["stack_stores"]
-            rows.append([c, f"{tot / 1e6:.0f}M"] + [f"{100 * agg.get(k, 0) / tot:.1f}%" for k in classes]
-                        + [f"{accesses / 1e6:.0f}M", f"{100 * stack / max(accesses, 1):.0f}%"])
-        md += [table(["config", "executed"] + classes + ["memory accesses", "to the stack"], rows), "",
-               "Memory accesses are counted by address (an `ldp` may be two); an access is to the stack if its "
-               "address is in [sp - 7 MiB, sp + 64 KiB) of the initial stack pointer sp, inside QEMU's 8 MiB "
-               "stack; `count` checks that no mapping meets that window.", ""]
+            rows.append(
+                [c, f"{tot / 1e6:.0f}M"]
+                + [f"{100 * agg.get(k, 0) / tot:.1f}%" for k in classes]
+                + [f"{accesses / 1e6:.0f}M", f"{100 * stack / max(accesses, 1):.0f}%"]
+            )
+        md += [
+            table(["config", "executed", *classes, "memory accesses", "to the stack"], rows),
+            "",
+            "Memory accesses are counted by address (an `ldp` may be two); an access is to the stack if its "
+            "address is in [sp - 7 MiB, sp + 64 KiB) of the initial stack pointer sp, inside QEMU's 8 MiB "
+            "stack; `count` checks that no mapping meets that window.",
+            "",
+        ]
     md += ["## Code size (.text bytes of the program's object)", ""]
-    md += [ratio_table(lambda n, c: build["programs"][n]["configs"][c]["text_bytes"], names, str), ""]
+    md += [
+        ratio_table(lambda n, c: build["programs"][n]["configs"][c]["text_bytes"], names, str),
+        "",
+    ]
     md += [f"## Compile time to an object file (host, minimum of {build['reps']} runs, ms)", ""]
-    md += [ratio_table(lambda n, c: build["programs"][n]["configs"][c]["compile"]["min"] * 1e3, names,
-                       lambda v: f"{v:.0f}"), ""]
+    md += [
+        ratio_table(
+            lambda n, c: build["programs"][n]["configs"][c]["compile"]["min"] * 1e3,
+            names,
+            lambda v: f"{v:.0f}",
+        ),
+        "",
+    ]
     cc = build["corpus_compile"]
-    md += [f"The {cc['programs']} programs of `frontends/c/tests`, one compile each, total seconds: "
-           + ", ".join(f"{c} {cc['seconds'][c]:.2f}" for c in CONFIGS) + ".", ""]
-    md += ["### Where fcc's time goes (ms, minimum of the runs; each stage includes the ones before)", "",
-           f"Startup (an empty file to HFIR): {build['fcc_startup']['min'] * 1e3:.0f} ms, of which the "
-           f"system include probe (`cc -E -Wp,-v`) is {build['include_probe']['min'] * 1e3:.0f} ms.", ""]
+    md += [
+        f"The {cc['programs']} programs of `frontends/c/tests`, one compile each, total seconds: "
+        + ", ".join(f"{c} {cc['seconds'][c]:.2f}" for c in CONFIGS)
+        + ".",
+        "",
+    ]
+    md += [
+        "### Where fcc's time goes (ms, minimum of the runs; each stage includes the ones before)",
+        "",
+        f"Startup (an empty file to HFIR): {build['fcc_startup']['min'] * 1e3:.0f} ms, of which the "
+        f"system include probe (`cc -E -Wp,-v`) is {build['include_probe']['min'] * 1e3:.0f} ms.",
+        "",
+    ]
     rows = []
     for n in names:
         p = build["programs"][n]["fcc_phases"]
         f = build["programs"][n]["fir_steps"]
-        rows.append([n, f"{p['O0']['hfir'] * 1e3:.0f}", f"{p['O']['mfir'] * 1e3:.0f}", f"{p['O']['asm'] * 1e3:.0f}",
-                     f"{p['O']['obj'] * 1e3:.0f}", f"{f['lower'] * 1e3:.1f}", f"{f['opt'] * 1e3:.1f}",
-                     f"{f['compile'] * 1e3:.1f}", f["hfir_lines"]])
-    md += [table(["program", "→HFIR", "→MFIR -O", "→asm -O", "→.o -O", "fir lower", "fir opt -O", "fir compile",
-                  "HFIR lines"], rows), "",
-           "The `fir` columns are the same module through the `fir` CLI, each step a separate process.", ""]
+        rows.append(
+            [
+                n,
+                f"{p['O0']['hfir'] * 1e3:.0f}",
+                f"{p['O']['mfir'] * 1e3:.0f}",
+                f"{p['O']['asm'] * 1e3:.0f}",
+                f"{p['O']['obj'] * 1e3:.0f}",
+                f"{f['lower'] * 1e3:.1f}",
+                f"{f['opt'] * 1e3:.1f}",
+                f"{f['compile'] * 1e3:.1f}",
+                f["hfir_lines"],
+            ]
+        )
+    md += [
+        table(
+            [
+                "program",
+                "→HFIR",
+                "→MFIR -O",
+                "→asm -O",
+                "→.o -O",
+                "fir lower",
+                "fir opt -O",
+                "fir compile",
+                "HFIR lines",
+            ],
+            rows,
+        ),
+        "",
+        "The `fir` columns are the same module through the `fir` CLI, each step a separate process.",
+        "",
+    ]
     if scaling:
         md += ["## Compile-time scaling (seconds, minimum of the runs)", ""]
         for kind in ("many_functions", "one_function"):
-            rows = [[r["functions"], r["statements"], r["lines"], r["hfir_lines"], f"{r['fcc_hfir']:.3f}",
-                     f"{r['fcc_asm']:.3f}", f"{r['fcc_O_asm']:.3f}", f"{r['fcc-O']:.3f}", f"{r['gcc-O0']:.3f}",
-                     f"{r['gcc-O2']:.3f}", f"{r['clang-O0']:.3f}"] for r in scaling[kind]]
-            md += [f"**{kind.replace('_', ' ')}**", "",
-                   table(["funcs", "stmts each", "C lines", "HFIR lines", "fcc →HFIR", "fcc →asm", "fcc -O →asm",
-                          "fcc -O →.o", "gcc -O0", "gcc -O2", "clang -O0"], rows), ""]
+            rows = [
+                [
+                    r["functions"],
+                    r["statements"],
+                    r["lines"],
+                    r["hfir_lines"],
+                    f"{r['fcc_hfir']:.3f}",
+                    f"{r['fcc_asm']:.3f}",
+                    f"{r['fcc_O_asm']:.3f}",
+                    f"{r['fcc-O']:.3f}",
+                    f"{r['gcc-O0']:.3f}",
+                    f"{r['gcc-O2']:.3f}",
+                    f"{r['clang-O0']:.3f}",
+                ]
+                for r in scaling[kind]
+            ]
+            md += [
+                f"**{kind.replace('_', ' ')}**",
+                "",
+                table(
+                    [
+                        "funcs",
+                        "stmts each",
+                        "C lines",
+                        "HFIR lines",
+                        "fcc →HFIR",
+                        "fcc →asm",
+                        "fcc -O →asm",
+                        "fcc -O →.o",
+                        "gcc -O0",
+                        "gcc -O2",
+                        "clang -O0",
+                    ],
+                    rows,
+                ),
+                "",
+            ]
     (out / "report.md").write_text("\n".join(md))
     print(out / "report.md")
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("step", choices=["build", "count", "scaling", "time", "report", "all"])
     ap.add_argument("--out", type=Path, default=ROOT / "target/cbench")
-    ap.add_argument("--only", nargs="*", default=[], help="programs whose names contain one of these")
+    ap.add_argument(
+        "--only", nargs="*", default=[], help="programs whose names contain one of these"
+    )
     ap.add_argument("--reps", type=int, default=5, help="compile-time repetitions (minimum)")
     ap.add_argument("--rounds", type=int, default=7, help="native timing rounds after one warmup")
     ap.add_argument("--ssh", help="time on this AArch64 host (or the Docker host with --docker)")
-    ap.add_argument("--docker", help="run the timing in this image (an arm64 Linux image) on --ssh's host")
+    ap.add_argument(
+        "--docker", help="run the timing in this image (an arm64 Linux image) on --ssh's host"
+    )
     ap.add_argument("--docker-bin", default="docker", help="docker's path on the --ssh host")
     args = ap.parse_args()
     if args.reps < 1 or args.rounds < 1:
         die("--reps and --rounds must be at least 1")
     args.out = args.out.resolve()
     tools = Tools()
-    steps = {"build": cmd_build, "count": cmd_count, "scaling": cmd_scaling, "time": cmd_time, "report": cmd_report}
+    steps = {
+        "build": cmd_build,
+        "count": cmd_count,
+        "scaling": cmd_scaling,
+        "time": cmd_time,
+        "report": cmd_report,
+    }
     if args.step == "all":
         for s in ("build", "count", "scaling"):
             steps[s](args, tools)

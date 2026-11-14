@@ -60,7 +60,10 @@ in
     # LLVM tools (llc, opt, llvm-mc, FileCheck) for the LLVM bridge and IR tests
     llvm.llvm
     pkgs.lit
-    pkgs.python3
+
+    # Python: the benchmark harnesses (pyproject.toml). uv runs them with the Python below, and
+    # installs the ruff and ty that check them (its dev group, pinned in uv.lock)
+    pkgs.uv
 
     # Lean 4 semantics and proofs; each Lean project pins its version in `lean-toolchain`
     pkgs.elan
@@ -108,6 +111,10 @@ in
     llvm.libclang.dev
     llvm.llvm.dev
   ];
+
+  # uv uses Nix's Python and never downloads one (a downloaded build wouldn't run on NixOS).
+  UV_PYTHON = "${pkgs.python3}/bin/python3";
+  UV_PYTHON_DOWNLOADS = "never";
 
   FCC_BENCH_LIBC_STATIC = benchLibc;
   FCC_BENCH_GLIB_CFLAGS = benchGlib;

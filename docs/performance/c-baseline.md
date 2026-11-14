@@ -331,16 +331,16 @@ over all configurations instead of biasing one. The tables give the median wall 
 
 ```sh
 nix develop                                   # Linux, x86-64 or AArch64
-python3 benchmarks/c/cbench.py build          # fcc (CMake), every config: objects, binaries,
+uv run benchmarks/c/cbench.py build           # fcc (CMake), every config: objects, binaries,
                                               # compile times, fcc's phases, sizes
-python3 benchmarks/c/cbench.py count          # behavior + instruction counts (qemu-user off AArch64)
-python3 benchmarks/c/cbench.py scaling        # compile time on generated inputs
-python3 benchmarks/c/cbench.py time           # natively, on an AArch64 Linux host
-python3 benchmarks/c/cbench.py time --ssh HOST                       # on an AArch64 Linux host
-python3 benchmarks/c/cbench.py time --ssh MAC --docker alpine:3.22 \
+uv run benchmarks/c/cbench.py count           # behavior + instruction counts (qemu-user off AArch64)
+uv run benchmarks/c/cbench.py scaling         # compile time on generated inputs
+uv run benchmarks/c/cbench.py time            # natively, on an AArch64 Linux host
+uv run benchmarks/c/cbench.py time --ssh HOST                        # on an AArch64 Linux host
+uv run benchmarks/c/cbench.py time --ssh MAC --docker alpine:3.22 \
     --docker-bin '/usr/local/bin/docker --context desktop-linux'      # in an arm64 Linux VM
-python3 benchmarks/c/cbench.py report         # target/cbench/report.md
-python3 benchmarks/c/cbench.py all [time options]
+uv run benchmarks/c/cbench.py report          # target/cbench/report.md
+uv run benchmarks/c/cbench.py all [time options]
 ```
 
 `--only NAME...` restricts the programs, `--reps N` the compile-time repetitions (5), `--rounds N`
@@ -352,7 +352,7 @@ The backend profile behind bottleneck 3 is outside the harness. To reproduce it 
 available on the build host, so callgrind):
 
 ```sh
-python3 -c 'import sys; sys.path.insert(0, "benchmarks/c"); import cbench
+uv run python -c 'import sys; sys.path.insert(0, "benchmarks/c"); import cbench
 for n in (400, 1600, 6400): open(f"one{n}.c", "w").write(cbench.synth(1, n))'
 for n in 400 1600 6400; do
   build/fcc/fcc one$n.c --emit hfir -o one$n.hfir && target/release/fir lower one$n.hfir > one$n.mfir

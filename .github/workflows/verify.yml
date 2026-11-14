@@ -47,7 +47,7 @@ jobs:
         run: nix develop -c cargo xtask verify full
       - name: Required verdict
         run: |
-          nix develop -c python3 - <<'EOF'
+          nix develop -c uv run python - <<'EOF'
           import json, sys
           r = json.load(open("target/verify/report.json"))
           want = "${{ matrix.require }}"

@@ -199,7 +199,7 @@ pub(crate) const CLEARED: &[&str] = &[
 ];
 
 /// Tools a full verification needs on `PATH`.
-const TOOLS: &[&str] = &["cargo", "rustc", "lake", "clang", "cbindgen"];
+const TOOLS: &[&str] = &["cargo", "rustc", "lake", "clang", "cbindgen", "uv"];
 
 /// Suites whose evidence a full verification needs, per test profile.
 const SUITES: &[&str] = &[
@@ -416,6 +416,19 @@ impl Verify {
             ("cargo", "cargo", &["--version"][..], &root),
             ("clippy", "cargo", &["clippy", "--version"][..], &root),
             ("rustfmt", "rustfmt", &["--version"][..], &root),
+            ("uv", "uv", &["--version"][..], &root),
+            (
+                "ruff",
+                "uv",
+                &["run", "--locked", "ruff", "--version"][..],
+                &root,
+            ),
+            (
+                "ty",
+                "uv",
+                &["run", "--locked", "ty", "--version"][..],
+                &root,
+            ),
             ("lean", "lake", &["env", "lean", "--version"][..], &spec),
             ("lake", "lake", &["--version"][..], &spec),
             ("clang", "clang", &["--version"][..], &root),
@@ -1254,6 +1267,18 @@ fn main() {
         ],
         &[],
     );
+    // The Python benchmark harnesses: ruff and ty as uv.lock pins them (pyproject.toml configures
+    // both).
+    let uv_run = |tool: &[&'static str]| [&["run", "--locked"][..], tool].concat();
+    v.command(
+        "ruff format",
+        &root,
+        "uv",
+        &uv_run(&["ruff", "format", "--check"]),
+        &[],
+    );
+    v.command("ruff check", &root, "uv", &uv_run(&["ruff", "check"]), &[]);
+    v.command("ty", &root, "uv", &uv_run(&["ty", "check"]), &[]);
     let ev_debug = out_dir.join("evidence/debug");
     v.tests("debug", &ev_debug);
     let ev_release = out_dir.join("evidence/release");

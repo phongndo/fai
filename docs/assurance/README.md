@@ -42,7 +42,7 @@ runs where.
 `report.json` record each, with times, the revision, whether the tree was dirty, and every
 toolchain's version):
 
-1. **Tools and environment.** `cargo`, `rustc`, `lake`, `clang`, `cbindgen`, and off AArch64
+1. **Tools and environment.** `cargo`, `rustc`, `lake`, `clang`, `cbindgen`, `uv`, and off AArch64
    `aarch64-unknown-linux-gnu-cc` and `qemu-aarch64` must be on `PATH`. Variables that weaken
    checks (`FIR_REF`, `FIR_FUZZ`, `FIR_CC`, …) are cleared for every child; `FIR_REF=none` in
    the environment fails the run outright.
@@ -53,7 +53,9 @@ toolchain's version):
    cbindgen's header must reproduce the committed files byte for byte.
 4. **Proof audit.** `fir-audit` against the lock (below).
 5. **`cargo fmt --check`** and **`cargo clippy --workspace --all-targets -D warnings`** with
-   the workspace lints (below).
+   the workspace lints (below), and for the Python benchmark harnesses **`ruff format --check`**,
+   **`ruff check`**, and **`ty check`** (configured in `pyproject.toml`; uv runs the versions
+   `uv.lock` pins).
 6. **Every Rust suite, debug and release**, with `FIR_REQUIRE_FULL=1` (a test that would skip
    for lack of the Lean reference, a native toolchain, or an emulator fails instead) and the
    fuzz counts set explicitly (200 programs, seed 1).

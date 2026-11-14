@@ -1,6 +1,9 @@
 # Measuring fcc's code
 
-Two sets of tools; nothing here is built by Cargo or CMake, and no test depends on it.
+Two sets of tools; nothing here is built by Cargo or CMake, and no test depends on it. The
+scripts are standard-library Python run by uv (`pyproject.toml` at the root), and `cargo xtask
+verify` checks them with `ruff format --check`, `ruff check`, and `ty check`, which uv installs
+(`uv run ruff format` applies the formatting).
 
 - `bench.py` and its plugins measure what `fcc`'s pipelines do to the C corpus (`frontends/c/tests/*.c`),
   for [docs/design/05-optimizing-c.md](../../docs/design/05-optimizing-c.md). Below.
@@ -20,8 +23,8 @@ count, and the same program compiled by GCC `-O1` is the yardstick.
 nix develop                                     # qemu-aarch64, the AArch64 cross compiler
 cmake --build build/fcc                      # the fcc to measure (or set BENCH_FCC)
 benchmarks/c/build-plugins.sh /tmp/bench        # libcount.so and libhist.so
-BENCH_HIST=1 python3 -I benchmarks/c/bench.py "$PWD" /tmp/bench
-python3 benchmarks/c/summarize.py /tmp/bench/results.json
+BENCH_HIST=1 uv run python -I benchmarks/c/bench.py "$PWD" /tmp/bench
+uv run benchmarks/c/summarize.py /tmp/bench/results.json
 ```
 
 Each program is built four ways (GCC `-O1`, `fcc`, `fcc -O`, and `fcc --passes
@@ -35,7 +38,7 @@ count the `mem.load`s, `mem.store`s, and stack slots left in each pipeline's MFI
 
 ```sh
 nix develop
-python3 benchmarks/c/cbench.py all --ssh HOST [--docker IMAGE --docker-bin '…']
+uv run benchmarks/c/cbench.py all --ssh HOST [--docker IMAGE --docker-bin '…']
 ```
 
 builds the 12 programs in `programs/` with `fcc`, `fcc -O`, GCC `-O0`/`-O1`/`-O2`, and Clang

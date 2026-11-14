@@ -1,24 +1,35 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
 """Summarize bench.py's results: totals and geometric-mean ratios to fcc -O, the programs
 that run longest, and (with BENCH_HIST=1 results) the executed instructions by category.
 Usage: summarize.py OUTDIR/results.json [N-PROGRAMS]"""
-import json, sys, math
-r = json.load(open(sys.argv[1]))
-cfgs = [c for c in next(iter(r.values())).keys()]
+
+import json
+import math
+import sys
+
+with open(sys.argv[1]) as f:
+    r = json.load(f)
+cfgs = list(next(iter(r.values())))
 bad = [(n, c) for n, v in r.items() for c in cfgs if not v[c].get("same", False)]
 print("mismatches or errors:", bad)
-def geo(xs): return math.exp(sum(map(math.log, xs)) / len(xs))
+
+
+def geo(xs):
+    return math.exp(sum(map(math.log, xs)) / len(xs))
+
+
 base = "fcc-O"
 rows = []
 for n, v in sorted(r.items()):
-    if any("error" in v[c] for c in cfgs): continue
+    if any("error" in v[c] for c in cfgs):
+        continue
     rows.append((n, v))
 print(f"{len(rows)} programs")
 for metric in ["insns", "loads", "stores", "text"]:
     line = f"{metric:7}"
     for c in cfgs:
         tot = sum(v[c][metric] for _, v in rows)
-        ratios = [max(v[c][metric],1) / max(v[base][metric],1) for _, v in rows]
+        ratios = [max(v[c][metric], 1) / max(v[base][metric], 1) for _, v in rows]
         line += f" | {c}: total {tot:>11,} geo x{geo(ratios):.3f}"
     print(line)
 for metric in ["mfir_loads", "mfir_stores", "mfir_slots"]:
@@ -29,9 +40,13 @@ for metric in ["mfir_loads", "mfir_stores", "mfir_slots"]:
     print(line)
 # Per-program top table
 print("\nprogram            gccO1-insns   fcc-O-insns   exp-insns  exp/O  | loads O -> exp (gcc)")
-for n, v in sorted(rows, key=lambda x: -x[1][base]["insns"])[: int(sys.argv[2]) if len(sys.argv) > 2 else 25]:
+for n, v in sorted(rows, key=lambda x: -x[1][base]["insns"])[
+    : int(sys.argv[2]) if len(sys.argv) > 2 else 25
+]:
     e = cfgs[-1]
-    print(f"{n:18} {v['gcc-O1']['insns']:>12,} {v[base]['insns']:>12,} {v[e]['insns']:>11,}  {v[e]['insns']/v[base]['insns']:.2f}  | {v[base]['loads']:>9,} -> {v[e]['loads']:>9,} ({v['gcc-O1']['loads']:,})")
+    print(
+        f"{n:18} {v['gcc-O1']['insns']:>12,} {v[base]['insns']:>12,} {v[e]['insns']:>11,}  {v[e]['insns'] / v[base]['insns']:.2f}  | {v[base]['loads']:>9,} -> {v[e]['loads']:>9,} ({v['gcc-O1']['loads']:,})"
+    )
 
 
 def category(m):
@@ -51,6 +66,7 @@ def category(m):
         return "branch"
     return "other"
 
+
 if any("hist" in v[c] for _, v in rows for c in cfgs):
     print("\nexecuted instructions by category:")
     for c in cfgs:
@@ -59,4 +75,7 @@ if any("hist" in v[c] for _, v in rows for c in cfgs):
             for k, n in v[c].get("hist", {}).items():
                 tot[category(k)] = tot.get(category(k), 0) + n
         s = sum(tot.values()) or 1
-        print(f"{c:8} " + "  ".join(f"{k} {n / s:.0%}" for k, n in sorted(tot.items(), key=lambda x: -x[1])))
+        print(
+            f"{c:8} "
+            + "  ".join(f"{k} {n / s:.0%}" for k, n in sorted(tot.items(), key=lambda x: -x[1]))
+        )

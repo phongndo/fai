@@ -1,0 +1,41 @@
+# FIR's Python: the C benchmark harnesses in benchmarks/c (standard library only). uv runs them
+# with the dev shell's Python (`uv run benchmarks/c/cbench.py ...`) and installs ruff and ty (the
+# dev group, pinned in uv.lock), which check them in `cargo xtask verify`
+# (`uv run ruff format --check`, `uv run ruff check`, `uv run ty check`).
+[project]
+name = "fai-benchmarks"
+version = "0"
+description = "FIR's C benchmark harnesses"
+requires-python = ">=3.14"
+dependencies = []
+
+[tool.uv]
+# Scripts, not a package: uv makes the environment and runs them, and builds nothing.
+package = false
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # import order
+    "B",   # bugbear
+    "UP",  # pyupgrade
+    "SIM", # simplifications
+    "RUF", # ruff's own
+]
+# The formatter wraps code; the long lines left are strings and comments.
+# Reports use × and − on purpose.
+ignore = ["E501", "RUF001"]
+
+[tool.ty.terminal]
+error-on-warning = true
+
+[dependency-groups]
+dev = [
+    "ruff>=0.17.5",
+    "ty>=0.0.104",
+]
