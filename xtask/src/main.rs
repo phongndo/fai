@@ -113,7 +113,7 @@ pub(crate) fn host_gap_reason(subject: &str) -> Option<&'static str> {
 }
 
 /// Why host `h` can't run `subject`, if [`HOST_GAPS`] says so.
-fn gap_on(h: &str, subject: &str) -> Option<&'static str> {
+pub(crate) fn gap_on(h: &str, subject: &str) -> Option<&'static str> {
     HOST_GAPS
         .iter()
         .find(|(gh, s, _)| *gh == h && *s == subject)

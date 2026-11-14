@@ -1,5 +1,7 @@
-//! `cargo xtask experiment`: propose a compiler change, test it, and measure it, without touching
-//! anything but `target/experiments/NAME/`.
+//! `cargo xtask experiment`: propose a compiler change, test it, and measure it, without changing
+//! any tracked file: it writes build outputs, its report under `target/experiments/NAME/`, the
+//! suites' scratch files, `spec/.lake/` (through `lake build`), and, for `--baseline-rev`, a
+//! temporary git worktree's registration (see docs/experiments.md, Safety).
 //!
 //! ```text
 //! cargo xtask experiment NAME [--passes P,... [--experimental] | --none]
@@ -42,6 +44,7 @@
 //! eligible for the default pipeline, whatever it measures. `verify full` (which clears
 //! `FIR_PASSES`) remains the required check for anything that lands.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -49,7 +52,7 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use crate::{CLEARED, filtered_out, host, host_gap_reason, load_evidence};
+use crate::{CLEARED, filtered_out, gap_on, host, load_evidence};
 
 /// What the experiment measures, primary first; lower is better for every one.
 const METRICS: &[&str] = &[
@@ -244,18 +247,37 @@ fn git(root: &Path, args: &[&str]) -> String {
 }
 
 /// The revision, whether the tree is dirty, and a hash of its diff against that revision.
-fn identity(root: &Path) -> Value {
+fn identity(root: &Path) -> Result<Value, String> {
     let dirty = !git(root, &["status", "--porcelain"]).is_empty();
     let mut diff = Command::new("git")
         .args(["diff", "HEAD", "--binary"])
         .current_dir(root)
         .output()
+        .ok()
+        .filter(|o| o.status.success())
         .map(|o| o.stdout)
-        .unwrap_or_default();
-    // Untracked files can be build inputs (a new pass): their names and contents count too.
-    for f in git(root, &["ls-files", "--others", "--exclude-standard"]).lines() {
-        diff.extend_from_slice(format!("\0untracked {f}\0").as_bytes());
-        diff.extend(std::fs::read(root.join(f)).unwrap_or_default());
+        .ok_or("git diff HEAD failed")?;
+    // Untracked files can be build inputs (a new pass): their names and contents count too,
+    // names as git stores them (`-z`: unquoted bytes), and a file that can't be read is an
+    // error, not an empty file.
+    let untracked = Command::new("git")
+        .args(["ls-files", "-z", "--others", "--exclude-standard"])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("git ls-files: {e}"))?
+        .stdout;
+    let mut n_untracked = 0;
+    for name in untracked.split(|&b| b == 0).filter(|n| !n.is_empty()) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = root.join(std::ffi::OsStr::from_bytes(name));
+        let contents = std::fs::read(&path)
+            .map_err(|e| format!("reading untracked {}: {e}", path.display()))?;
+        diff.extend_from_slice(b"\0untracked ");
+        diff.extend_from_slice(name);
+        diff.push(0);
+        diff.extend_from_slice(&(contents.len() as u64).to_le_bytes());
+        diff.extend(contents);
+        n_untracked += 1;
     }
     let hash = Command::new("git")
         .args(["hash-object", "--stdin"])
@@ -270,14 +292,14 @@ fn identity(root: &Path) -> Value {
         })
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .unwrap_or_default();
-    json!({
+    Ok(json!({
         "revision": git(root, &["rev-parse", "HEAD"]),
         "branch": git(root, &["rev-parse", "--abbrev-ref", "HEAD"]),
         "dirty": dirty,
         // Of `git diff HEAD` and every untracked file's name and contents.
         "diff hash": if dirty { hash } else { String::new() },
-        "untracked files": git(root, &["ls-files", "--others", "--exclude-standard"]).lines().count(),
-    })
+        "untracked files": n_untracked,
+    }))
 }
 
 /// The modules measured: every `.fir` file under `tests/` outside an `errors/` directory.
@@ -335,7 +357,11 @@ fn measure_all(
                         // `fir measure` exits 0 or 1 with its JSON; anything else (a panic, a
                         // crash, bad usage) is a harness failure, whatever it printed.
                         Ok(o) => match serde_json::from_slice::<Value>(&o.stdout) {
-                            Ok(v) if matches!(o.status.code(), Some(0 | 1)) => Ok(v),
+                            Ok(v) if matches!(o.status.code(), Some(0 | 1)) => {
+                                valid(&v, o.status.code() == Some(1))
+                                    .map(|()| v)
+                                    .map_err(|e| format!("fir measure printed a bad record: {e}"))
+                            }
                             _ => Err(format!(
                                 "fir measure exited with {}: {}",
                                 o.status,
@@ -354,19 +380,114 @@ fn measure_all(
         .collect()
 }
 
-/// Build `fir` in release from the tree at `dir`, into `target` (with the tree's own lock file),
-/// and copy the binary to `keep`, so another build into `target` (another experiment) can't
-/// replace it while this one measures; the copy.
-fn build_fir(dir: &Path, target: &Path, log: &Path, keep: &Path) -> Result<PathBuf, String> {
-    let mut c = clean("cargo", dir);
-    c.args(["build", "--release", "--locked", "--bin", "fir"])
-        .env("CARGO_TARGET_DIR", target);
-    let (ok, tail) = logged(c, log);
-    if !ok {
-        return Err(format!("building fir in {} failed:\n{tail}", dir.display()));
+/// Whether a record `fir measure` printed is one: a pipeline, and either a preparation error or
+/// runs and every metric, consistent with its exit code (1 exactly when it has an error or a
+/// run problem), so a broken `fir measure` can't make modules vanish from the comparison.
+fn valid(v: &Value, exited_1: bool) -> Result<(), String> {
+    if !v["pipeline"]["passes"].is_array() {
+        return Err("no pipeline".into());
     }
-    std::fs::copy(target.join("release/fir"), keep)
-        .map_err(|e| format!("copying fir to {}: {e}", keep.display()))?;
+    if v["error"].is_string() {
+        return if exited_1 {
+            Ok(())
+        } else {
+            Err("an error, but exit 0".into())
+        };
+    }
+    let runs = v["runs"].as_array().ok_or("no runs")?;
+    for r in runs {
+        for k in ["call", "source", "target", "how"] {
+            if !r[k].is_string() {
+                return Err(format!("a run without {k}"));
+            }
+        }
+        for k in ["refines", "matches expectation"] {
+            if !r[k].is_boolean() {
+                return Err(format!("a run without {k}"));
+            }
+        }
+    }
+    let m = &v["metrics"];
+    for k in [
+        "ops.static",
+        "ops.executed",
+        "mem.executed",
+        "calls.executed",
+        "runs",
+        "runs measured",
+        "run problems",
+    ] {
+        if !m[k].is_u64() {
+            return Err(format!("no metric {k}"));
+        }
+    }
+    for t in ["aarch64", "x86_64"] {
+        // Each backend either compiled it (a count) or refused it (why), never neither.
+        if m[format!("{t}.insns")].is_u64() == v[format!("{t}.refused")].is_string() {
+            return Err(format!(
+                "{t}: neither an instruction count nor a refusal, or both"
+            ));
+        }
+    }
+    if m["runs"].as_u64() != Some(runs.len() as u64) {
+        return Err("the run count doesn't match the runs".into());
+    }
+    let problems = runs
+        .iter()
+        .filter(|r| r["refines"] != json!(true) || r["matches expectation"] != json!(true))
+        .count() as u64;
+    if m["run problems"].as_u64() != Some(problems) || exited_1 != (problems > 0) {
+        return Err(format!(
+            "{problems} run problems, but the record or exit code says otherwise"
+        ));
+    }
+    Ok(())
+}
+
+/// Build `fir` in release from the tree at `dir`, into `target` (with the tree's own lock file),
+/// and copy the binary cargo reports building to `keep`, so another build into `target` (another
+/// experiment) can't replace it while this one measures; the copy. A lock file next to `target`
+/// is held from the build through the copy.
+fn build_fir(dir: &Path, target: &Path, log: &Path, keep: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(target).map_err(|e| format!("{}: {e}", target.display()))?;
+    let lock = std::fs::File::create(target.join(".fir-experiment.lock"))
+        .and_then(|f| f.lock().map(|()| f))
+        .map_err(|e| format!("locking {}: {e}", target.display()))?;
+    let mut c = clean("cargo", dir);
+    c.args([
+        "build",
+        "--release",
+        "--locked",
+        "--bin",
+        "fir",
+        "--message-format=json-render-diagnostics",
+    ])
+    .env("CARGO_TARGET_DIR", target)
+    .stderr(Stdio::piped())
+    .stdout(Stdio::piped());
+    let out = c.output().map_err(|e| format!("can't run cargo: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    std::fs::write(log, format!("{stdout}\n--- stderr ---\n{stderr}")).unwrap();
+    if !out.status.success() {
+        let lines: Vec<&str> = stderr.lines().collect();
+        return Err(format!(
+            "building fir in {} failed:\n{}",
+            dir.display(),
+            lines[lines.len().saturating_sub(25)..].join("\n")
+        ));
+    }
+    // The executable cargo says it built (wherever a configured target triple puts it).
+    let exe = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == "fir")
+        .filter_map(|m| m["executable"].as_str().map(PathBuf::from))
+        .next_back()
+        .ok_or_else(|| format!("cargo didn't report building fir (see {})", log.display()))?;
+    std::fs::copy(&exe, keep)
+        .map_err(|e| format!("copying {} to {}: {e}", exe.display(), keep.display()))?;
+    drop(lock);
     Ok(keep.to_owned())
 }
 
@@ -385,7 +506,7 @@ impl Drop for Worktree<'_> {
             .output();
         if !removed.is_ok_and(|o| o.status.success()) {
             eprintln!(
-                "warning: couldn't remove the baseline worktree {}: remove it with `git worktree remove --force` (the next experiment prunes it)",
+                "warning: couldn't remove the baseline worktree {}: remove it with `git worktree remove --force` (the next run of this experiment reclaims it)",
                 self.path.display()
             );
         }
@@ -536,16 +657,34 @@ fn problems(files: &[String], base: &[Measured], cand: &[Measured]) -> (Vec<Stri
     (bad, unmeasured)
 }
 
-/// The suites a gate test binary writes evidence for, and the key counting its random programs.
-const GATE: &[(&str, &[(&str, &str)])] = &[
-    ("opt", &[("opt_fixtures", ""), ("opt_fuzz", "programs")]),
+/// The suites a gate test binary writes evidence for: each suite, the key counting its random
+/// programs (empty for fixtures), and the prefix of the keys counting the comparisons it made,
+/// which must add up to more than zero, so a suite that counted its programs and returned early
+/// can't pass.
+/// A suite the gate reads: its evidence name, its programs key, its comparisons prefix.
+type GateSuite = (&'static str, &'static str, &'static str);
+
+const GATE: &[(&str, &[GateSuite])] = &[
+    (
+        "opt",
+        &[
+            ("opt_fixtures", "", "runs compared"),
+            ("opt_fuzz", "programs", "runs compared"),
+        ],
+    ),
     (
         "aarch64",
-        &[("aarch64_fixtures", ""), ("aarch64_fuzz", "(programs)")],
+        &[
+            ("aarch64_fixtures", "", "native matches"),
+            ("aarch64_fuzz", "(programs)", "native matches"),
+        ],
     ),
     (
         "x86_64",
-        &[("x86_64_fixtures", ""), ("x86_64_fuzz", "(programs)")],
+        &[
+            ("x86_64_fixtures", "", "native matches"),
+            ("x86_64_fuzz", "(programs)", "native matches"),
+        ],
     ),
 ];
 
@@ -651,52 +790,8 @@ fn gate(root: &Path, out: &Path, o: &Opts, run_id: &str) -> Gate {
     );
     // What the suites say they did.
     let evs = load_evidence(&evidence);
-    let mut bad = Vec::new();
-    for (_, suites) in GATE {
-        for (s, programs) in *suites {
-            let Some(ev) = evs.get(*s) else {
-                if let Some(why) = host_gap_reason(s) {
-                    g.host_gaps.push(json!({"suite": s, "why": why}));
-                } else {
-                    bad.push(format!("{s}: no evidence"));
-                }
-                continue;
-            };
-            if ev["run"].as_str() != Some(run_id) {
-                bad.push(format!("{s}: evidence from another run"));
-            }
-            if let Some(gap) = ev["facts"]["host gap"].as_str() {
-                match host_gap_reason(s) {
-                    Some(why) => g
-                        .host_gaps
-                        .push(json!({"suite": s, "why": why, "test says": gap})),
-                    None => bad.push(format!(
-                        "{s}: reports a host gap ({gap}) not declared for {}",
-                        host()
-                    )),
-                }
-                continue;
-            }
-            for sk in ev["skipped"].as_array().into_iter().flatten() {
-                bad.push(format!("{s}: skipped {sk}"));
-            }
-            if ev["counts"]["failures"].as_u64().unwrap_or(0) > 0 {
-                bad.push(format!("{s}: {} failures", ev["counts"]["failures"]));
-            }
-            let got = ev["facts"]["pipeline"].as_str().unwrap_or("(not recorded)");
-            if got != want_pipeline {
-                bad.push(format!(
-                    "{s}: tested the pipeline {got:?}, not the candidate's {want_pipeline:?}"
-                ));
-            }
-            if !programs.is_empty() {
-                let n = ev["counts"][*programs].as_u64().unwrap_or(0);
-                if n != o.fuzz {
-                    bad.push(format!("{s}: {programs} is {n}, expected {}", o.fuzz));
-                }
-            }
-        }
-    }
+    let (bad, gaps) = gate_evidence(&evs, run_id, &want_pipeline, o.fuzz, &host());
+    g.host_gaps.extend(gaps);
     let n = evs.len();
     g.check(
         "evidence: every suite tested the candidate, fully",
@@ -711,6 +806,72 @@ fn gate(root: &Path, out: &Path, o: &Opts, run_id: &str) -> Gate {
     g
 }
 
+/// What the gate's suites must have recorded (`evs`, from run `run_id`, on host `h`): the
+/// problems, and the declared host gaps that stood in for a suite's work.
+fn gate_evidence(
+    evs: &BTreeMap<String, Value>,
+    run_id: &str,
+    want_pipeline: &str,
+    fuzz: u64,
+    h: &str,
+) -> (Vec<String>, Vec<Value>) {
+    let mut bad = Vec::new();
+    let mut gaps = Vec::new();
+    for (_, suites) in GATE {
+        for (s, programs, compared) in *suites {
+            // Integrity first, gap or no gap: the suite reported, in this run, skipping and
+            // failing nothing, having tested the candidate's pipeline.
+            let Some(ev) = evs.get(*s) else {
+                bad.push(format!("{s}: no evidence"));
+                continue;
+            };
+            if ev["run"].as_str() != Some(run_id) {
+                bad.push(format!("{s}: evidence from another run"));
+                continue;
+            }
+            for sk in ev["skipped"].as_array().into_iter().flatten() {
+                bad.push(format!("{s}: skipped {sk}"));
+            }
+            if ev["counts"]["failures"].as_u64().unwrap_or(0) > 0 {
+                bad.push(format!("{s}: {} failures", ev["counts"]["failures"]));
+            }
+            let got = ev["facts"]["pipeline"].as_str().unwrap_or("(not recorded)");
+            if got != want_pipeline {
+                bad.push(format!(
+                    "{s}: tested the pipeline {got:?}, not the candidate's {want_pipeline:?}"
+                ));
+            }
+            // Only then a declared host gap stands in for the work.
+            if let Some(gap) = ev["facts"]["host gap"].as_str() {
+                match gap_on(h, s) {
+                    Some(why) => gaps.push(json!({"suite": s, "why": why, "test says": gap})),
+                    None => bad.push(format!(
+                        "{s}: reports a host gap ({gap}) not declared for {h}"
+                    )),
+                }
+                continue;
+            }
+            let comparisons: u64 = ev["counts"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(k, _)| k.starts_with(*compared))
+                .filter_map(|(_, v)| v.as_u64())
+                .sum();
+            if comparisons == 0 {
+                bad.push(format!("{s}: no comparisons ({compared}... is 0)"));
+            }
+            if !programs.is_empty() {
+                let n = ev["counts"][*programs].as_u64().unwrap_or(0);
+                if n != fuzz {
+                    bad.push(format!("{s}: {programs} is {n}, expected {fuzz}"));
+                }
+            }
+        }
+    }
+    (bad, gaps)
+}
+
 pub fn main(root: &Path, args: &[String]) -> i32 {
     let o = match parse(args) {
         Ok(o) => o,
@@ -721,6 +882,12 @@ pub fn main(root: &Path, args: &[String]) -> i32 {
     };
     let start = Instant::now();
     let out = root.join("target/experiments").join(&o.name);
+    // A killed run's baseline worktree: unregister it (only it) before its directory goes.
+    let _ = Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(out.join("baseline-tree"))
+        .current_dir(root)
+        .output();
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out).unwrap();
     let run_id = format!(
@@ -741,7 +908,13 @@ pub fn main(root: &Path, args: &[String]) -> i32 {
             .unwrap_or_default()
     );
     let mut errors: Vec<String> = Vec::new();
-    let cand_id = identity(root);
+    let cand_id = match identity(root) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("can't identify the candidate's tree: {e}");
+            return 1;
+        }
+    };
 
     // The two `fir`s.
     // The candidate builds where cargo would put it (`cargo xtask mutate` sets its own).
@@ -765,14 +938,10 @@ pub fn main(root: &Path, args: &[String]) -> i32 {
         None => (cand_fir.clone(), cand_id.clone()),
         Some(rev) => {
             let path = out.join("baseline-tree");
-            // A run that was killed leaves its worktree registered; its directory went with
-            // `out` above, so pruning unregisters it.
-            let _ = Command::new("git")
-                .args(["worktree", "prune"])
-                .current_dir(root)
-                .output();
+            // `-f`: a killed run may have left this path registered with its directory gone;
+            // reclaim it without touching any other worktree's registration.
             let added = Command::new("git")
-                .args(["worktree", "add", "--detach", "--quiet"])
+                .args(["worktree", "add", "-f", "--detach", "--quiet"])
                 .arg(&path)
                 .arg(rev)
                 .current_dir(root)
@@ -803,7 +972,13 @@ pub fn main(root: &Path, args: &[String]) -> i32 {
                 &out.join("build-baseline.log"),
                 &out.join("fir-baseline"),
             ) {
-                Ok(p) => (p, identity(&path)),
+                Ok(p) => match identity(&path) {
+                    Ok(id) => (p, id),
+                    Err(e) => {
+                        eprintln!("can't identify the baseline's tree: {e}");
+                        return 1;
+                    }
+                },
                 Err(e) => {
                     eprintln!("{e}");
                     return 1;
@@ -1195,6 +1370,108 @@ mod tests {
             bad[0].contains("the baseline's measurement failed"),
             "{bad:?}"
         );
+    }
+
+    /// Found in review: fresh evidence with the right program counts but no comparisons passed,
+    /// and a host gap skipped the skip and failure checks.
+    #[test]
+    fn the_gate_needs_comparisons_and_integrity_before_gaps() {
+        let ev = |name: &str, counts: Value, facts: Value| {
+            (
+                name.to_owned(),
+                json!({"run": "r", "counts": counts, "skipped": [], "facts": facts}),
+            )
+        };
+        let p = json!({"pipeline": "dce"});
+        let full = |cmp: u64| -> BTreeMap<String, Value> {
+            BTreeMap::from([
+                ev("opt_fixtures", json!({"runs compared": cmp}), p.clone()),
+                ev(
+                    "opt_fuzz",
+                    json!({"programs": 7, "runs compared: Equal": cmp}),
+                    p.clone(),
+                ),
+                ev(
+                    "aarch64_fixtures",
+                    json!({"native matches": cmp}),
+                    p.clone(),
+                ),
+                ev(
+                    "aarch64_fuzz",
+                    json!({"(programs)": 7, "native matches": cmp}),
+                    p.clone(),
+                ),
+                ev("x86_64_fixtures", json!({"native matches": cmp}), p.clone()),
+                ev(
+                    "x86_64_fuzz",
+                    json!({"(programs)": 7, "native matches (floats)": cmp}),
+                    p.clone(),
+                ),
+            ])
+        };
+        assert!(
+            gate_evidence(&full(3), "r", "dce", 7, "x86_64-linux")
+                .0
+                .is_empty()
+        );
+        let (bad, _) = gate_evidence(&full(0), "r", "dce", 7, "x86_64-linux");
+        assert_eq!(bad.len(), 6, "{bad:?}");
+        assert!(
+            gate_evidence(&full(3), "r", "-O", 7, "x86_64-linux")
+                .0
+                .len()
+                == 6
+        );
+        assert!(
+            gate_evidence(&full(3), "other", "dce", 7, "x86_64-linux")
+                .0
+                .len()
+                == 6
+        );
+        // A gap on its host stands in for the work, but not for a failure, and not elsewhere.
+        let mut evs = full(3);
+        let gap = json!({"pipeline": "dce", "host gap": "no x86-64 here"});
+        evs.insert(
+            "x86_64_fixtures".into(),
+            json!({"run": "r", "counts": {}, "skipped": [], "facts": gap}),
+        );
+        let (bad, gaps) = gate_evidence(&evs, "r", "dce", 7, "aarch64-macos");
+        assert!(bad.is_empty() && gaps.len() == 1, "{bad:?}");
+        assert_eq!(
+            gate_evidence(&evs, "r", "dce", 7, "x86_64-linux").0.len(),
+            1
+        );
+        evs.insert(
+            "x86_64_fixtures".into(),
+            json!({"run": "r", "counts": {"failures": 1}, "skipped": [], "facts": gap}),
+        );
+        assert_eq!(
+            gate_evidence(&evs, "r", "dce", 7, "aarch64-macos").0.len(),
+            1
+        );
+        evs.remove("x86_64_fixtures");
+        assert_eq!(
+            gate_evidence(&evs, "r", "dce", 7, "aarch64-macos").0.len(),
+            1
+        );
+    }
+
+    /// Found in review: `{}` with exit 1 passed as a measurement, and every module could vanish.
+    #[test]
+    fn measurement_records_are_validated() {
+        assert!(valid(&json!({}), true).is_err());
+        let ok = json!({"pipeline": {"passes": []}, "runs": [{"call": "@f()", "source": "x", "target": "x",
+            "how": "equal", "refines": true, "matches expectation": true}],
+            "aarch64.refused": null, "x86_64.refused": "floats",
+            "metrics": {"ops.static": 1, "ops.executed": 1, "mem.executed": 0, "calls.executed": 0,
+                "runs": 1, "runs measured": 1, "run problems": 0, "aarch64.insns": 4}});
+        assert_eq!(valid(&ok, false), Ok(()));
+        assert!(valid(&ok, true).is_err(), "exit 1 without a problem");
+        let mut both = ok.clone();
+        both["metrics"]["x86_64.insns"] = json!(3);
+        assert!(valid(&both, false).is_err(), "a count and a refusal");
+        let refused = json!({"pipeline": {"passes": []}, "error": "preparing: no"});
+        assert!(valid(&refused, true).is_ok() && valid(&refused, false).is_err());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 This is how to try a change to the compiler (a new pass, a different pipeline, a change to a
 pass, a backend, or the lowering) and find out whether it is correct and whether it helps,
-without touching anything outside `target/`. It is written for agents as much as for people:
+without changing any tracked file (Safety lists exactly what it writes). It is written for agents as much as for people:
 every step is one command, every result is a file, and every verdict says what it rests on.
 
 ## The loop
@@ -92,13 +92,25 @@ proof, and nothing here connects a measurement to the Lean theorems.
   (`target/`, or `$CARGO_TARGET_DIR`), the baseline in `target/experiments/.baseline-target`,
   both `--locked`; the gate's suites write their scratch files under `target/tmp/`, and its
   `lake build` updates `spec/.lake/` (a no-op when the Lean build is current). A baseline
-  revision's worktree is removed when the experiment ends (a warning says so if it can't be),
-  and a killed run's registration is pruned by the next one.
+  revision is checked out as a git worktree in `target/experiments/NAME/baseline-tree`, which
+  registers it in the repository's shared git metadata until the experiment ends and removes
+  it (a warning says so if it can't); a killed run's registration is reclaimed by the next run
+  of the same experiment (`git worktree add -f` on that path only). No other worktree's
+  registration is touched.
 * The variables that weaken checks (`FIR_REF`, `FIR_FUZZ`, `FIR_CC`, …: `CLEARED` in
   `xtask/src/main.rs`) are cleared for every child; the gate sets only what it means to.
 * The candidate's tree is identified by revision, whether it is dirty, and a hash of its diff
-  and of every untracked file's name and contents, so a report can't be mistaken for one of
-  another tree.
+  and of every untracked file's name and contents (an unreadable one is an error), so a report
+  can't be mistaken for one of another tree. Each binary measured is the one cargo reports
+  building (wherever a configured target puts it), copied while a lock keeps another
+  experiment's build out of that target directory.
+* Every record `fir measure` prints is validated (a pipeline; an error or runs and every
+  metric; a count or a refusal per backend; run problems matching the runs and the exit code),
+  so a broken measurement rejects the experiment instead of shrinking the comparison.
+* The gate requires each suite's evidence from this run, with no skips or failures, the
+  candidate's pipeline, the configured number of random programs, and more than zero
+  comparisons; on macOS a declared host gap stands in for a suite's work only after those
+  integrity checks.
 * A module either side can't measure at all (`fir measure` crashing, or exiting other than 0
   or 1) rejects the experiment: it can't silently drop out of the comparison. One that neither
   side can *prepare* (LFIR inputs, lowering limits) is listed as unmeasured.
