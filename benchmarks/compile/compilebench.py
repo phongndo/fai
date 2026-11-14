@@ -209,8 +209,8 @@ class Bench:
     def run(self):
         identity = self.tools.identity()
         identity["loadavg_start"] = Path("/proc/loadavg").read_text().split()[:3]
-        identity["builds"] = {**{k: str(v) for k, v in self.fccs.items()},
-                              **{k: str(v) for k, v in self.firs.items()}}
+        identity["builds"] = {**{("fcc" if k == "fcc" else f"fcc@{k}"): str(v) for k, v in self.fccs.items()},
+                              **{("fir" if k == "fir" else f"fir@{k}"): str(v) for k, v in self.firs.items()}}
         identity["build_sha256"] = {k: sha256(v) for k, v in identity["builds"].items()}
         work = self.workloads()
         configs = self.configs()
