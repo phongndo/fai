@@ -14,8 +14,9 @@
 //!   equality takes a chunk both sides share as it is.
 //! - A set of up to [`INLINE`] values is stored in place ([`Set`]), so copying a chunk allocates
 //!   nothing else.
-//! - Each chunk lists the values its sets may hold (a superset), so removing a value from every
-//!   location skips the chunks that can't hold it.
+//! - Each chunk lists the values its sets may hold (a superset, rebuilt when it grows past twice
+//!   what the sets hold), so removing a value from every location skips the chunks that can't
+//!   hold it.
 //!
 //! None of this changes what the state means, so it changes nothing the validator accepts or
 //! refuses, or its messages: the model-based tests check that every operation agrees with the
@@ -180,6 +181,23 @@ impl Chunk {
         }
     }
 
+    /// Rebuild `may_hold` from the sets when it has grown well past them: a location that is
+    /// overwritten leaves its old values listed, and a register chunk would otherwise list every
+    /// value that ever passed through it, making each write cost as much as the function's size.
+    fn prune(&mut self) {
+        let held: usize = self.sets.iter().map(|s| s.as_slice().len()).sum();
+        if self.may_hold.len() > 2 * held + 16 {
+            let mut v: Vec<Val> = self
+                .sets
+                .iter()
+                .flat_map(|s| s.as_slice().iter().copied())
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            self.may_hold = v;
+        }
+    }
+
     fn holds_somewhere(&self, v: Val) -> bool {
         self.may_hold.binary_search(&v).is_ok() && self.sets.iter().any(|s| s.contains(v))
     }
@@ -221,6 +239,7 @@ impl Locs {
         }
         c.sets[i % CHUNK] = s;
         c.present |= 1 << (i % CHUNK);
+        c.prune();
     }
 
     /// No location holds `v` any more.
