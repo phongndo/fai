@@ -134,8 +134,9 @@ struct Jump {
 
 class Lowerer {
 public:
-  Lowerer(ASTContext &ctx, FirModule *m)
-      : ctx(ctx), diags(ctx.getDiagnostics()), sm(ctx.getSourceManager()), m(m) {}
+  Lowerer(ASTContext &ctx, FirModule *m, std::string salt)
+      : ctx(ctx), diags(ctx.getDiagnostics()), sm(ctx.getSourceManager()), m(m),
+        salt(std::move(salt)) {}
 
   bool run();
 
@@ -154,6 +155,21 @@ private:
   llvm::DenseMap<const Expr *, FirGlobal> exprGlobals; // string and compound literals
   std::map<FirType, FirGlobal> zeros;
   std::vector<const VarDecl *> pendingVars;
+  // Initializers that take the address of a variable defined in another file: FIR's
+  // initializers name only the module's globals and functions, so the slot starts null and a
+  // function of this file's, which `fcc` puts in the ELF `.init_array` (`main.cpp`), fills it
+  // before `main`: global `g`, byte offset `off`, the variable, and the offset into it. The
+  // global isn't `const` in FIR (the fill writes it).
+  struct Patch {
+    FirGlobal g;
+    uint64_t off;
+    const VarDecl *var;
+    int64_t addend;
+    SourceLocation loc;
+  };
+  std::vector<Patch> patches;
+  FirGlobal initTarget = FIR_INVALID;
+  uint64_t initOffset = 0;
   std::vector<const CompoundLiteralExpr *> pendingLits;
   std::set<std::string> usedNames;
   unsigned counter = 0;
@@ -170,6 +186,9 @@ private:
   llvm::DenseMap<const CompoundLiteralExpr *, FirValue> litSlots;
   llvm::DenseMap<const Expr *, FirValue> tempSlots; // struct-valued calls and `va_arg`s
   llvm::DenseMap<const LabelDecl *, FirRegion> labels;
+  // The labels whose address the function takes (`&&L`), numbered from 1 in source order.
+  llvm::DenseMap<const LabelDecl *, int64_t> labelIds;
+  std::vector<const LabelDecl *> addrLabels;
   llvm::DenseMap<const SwitchCase *, FirRegion> caseBlocks;
   std::vector<Jump> jumps;
   std::set<std::string> valueNames;
@@ -224,6 +243,30 @@ private:
 
   // Names.
 
+  // The suffix of the symbols of this file's internal objects and functions (C's `static` ones,
+  // string literals, compound literals): FIR has no linkage yet, so each symbol is global, and
+  // the suffix, a hash of the file's path and of the command line (`salt`: one file compiled
+  // twice with different macros is two objects), keeps two objects' internal symbols apart
+  // when they are linked together. The `.` keeps them apart from C's names.
+  const std::string &localSuffix() {
+    if (localSfx.empty()) {
+      std::string path = "<input>";
+      if (OptionalFileEntryRef fe = sm.getFileEntryRefForID(sm.getMainFileID())) {
+        StringRef real = fe->getFileEntry().tryGetRealPathName();
+        path = (real.empty() ? fe->getName() : real).str();
+      }
+      uint64_t h = 1469598103934665603ull; // FNV-1a
+      for (unsigned char c : path + '\0' + salt)
+        h = (h ^ c) * 1099511628211ull;
+      char buf[24];
+      snprintf(buf, sizeof buf, ".l%08x", (unsigned)(h ^ (h >> 32)));
+      localSfx = buf;
+    }
+    return localSfx;
+  }
+  std::string localSfx;
+  std::string salt;
+
   std::string uniqueName(const std::string &want) {
     std::string n = want;
     for (unsigned i = 1; usedNames.count(n) || fir_func_find(m, n.c_str()) != FIR_INVALID; i++)
@@ -257,9 +300,10 @@ private:
 
   bool isScalar(QualType t) {
     t = t.getCanonicalType();
-    return t->isIntegerType() || t->isPointerType() || t->isBooleanType() ||
-           t->isRealFloatingType();
+    return t->isIntegerType() || isPtrLike(t) || t->isBooleanType() || t->isRealFloatingType();
   }
+  // A pointer, or C23's `nullptr_t` (whose one value is the null pointer): a FIR `ptr`.
+  static bool isPtrLike(QualType t) { return t->isPointerType() || t->isNullPtrType(); }
   // `float` or `double` (and the formats `scalarTy` rejects).
   static bool isFloat(QualType t) { return t.getCanonicalType()->isRealFloatingType(); }
   FirType floatTy(QualType t) {
@@ -268,18 +312,18 @@ private:
 
   FirType scalarTy(QualType t, SourceLocation loc) {
     QualType c = t.getCanonicalType();
-    if (c.isVolatileQualified())
-      unsupported(loc, "'volatile'");
     if (c->isBooleanType())
       return fir_type_int(8);
-    if (c->isPointerType())
+    if (isPtrLike(c))
       return FIR_TYPE_PTR;
     if (c->isIntegerType()) {
-      if (c->isBitIntType())
-        unsupported(loc, "'_BitInt'");
       unsigned n = bits(c);
+      if (n == 128)
+        return wideTy();
+      if (c->isBitIntType() && n > 64)
+        unsupported(loc, "'_BitInt' wider than 128 bits");
       if (n > 64)
-        unsupported(loc, "128-bit integers ('" + t.getAsString() + "')");
+        unsupported(loc, "integers wider than 128 bits ('" + t.getAsString() + "')");
       return fir_type_int(n);
     }
     if (const auto *bt = c->getAs<BuiltinType>()) {
@@ -329,8 +373,6 @@ private:
 
   FirType memTy(QualType t, SourceLocation loc) {
     QualType c = t.getCanonicalType();
-    if (c.isVolatileQualified())
-      unsupported(loc, "'volatile'");
     if (isVaList(c))
       return vaListTy(loc);
     if (isScalar(c) || c->isAnyComplexType())
@@ -766,6 +808,8 @@ private:
     if (!validName(name))
       unsupported(loc, "the function name '" + name + "'");
     Sig s = sigOf(fnType(typed->getType()), loc);
+    if (def && !fd->isExternallyVisible())
+      name += localSuffix();
     FirFunc f;
     if (def) {
       f = ck(fir_func_declare_va(m, name.c_str(), s.params.data(), s.params.size(), s.rets.data(),
@@ -788,14 +832,24 @@ private:
     return t.isConstQualified() || ctx.getBaseElementType(t).isConstQualified();
   }
 
+  // A variable's definition in this file: the one with an initializer, else a tentative one
+  // (`int x;` after a header's `extern int x;`), whichever declaration is asked about.
+  static const VarDecl *definitionOf(const VarDecl *vd) {
+    if (const VarDecl *def = vd->getDefinition())
+      return def;
+    const VarDecl *tentative = nullptr;
+    for (const VarDecl *r : vd->redecls())
+      if (r->isThisDeclarationADefinition() == VarDecl::TentativeDefinition)
+        tentative = r;
+    return tentative;
+  }
+
   FirGlobal globalFor(const VarDecl *vd, SourceLocation loc) {
     vd = vd->getCanonicalDecl();
     auto it = globals.find(vd);
     if (it != globals.end())
       return it->second;
-    const VarDecl *def = vd->getDefinition();
-    if (!def)
-      def = vd->getActingDefinition();
+    const VarDecl *def = definitionOf(vd);
     if (!def)
       unsupported(loc, "external variables ('" + vd->getNameAsString() +
                            "' is defined in another file; FIR has no external globals)");
@@ -809,10 +863,16 @@ private:
     if (!validName(vd->getName()))
       unsupported(loc, "the variable name '" + name + "'");
     name = vd->isStaticLocal() ? uniqueName(name) : name;
+    if (!def->isExternallyVisible())
+      name += localSuffix();
     usedNames.insert(name);
     FirType t = memTy(def->getType(), def->getLocation());
     unsigned align = (unsigned)ctx.getDeclAlign(def).getQuantity();
-    FirGlobal g = ck(fir_global_declare(m, name.c_str(), t, isConstObject(def->getType()), align,
+    bool constant = isConstObject(def->getType());
+    if (constant && def->getInit())
+      if (const APValue *v = def->evaluateValue())
+        constant = !hasExternAddr(*v);
+    FirGlobal g = ck(fir_global_declare(m, name.c_str(), t, constant, align,
                                         ck(fir_init_zero(m), "fir_init_zero")),
                      "fir_global_declare");
     globals[vd] = g;
@@ -841,7 +901,8 @@ private:
       bytes[i] = (uint8_t)s[i];
     FirType t = ck(fir_type_array(m, n, fir_type_int(8)), "fir_type_array");
     FirInit init = ck(fir_init_bytes(m, bytes.data(), bytes.size()), "fir_init_bytes");
-    std::string name = uniqueName(std::string(prefix) + "." + std::to_string(counter++));
+    std::string name =
+        uniqueName(std::string(prefix) + "." + std::to_string(counter++)) + localSuffix();
     return ck(fir_global_declare(m, name.c_str(), t, constant, 1, init), "fir_global_declare");
   }
 
@@ -849,7 +910,7 @@ private:
     auto it = zeros.find(t);
     if (it != zeros.end())
       return it->second;
-    std::string name = uniqueName("zero." + std::to_string(counter++));
+    std::string name = uniqueName("zero." + std::to_string(counter++)) + localSuffix();
     FirGlobal g = ck(fir_global_declare(m, name.c_str(), t, true, 1, ck(fir_init_zero(m), "zero")),
                      "fir_global_declare");
     zeros[t] = g;
@@ -861,9 +922,14 @@ private:
     if (it != exprGlobals.end())
       return it->second;
     FirType t = memTy(cle->getType(), cle->getBeginLoc());
-    std::string name = uniqueName("lit." + std::to_string(counter++));
-    FirGlobal g = ck(fir_global_declare(m, name.c_str(), t, isConstObject(cle->getType()),
-                                        alignOf(cle->getType()), ck(fir_init_zero(m), "zero")),
+    std::string name = uniqueName("lit." + std::to_string(counter++)) + localSuffix();
+    // Not `const` in FIR when a fill before `main` writes it (see `patches`).
+    bool constant = isConstObject(cle->getType());
+    Expr::EvalResult r;
+    if (constant && cle->getInitializer()->EvaluateAsRValue(r, ctx, true))
+      constant = !hasExternAddr(r.Val);
+    FirGlobal g = ck(fir_global_declare(m, name.c_str(), t, constant, alignOf(cle->getType()),
+                                        ck(fir_init_zero(m), "zero")),
                      "fir_global_declare");
     exprGlobals[cle] = g;
     pendingLits.push_back(cle);
@@ -916,6 +982,31 @@ private:
     }
   }
 
+  // Whether a constant takes the address of a variable defined in another file.
+  bool hasExternAddr(const APValue &v) {
+    switch (v.getKind()) {
+    case APValue::LValue:
+      if (const ValueDecl *d = v.getLValueBase().dyn_cast<const ValueDecl *>())
+        if (const auto *vd = dyn_cast<VarDecl>(d))
+          return !vd->hasLocalStorage() && !definitionOf(vd);
+      return false;
+    case APValue::Array:
+      for (unsigned i = 0; i < v.getArrayInitializedElts(); i++)
+        if (hasExternAddr(v.getArrayInitializedElt(i)))
+          return true;
+      return v.hasArrayFiller() && hasExternAddr(v.getArrayFiller());
+    case APValue::Struct:
+      for (unsigned i = 0; i < v.getStructNumFields(); i++)
+        if (hasExternAddr(v.getStructField(i)))
+          return true;
+      return false;
+    case APValue::Union:
+      return v.getUnionField() && hasExternAddr(v.getUnionValue());
+    default:
+      return false;
+    }
+  }
+
   FirInit initFrom(const APValue &v, QualType t, SourceLocation loc) {
     if (isZero(v))
       return izero();
@@ -924,6 +1015,13 @@ private:
       if (!v.isInt())
         unsupported(loc, "addresses used as integers in a global's initializer");
       const llvm::APSInt &n = v.getInt();
+      if (isWide(c)) {
+        scalarTy(c, loc);
+        llvm::APInt w = n.extOrTrunc(128);
+        FirInit halves[3] = {izero(), iint((int64_t)w.extractBitsAsZExtValue(64, 0)),
+                             iint((int64_t)w.extractBitsAsZExtValue(64, 64))};
+        return ck(fir_init_list(m, halves, 3), "fir_init_list");
+      }
       return iint(pattern(n.isSigned() ? (uint64_t)n.getExtValue() : n.getZExtValue(), bits(c)));
     }
     if (isFloat(c)) {
@@ -933,24 +1031,40 @@ private:
       return ifloat(v.getFloat(), c);
     }
     if (c->isPointerType()) {
-      if (!v.isLValue() || !v.getLValueBase())
-        unsupported(loc, "integers used as pointers in a global's initializer");
-      if (!v.getLValueOffset().isZero())
-        unsupported(loc, "a global's initializer pointing inside another object (FIR's "
-                         "initializers name only the start of a global)");
+      // An integer converted to a pointer (`(void *)5`): an address with no provenance.
+      if (v.isInt())
+        return ck(fir_init_int(m, (int64_t)v.getInt().getExtValue()), "fir_init_int");
+      if (!v.isLValue())
+        unsupported(loc, "this address in a global's initializer");
+      int64_t off = v.getLValueOffset().getQuantity();
       APValue::LValueBase base = v.getLValueBase();
+      if (!base)
+        return ck(fir_init_int(m, off), "fir_init_int");
+      // An address, plus a byte offset when it points inside the object (`&table[2]`).
+      auto global = [&](FirGlobal g) {
+        return off ? ck(fir_init_global_offset(m, g, off), "fir_init_global_offset")
+                   : ck(fir_init_global(m, g), "fir_init_global");
+      };
       if (const ValueDecl *d = base.dyn_cast<const ValueDecl *>()) {
         if (const auto *fd = dyn_cast<FunctionDecl>(d))
-          return ck(fir_init_func(m, funcFor(fd, loc)), "fir_init_func");
-        if (const auto *vd = dyn_cast<VarDecl>(d))
-          return ck(fir_init_global(m, globalFor(vd, loc)), "fir_init_global");
+          return off ? ck(fir_init_func_offset(m, funcFor(fd, loc), off), "fir_init_func_offset")
+                     : ck(fir_init_func(m, funcFor(fd, loc)), "fir_init_func");
+        if (const auto *vd = dyn_cast<VarDecl>(d)) {
+          if (!vd->hasLocalStorage() && !definitionOf(vd)) {
+            if (initTarget == FIR_INVALID)
+              unsupported(loc, "the address of a variable defined in another file here");
+            patches.push_back({initTarget, initOffset, vd, off, loc});
+            return izero();
+          }
+          return global(globalFor(vd, loc));
+        }
       } else if (const Expr *e = base.dyn_cast<const Expr *>()) {
         if (const auto *sl = dyn_cast<StringLiteral>(e))
-          return ck(fir_init_global(m, stringGlobal(sl)), "fir_init_global");
+          return global(stringGlobal(sl));
         if (const auto *pe = dyn_cast<PredefinedExpr>(e))
-          return ck(fir_init_global(m, stringGlobal(pe->getFunctionName())), "fir_init_global");
+          return global(stringGlobal(pe->getFunctionName()));
         if (const auto *cle = dyn_cast<CompoundLiteralExpr>(e))
-          return ck(fir_init_global(m, litGlobal(cle)), "fir_init_global");
+          return global(litGlobal(cle));
       }
       unsupported(loc, "this address in a global's initializer");
     }
@@ -960,9 +1074,14 @@ private:
       uint64_t n = at->getSize().getZExtValue();
       std::vector<FirInit> items;
       FirInit filler = FIR_INVALID;
+      uint64_t base = initOffset;
+      uint64_t stride = ctx.getTypeSizeInChars(at->getElementType()).getQuantity();
       for (uint64_t i = 0; i < n; i++) {
+        initOffset = base + i * stride;
         if (i < v.getArrayInitializedElts()) {
           items.push_back(initFrom(v.getArrayInitializedElt(i), at->getElementType(), loc));
+        } else if (v.hasArrayFiller() && hasExternAddr(v.getArrayFiller())) {
+          items.push_back(initFrom(v.getArrayFiller(), at->getElementType(), loc));
         } else {
           if (filler == FIR_INVALID)
             filler = v.hasArrayFiller() ? initFrom(v.getArrayFiller(), at->getElementType(), loc)
@@ -970,6 +1089,7 @@ private:
           items.push_back(filler);
         }
       }
+      initOffset = base;
       return ck(fir_init_list(m, items.data(), items.size()), "fir_init_list");
     }
     if (const RecordDecl *rd = c->getAsRecordDecl()) {
@@ -988,10 +1108,13 @@ private:
             storeBytes(v.getStructField(fd->getFieldIndex()), fd, info, image, 0, loc);
       }
       std::vector<FirInit> items;
+      uint64_t base = initOffset;
       for (const Slot &s : info.slots) {
         if (s.kind == Slot::Member) {
+          initOffset = base + s.offset;
           items.push_back(
               initFrom(v.getStructField(s.field->getFieldIndex()), s.field->getType(), loc));
+          initOffset = base;
         } else if (s.kind == Slot::Pad) {
           items.push_back(bytesInit(image, s.offset, s.len));
         } else {
@@ -1042,9 +1165,9 @@ private:
     if (c->isIntegerType() || c->isBooleanType()) {
       if (!v.isInt())
         unsupported(loc, "addresses used as integers in a global's initializer");
-      uint64_t x = v.getInt().getZExtValue();
+      llvm::APInt x = v.getInt().extOrTrunc(bits(c));
       for (unsigned i = 0; i < bits(c) / 8; i++)
-        image[off + i] = (uint8_t)(x >> (8 * i));
+        image[off + i] = (uint8_t)x.extractBitsAsZExtValue(8, 8 * i);
       return;
     }
     if (isFloat(c)) {
@@ -1097,8 +1220,10 @@ private:
             const APValue *v = vd->evaluateValue();
             if (!v)
               unsupported(init->getBeginLoc(), "this global initializer (not a constant)");
-            ok(fir_global_set_init(m, g, initFrom(*v, vd->getType(), init->getBeginLoc())),
-               "fir_global_set_init");
+            initTarget = g, initOffset = 0;
+            FirInit gi = initFrom(*v, vd->getType(), init->getBeginLoc());
+            initTarget = FIR_INVALID;
+            ok(fir_global_set_init(m, g, gi), "fir_global_set_init");
           }
         } catch (Abort &) {
         }
@@ -1110,12 +1235,44 @@ private:
         Expr::EvalResult r;
         if (!cle->getInitializer()->EvaluateAsRValue(r, ctx, true))
           unsupported(cle->getBeginLoc(), "this compound literal's initializer (not a constant)");
-        ok(fir_global_set_init(m, exprGlobals.find(cle)->second, // made by litGlobal
-                               initFrom(r.Val, cle->getType(), cle->getBeginLoc())),
-           "fir_global_set_init");
+        FirGlobal g = exprGlobals.find(cle)->second; // made by litGlobal
+        initTarget = g, initOffset = 0;
+        FirInit gi = initFrom(r.Val, cle->getType(), cle->getBeginLoc());
+        initTarget = FIR_INVALID;
+        ok(fir_global_set_init(m, g, gi), "fir_global_set_init");
       } catch (Abort &) {
       }
     }
+  }
+
+  // The function that fills the slots of `patches` (see there), `__fcc_init.SUFFIX`.
+  void emitPatches() {
+    if (patches.empty())
+      return;
+    std::string name = "__fcc_init" + localSuffix();
+    FirFunc f = ck(fir_func_declare(m, name.c_str(), nullptr, 0, nullptr, 0), "fir_func_declare");
+    b = fir_func_begin(m, f);
+    if (!b)
+      internal("fir_func_begin");
+    region = fir_builder_entry(b);
+    PresumedLoc pl = sm.getPresumedLoc(sm.getLocForStartOfFile(sm.getMainFileID()));
+    if (pl.isValid())
+      ok(fir_set_file(b, pl.getFilename()), "fir_set_file");
+    FirType i64 = fir_type_int(64);
+    for (const Patch &p : patches) {
+      FirValue a = externAddr(p.var, p.loc);
+      LocScope ls(*this, p.loc);
+      if (p.addend)
+        a = ck(fir_ptr_offset(b, false, a, cint(i64, p.addend)), "ptr.offset");
+      FirValue slot = ck(fir_mem_global(b, p.g), "mem.global");
+      if (p.off)
+        slot = ck(fir_ptr_offset(b, true, slot, cint(i64, (int64_t)p.off)), "ptr.offset");
+      ck(fir_mem_store(b, FIR_TYPE_PTR, a, slot, 8), "mem.store");
+    }
+    ck(fir_func_ret(b, nullptr, 0), "func.ret");
+    if (fir_func_end(b) != FIR_OK)
+      internal("fir_func_end");
+    b = nullptr;
   }
 
   // Values.
@@ -1150,6 +1307,8 @@ private:
   FirValue convert(FirValue v, QualType from, QualType to, SourceLocation loc) {
     from = from.getCanonicalType();
     to = to.getCanonicalType();
+    if (isWide(from) || isWide(to))
+      return wideConvert(v, from, to, loc);
     if (isFloat(from) || isFloat(to)) {
       if (isFloat(from))
         scalarTy(from, loc); // diagnose `long double`
@@ -1177,8 +1336,8 @@ private:
         return v;
       return boolToInt(truth(v, from), to);
     }
-    if (to->isPointerType()) {
-      if (from->isPointerType())
+    if (isPtrLike(to)) {
+      if (isPtrLike(from))
         return v;
       FirValue a = resize(v, bits(from), 64, isSigned(from));
       return ck(fir_ptr_from_exposed(b, a), "ptr.from_exposed");
@@ -1196,9 +1355,12 @@ private:
 
   // Whether a scalar is nonzero, as an `i1`.
   FirValue truth(FirValue v, QualType t) {
+    if (isWide(t))
+      return ck(fir_int_cmp(b, FIR_PRED_NE, wbit(FIR_BIT_OP_OR, wlo(v), whi(v)), cbits(64, 0)),
+                "int.cmp");
     if (isFloat(t))
       return ck(fir_float_cmp(b, FIR_FPRED_UNE, v, fzero(t)), "float.cmp");
-    if (t->isPointerType())
+    if (isPtrLike(t))
       return ck(fir_ptr_cmp(b, FIR_PRED_NE, v, ck(fir_ptr_null(b), "ptr.null")), "ptr.cmp");
     return ck(fir_int_cmp(b, FIR_PRED_NE, v, cbits(bits(t), 0)), "int.cmp");
   }
@@ -1310,15 +1472,582 @@ private:
   }
 
   FirValue loadLV(const LValue &lv, QualType t, SourceLocation loc) {
-    if (lv.bitfield)
+    if (lv.bitfield) {
+      if (t.isVolatileQualified())
+        unsupported(loc, "'volatile' bitfields");
       return bitRead(lv.addr, lv.bitfield);
-    return load(t, lv.addr, loc);
+    }
+    // A `_BitInt`'s bits above N may be anything (another compiler's, or bytes written
+    // through a `char *`): its value is the low N.
+    if (t.isVolatileQualified())
+      return bitIntValue(volatileLoad(t, lv.addr, loc), t);
+    return bitIntValue(load(t, lv.addr, loc), t);
   }
   FirValue storeLV(const LValue &lv, QualType t, FirValue v, SourceLocation loc) {
-    if (lv.bitfield)
+    if (lv.bitfield) {
+      if (t.isVolatileQualified())
+        unsupported(loc, "'volatile' bitfields");
       return bitWrite(lv.addr, lv.bitfield, v);
-    store(t, v, lv.addr, loc);
+    }
+    v = bitIntValue(v, t);
+    if (t.isVolatileQualified())
+      volatileStore(t, v, lv.addr, loc);
+    else
+      store(t, v, lv.addr, loc);
     return v;
+  }
+
+  // C's volatile accesses: FIR has no volatile ops yet (they are reserved, as events of the
+  // trace), so each is a call of an external function that does the access (`__fcc_vload32`,
+  // `__fcc_vstore8`, `__fcc_vloadp`, …), which `fcc` defines in assembly in each object it writes
+  // (weak, in a COMDAT group). An external call is an event, and the world may read and write
+  // the memory it is given, so no pass deletes, merges, or moves a volatile access, and the call
+  // does the one access C asks for. Integers travel as `i64` (zero-extended), floats as their
+  // bits, pointers as `ptr`.
+  FirFunc volatileHelper(bool isStore, unsigned nbits) {
+    std::string name = std::string(isStore ? "__fcc_vstore" : "__fcc_vload") +
+                       (nbits ? std::to_string(nbits) : std::string("p"));
+    auto it = helpers.find(name);
+    if (it != helpers.end())
+      return it->second;
+    FirType v = nbits ? fir_type_int(64) : (FirType)FIR_TYPE_PTR;
+    FirType params[2] = {FIR_TYPE_PTR, v};
+    static constexpr FirEffect effects[] = {FIR_EFFECT_READ_ARGS, FIR_EFFECT_WRITE_ARGS};
+    FirFunc f =
+        ck(fir_extern_declare_va(m, name.c_str(), params, isStore ? 2 : 1, &v, isStore ? 0 : 1,
+                                 false, effects, std::size(effects), FIR_TRUST_ASSUME),
+           "fir_extern_declare_va");
+    usedNames.insert(name);
+    helpers[name] = f;
+    return f;
+  }
+  FirValue volatileLoad(QualType t, FirValue addr, SourceLocation loc) {
+    FirType ty = scalarTy(t, loc);
+    if (isWide(t))
+      unsupported(loc, "volatile 128-bit integers");
+    LocScope ls(*this, loc);
+    QualType c = t.getCanonicalType();
+    unsigned n = isPtrLike(c) ? 0 : bits(c);
+    FirOp op = ck(fir_func_call(b, volatileHelper(false, n), &addr, 1), "func.call");
+    FirValue r = ck(fir_op_result(b, op, 0), "result");
+    if (n == 0)
+      return r;
+    if (isFloat(c))
+      return ck(fir_float_from_bits(b, ty, resize(r, 64, n, false)), "float.from_bits");
+    return resize(r, 64, n, false);
+  }
+  void volatileStore(QualType t, FirValue v, FirValue addr, SourceLocation loc) {
+    scalarTy(t, loc);
+    if (isWide(t))
+      unsupported(loc, "volatile 128-bit integers");
+    LocScope ls(*this, loc);
+    QualType c = t.getCanonicalType();
+    unsigned n = isPtrLike(c) ? 0 : bits(c);
+    if (n && isFloat(c))
+      v = ck(fir_float_to_bits(b, fir_type_int(n), v), "float.to_bits");
+    if (n)
+      v = resize(v, n, 64, false);
+    FirValue args[2] = {addr, v};
+    ck(fir_func_call(b, volatileHelper(true, n), args, 2), "func.call");
+  }
+  std::map<std::string, FirFunc> helpers;
+
+  // C11's and GNU C's atomic operations (`AtomicExpr`: `__atomic_load_n`, `__c11_atomic_*`,
+  // …, which `<stdatomic.h>` expands to): FIR has no atomic ops yet, so each is a call of an
+  // external function that does it, defined in assembly as the volatile accesses' are
+  // (`__fcc_atomic_load32`, `__fcc_atomic_cas64`, `__fcc_atomic_addp`, …), always sequentially
+  // consistent (stronger than any order asked for, which C allows), with every memory effect:
+  // other threads may read and write anything exposed meanwhile, so no pass moves a memory
+  // access across one. Values travel as `i64` (integers zero-extended, floats as bits) or `ptr`.
+  FirFunc atomicHelper(const std::string &op, unsigned nbits) {
+    std::string name = "__fcc_atomic_" + op + (nbits ? std::to_string(nbits) : std::string("p"));
+    auto it = helpers.find(name);
+    if (it != helpers.end())
+      return it->second;
+    FirType v = nbits ? fir_type_int(64) : (FirType)FIR_TYPE_PTR;
+    std::vector<FirType> params = {FIR_TYPE_PTR}, rets;
+    if (op == "load") {
+      rets = {v};
+    } else if (op == "store") {
+      params.push_back(v);
+    } else if (op == "cas") {
+      params.push_back(FIR_TYPE_PTR);
+      params.push_back(v);
+      rets = {fir_type_int(32)};
+    } else if (op == "fence") {
+      params.clear();
+    } else {
+      params.push_back(v);
+      rets = {v};
+    }
+    FirFunc f = ck(fir_extern_declare_va(m, name.c_str(), params.data(), params.size(), rets.data(),
+                                         rets.size(), false, kMemEffects, std::size(kMemEffects),
+                                         FIR_TRUST_ASSUME),
+                   "fir_extern_declare_va");
+    usedNames.insert(name);
+    helpers[name] = f;
+    return f;
+  }
+  static constexpr FirEffect kMemEffects[] = {
+      FIR_EFFECT_READ_ARGS,  FIR_EFFECT_READ_EXPOSED,  FIR_EFFECT_READ_GLOBALS,
+      FIR_EFFECT_WRITE_ARGS, FIR_EFFECT_WRITE_EXPOSED, FIR_EFFECT_WRITE_GLOBALS,
+  };
+  FirValue callHelper(FirFunc f, std::vector<FirValue> args, bool result) {
+    FirOp op = ck(fir_func_call(b, f, args.data(), args.size()), "func.call");
+    return result ? ck(fir_op_result(b, op, 0), "result") : FIR_INVALID;
+  }
+  // A memory fence (`__atomic_thread_fence`, `__sync_synchronize`).
+  void atomicFence() { callHelper(atomicHelper("fence", 64), {}, false); }
+
+  FirValue atomicExpr(const AtomicExpr *ae) {
+    SourceLocation loc = ae->getExprLoc();
+    enum Kind { Load, Store, Xchg, Cas, Fetch, OpFetch } kind;
+    bool generic = false; // values through pointers (`__atomic_load`, …)
+    const char *rmw = nullptr;
+    switch (ae->getOp()) {
+    case AtomicExpr::AO__c11_atomic_load:
+    case AtomicExpr::AO__atomic_load_n:
+      kind = Load;
+      break;
+    case AtomicExpr::AO__atomic_load:
+      kind = Load, generic = true;
+      break;
+    case AtomicExpr::AO__c11_atomic_init:
+    case AtomicExpr::AO__c11_atomic_store:
+    case AtomicExpr::AO__atomic_store_n:
+      kind = Store;
+      break;
+    case AtomicExpr::AO__atomic_store:
+      kind = Store, generic = true;
+      break;
+    case AtomicExpr::AO__c11_atomic_exchange:
+    case AtomicExpr::AO__atomic_exchange_n:
+      kind = Xchg;
+      break;
+    case AtomicExpr::AO__atomic_exchange:
+      kind = Xchg, generic = true;
+      break;
+    case AtomicExpr::AO__c11_atomic_compare_exchange_strong:
+    case AtomicExpr::AO__c11_atomic_compare_exchange_weak:
+    case AtomicExpr::AO__atomic_compare_exchange_n:
+      kind = Cas;
+      break;
+    case AtomicExpr::AO__atomic_compare_exchange:
+      kind = Cas, generic = true;
+      break;
+#define FETCH(NAME, OP)                                                                            \
+  case AtomicExpr::AO__c11_atomic_fetch_##NAME:                                                    \
+  case AtomicExpr::AO__atomic_fetch_##NAME:                                                        \
+    kind = Fetch, rmw = OP;                                                                        \
+    break;                                                                                         \
+  case AtomicExpr::AO__atomic_##NAME##_fetch:                                                      \
+    kind = OpFetch, rmw = OP;                                                                      \
+    break;
+      FETCH(add, "add")
+      FETCH(sub, "sub")
+      FETCH(and, "and")
+      FETCH(or, "or")
+      FETCH(xor, "xor")
+      FETCH(nand, "nand")
+#undef FETCH
+    default:
+      unsupported(loc, "this atomic operation");
+    }
+    QualType vt = ae->getValueType().getUnqualifiedType();
+    QualType c = vt.getCanonicalType();
+    FirType ty = scalarTy(vt, loc);
+    unsigned n = isPtrLike(c) ? 0 : bits(c);
+    if (n != 0 && n != 8 && n != 16 && n != 32 && n != 64)
+      unsupported(loc, "atomic operations on " + std::to_string(n) + "-bit values");
+    if (rmw && (n == 0 || isFloat(c)))
+      unsupported(loc, "atomic arithmetic on pointers or floats");
+    // Every operand first, side effects included (the orders' too), then the operation: a
+    // generic form's value is read through its pointer after them, as GCC does.
+    bool hasVal1 = kind != Load || generic, hasVal2 = (kind == Xchg && generic) || kind == Cas;
+    QualType v1t = hasVal1 ? ae->getVal1()->getType() : QualType();
+    FirValue p = rvalue(ae->getPtr());
+    FirValue v1 = hasVal1 ? rvalue(ae->getVal1()) : FIR_INVALID;
+    FirValue v2 = hasVal2 ? rvalue(ae->getVal2()) : FIR_INVALID;
+    if (ae->getOp() == AtomicExpr::AO__atomic_compare_exchange_n ||
+        ae->getOp() == AtomicExpr::AO__atomic_compare_exchange)
+      discard(ae->getWeak());
+    discard(ae->getOrder());
+    if (kind == Cas)
+      discard(ae->getOrderFail());
+    LocScope ls(*this, loc);
+    // A value operand (or, for a generic form, the value its pointer points to): its bits as
+    // the helper takes them.
+    auto valueArg = [&](FirValue v) {
+      if (generic)
+        v = load(vt, v, loc);
+      if (n && isFloat(c))
+        v = ck(fir_float_to_bits(b, fir_type_int(n), v), "float.to_bits");
+      return n ? resize(v, n, 64, false) : v;
+    };
+    // A result from the helper, as a value of the atomic type.
+    auto fromHelper = [&](FirValue r) {
+      if (n == 0)
+        return r;
+      FirValue v = resize(r, 64, n, false);
+      if (isFloat(c))
+        v = ck(fir_float_from_bits(b, ty, v), "float.from_bits");
+      return bitIntValue(v, vt);
+    };
+    FirValue result = FIR_INVALID;
+    switch (kind) {
+    case Load: {
+      FirValue v = fromHelper(callHelper(atomicHelper("load", n), {p}, true));
+      if (generic)
+        store(vt, v, v1, loc);
+      else
+        result = v;
+      break;
+    }
+    case Store:
+      callHelper(atomicHelper("store", n), {p, valueArg(v1)}, false);
+      break;
+    case Xchg: {
+      FirValue v = fromHelper(callHelper(atomicHelper("xchg", n), {p, valueArg(v1)}, true));
+      if (generic)
+        store(vt, v, v2, loc);
+      else
+        result = v;
+      break;
+    }
+    case Cas: {
+      FirValue ok = callHelper(atomicHelper("cas", n), {p, v1, valueArg(v2)}, true);
+      result = boolToInt(ck(fir_int_cmp(b, FIR_PRED_NE, ok, cbits(32, 0)), "cmp"), ae->getType());
+      break;
+    }
+    case Fetch:
+    case OpFetch: {
+      FirValue a64 = resize(v1, bits(v1t), 64, isSigned(v1t));
+      FirValue old = fromHelper(callHelper(atomicHelper(rmw, n), {p, a64}, true));
+      if (kind == Fetch) {
+        result = old;
+        break;
+      }
+      FirValue a = resize(a64, 64, n, false), r;
+      std::string o = rmw;
+      if (o == "add" || o == "sub")
+        r = ck(fir_int_arith(b, o == "add" ? FIR_ARITH_OP_ADD : FIR_ARITH_OP_SUB, FIR_OVF_WRAP, old,
+                             a),
+               "int.arith");
+      else if (o == "nand")
+        r = ck(fir_int_bit(b, FIR_BIT_OP_XOR, ck(fir_int_bit(b, FIR_BIT_OP_AND, old, a), "and"),
+                           cbits(n, ~0ull)),
+               "xor");
+      else
+        r = ck(fir_int_bit(b,
+                           o == "and"  ? FIR_BIT_OP_AND
+                           : o == "or" ? FIR_BIT_OP_OR
+                                       : FIR_BIT_OP_XOR,
+                           old, a),
+               "bit");
+      result = bitIntValue(r, vt);
+      break;
+    }
+    }
+    if (result == FIR_INVALID || ae->getType()->isVoidType())
+      return FIR_INVALID;
+    return result;
+  }
+
+  // 128-bit integers (`__int128`, `_BitInt(65)` to `_BitInt(128)`): FIR's backends have no
+  // `i128` yet, so one is a struct value of its two halves, `struct<C>{array<0 x i128>, i64,
+  // i64}` (the empty array makes it 16-byte aligned, as C's is, in memory and as an argument:
+  // AAPCS64 passes it in an even register pair, as `__int128`), low half first; the lowering to
+  // MFIR splits it into the two `i64`s. The operators work on the halves: carries and borrows,
+  // the product's high half from 32-bit pieces, shifts as `select`s of in-range shifts;
+  // division and the conversions to and from floats call libgcc's functions, as GCC does.
+  bool isWide(QualType t) {
+    QualType c = t.getCanonicalType();
+    return c->isIntegerType() && !c->isBooleanType() && ctx.getTypeSize(c) == 128;
+  }
+  FirType wideTy() {
+    if (wideT == FIR_INVALID) {
+      wideMarkT = ck(fir_type_array(m, 0, fir_type_int(128)), "fir_type_array");
+      FirType f[3] = {wideMarkT, fir_type_int(64), fir_type_int(64)};
+      wideT = ck(fir_type_struct(m, FIR_POLICY_C, f, 3), "fir_type_struct");
+    }
+    return wideT;
+  }
+  FirType wideT = FIR_INVALID, wideMarkT = FIR_INVALID;
+  FirValue wlo(FirValue v) { return ck(fir_agg_extract(b, fir_type_int(64), v, 1), "agg.extract"); }
+  FirValue whi(FirValue v) { return ck(fir_agg_extract(b, fir_type_int(64), v, 2), "agg.extract"); }
+  FirValue wmake(FirValue lo, FirValue hi) {
+    FirValue v[3] = {ck(fir_agg_make(b, wideMarkT, nullptr, 0), "agg.make"), lo, hi};
+    return ck(fir_agg_make(b, wideTy(), v, 3), "agg.make");
+  }
+  FirValue wideConst(const llvm::APInt &n) {
+    return wmake(cbits(64, n.extractBitsAsZExtValue(64, 0)),
+                 cbits(64, n.extractBitsAsZExtValue(64, 64)));
+  }
+  FirValue wbit(FirBitOp o, FirValue a, FirValue c) { return ck(fir_int_bit(b, o, a, c), "bit"); }
+  FirValue warith(FirArithOp o, FirValue a, FirValue c) {
+    return ck(fir_int_arith(b, o, FIR_OVF_WRAP, a, c), "int.arith");
+  }
+  FirValue wcmp64(FirPred p, FirValue a, FirValue c) { return ck(fir_int_cmp(b, p, a, c), "cmp"); }
+  FirValue wsel(FirValue c, FirValue a, FirValue d) { return ck(fir_select(b, c, a, d), "select"); }
+  FirValue wsh(FirShiftOp o, FirValue a, FirValue n) {
+    return ck(fir_int_shift(b, o, FIR_SHIFT_EDGE_UB, a, n), "shift");
+  }
+  FirValue wzext(FirValue c) { return resize(c, 1, 64, false); }
+  // The high 64 bits of the 128-bit product of two 64-bit unsigned numbers.
+  FirValue mulhu(FirValue a, FirValue c) {
+    FirValue m32 = cbits(64, 0xffffffffull), k32 = cbits(64, 32);
+    FirValue a0 = wbit(FIR_BIT_OP_AND, a, m32), a1 = wsh(FIR_SHIFT_OP_SHR_U, a, k32);
+    FirValue c0 = wbit(FIR_BIT_OP_AND, c, m32), c1 = wsh(FIR_SHIFT_OP_SHR_U, c, k32);
+    FirValue t = warith(FIR_ARITH_OP_MUL, a0, c0);
+    FirValue m1 =
+        warith(FIR_ARITH_OP_ADD, warith(FIR_ARITH_OP_MUL, a1, c0), wsh(FIR_SHIFT_OP_SHR_U, t, k32));
+    FirValue m2 =
+        warith(FIR_ARITH_OP_ADD, warith(FIR_ARITH_OP_MUL, a0, c1), wbit(FIR_BIT_OP_AND, m1, m32));
+    FirValue hi = warith(FIR_ARITH_OP_ADD, warith(FIR_ARITH_OP_MUL, a1, c1),
+                         wsh(FIR_SHIFT_OP_SHR_U, m1, k32));
+    return warith(FIR_ARITH_OP_ADD, hi, wsh(FIR_SHIFT_OP_SHR_U, m2, k32));
+  }
+  // A libgcc function of 128-bit integers or floats (`__divti3`, `__floattidf`, …).
+  FirValue wideCall(const char *name, std::vector<FirType> params, FirType ret,
+                    std::vector<FirValue> args) {
+    FirFunc f;
+    auto it = helpers.find(name);
+    if (it != helpers.end()) {
+      f = it->second;
+    } else {
+      static constexpr FirEffect none[] = {FIR_EFFECT_TRAP};
+      f = ck(fir_extern_declare_va(m, name, params.data(), params.size(), &ret, 1, false, none,
+                                   std::size(none), FIR_TRUST_ASSUME),
+             "fir_extern_declare_va");
+      usedNames.insert(name);
+      helpers[name] = f;
+    }
+    FirOp op = ck(fir_func_call(b, f, args.data(), args.size()), "func.call");
+    return ck(fir_op_result(b, op, 0), "result");
+  }
+  // `x << n`, `x >> n` (arithmetic if `sgn`) for `n` in [0, 128).
+  FirValue wideShift(bool left, bool sgn, FirValue x, FirValue n64) {
+    FirValue lo = wlo(x), hi = whi(x);
+    FirValue n = wbit(FIR_BIT_OP_AND, n64, cbits(64, 127));
+    FirValue small = wcmp64(FIR_PRED_ULT, n, cbits(64, 64));
+    FirValue k = wbit(FIR_BIT_OP_AND, n, cbits(64, 63));       // n mod 64
+    FirValue inv = warith(FIR_ARITH_OP_SUB, cbits(64, 63), k); // 63 - k
+    FirValue one = cbits(64, 1);
+    if (left) {
+      // n < 64: lo << k, hi << k | lo >> (64 - k); else: 0, lo << k.
+      FirValue carry = wsh(FIR_SHIFT_OP_SHR_U, wsh(FIR_SHIFT_OP_SHR_U, lo, one), inv);
+      FirValue lsh = wsh(FIR_SHIFT_OP_SHL, lo, k);
+      FirValue nlo = wsel(small, lsh, cbits(64, 0));
+      FirValue nhi = wsel(small, wbit(FIR_BIT_OP_OR, wsh(FIR_SHIFT_OP_SHL, hi, k), carry), lsh);
+      return wmake(nlo, nhi);
+    }
+    FirShiftOp r = sgn ? FIR_SHIFT_OP_SHR_S : FIR_SHIFT_OP_SHR_U;
+    FirValue carry = wsh(FIR_SHIFT_OP_SHL, wsh(FIR_SHIFT_OP_SHL, hi, one), inv);
+    FirValue hsh = wsh(r, hi, k);
+    FirValue nlo = wsel(small, wbit(FIR_BIT_OP_OR, wsh(FIR_SHIFT_OP_SHR_U, lo, k), carry), hsh);
+    FirValue fill = sgn ? wsh(FIR_SHIFT_OP_SHR_S, hi, cbits(64, 63)) : cbits(64, 0);
+    FirValue nhi = wsel(small, hsh, fill);
+    return wmake(nlo, nhi);
+  }
+  FirValue wideArith(BinaryOperatorKind op, FirValue a, FirValue c, QualType t, QualType rt,
+                     SourceLocation loc) {
+    LocScope ls(*this, loc);
+    bool sgn = isSigned(t);
+    switch (op) {
+    case BO_Shl:
+    case BO_ShlAssign:
+    case BO_Shr:
+    case BO_ShrAssign: {
+      // The amount has its own type, maybe a narrow one, maybe a wide one.
+      FirValue n = isWide(rt) ? wlo(c) : resize(c, bits(rt), 64, isSigned(rt));
+      if (!isWide(t))
+        internal("a 128-bit shift amount of a narrow value");
+      return wideShift(op == BO_Shl || op == BO_ShlAssign, sgn, a, n);
+    }
+    default:
+      break;
+    }
+    if (!isWide(t))
+      internal("128-bit arithmetic on a narrow type");
+    FirValue alo = wlo(a), ahi = whi(a), clo = wlo(c), chi = whi(c);
+    switch (op) {
+    case BO_Add:
+    case BO_AddAssign: {
+      FirValue lo = warith(FIR_ARITH_OP_ADD, alo, clo);
+      FirValue carry = wzext(wcmp64(FIR_PRED_ULT, lo, alo));
+      return wmake(lo, warith(FIR_ARITH_OP_ADD, warith(FIR_ARITH_OP_ADD, ahi, chi), carry));
+    }
+    case BO_Sub:
+    case BO_SubAssign: {
+      FirValue lo = warith(FIR_ARITH_OP_SUB, alo, clo);
+      FirValue borrow = wzext(wcmp64(FIR_PRED_ULT, alo, clo));
+      return wmake(lo, warith(FIR_ARITH_OP_SUB, warith(FIR_ARITH_OP_SUB, ahi, chi), borrow));
+    }
+    case BO_Mul:
+    case BO_MulAssign: {
+      FirValue lo = warith(FIR_ARITH_OP_MUL, alo, clo);
+      FirValue hi = warith(FIR_ARITH_OP_ADD, mulhu(alo, clo),
+                           warith(FIR_ARITH_OP_ADD, warith(FIR_ARITH_OP_MUL, alo, chi),
+                                  warith(FIR_ARITH_OP_MUL, ahi, clo)));
+      return wmake(lo, hi);
+    }
+    case BO_Div:
+    case BO_DivAssign:
+    case BO_Rem:
+    case BO_RemAssign: {
+      bool div = op == BO_Div || op == BO_DivAssign;
+      const char *fn = div ? (sgn ? "__divti3" : "__udivti3") : (sgn ? "__modti3" : "__umodti3");
+      return wideCall(fn, {wideTy(), wideTy()}, wideTy(), {a, c});
+    }
+    case BO_And:
+    case BO_AndAssign:
+      return wmake(wbit(FIR_BIT_OP_AND, alo, clo), wbit(FIR_BIT_OP_AND, ahi, chi));
+    case BO_Or:
+    case BO_OrAssign:
+      return wmake(wbit(FIR_BIT_OP_OR, alo, clo), wbit(FIR_BIT_OP_OR, ahi, chi));
+    case BO_Xor:
+    case BO_XorAssign:
+      return wmake(wbit(FIR_BIT_OP_XOR, alo, clo), wbit(FIR_BIT_OP_XOR, ahi, chi));
+    default:
+      unsupported(loc, "this operator on 128-bit integers");
+    }
+  }
+  FirValue wideCmp(FirPred p, FirValue a, FirValue c) {
+    FirValue alo = wlo(a), ahi = whi(a), clo = wlo(c), chi = whi(c);
+    FirValue heq = wcmp64(FIR_PRED_EQ, ahi, chi);
+    FirValue eq = wbit(FIR_BIT_OP_AND, heq, wcmp64(FIR_PRED_EQ, alo, clo));
+    if (p == FIR_PRED_EQ)
+      return eq;
+    if (p == FIR_PRED_NE)
+      return wbit(FIR_BIT_OP_XOR, eq, i1(true));
+    bool sgn = p == FIR_PRED_SLT || p == FIR_PRED_SLE || p == FIR_PRED_SGT || p == FIR_PRED_SGE;
+    bool gt = p == FIR_PRED_SGT || p == FIR_PRED_SGE || p == FIR_PRED_UGT || p == FIR_PRED_UGE;
+    bool orEq = p == FIR_PRED_SLE || p == FIR_PRED_SGE || p == FIR_PRED_ULE || p == FIR_PRED_UGE;
+    // a < c (or a > c): the high halves decide, else the low ones, unsigned.
+    FirPred hp = gt ? (sgn ? FIR_PRED_SGT : FIR_PRED_UGT) : (sgn ? FIR_PRED_SLT : FIR_PRED_ULT);
+    FirValue strict =
+        wbit(FIR_BIT_OP_OR, wcmp64(hp, ahi, chi),
+             wbit(FIR_BIT_OP_AND, heq, wcmp64(gt ? FIR_PRED_UGT : FIR_PRED_ULT, alo, clo)));
+    return orEq ? wbit(FIR_BIT_OP_OR, strict, eq) : strict;
+  }
+  FirValue wideConvert(FirValue v, QualType from, QualType to, SourceLocation loc) {
+    LocScope ls(*this, loc);
+    if (isWide(from) && isWide(to))
+      return bitIntValue(v, to);
+    if (isWide(to)) {
+      if (isFloat(from)) {
+        scalarTy(from, loc);
+        bool f32 = bits(from) == 32;
+        const char *fn = isSigned(to) ? (f32 ? "__fixsfti" : "__fixdfti")
+                                      : (f32 ? "__fixunssfti" : "__fixunsdfti");
+        return bitIntValue(wideCall(fn, {floatTy(from)}, wideTy(), {v}), to);
+      }
+      FirValue lo;
+      bool sgn;
+      if (isPtrLike(from)) {
+        lo = ck(fir_ptr_expose(b, v), "ptr.expose");
+        sgn = false;
+      } else if (from->isBooleanType()) {
+        lo = resize(v, bits(from), 64, false);
+        sgn = false;
+      } else {
+        sgn = isSigned(from);
+        lo = resize(v, bits(from), 64, sgn);
+      }
+      FirValue hi = sgn ? wsh(FIR_SHIFT_OP_SHR_S, lo, cbits(64, 63)) : cbits(64, 0);
+      return bitIntValue(wmake(lo, hi), to);
+    }
+    // From a wide integer.
+    if (to->isBooleanType())
+      return boolToInt(truth(v, from), to);
+    if (isFloat(to)) {
+      scalarTy(to, loc);
+      bool f32 = bits(to) == 32;
+      const char *fn = isSigned(from) ? (f32 ? "__floattisf" : "__floattidf")
+                                      : (f32 ? "__floatuntisf" : "__floatuntidf");
+      return wideCall(fn, {wideTy()}, floatTy(to), {v});
+    }
+    if (isPtrLike(to))
+      return ck(fir_ptr_from_exposed(b, wlo(v)), "ptr.from_exposed");
+    if (to->isIntegerType())
+      return resize(wlo(v), 64, bits(to), false);
+    unsupported(loc, "conversions from '" + from.getAsString() + "' to '" + to.getAsString() + "'");
+  }
+
+  // Whether a type is volatile or has volatile members or elements: copying it as one
+  // `mem.copy` would make its volatile accesses ordinary ones.
+  bool hasVolatile(QualType t) {
+    if (t.isVolatileQualified())
+      return true;
+    t = t.getCanonicalType();
+    if (const auto *a = ctx.getAsArrayType(t))
+      return hasVolatile(a->getElementType());
+    if (const RecordDecl *rd = t->getAsRecordDecl()) {
+      if (const RecordDecl *def = rd->getDefinition())
+        for (const FieldDecl *fd : def->fields())
+          if (hasVolatile(fd->getType()))
+            return true;
+    }
+    return false;
+  }
+
+  // The address of a variable defined in another file (`extern int x;`, libc's `stdout`):
+  // FIR has no external globals yet, so it is the result of an external function,
+  // `__fcc_addr.NAME`, which reads it from the GOT, defined in assembly (weak, in a COMDAT group
+  // of its own) in each object that calls it (`main.cpp`). The object is the world's: in FIR's
+  // model, the first call may make it (`alloc`; the world's allocations are exposed) and every
+  // later one return it again (`read(exposed)` lets the world reach it), which is what the GOT
+  // does, so the program may read and write it.
+  FirValue externAddr(const VarDecl *vd, SourceLocation loc) {
+    if (vd->getTLSKind() != VarDecl::TLS_None)
+      unsupported(loc, "thread-local variables");
+    std::string name = "__fcc_addr." + vd->getName().str();
+    if (!validName(vd->getName()))
+      unsupported(loc, "the variable name '" + vd->getName().str() + "'");
+    FirFunc f;
+    auto it = helpers.find(name);
+    if (it != helpers.end()) {
+      f = it->second;
+    } else {
+      FirType p = FIR_TYPE_PTR;
+      static constexpr FirEffect effects[] = {FIR_EFFECT_ALLOC, FIR_EFFECT_READ_EXPOSED};
+      f = ck(fir_extern_declare_va(m, name.c_str(), nullptr, 0, &p, 1, false, effects,
+                                   std::size(effects), FIR_TRUST_ASSUME),
+             "fir_extern_declare_va");
+      usedNames.insert(name);
+      helpers[name] = f;
+    }
+    LocScope ls(*this, loc);
+    FirOp op = ck(fir_func_call(b, f, nullptr, 0), "func.call");
+    return ck(fir_op_result(b, op, 0), "result");
+  }
+
+  // A `_BitInt(N)` lives in Clang's storage for it (8, 16, 32, or 64 bits), as its value
+  // sign- or zero-extended from N bits: each value an expression makes (and each stored by
+  // `++`, `--`, or a compound assignment) is reduced modulo 2^N so, which makes the
+  // container's operations C's on N bits (signed overflow is UB in C either way).
+  FirValue bitIntValue(FirValue v, QualType t) {
+    const auto *bt = t.getCanonicalType()->getAs<BitIntType>();
+    if (!bt || v == FIR_INVALID)
+      return v;
+    unsigned n = bt->getNumBits(), c = bits(t);
+    if (n == c)
+      return v;
+    if (c == 128) {
+      if (n <= 64)
+        internal("a narrow _BitInt in 128 bits");
+      FirValue k = cbits(64, 128 - n);
+      FirValue up = ck(fir_int_shift(b, FIR_SHIFT_OP_SHL, FIR_SHIFT_EDGE_UB, whi(v), k), "shl");
+      FirValue hi = ck(fir_int_shift(b, bt->isSigned() ? FIR_SHIFT_OP_SHR_S : FIR_SHIFT_OP_SHR_U,
+                                     FIR_SHIFT_EDGE_UB, up, k),
+                       "shr");
+      return wmake(wlo(v), hi);
+    }
+    FirValue k = cbits(c, c - n);
+    FirValue up = ck(fir_int_shift(b, FIR_SHIFT_OP_SHL, FIR_SHIFT_EDGE_UB, v, k), "shl");
+    return ck(fir_int_shift(b, bt->isSigned() ? FIR_SHIFT_OP_SHR_S : FIR_SHIFT_OP_SHR_U,
+                            FIR_SHIFT_EDGE_UB, up, k),
+              "shr");
   }
 
   // Expressions.
@@ -1333,14 +2062,29 @@ private:
     if (!e->EvaluateAsInt(r, ctx, Expr::SE_NoSideEffects) || r.HasUndefinedBehavior)
       return false;
     const llvm::APSInt &n = r.Val.getInt();
+    if (n.getBitWidth() > 64)
+      return false; // a 128-bit constant (`wideConst`)
     out = n.isSigned() ? (uint64_t)n.getExtValue() : n.getZExtValue();
     return true;
   }
 
   // The value of a scalar expression (`FIR_INVALID` for a void one).
   FirValue rvalue(const Expr *e) {
+    FirValue v = rvalueOf(e);
+    if (e->getType()->isBitIntType()) {
+      LocScope ls(*this, e->getExprLoc());
+      v = bitIntValue(v, e->getType());
+    }
+    return v;
+  }
+  FirValue rvalueOf(const Expr *e) {
     LocScope ls(*this, e->getExprLoc());
     uint64_t k;
+    if (isWide(e->getType()) && !e->isValueDependent()) {
+      Expr::EvalResult r;
+      if (e->EvaluateAsInt(r, ctx, Expr::SE_NoSideEffects) && !r.HasUndefinedBehavior)
+        return wideConst(r.Val.getInt().extOrTrunc(128));
+    }
     if (foldInt(e, k)) {
       if (e->getType()->isBooleanType())
         return cbits(8, k != 0);
@@ -1373,14 +2117,18 @@ private:
     }
     if (isa<ImplicitValueInitExpr>(e))
       return zeroOf(e->getType(), e->getExprLoc());
+    if (isa<CXXNullPtrLiteralExpr>(e))
+      return ck(fir_ptr_null(b), "ptr.null");
     if (isa<StmtExpr>(e))
       unsupported(e->getExprLoc(), "statement expressions");
-    if (isa<AddrLabelExpr>(e))
-      unsupported(e->getExprLoc(), "labels as values (computed 'goto')");
+    if (const auto *al = dyn_cast<AddrLabelExpr>(e))
+      return labelAddr(al->getLabel());
     if (isa<BinaryConditionalOperator>(e))
       unsupported(e->getExprLoc(), "'?:' without a middle operand");
     if (const auto *va = dyn_cast<VAArgExpr>(e))
       return vaArg(va);
+    if (const auto *ae = dyn_cast<AtomicExpr>(e))
+      return atomicExpr(ae);
     if (const auto *fl = dyn_cast<FloatingLiteral>(e)) {
       scalarTy(e->getType(), e->getExprLoc()); // diagnose `long double`
       return fconst(e->getType(), fl->getValue());
@@ -1393,7 +2141,9 @@ private:
   }
 
   FirValue zeroOf(QualType t, SourceLocation loc) {
-    if (t->isPointerType())
+    if (isWide(t))
+      return wideConst(llvm::APInt(128, 0));
+    if (isPtrLike(t))
       return ck(fir_ptr_null(b), "ptr.null");
     if (isFloat(t)) {
       scalarTy(t, loc);
@@ -1427,10 +2177,8 @@ private:
     case CK_LValueToRValue: {
       if (!isScalar(to))
         unsupported(loc, "values of type '" + to.getAsString() + "' here");
-      if (to.isVolatileQualified() || from.isVolatileQualified())
-        unsupported(loc, "'volatile'");
       LValue lv = lvalueFull(sub);
-      return loadLV(lv, to, loc);
+      return loadLV(lv, from.isVolatileQualified() ? from : to, loc);
     }
     case CK_NoOp:
     case CK_BitCast:
@@ -1490,11 +2238,15 @@ private:
       FirValue x = rvalue(sub);
       if (isFloat(t))
         return ck(fir_float_un(b, FIR_FUN_OP_NEG, x), "float.neg");
+      if (isWide(t))
+        return wideArith(BO_Sub, zeroOf(t, loc), x, t, t, loc);
       return ck(fir_int_arith(b, FIR_ARITH_OP_SUB, isSigned(t) ? FIR_OVF_NSW : FIR_OVF_WRAP,
                               cbits(bits(t), 0), x),
                 "int.sub");
     }
     case UO_Not:
+      if (isWide(t))
+        return wideArith(BO_Xor, rvalue(sub), wideConst(llvm::APInt::getAllOnes(128)), t, t, loc);
       return ck(fir_int_bit(b, FIR_BIT_OP_XOR, rvalue(sub), cbits(bits(t), ~uint64_t(0))), "xor");
     case UO_LNot:
       return boolToInt(cond(u), t);
@@ -1523,9 +2275,12 @@ private:
         // A type narrower than int is promoted, so the step can't overflow; it wraps when
         // converted back.
         bool nsw = isSigned(st) && bits(st) >= bits(ctx.IntTy);
-        nv = ck(fir_int_arith(b, inc ? FIR_ARITH_OP_ADD : FIR_ARITH_OP_SUB,
-                              nsw ? FIR_OVF_NSW : FIR_OVF_WRAP, old, cbits(bits(st), 1)),
-                "int.add");
+        if (isWide(st))
+          nv = wideArith(inc ? BO_Add : BO_Sub, old, wideConst(llvm::APInt(128, 1)), st, st, loc);
+        else
+          nv = ck(fir_int_arith(b, inc ? FIR_ARITH_OP_ADD : FIR_ARITH_OP_SUB,
+                                nsw ? FIR_OVF_NSW : FIR_OVF_WRAP, old, cbits(bits(st), 1)),
+                  "int.add");
       }
       FirValue stored = storeLV(lv, st, nv, loc);
       return u->isPrefix() ? stored : old;
@@ -1545,7 +2300,11 @@ private:
     return ck(fir_ptr_index(b, true, memTy(elem, loc), p, idx64), "ptr.index");
   }
 
-  FirValue toIndex(FirValue v, QualType t) { return resize(v, bits(t), 64, isSigned(t)); }
+  FirValue toIndex(FirValue v, QualType t) {
+    if (isWide(t))
+      return wlo(v);
+    return resize(v, bits(t), 64, isSigned(t));
+  }
 
   static bool isComparison(BinaryOperatorKind op) {
     return op == BO_LT || op == BO_GT || op == BO_LE || op == BO_GE || op == BO_EQ || op == BO_NE;
@@ -1569,8 +2328,6 @@ private:
         aggAddr(bo);
         return FIR_INVALID;
       }
-      if (t.isVolatileQualified())
-        unsupported(loc, "'volatile'");
       LValue lv = lvalueFull(l);
       FirValue v = rvalue(r);
       return storeLV(lv, l->getType(), v, loc);
@@ -1639,6 +2396,14 @@ private:
     }
     if (!t->isIntegerType())
       unsupported(loc, "arithmetic on '" + t.getAsString() + "'");
+    if (isWide(rt) && !isWide(t)) {
+      // A narrow value shifted by a 128-bit amount: the amount's low bits will do (a larger
+      // one is UB).
+      c = resize(wlo(c), 64, bits(t), false);
+      rt = t;
+    }
+    if (isWide(t))
+      return wideArith(op, a, c, t, rt, loc);
     bool sgn = isSigned(t);
     switch (op) {
     case BO_Add:
@@ -1689,8 +2454,6 @@ private:
     SourceLocation loc = ca->getExprLoc();
     const Expr *l = ca->getLHS(), *r = ca->getRHS();
     QualType lt = l->getType();
-    if (lt.isVolatileQualified())
-      unsupported(loc, "'volatile'");
     LValue lv = lvalueFull(l);
     FirValue old = loadLV(lv, lt, loc);
     FirValue nv;
@@ -1805,6 +2568,8 @@ private:
         }
         if (lt->isPointerType())
           return ck(fir_ptr_cmp(b, p, a, c), "ptr.cmp");
+        if (isWide(lt))
+          return wideCmp(p, a, c);
         return ck(fir_int_cmp(b, p, a, c), "int.cmp");
       }
     }
@@ -1953,6 +2718,347 @@ private:
     }
   }
 
+  // The bit-counting builtins: `__builtin_clz`, `_ctz`, `_popcount` (and their `s`, `l`, `ll`,
+  // and type-generic `g` forms), and C23's `<stdbit.h>` ones, `__builtin_stdc_leading_zeros`
+  // and the rest. FIR has no such ops: a population count is the usual SWAR sum, the leading
+  // zeros those of the value with every bit below its highest set (as a count of ones), and
+  // the trailing zeros the ones below its lowest set bit. On the operand's width `w`, zero
+  // extended to 64 bits. `FIR_INVALID` for other builtins.
+  FirValue bitBuiltin(const CallExpr *ce, unsigned id) {
+    enum K {
+      Clz,
+      Ctz,
+      Pop,
+      LZ,
+      LO,
+      TZ,
+      TO,
+      FLZ,
+      FLO,
+      FTZ,
+      FTO,
+      CZ,
+      CO,
+      Single,
+      Width,
+      Floor,
+      Ceil
+    };
+    K kind;
+    switch (id) {
+    case Builtin::BI__builtin_clz:
+    case Builtin::BI__builtin_clzs:
+    case Builtin::BI__builtin_clzl:
+    case Builtin::BI__builtin_clzll:
+    case Builtin::BI__builtin_clzg:
+      kind = Clz;
+      break;
+    case Builtin::BI__builtin_ctz:
+    case Builtin::BI__builtin_ctzs:
+    case Builtin::BI__builtin_ctzl:
+    case Builtin::BI__builtin_ctzll:
+    case Builtin::BI__builtin_ctzg:
+      kind = Ctz;
+      break;
+    case Builtin::BI__builtin_popcount:
+    case Builtin::BI__builtin_popcountl:
+    case Builtin::BI__builtin_popcountll:
+    case Builtin::BI__builtin_popcountg:
+      kind = Pop;
+      break;
+    case Builtin::BI__builtin_stdc_leading_zeros:
+      kind = LZ;
+      break;
+    case Builtin::BI__builtin_stdc_leading_ones:
+      kind = LO;
+      break;
+    case Builtin::BI__builtin_stdc_trailing_zeros:
+      kind = TZ;
+      break;
+    case Builtin::BI__builtin_stdc_trailing_ones:
+      kind = TO;
+      break;
+    case Builtin::BI__builtin_stdc_first_leading_zero:
+      kind = FLZ;
+      break;
+    case Builtin::BI__builtin_stdc_first_leading_one:
+      kind = FLO;
+      break;
+    case Builtin::BI__builtin_stdc_first_trailing_zero:
+      kind = FTZ;
+      break;
+    case Builtin::BI__builtin_stdc_first_trailing_one:
+      kind = FTO;
+      break;
+    case Builtin::BI__builtin_stdc_count_zeros:
+      kind = CZ;
+      break;
+    case Builtin::BI__builtin_stdc_count_ones:
+      kind = CO;
+      break;
+    case Builtin::BI__builtin_stdc_has_single_bit:
+      kind = Single;
+      break;
+    case Builtin::BI__builtin_stdc_bit_width:
+      kind = Width;
+      break;
+    case Builtin::BI__builtin_stdc_bit_floor:
+      kind = Floor;
+      break;
+    case Builtin::BI__builtin_stdc_bit_ceil:
+      kind = Ceil;
+      break;
+    default:
+      return FIR_INVALID;
+    }
+    SourceLocation loc = ce->getExprLoc();
+    QualType t = ce->getArg(0)->getType(), rt = ce->getType();
+    scalarTy(t, loc); // diagnose `_BitInt`, 128-bit integers
+    if (isWide(t))
+      unsupported(loc, "bit counts of 128-bit integers");
+    unsigned w = bits(t);
+    if (const auto *bt = t.getCanonicalType()->getAs<BitIntType>())
+      w = bt->getNumBits();
+    FirValue x = rvalue(ce->getArg(0));
+    FirValue fallback = ce->getNumArgs() > 1 ? rvalue(ce->getArg(1)) : FIR_INVALID;
+    LocScope ls(*this, loc);
+    FirType i64 = fir_type_int(64);
+    auto c64 = [&](uint64_t v) { return cint(i64, (int64_t)v); };
+    auto bit = [&](FirBitOp o, FirValue a, FirValue c) {
+      return ck(fir_int_bit(b, o, a, c), "bit");
+    };
+    auto arith = [&](FirArithOp o, FirValue a, FirValue c) {
+      return ck(fir_int_arith(b, o, FIR_OVF_WRAP, a, c), "int.arith");
+    };
+    auto shift = [&](FirShiftOp o, FirValue a, FirValue n) {
+      return ck(fir_int_shift(b, o, FIR_SHIFT_EDGE_UB, a, n), "shift");
+    };
+    auto shr = [&](FirValue a, unsigned n) { return shift(FIR_SHIFT_OP_SHR_U, a, c64(n)); };
+    auto icmp = [&](FirPred p, FirValue a, FirValue c) {
+      return ck(fir_int_cmp(b, p, a, c), "cmp");
+    };
+    auto sel = [&](FirValue c, FirValue a, FirValue d) {
+      return ck(fir_select(b, c, a, d), "select");
+    };
+    uint64_t mask = w == 64 ? ~uint64_t(0) : (uint64_t(1) << w) - 1;
+    FirValue v = bit(FIR_BIT_OP_AND, resize(x, bits(t), 64, false), c64(mask));
+    auto pop = [&](FirValue a) {
+      a = arith(FIR_ARITH_OP_SUB, a, bit(FIR_BIT_OP_AND, shr(a, 1), c64(0x5555555555555555)));
+      a = arith(FIR_ARITH_OP_ADD, bit(FIR_BIT_OP_AND, a, c64(0x3333333333333333)),
+                bit(FIR_BIT_OP_AND, shr(a, 2), c64(0x3333333333333333)));
+      a = bit(FIR_BIT_OP_AND, arith(FIR_ARITH_OP_ADD, a, shr(a, 4)), c64(0x0f0f0f0f0f0f0f0f));
+      return shr(arith(FIR_ARITH_OP_MUL, a, c64(0x0101010101010101)), 56);
+    };
+    // The leading and trailing zeros of an operand-width value (`w` for 0).
+    auto clz = [&](FirValue a) {
+      for (unsigned s = 1; s < 64; s *= 2)
+        a = bit(FIR_BIT_OP_OR, a, shr(a, s));
+      return arith(FIR_ARITH_OP_SUB, c64(w), pop(a));
+    };
+    auto ctz = [&](FirValue a) {
+      FirValue below = bit(FIR_BIT_OP_AND, bit(FIR_BIT_OP_XOR, a, c64(~uint64_t(0))),
+                           arith(FIR_ARITH_OP_SUB, a, c64(1)));
+      return pop(bit(FIR_BIT_OP_AND, below, c64(mask)));
+    };
+    FirValue inv = bit(FIR_BIT_OP_XOR, v, c64(mask));
+    FirValue isZero = icmp(FIR_PRED_EQ, v, c64(0)), isOnes = icmp(FIR_PRED_EQ, v, c64(mask));
+    auto plus1Unless = [&](FirValue c, FirValue n) {
+      return sel(c, c64(0), arith(FIR_ARITH_OP_ADD, n, c64(1)));
+    };
+    // `1 << n` at the operand's width (0 where `n` is `w`).
+    auto pow2 = [&](FirValue n) {
+      FirValue p = shift(FIR_SHIFT_OP_SHL, c64(1), sel(icmp(FIR_PRED_ULT, n, c64(64)), n, c64(0)));
+      return sel(icmp(FIR_PRED_ULT, n, c64(w)), p, c64(0));
+    };
+    FirValue r;
+    switch (kind) {
+    case Clz:
+    case Ctz:
+    case Pop:
+      r = kind == Clz ? clz(v) : kind == Ctz ? ctz(v) : pop(v);
+      if (fallback != FIR_INVALID && kind != Pop)
+        return sel(isZero, fallback, resize(r, 64, bits(rt), false));
+      break;
+    case LZ:
+      r = clz(v);
+      break;
+    case LO:
+      r = clz(inv);
+      break;
+    case TZ:
+      r = ctz(v);
+      break;
+    case TO:
+      r = ctz(inv);
+      break;
+    case FLZ:
+      r = plus1Unless(isOnes, clz(inv));
+      break;
+    case FLO:
+      r = plus1Unless(isZero, clz(v));
+      break;
+    case FTZ:
+      r = plus1Unless(isOnes, ctz(inv));
+      break;
+    case FTO:
+      r = plus1Unless(isZero, ctz(v));
+      break;
+    case CZ:
+      r = arith(FIR_ARITH_OP_SUB, c64(w), pop(v));
+      break;
+    case CO:
+      r = pop(v);
+      break;
+    case Single:
+      return boolToInt(icmp(FIR_PRED_EQ, pop(v), c64(1)), rt);
+    case Width:
+      r = arith(FIR_ARITH_OP_SUB, c64(w), clz(v));
+      break;
+    case Floor:
+      r = sel(isZero, c64(0),
+              pow2(arith(FIR_ARITH_OP_SUB, arith(FIR_ARITH_OP_SUB, c64(w), clz(v)), c64(1))));
+      break;
+    case Ceil: {
+      FirValue m1 = bit(FIR_BIT_OP_AND, arith(FIR_ARITH_OP_SUB, v, c64(1)), c64(mask));
+      r = sel(icmp(FIR_PRED_ULE, v, c64(1)), c64(1),
+              pow2(arith(FIR_ARITH_OP_SUB, c64(w), clz(m1))));
+      break;
+    }
+    }
+    return resize(r, 64, bits(rt), false);
+  }
+
+  // The checked arithmetic builtins (`__builtin_add_overflow`, `_sub_`, `_mul_`, and their
+  // typed forms, which C23's `<stdckdint.h>` names `ckd_add`, `ckd_sub`, `ckd_mul`): the exact
+  // result of the operation on the operands' values, whatever their types, stored into `*r`
+  // wrapped to `*r`'s type, and whether it didn't fit there. The exact result is
+  // `k * 2^64 + lo` with `lo` 64 bits and `k` in {-1, 0, 1}; for a product, from the
+  // magnitudes' product and the sign. `FIR_INVALID` for other builtins.
+  FirValue overflowBuiltin(const CallExpr *ce, unsigned id) {
+    FirArithOp op;
+    switch (id) {
+    case Builtin::BI__builtin_add_overflow:
+    case Builtin::BI__builtin_sadd_overflow:
+    case Builtin::BI__builtin_saddl_overflow:
+    case Builtin::BI__builtin_saddll_overflow:
+    case Builtin::BI__builtin_uadd_overflow:
+    case Builtin::BI__builtin_uaddl_overflow:
+    case Builtin::BI__builtin_uaddll_overflow:
+      op = FIR_ARITH_OP_ADD;
+      break;
+    case Builtin::BI__builtin_sub_overflow:
+    case Builtin::BI__builtin_ssub_overflow:
+    case Builtin::BI__builtin_ssubl_overflow:
+    case Builtin::BI__builtin_ssubll_overflow:
+    case Builtin::BI__builtin_usub_overflow:
+    case Builtin::BI__builtin_usubl_overflow:
+    case Builtin::BI__builtin_usubll_overflow:
+      op = FIR_ARITH_OP_SUB;
+      break;
+    case Builtin::BI__builtin_mul_overflow:
+    case Builtin::BI__builtin_smul_overflow:
+    case Builtin::BI__builtin_smull_overflow:
+    case Builtin::BI__builtin_smulll_overflow:
+    case Builtin::BI__builtin_umul_overflow:
+    case Builtin::BI__builtin_umull_overflow:
+    case Builtin::BI__builtin_umulll_overflow:
+      op = FIR_ARITH_OP_MUL;
+      break;
+    default:
+      return FIR_INVALID;
+    }
+    SourceLocation loc = ce->getExprLoc();
+    QualType ta = ce->getArg(0)->getType(), tb = ce->getArg(1)->getType();
+    QualType tr = ce->getArg(2)->getType()->getPointeeType();
+    for (QualType t : {ta, tb, tr}) {
+      scalarTy(t, loc); // diagnose `_BitInt`, 128-bit integers
+      if (isWide(t))
+        unsupported(loc, "checked arithmetic on 128-bit integers");
+    }
+    FirValue a = rvalue(ce->getArg(0)), bv = rvalue(ce->getArg(1));
+    FirValue r = rvalue(ce->getArg(2));
+    LocScope ls(*this, loc);
+    FirType i64 = fir_type_int(64);
+    auto icmp = [&](FirPred p, FirValue x, FirValue y) {
+      return ck(fir_int_cmp(b, p, x, y), "cmp");
+    };
+    auto bit = [&](FirBitOp o, FirValue x, FirValue y) {
+      return ck(fir_int_bit(b, o, x, y), "bit");
+    };
+    auto arith = [&](FirArithOp o, FirValue x, FirValue y) {
+      return ck(fir_int_arith(b, o, FIR_OVF_WRAP, x, y), "int.arith");
+    };
+    auto sel = [&](FirValue c, FirValue x, FirValue y) {
+      return ck(fir_select(b, c, x, y), "select");
+    };
+    auto shr = [&](FirValue x, unsigned n) {
+      return ck(fir_int_shift(b, FIR_SHIFT_OP_SHR_U, FIR_SHIFT_EDGE_UB, x, cint(i64, n)), "shr");
+    };
+    FirValue zero = cint(i64, 0), one = cint(i64, 1), minus1 = cint(i64, -1);
+    // An operand: its value's low 64 bits, and whether it is negative.
+    auto operand = [&](FirValue v, QualType t, FirValue &lo, FirValue &neg) {
+      bool sg = isSigned(t);
+      lo = resize(v, bits(t), 64, sg);
+      neg = sg ? icmp(FIR_PRED_SLT, lo, zero) : cbits(1, 0);
+    };
+    FirValue la, na, lb, nb;
+    operand(a, ta, la, na);
+    operand(bv, tb, lb, nb);
+    auto k1 = [&](FirValue c) { return sel(c, one, zero); };
+    auto km = [&](FirValue c) { return sel(c, minus1, zero); };
+    FirValue lo, k, big = cbits(1, 0);
+    if (op == FIR_ARITH_OP_ADD) {
+      lo = arith(FIR_ARITH_OP_ADD, la, lb);
+      FirValue carry = icmp(FIR_PRED_ULT, lo, la);
+      k = arith(FIR_ARITH_OP_ADD, arith(FIR_ARITH_OP_ADD, km(na), km(nb)), k1(carry));
+    } else if (op == FIR_ARITH_OP_SUB) {
+      lo = arith(FIR_ARITH_OP_SUB, la, lb);
+      FirValue borrow = icmp(FIR_PRED_ULT, la, lb);
+      k = arith(FIR_ARITH_OP_SUB, arith(FIR_ARITH_OP_SUB, km(na), km(nb)), k1(borrow));
+    } else {
+      // |a| * |b|: whether it reaches 2^64, its low 64 bits, and its sign.
+      FirValue ma = sel(na, arith(FIR_ARITH_OP_SUB, zero, la), la);
+      FirValue mb = sel(nb, arith(FIR_ARITH_OP_SUB, zero, lb), lb);
+      FirValue div = sel(icmp(FIR_PRED_EQ, mb, zero), one, mb);
+      FirValue lim =
+          ck(fir_int_div(b, FIR_DIV_OP_DIV_U, FIR_EDGE_UB, FIR_EDGE_UB, minus1, div), "int.div");
+      big = icmp(FIR_PRED_UGT, ma, lim);
+      FirValue p = arith(FIR_ARITH_OP_MUL, ma, mb);
+      FirValue neg = bit(FIR_BIT_OP_AND, bit(FIR_BIT_OP_XOR, na, nb), icmp(FIR_PRED_NE, p, zero));
+      lo = sel(neg, arith(FIR_ARITH_OP_SUB, zero, p), p);
+      k = km(neg);
+    }
+    // Whether `k * 2^64 + lo` fits in the result's type: its precision, N for `_BitInt(N)`, and
+    // one bit for `bool` (Clang accepts it).
+    unsigned rb = bits(tr);
+    if (const auto *bt = tr.getCanonicalType()->getAs<BitIntType>())
+      rb = bt->getNumBits();
+    if (tr->isBooleanType())
+      rb = 1;
+    FirValue fits;
+    if (!isSigned(tr)) {
+      fits = icmp(FIR_PRED_EQ, k, zero);
+      if (rb < 64)
+        fits = bit(FIR_BIT_OP_AND, fits, icmp(FIR_PRED_EQ, shr(lo, rb), zero));
+    } else {
+      FirValue pos =
+          bit(FIR_BIT_OP_AND, icmp(FIR_PRED_EQ, k, zero), icmp(FIR_PRED_EQ, shr(lo, rb - 1), zero));
+      FirValue nlo = bit(FIR_BIT_OP_XOR, lo, minus1);
+      FirValue negf = bit(FIR_BIT_OP_AND, icmp(FIR_PRED_EQ, k, minus1),
+                          icmp(FIR_PRED_EQ, shr(nlo, rb - 1), zero));
+      fits = bit(FIR_BIT_OP_OR, pos, negf);
+    }
+    FirValue over = bit(FIR_BIT_OP_OR, big, bit(FIR_BIT_OP_XOR, fits, cbits(1, 1)));
+    FirValue res = bitIntValue(resize(lo, 64, bits(tr), false), tr);
+    if (tr->isBooleanType())
+      res = bit(FIR_BIT_OP_AND, res, cbits(bits(tr), 1));
+    if (tr.isVolatileQualified())
+      volatileStore(tr, res, r, loc);
+    else
+      store(tr, res, r, loc);
+    return boolToInt(over, ce->getType());
+  }
+
   // `<stdarg.h>`'s builtins: `va_start` (C17's and C23's), `va_end`, and `va_copy` as
   // `va.start`, `va.end`, and `mem.copy va_list`; false for other builtins.
   bool vaBuiltin(const CallExpr *ce, unsigned id) {
@@ -1994,6 +3100,8 @@ private:
       unsupported(loc, "'va_arg' of a 'va_list'");
     if (t->isRecordType())
       unsupported(loc, "this 'va_arg'"); // aggAddr reads structs and unions
+    if (isWide(t))
+      unsupported(loc, "'va_arg' of a 128-bit integer");
     FirType ty = scalarTy(t, loc);
     FirValue ap = lvalue(va->getSubExpr());
     LocScope ls(*this, loc);
@@ -2034,7 +3142,29 @@ private:
           ck(fir_mem_free(b, "c.malloc", rvalue(ce->getArg(0))), "mem.free");
           return FIR_INVALID;
         }
+        // C23's `unreachable()`: reaching it is UB, so it is an op whose execution is UB
+        // (`int.div.s.ub` by zero), which FIR's passes may assume never runs.
+        if (id == Builtin::BI__builtin_unreachable) {
+          LocScope ls(*this, loc);
+          FirType i32 = fir_type_int(32);
+          ck(fir_int_div(b, FIR_DIV_OP_DIV_S, FIR_EDGE_UB, FIR_EDGE_UB, cint(i32, 1), cint(i32, 0)),
+             "int.div");
+          return FIR_INVALID;
+        }
         if (FirValue v = floatBuiltin(ce, id); v != FIR_INVALID)
+          return v;
+        if (FirValue v = overflowBuiltin(ce, id); v != FIR_INVALID)
+          return v;
+        if (id == Builtin::BI__sync_synchronize || id == Builtin::BI__atomic_thread_fence ||
+            id == Builtin::BI__atomic_signal_fence || id == Builtin::BI__c11_atomic_thread_fence ||
+            id == Builtin::BI__c11_atomic_signal_fence) {
+          for (unsigned i = 0; i < ce->getNumArgs(); i++)
+            discard(ce->getArg(i));
+          LocScope ls(*this, loc);
+          atomicFence();
+          return FIR_INVALID;
+        }
+        if (FirValue v = bitBuiltin(ce, id); v != FIR_INVALID)
           return v;
         if (vaBuiltin(ce, id))
           return FIR_INVALID;
@@ -2073,6 +3203,8 @@ private:
         args.push_back(loadValue(a->getType(), addr, a->getExprLoc(), i >= nfixed));
         continue;
       }
+      if (i >= nfixed && isWide(a->getType()))
+        unsupported(a->getExprLoc(), "128-bit integers as variadic arguments");
       args.push_back(rvalue(a));
     }
     LocScope ls(*this, loc);
@@ -2141,6 +3273,8 @@ private:
           return {it->second};
         if (vd->hasLocalStorage())
           unsupported(loc, "this local variable");
+        if (!definitionOf(vd))
+          return {externAddr(vd, loc)};
         return {ck(fir_mem_global(b, globalFor(vd, loc)), "mem.global")};
       }
       unsupported(loc, "this reference");
@@ -2205,6 +3339,8 @@ private:
     SourceLocation loc = e->getExprLoc();
     if (const auto *bo = dyn_cast<BinaryOperator>(e)) {
       if (bo->getOpcode() == BO_Assign) {
+        if (hasVolatile(bo->getLHS()->getType()))
+          unsupported(loc, "assigning a struct or union with 'volatile' members");
         FirValue dst = lvalue(bo->getLHS());
         FirValue src = aggAddr(bo->getRHS());
         copy(bo->getType(), dst, src, loc);
@@ -2269,13 +3405,13 @@ private:
     if (isScalar(t)) {
       const Expr *e = init;
       if (const auto *ile = dyn_cast<InitListExpr>(e)) {
-        if (ile->getNumInits() == 0) {
-          store(t, zeroOf(t, loc), addr, loc);
-          return;
-        }
-        e = ile->getInit(0);
+        e = ile->getNumInits() == 0 ? nullptr : ile->getInit(0);
       }
-      store(t, rvalue(e), addr, loc);
+      FirValue v = e ? rvalue(e) : zeroOf(t, loc);
+      if (t.isVolatileQualified())
+        volatileStore(t, v, addr, loc);
+      else
+        store(t, v, addr, loc);
       return;
     }
     if (const auto *sl = dyn_cast<StringLiteral>(init)) {
@@ -2553,8 +3689,22 @@ private:
     case Stmt::GotoStmtClass:
       br(labelBlock(cast<GotoStmt>(s)->getLabel()));
       return;
-    case Stmt::IndirectGotoStmtClass:
-      unsupported(loc, "computed 'goto'");
+    case Stmt::IndirectGotoStmtClass: {
+      // `goto *p`: a switch on the label number `p` holds, over the labels whose address the
+      // function takes (to any of them when `p` holds none of them: that is UB in C).
+      FirValue p = rvalue(cast<IndirectGotoStmt>(s)->getTarget());
+      numberLabels();
+      if (addrLabels.empty())
+        unsupported(loc, "'goto *' in a function that takes no label's address");
+      FirValue x = ck(fir_ptr_addr(b, p), "ptr.addr");
+      std::vector<FirCase> cases;
+      for (const LabelDecl *ld : addrLabels)
+        cases.push_back({labelIds[ld], {labelBlock(ld), nullptr, 0}});
+      FirTarget d = {labelBlock(addrLabels.front()), nullptr, 0};
+      ck(fir_cf_switch(b, x, d, cases.data(), cases.size()), "cf.switch");
+      term = true;
+      return;
+    }
     case Stmt::AttributedStmtClass:
       return stmt(cast<AttributedStmt>(s)->getSubStmt());
     case Stmt::GCCAsmStmtClass:
@@ -2563,6 +3713,89 @@ private:
     default:
       unsupported(loc, std::string("the statement '") + s->getStmtClassName() + "'");
     }
+  }
+
+  // GNU C's labels as values: `&&L` is a pointer whose address is L's number in its function
+  // (`ptr.with_addr` of `ptr.null`: it points into no object), which `goto *` switches on.
+  static void findAddrLabels(const Stmt *s, std::vector<const LabelDecl *> &out) {
+    if (!s)
+      return;
+    if (const auto *al = dyn_cast<AddrLabelExpr>(s))
+      out.push_back(al->getLabel());
+    for (const Stmt *c : s->children())
+      findAddrLabels(c, out);
+  }
+  void numberLabels() {
+    if (!addrLabels.empty() || !curFn)
+      return;
+    std::vector<const LabelDecl *> found;
+    findAddrLabels(curFn->getBody(), found);
+    for (const LabelDecl *ld : found)
+      if (!labelIds.count(ld)) {
+        labelIds[ld] = (int64_t)addrLabels.size() + 1;
+        addrLabels.push_back(ld);
+      }
+  }
+  FirValue labelAddr(const LabelDecl *ld) {
+    numberLabels();
+    auto it = labelIds.find(ld);
+    if (it == labelIds.end())
+      unsupported(ld->getLocation(), "this label's address");
+    FirValue null = ck(fir_ptr_null(b), "ptr.null");
+    return ck(fir_ptr_with_addr(b, null, cint(fir_type_int(64), it->second)), "ptr.with_addr");
+  }
+  // A static local holding label addresses (an interpreter's dispatch table): FIR's
+  // initializers can't hold them, so it is a zeroed global that the function fills when it
+  // first starts (a flag says whether it has), before any of its code runs, so no jump skips
+  // it and it is one object for the whole run. (Two threads making the first call at once race
+  // on it, as no C program could tell for a constant initializer.)
+  bool labelTable(const VarDecl *vd) {
+    if (!vd->isStaticLocal() || !vd->getInit())
+      return false;
+    std::vector<const LabelDecl *> found;
+    findAddrLabels(vd->getInit(), found);
+    return !found.empty();
+  }
+
+  void fillLabelTables(const Stmt *s) {
+    if (!s)
+      return;
+    if (const auto *ds = dyn_cast<DeclStmt>(s)) {
+      for (const Decl *d : ds->decls()) {
+        const auto *vd = dyn_cast<VarDecl>(d);
+        if (!vd || !labelTable(vd))
+          continue;
+        SourceLocation loc = vd->getLocation();
+        LocScope ls(*this, loc);
+        std::string name = uniqueName(curFn->getName().str() + "." + vd->getName().str());
+        name += localSuffix();
+        usedNames.insert(name);
+        FirInit zero = ck(fir_init_zero(m), "fir_init_zero");
+        FirGlobal g = ck(fir_global_declare(m, name.c_str(), memTy(vd->getType(), loc), false,
+                                            (unsigned)ctx.getDeclAlign(vd).getQuantity(), zero),
+                         "fir_global_declare");
+        globals[vd->getCanonicalDecl()] = g;
+        std::string fname = uniqueName(name + ".filled");
+        usedNames.insert(fname);
+        FirGlobal flag = ck(fir_global_declare(m, fname.c_str(), fir_type_int(8), false, 1,
+                                               ck(fir_init_zero(m), "fir_init_zero")),
+                            "fir_global_declare");
+        FirValue fp = ck(fir_mem_global(b, flag), "mem.global");
+        FirValue filled = ck(fir_mem_load(b, fir_type_int(8), fp, 1), "mem.load");
+        FirValue c = ck(fir_int_cmp(b, FIR_PRED_EQ, filled, cbits(8, 0)), "cmp");
+        FirOp op = ck(fir_cf_if_begin(b, nullptr, 0, c), "cf.if");
+        FirRegion saved = region;
+        enter(ck(fir_op_region(b, op, 0), "region"));
+        initObject(ck(fir_mem_global(b, g), "mem.global"), vd->getType(), vd->getInit());
+        ck(fir_mem_store(b, fir_type_int(8), cbits(8, 1), fp, 1), "mem.store");
+        yield(nullptr, 0);
+        enter(ck(fir_op_region(b, op, 1), "region"));
+        yield(nullptr, 0);
+        enter(saved);
+      }
+    }
+    for (const Stmt *c : s->children())
+      fillLabelTables(c);
   }
 
   FirRegion labelBlock(const LabelDecl *ld) {
@@ -2586,7 +3819,7 @@ private:
     if (vd->getType()->isVariablyModifiedType())
       unsupported(vd->getLocation(), "variable-length arrays");
     if (!vd->hasLocalStorage()) {
-      if (vd->isStaticLocal())
+      if (vd->isStaticLocal() && !labelTable(vd))
         globalFor(vd, vd->getLocation());
       return;
     }
@@ -2770,6 +4003,8 @@ private:
     SourceLocation loc = s->getBeginLoc();
     if (s->getInit() || s->getConditionVariable())
       unsupported(loc, "this 'switch'");
+    if (isWide(s->getCond()->getType()))
+      unsupported(loc, "a 'switch' on a 128-bit integer");
     FirValue x = rvalue(s->getCond());
     std::vector<FirCase> cases;
     FirRegion dflt = FIR_INVALID;
@@ -2891,6 +4126,8 @@ private:
     litSlots.clear();
     tempSlots.clear();
     labels.clear();
+    labelIds.clear();
+    addrLabels.clear();
     caseBlocks.clear();
     jumps.clear();
     valueNames.clear();
@@ -2939,6 +4176,7 @@ private:
       }
       const Stmt *body = fd->getBody();
       collectSlots(body);
+      fillLabelTables(body);
       cfg = needsCFG(body);
       if (cfg) {
         blocksOp = ck(fir_cf_blocks_begin(b, nullptr, 0, false), "cf.blocks");
@@ -2990,13 +4228,17 @@ bool Lowerer::run() {
     function(fd);
   }
   emitPendingInits();
+  try {
+    emitPatches();
+  } catch (Abort &) {
+  }
   return !failed;
 }
 
 } // namespace
 
-bool lowerTranslationUnit(ASTContext &ctx, FirModule *m) {
-  Lowerer l(ctx, m);
+bool lowerTranslationUnit(ASTContext &ctx, FirModule *m, const std::string &salt) {
+  Lowerer l(ctx, m, salt);
   return l.run();
 }
 

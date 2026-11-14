@@ -383,6 +383,9 @@ std::vector<std::string> systemIncludes(const Options &o) {
 // How long the lowering to HFIR took, to tell it apart from Clang's own time.
 double lowerSeconds = 0;
 
+// The command line, which the names of a file's internal symbols hash with its path.
+std::string commandLine;
+
 class Consumer : public clang::ASTConsumer {
 public:
   Consumer(FirModule *m, bool &lowered) : m(m), lowered(lowered) {}
@@ -390,7 +393,7 @@ public:
     if (ctx.getDiagnostics().hasErrorOccurred())
       return;
     Step step("fcc: lower AST to HFIR");
-    lowered = fai::lowerTranslationUnit(ctx, m);
+    lowered = fai::lowerTranslationUnit(ctx, m, commandLine);
     lowerSeconds = step.seconds();
   }
 
@@ -455,6 +458,215 @@ struct ModuleHandle {
   }
 };
 
+// The external functions that do C's volatile accesses for `fcc`'s code (`Lower.cpp`): one
+// load or store each, of 8, 16, 32, or 64 bits (integers zero-extended to 64 bits) or of a
+// pointer, appended to each object that calls them, weak and in one COMDAT group, so the copies in
+// objects linked together are one.
+std::string volatileHelpers(const Options &o) {
+  struct Fn {
+    const char *name, *a64, *x64;
+  };
+  static const Fn fns[] = {
+      {"__fcc_vload8", "ldrb w0, [x0]", "movzbl (%rdi), %eax"},
+      {"__fcc_vload16", "ldrh w0, [x0]", "movzwl (%rdi), %eax"},
+      {"__fcc_vload32", "ldr w0, [x0]", "movl (%rdi), %eax"},
+      {"__fcc_vload64", "ldr x0, [x0]", "movq (%rdi), %rax"},
+      {"__fcc_vloadp", "ldr x0, [x0]", "movq (%rdi), %rax"},
+      {"__fcc_vstore8", "strb w1, [x0]", "movb %sil, (%rdi)"},
+      {"__fcc_vstore16", "strh w1, [x0]", "movw %si, (%rdi)"},
+      {"__fcc_vstore32", "str w1, [x0]", "movl %esi, (%rdi)"},
+      {"__fcc_vstore64", "str x1, [x0]", "movq %rsi, (%rdi)"},
+      {"__fcc_vstorep", "str x1, [x0]", "movq %rsi, (%rdi)"},
+  };
+  bool x86 = o.target == "x86_64";
+  std::string s = "\n// fcc's volatile accesses\n";
+  if (x86)
+    s += "\t.att_syntax prefix\n";
+  s += "\t.section .text.__fcc_volatile,\"axG\",@progbits,__fcc_volatile,comdat\n";
+  for (const Fn &f : fns) {
+    s += std::string("\t.p2align 2\n\t.weak ") + f.name + "\n\t.type " + f.name + ",@function\n" +
+         f.name + ":\n\t" + (x86 ? f.x64 : f.a64) + "\n\tret\n\t.size " + f.name + ", .-" + f.name +
+         "\n";
+  }
+  return s;
+}
+
+// The external functions that give the addresses of variables defined in another file
+// (`Lower.cpp`), `__fcc_addr.NAME`, read from the GOT, for each one the assembly calls: weak, each
+// in its own COMDAT group.
+std::string externAddrHelpers(const Options &o, const std::string &text) {
+  static const std::string prefix = "__fcc_addr.";
+  std::set<std::string> names;
+  for (size_t i = text.find(prefix); i != std::string::npos; i = text.find(prefix, i + 1)) {
+    size_t j = i + prefix.size();
+    while (j < text.size() && (isalnum((unsigned char)text[j]) || text[j] == '_'))
+      j++;
+    if (j > i + prefix.size())
+      names.insert(text.substr(i + prefix.size(), j - i - prefix.size()));
+  }
+  bool x86 = o.target == "x86_64";
+  std::string s;
+  if (!names.empty())
+    s += x86 ? "\n// fcc's external variables\n\t.att_syntax prefix\n"
+             : "\n// fcc's external variables\n";
+  for (const std::string &n : names) {
+    std::string f = prefix + n;
+    s += "\t.section .text." + f + ",\"axG\",@progbits," + f + ",comdat\n\t.p2align 2\n\t.weak " +
+         f + "\n\t.type " + f + ",@function\n" + f + ":\n";
+    s += x86 ? "\tmovq " + n + "@GOTPCREL(%rip), %rax\n"
+             : "\tadrp x0, :got:" + n + "\n\tldr x0, [x0, :got_lo12:" + n + "]\n";
+    s += "\tret\n\t.size " + f + ", .-" + f + "\n";
+  }
+  return s;
+}
+
+// The external functions that do the atomic operations for `fcc`'s code (`Lower.cpp`),
+// `__fcc_atomic_OPN` (OP one of load, store, xchg, cas, add, sub, and, or, xor, nand, fence;
+// N the bits, 8 to 64, or `p` for a pointer), sequentially consistent: AArch64's acquire and
+// release loads and stores and exclusive pairs, x86-64's `xchg` and `lock` instructions. Each
+// one the assembly calls is appended, weak, in its own COMDAT group. Values arrive and leave
+// zero-extended to 64 bits.
+std::string atomicBody(const Options &o, const std::string &op, unsigned n) {
+  bool x86 = o.target == "x86_64";
+  std::string s;
+  auto L = [&](const std::string &l) { s += "\t" + l + "\n"; };
+  if (op == "fence") {
+    L(x86 ? "mfence" : "dmb ish");
+    L("ret");
+    return s;
+  }
+  if (!x86) {
+    std::string sz = n == 8 ? "b" : n == 16 ? "h" : "";
+    std::string r = n == 64 ? "x" : "w";
+    if (op == "load") {
+      L("ldar" + sz + " " + r + "0, [x0]");
+    } else if (op == "store") {
+      L("stlr" + sz + " " + r + "1, [x0]");
+    } else if (op == "cas") {
+      L("ldr" + sz + " " + r + "4, [x1]");
+      s += "1:\n";
+      L("ldaxr" + sz + " " + r + "3, [x0]");
+      L("cmp " + r + "3, " + r + "4");
+      L("b.ne 2f");
+      L("stlxr" + sz + " w5, " + r + "2, [x0]");
+      L("cbnz w5, 1b");
+      L("mov w0, #1");
+      L("ret");
+      s += "2:\n";
+      L("clrex");
+      L("str" + sz + " " + r + "3, [x1]");
+      L("mov w0, #0");
+    } else {
+      s += "1:\n";
+      L("ldaxr" + sz + " " + r + "2, [x0]");
+      if (op == "xchg") {
+        L("stlxr" + sz + " w3, " + r + "1, [x0]");
+      } else {
+        std::string i = op == "add"                   ? "add"
+                        : op == "sub"                 ? "sub"
+                        : op == "and" || op == "nand" ? "and"
+                        : op == "or"                  ? "orr"
+                                                      : "eor";
+        L(i + " " + r + "4, " + r + "2, " + r + "1");
+        if (op == "nand")
+          L("mvn " + r + "4, " + r + "4");
+        L("stlxr" + sz + " w3, " + r + "4, [x0]");
+      }
+      L("cbnz w3, 1b");
+      if (n == 8)
+        L("and w0, w2, #0xff");
+      else if (n == 16)
+        L("and w0, w2, #0xffff");
+      else
+        L("mov " + r + "0, " + r + "2");
+    }
+    L("ret");
+    return s;
+  }
+  std::string sfx = n == 8 ? "b" : n == 16 ? "w" : n == 32 ? "l" : "q";
+  auto reg = [&](const char *q, const char *d, const char *w, const char *b8) {
+    return std::string("%") + (n == 64 ? q : n == 32 ? d : n == 16 ? w : b8);
+  };
+  std::string ax = reg("rax", "eax", "ax", "al"), si = reg("rsi", "esi", "si", "sil"),
+              cx = reg("rcx", "ecx", "cx", "cl"), dx = reg("rdx", "edx", "dx", "dl");
+  std::string zload = n == 8 ? "movzbl" : n == 16 ? "movzwl" : n == 32 ? "movl" : "movq";
+  std::string zdst = n == 64 ? "%rax" : "%eax";
+  std::string zext = n == 8 ? "movzbl %al, %eax" : n == 16 ? "movzwl %ax, %eax" : "";
+  if (op == "load") {
+    L(zload + " (%rdi), " + zdst);
+  } else if (op == "store") {
+    L("xchg" + sfx + " " + si + ", (%rdi)");
+  } else if (op == "xchg") {
+    L("movq %rsi, %rax");
+    L("xchg" + sfx + " " + ax + ", (%rdi)");
+    if (!zext.empty())
+      L(zext);
+  } else if (op == "add" || op == "sub") {
+    L("movq %rsi, %rax");
+    if (op == "sub")
+      L("negq %rax");
+    L("lock xadd" + sfx + " " + ax + ", (%rdi)");
+    if (!zext.empty())
+      L(zext);
+  } else if (op == "cas") {
+    L(zload + " (%rsi), " + zdst);
+    L("lock cmpxchg" + sfx + " " + dx + ", (%rdi)");
+    L("je 1f");
+    L("mov" + sfx + " " + ax + ", (%rsi)");
+    L("xorl %eax, %eax");
+    L("ret");
+    s += "1:\n";
+    L("movl $1, %eax");
+  } else {
+    L(zload + " (%rdi), " + zdst);
+    s += "1:\n";
+    L("movq %rax, %rcx");
+    std::string i = op == "or" ? "orq" : op == "xor" ? "xorq" : "andq";
+    L(i + " %rsi, %rcx");
+    if (op == "nand")
+      L("notq %rcx");
+    L("lock cmpxchg" + sfx + " " + cx + ", (%rdi)");
+    L("jne 1b");
+    if (!zext.empty())
+      L(zext);
+  }
+  L("ret");
+  return s;
+}
+
+std::string atomicHelpers(const Options &o, const std::string &text) {
+  static const std::string prefix = "__fcc_atomic_";
+  std::set<std::string> names;
+  for (size_t i = text.find(prefix); i != std::string::npos; i = text.find(prefix, i + 1)) {
+    size_t j = i + prefix.size();
+    while (j < text.size() && (isalnum((unsigned char)text[j]) || text[j] == '_'))
+      j++;
+    names.insert(text.substr(i, j - i));
+  }
+  bool x86 = o.target == "x86_64";
+  std::string s;
+  if (!names.empty())
+    s += x86 ? "\n// fcc's atomic operations\n\t.att_syntax prefix\n"
+             : "\n// fcc's atomic operations\n";
+  for (const std::string &f : names) {
+    std::string rest = f.substr(prefix.size());
+    std::string op = rest, size;
+    // OP is letters; N digits or a final `p`.
+    size_t d = rest.size();
+    while (d > 0 && isdigit((unsigned char)rest[d - 1]))
+      d--;
+    if (d == rest.size() && !rest.empty() && rest.back() == 'p')
+      d = rest.size() - 1;
+    op = rest.substr(0, d);
+    size = rest.substr(d);
+    unsigned n = size == "p" || size.empty() ? 64 : (unsigned)std::stoul(size);
+    s += "\t.section .text." + f + ",\"axG\",@progbits," + f + ",comdat\n\t.p2align 2\n\t.weak " +
+         f + "\n\t.type " + f + ",@function\n" + f + ":\n" + atomicBody(o, op, n) + "\t.size " + f +
+         ", .-" + f + "\n";
+  }
+  return s;
+}
+
 int compileAndLink(FirModule *m, const Options &o) {
   FirString as;
   FirStatus st = o.hasPasses
@@ -471,11 +683,26 @@ int compileAndLink(FirModule *m, const Options &o) {
                    << " backend can't compile this program: " << err << "\n";
     return 1;
   }
+  std::string text = as.str();
+  if (text.find("__fcc_vload") != std::string::npos ||
+      text.find("__fcc_vstore") != std::string::npos)
+    text += volatileHelpers(o);
+  text += externAddrHelpers(o, text);
+  text += atomicHelpers(o, text);
+  // The function that fills initializers' addresses of other files' variables (`Lower.cpp`),
+  // run before `main` from the ELF `.init_array`, at priority 0 (`.init_array.00000`, one of
+  // the priorities C implementations keep for themselves), so before every constructor a
+  // program declares, which may read those slots.
+  if (size_t i = text.find("\n__fcc_init."); i != std::string::npos) {
+    size_t j = text.find(':', i + 1);
+    text += "\n\t.section .init_array.00000,\"aw\"\n\t.p2align 3\n\t.quad " +
+            text.substr(i + 1, j - i - 1) + "\n";
+  }
   if (o.emit == "asm")
-    return writeOut(o.out, as.str()) ? 0 : 1;
+    return writeOut(o.out, text) ? 0 : 1;
   std::string out = o.out.empty() ? "a.out" : o.out;
   if (llvm::StringRef(out).ends_with(".s"))
-    return writeOut(out, as.str()) ? 0 : 1;
+    return writeOut(out, text) ? 0 : 1;
   llvm::SmallString<128> tmp;
   if (std::error_code ec = llvm::sys::fs::createTemporaryFile("fcc", "s", tmp)) {
     llvm::errs() << "fcc: a temporary file: " << ec.message() << "\n";
@@ -486,7 +713,7 @@ int compileAndLink(FirModule *m, const Options &o) {
   bool written;
   {
     Step step("fcc: write assembly");
-    written = writeOut(s, as.str());
+    written = writeOut(s, text);
   }
   if (written) {
     std::string cc = linker(o);
@@ -518,6 +745,8 @@ int compileAndLink(FirModule *m, const Options &o) {
 }
 
 int run(int argc, char **argv) {
+  for (int i = 1; i < argc; i++)
+    commandLine += std::string(argv[i]) + '\0';
   Options o;
   if (!parseArgs(argc, argv, o)) {
     llvm::errs() << kUsage;

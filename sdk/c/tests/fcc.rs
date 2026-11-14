@@ -32,8 +32,9 @@
 //! The test needs the dev shell's CMake, Ninja, Clang libraries, AArch64 C compiler, and (off
 //! AArch64) `qemu-aarch64`, and fails with a message naming what's missing. It runs by default
 //! on Linux; elsewhere (macOS, whose binaries aren't Linux ones) only with `FCC_TESTS=1`, and
-//! `FCC_TESTS=0` turns it off. `FCC_ONLY=name` runs only the programs whose names contain
-//! `name`; `--nocapture` shows the summary.
+//! `FCC_TESTS=0` turns it off. Programs named `c23_*` are C23 (`-std=c23` for the reference
+//! compiler and `fcc` alike, error tests included); the others are GNU C17 (`-std=gnu17`). `FCC_ONLY=name` runs
+//! only the programs whose names contain `name`; `--nocapture` shows the summary.
 //!
 //! `FCC_PASSES=p,q,…` adds a fourth build, `fcc --passes p,q,… --experimental` (the named
 //! passes to a fixed point, experimental ones included, such as `mem2reg`), which must match the
@@ -356,6 +357,20 @@ fn corpus(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// The C standard a corpus program is written in: C23 for `c23_*`, else GNU C17.
+fn std_flag(file: &Path) -> &'static str {
+    if file
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("c23_")
+    {
+        "-std=c23"
+    } else {
+        "-std=gnu17"
+    }
+}
+
 #[derive(Default)]
 struct Tally {
     programs: usize,
@@ -442,7 +457,7 @@ fn one(
     if helper.is_file() {
         let obj = out.join(format!("{name}.extern.o"));
         let built = Command::new(&tc.cc)
-            .args(["-O1", "-w", "-std=gnu17", "-ffp-contract=off", "-c", "-I"])
+            .args(["-O1", "-w", std_flag(file), "-ffp-contract=off", "-c", "-I"])
             .arg(&inc)
             .arg(&helper)
             .arg("-o")
@@ -460,7 +475,7 @@ fn one(
     }
     let reference = out.join(format!("{name}.ref"));
     let built = Command::new(&tc.cc)
-        .args(["-O1", "-w", "-std=gnu17", "-ffp-contract=off", "-I"])
+        .args(["-O1", "-w", std_flag(file), "-ffp-contract=off", "-I"])
         .arg(&inc)
         .arg(file)
         .args(&objs)
@@ -496,6 +511,7 @@ fn one(
         let exe = out.join(format!("{name}{suffix}"));
         let mut cmd = Command::new(fcc_exe);
         cmd.arg(file)
+            .arg(std_flag(file))
             .arg("-I")
             .arg(&inc)
             .args(&objs)
@@ -558,6 +574,7 @@ fn one(
     }
     let hfir = Command::new(fcc_exe)
         .arg(file)
+        .arg(std_flag(file))
         .arg("-I")
         .arg(&inc)
         .args(["--emit", "hfir"])
@@ -646,6 +663,7 @@ fn error_test(file: &Path, fcc_exe: &Path) -> Result<(), String> {
     let out = run_limited(
         Command::new(fcc_exe)
             .arg(file)
+            .arg(std_flag(file))
             .arg("-I")
             .arg(repo().join("frontends/c/tests/runtime"))
             .args(["--emit", "hfir"]),
@@ -882,6 +900,7 @@ fn one_x86(
         c.env("FIR_CC", &tc.cc)
             .args(["--target", "x86_64"])
             .arg(file)
+            .arg(std_flag(file))
             .arg("-I")
             .arg(&inc)
             .args(["-D", "FAI_TEST_INTEGERS_ONLY"]);
@@ -934,7 +953,7 @@ fn one_x86(
             .args([
                 "-O1",
                 "-w",
-                "-std=gnu17",
+                std_flag(file),
                 "-c",
                 "-DFAI_TEST_INTEGERS_ONLY",
                 "-I",
@@ -956,7 +975,13 @@ fn one_x86(
     }
     let reference = out.join(format!("{name}.ref"));
     let built = Command::new(&tc.cc)
-        .args(["-O1", "-w", "-std=gnu17", "-DFAI_TEST_INTEGERS_ONLY", "-I"])
+        .args([
+            "-O1",
+            "-w",
+            std_flag(file),
+            "-DFAI_TEST_INTEGERS_ONLY",
+            "-I",
+        ])
         .arg(&inc)
         .arg(file)
         .args(&objs)

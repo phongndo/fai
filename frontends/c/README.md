@@ -97,7 +97,8 @@ builds `fcc` with CMake (against the static library of the current sources), the
   `tests/runtime/fai_runtime.c`, libm (`-lm`), and, if the program has one, `tests/extern/NAME.c`
   compiled by the reference compiler (C functions it calls and that call it back, compiled
   separately), runs them (under `qemu-aarch64` off AArch64), and requires the same output and exit
-  code;
+  code; the programs named `c23_*` (one per C23 feature) are compiled as C23 (`-std=c23`, for
+  both compilers, and for the error tests named so), the others as GNU C17 (`-std=gnu17`);
 - runs each program's HFIR in FIR's interpreter under Arm's NaN choice (`NanRule::Arm`, the NaNs
   the hardware gives): the calls of the output helpers (events) must spell the same output and
   `main` must return the same code. Programs that call other external functions (libc's `printf`,
@@ -206,6 +207,77 @@ extensions Clang accepts, such as case ranges and `__extension__`):
   `isfinite`, `isnormal`, `signbit`, `fpclassify`, `__builtin_isinf_sign`), and the quiet
   comparisons (`__builtin_isgreater` and friends). The library functions (`sqrt`, `fabs`, …) stay
   calls of libm, which may set `errno`.
+- **Integer builtins:** the checked arithmetic of `__builtin_add_overflow`, `_sub_`, `_mul_` (and
+  the typed `sadd`, `uaddl`, … forms), on operands and results of any integer types, which C23's
+  `<stdckdint.h>` (`ckd_add`, `ckd_sub`, `ckd_mul`) expands to: the exact result is `k * 2^64 +
+  lo` with `k` in {-1, 0, 1} (for a product, from the magnitudes and the sign), checked against
+  the result's type; the bit counts `__builtin_clz`, `_ctz`, `_popcount` (with their `s`, `l`,
+  `ll`, and type-generic `g` forms) and C23's `__builtin_stdc_*` (`<stdbit.h>`'s functions and
+  type-generic macros: leading and trailing zeros and ones, the first ones and zeros, the
+  counts, `has_single_bit`, `bit_width`, `bit_floor`, `bit_ceil`), made of FIR's shifts, masks,
+  and a SWAR population count, since FIR has no such ops; and `__builtin_unreachable` (C23's
+  `unreachable()`), an op whose execution is UB (`int.div.s.ub` by zero).
+- **Volatile** objects (locals, globals, members, through pointers; not bitfields): FIR has no
+  volatile ops yet (`mem.load.volatile` and `mem.store.volatile` are reserved, as trace
+  events), so each access is a call of an external function that does it (`__fcc_vload32(p)`,
+  `__fcc_vstore8(p, v)`, `__fcc_vloadp`, …; integers as `i64`, floats as their bits), with
+  `read(args)` and `write(args)` effects; initializers of volatile scalars and the results the
+  checked arithmetic builtins store through a volatile pointer are such writes too. A call is
+  an event the world answers, so no pass deletes, merges, or moves one, `-O` included. `fcc`
+  defines the functions in assembly in each object that calls them (weak, in a COMDAT group),
+  so nothing else needs linking. Assigning a whole struct or union with volatile members is
+  rejected (one `mem.copy` would make those accesses ordinary).
+- **Variables defined in another file** (`extern int x;`, libc's `stdout`, `stderr`, `stdin`,
+  `environ`): FIR has no external globals yet, so the address is the result of an external
+  function, `__fcc_addr.NAME`, which reads it from the GOT (defined the same way in each
+  object), with effects `alloc` and `read(exposed)`: in FIR's model the first call may make the
+  object (the world's allocations are exposed) and every later one return it again, which is
+  what the GOT does. Not in global initializers.
+- **Labels as values** (GNU C): `&&L` is a pointer whose address is L's number in its function
+  (`ptr.with_addr` of `ptr.null`, pointing into no object), and `goto *p` a `cf.switch` on it
+  over the labels the function takes the address of. A static local table of them (an
+  interpreter's dispatch table, as Lua's `disptab`) is a zeroed global that the function fills
+  when it first starts (a flag says whether it has), since FIR's initializers can't hold label
+  addresses: before any of its code, so no jump skips it, and one object for the whole run.
+- **Atomics:** GNU C's `__atomic_*` builtins and Clang's `__c11_atomic_*` (what
+  `<stdatomic.h>` expands to; `_Atomic` objects themselves aren't supported yet) on 8- to 64-bit
+  integers, floats (loads, stores, exchanges), and pointers, and the fences
+  (`__atomic_thread_fence`, `__sync_synchronize`): FIR has no atomic ops yet, so each is a call
+  of an external function, `__fcc_atomic_OPN` (load, store, xchg, cas, add, sub, and, or, xor,
+  nand, fence), defined in assembly in each object that calls it as the volatile accesses' are:
+  sequentially consistent (AArch64's `ldar`/`stlr` and exclusive pairs, x86-64's `xchg` and
+  `lock` instructions), stronger than any order asked for, which C allows, with every memory
+  effect, so no pass moves a memory access across one. The op-fetch forms compute the new value
+  from the old one.
+- **128-bit integers** (`__int128`, `unsigned __int128`, `_BitInt(65)` to `_BitInt(128)`) on
+  AArch64: FIR's backends have no `i128` yet, so one is a struct value of its halves,
+  `struct<C>{array<0 x i128>, i64, i64}` (16-byte aligned, passed in an even register pair as
+  AAPCS64 passes `__int128`), which the lowering to MFIR splits; `+ - *` with carries and the
+  product's high half from 32-bit pieces, shifts as `select`s of in-range shifts, comparisons
+  on the halves, and division, remainder, and the conversions to and from floats calling
+  libgcc's functions (`__divti3`, `__floattidf`, …), as GCC does.
+- **Global initializers** with addresses inside objects (`&table[2]`, `"abc" + 1`: FIR's
+  `offset(@g, N)`), integers converted to pointers (`(void *)1`), and addresses of variables
+  defined in another file (`(void *)&config`): FIR's initializers name only the module's
+  globals and functions, so such a slot starts null and `__fcc_init.SUFFIX`, a function `fcc`
+  adds to the file and lists in the ELF `.init_array` at priority 0 (`.init_array.00000`, so
+  before any constructor the program declares), fills it before `main` from
+  `__fcc_addr.NAME` (the global isn't `const` in FIR). A variable a header declares `extern`
+  and this file then defines tentatively (`int x;`) is this file's.
+- **C23** (`-std=c23`): `bool`, `true`, and `false` as keywords, `nullptr` and `nullptr_t` (a
+  `ptr`, always null), `constexpr` objects, `typeof` and `typeof_unqual`, `auto`, the standard
+  attributes, binary literals and digit separators, `u8` character literals, `{}` initializers,
+  enums with a fixed underlying type, `static_assert` without a message, labels before
+  declarations and at the end of blocks, unnamed parameters, `()` as `(void)`, `f(...)` with
+  one-argument `va_start`, `#embed`, `#elifdef`, `__VA_OPT__`, and `_BitInt(N)` up to 128 bits
+  (above 64, as the 128-bit integers above):
+  in Clang's storage for it (8, 16, 32, or 64 bits), as its value sign- or zero-extended from N
+  bits, which every value an expression makes or reads from memory (and every one `++`, `--`, or
+  a compound assignment stores) is reduced to, so the container's operations are C's on N bits;
+  the checked arithmetic and the bit counts work on N bits too. Clang
+  doesn't parse storage-class specifiers in compound literals (`(static int){0}`) or the
+  `_FloatN` types, so neither do `fcc`'s programs (`tests/errors/c23_compound_storage.c`,
+  `tests/errors/c23_float_types.c`).
 
 ## How C maps to FIR
 
@@ -303,17 +375,20 @@ Each is diagnosed where it appears:
   `#pragma STDC FENV_ACCESS`: FIR's floats round to nearest and have no exception flags, so a
   program that changes the rounding mode (`fesetround`) or tests the flags isn't modeled (the
   pragma isn't diagnosed).
-- Integers over 64 bits (`__int128`, `_BitInt`), `volatile`, `_Atomic`, variable-length arrays,
-  packed structs, alignments above 16, thread-local variables, inline assembly, statement
-  expressions, labels as values, `++`/`--` on `_Bool`, wide string literals, calls with arguments
-  through declarations without prototypes, old-style (K&R) definitions.
-- Variables defined in another file (`extern int x;`, libc's `stdout`, `stderr`, and `errno`): FIR
-  has no external globals, so `fprintf` and `vfprintf` work on streams the program opens
-  (`fopen`, `fmemopen`, `fdopen`) but not on `stdout` and `stderr`.
-- Global initializers that point inside an object (`&table[2]`, `"abc" + 1`), or that store an
-  address as an integer: FIR's initializers name only the start of a global.
+- Integers over 128 bits (`_BitInt(129)` and wider); on 128-bit integers, `switch`, volatile
+  access, atomics, variadic arguments and `va_arg`, and the checked arithmetic and bit count
+  builtins; 128-bit integers on
+  x86-64 (its backend passes no structs by value); `_Atomic` objects (the builtins work),
+  variable-length arrays, packed structs, alignments above 16, thread-local
+  variables, inline assembly, statement expressions, volatile bitfields, `++`/`--` on `_Bool`,
+  wide string literals, calls with arguments through declarations without prototypes,
+  old-style (K&R) definitions.
+- Global initializers that store an address as an integer (`(long)&x`), or that take the
+  address of another file's variable inside a union.
 
-Also: C's `static` functions and globals become global symbols (FIR has no linkage yet), so a
-program can't define a `static` function with a libc function's name; the generated names (`str.0`,
-`zero.1`, `f.counter` for a static local) contain a `.`, so they can't clash with C names, but they
-clash between two objects `fcc` compiled (two files with string literals don't link together).
+Also: FIR has no linkage yet, so every function and global is a global symbol. A file's internal
+ones (C's `static` functions and variables, string and compound literals, and the generated
+`zero.1` and `f.counter` for a static local) are named with a suffix, `.l` and a hash of the
+file's path and the command line (`str.0.l1a2b3c4d`; one file compiled twice with different
+macros makes two objects), so two files `fcc` compiled link together (Lua's 33, for
+example), and a `static` function may have a libc function's name.
