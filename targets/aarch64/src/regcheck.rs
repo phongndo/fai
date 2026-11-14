@@ -34,36 +34,23 @@
 //! tests' job); and the encoding of the output is right (the native tests). The checker is not
 //! proved in Lean: see `docs/assurance/README.md`.
 
-use std::collections::BTreeMap;
+mod state;
 
 use super::abi::{CallShape, FP_CALLER_SAVED};
 use super::mir::{CALLER_SAVED, Inst, MFunc};
 use super::regalloc::{Effects, Shapes, effects};
 use fai_ir::ir::{AluImmOp, AluOp, FSize, FUnaryOp, MemSize, MovOp, Reg, Sf};
+use state::{Addr, Set, State, Val, loc};
 
-/// An input value a location may hold.
-type Val = u32;
 /// The physical register at location `p` as the input last wrote it.
 const PHYS: u32 = 1 << 30;
 /// The callee-saved register at location `p`'s value at entry.
 const ENTRY: u32 = PHYS + 128;
-/// The register locations: `x0`…`x30` are 0…30, `d0`…`d31` are 31…62.
-const NREGS: usize = 63;
+/// The first `d` register's location (`x0`…`x30` are 0…30, `d0`…`d31` are 31…62).
 const FP_BASE: u32 = 31;
 
 fn phys(p: u32) -> Val {
     PHYS + p
-}
-
-/// A physical register's location.
-fn loc(r: Reg) -> Option<usize> {
-    if r.is_gpr() {
-        Some(r.0 as usize)
-    } else if r.is_fpr() {
-        Some((FP_BASE + r.fpr_index()) as usize)
-    } else {
-        None
-    }
 }
 
 /// The callee-saved registers' locations: `x19`…`x28`, and `d8`…`d15` (their low 64 bits, all
@@ -80,104 +67,34 @@ fn reg_name(p: u32) -> String {
     }
 }
 
-/// What `x16` holds, for far spill-slot addresses.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Addr {
-    Unknown,
-    Const(u64),
-    SpPlus(i64),
+/// At entry, every register holds itself (as the input last wrote it), and each callee-saved
+/// register also its value at entry.
+fn entry_state() -> State {
+    State::new(|p| {
+        let mut s = Set::one(phys(p));
+        if callee_saved().any(|c| c == p) {
+            s.insert(ENTRY + p);
+        }
+        s
+    })
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
-struct State {
-    regs: Vec<Vec<Val>>,
-    slots: BTreeMap<i64, Vec<Val>>,
-    saves: BTreeMap<i64, Vec<Val>>,
-    x16: Addr,
-}
-
-fn insert(set: &mut Vec<Val>, v: Val) {
-    if let Err(i) = set.binary_search(&v) {
-        set.insert(i, v);
+/// Register `r` now holds exactly `set` (the old contents are gone); `x16` is then no address.
+fn set_reg(st: &mut State, r: Reg, set: Set) {
+    if let Some(p) = loc(r) {
+        st.set_reg_loc(p, set);
+        if r == Reg::x(16) {
+            st.set_x16(Addr::Unknown);
+        }
     }
 }
 
-fn intersect(a: &[Val], b: &[Val]) -> Vec<Val> {
-    a.iter()
-        .copied()
-        .filter(|x| b.binary_search(x).is_ok())
-        .collect()
+fn holds(st: &State, r: Reg, v: Val) -> bool {
+    loc(r).is_some_and(|p| st.reg(p).contains(v))
 }
 
-impl State {
-    fn entry() -> State {
-        let mut regs: Vec<Vec<Val>> = (0..NREGS as u32).map(|p| vec![phys(p)]).collect();
-        for p in callee_saved() {
-            insert(&mut regs[p as usize], ENTRY + p);
-        }
-        State {
-            regs,
-            slots: BTreeMap::new(),
-            saves: BTreeMap::new(),
-            x16: Addr::Unknown,
-        }
-    }
-
-    fn join(&self, o: &State) -> State {
-        let map = |a: &BTreeMap<i64, Vec<Val>>, b: &BTreeMap<i64, Vec<Val>>| {
-            a.iter()
-                .filter_map(|(k, x)| b.get(k).map(|y| (*k, intersect(x, y))))
-                .filter(|(_, s)| !s.is_empty())
-                .collect()
-        };
-        State {
-            regs: self
-                .regs
-                .iter()
-                .zip(&o.regs)
-                .map(|(a, b)| intersect(a, b))
-                .collect(),
-            slots: map(&self.slots, &o.slots),
-            saves: map(&self.saves, &o.saves),
-            x16: if self.x16 == o.x16 {
-                self.x16
-            } else {
-                Addr::Unknown
-            },
-        }
-    }
-
-    /// `v` gets a new value: no location holds the old one any more.
-    fn kill(&mut self, v: Val) {
-        for s in self
-            .regs
-            .iter_mut()
-            .chain(self.slots.values_mut())
-            .chain(self.saves.values_mut())
-        {
-            if let Ok(i) = s.binary_search(&v) {
-                s.remove(i);
-            }
-        }
-    }
-
-    /// Register `r` now holds exactly `set` (the old contents are gone).
-    fn set_reg(&mut self, r: Reg, set: Vec<Val>) {
-        if let Some(p) = loc(r) {
-            self.regs[p] = set;
-            if r == Reg::x(16) {
-                self.x16 = Addr::Unknown;
-            }
-        }
-    }
-
-    fn holds(&self, r: Reg, v: Val) -> bool {
-        loc(r).is_some_and(|p| self.regs[p].binary_search(&v).is_ok())
-    }
-
-    fn get(&self, r: Reg) -> Vec<Val> {
-        loc(r).map_or_else(Vec::new, |p| self.regs[p].clone())
-    }
+fn get(st: &State, r: Reg) -> Set {
+    loc(r).map_or(Set::EMPTY, |p| st.reg(p).clone())
 }
 
 /// The value an input register denotes.
@@ -252,7 +169,7 @@ struct Checker<'a> {
 impl Checker<'_> {
     /// Whether the register at location `p` holds `v`.
     fn regs_hold(&self, st: &State, p: u32, v: Val) -> Option<()> {
-        st.regs[p as usize].binary_search(&v).ok().map(|_| ())
+        st.reg(p as usize).contains(v).then_some(())
     }
 
     fn err<T>(&self, b: usize, j: usize, msg: impl std::fmt::Display) -> Result<T, String> {
@@ -290,7 +207,7 @@ impl Checker<'_> {
                 d,
                 base,
                 off: 0,
-            } if base == x16 => match st.x16 {
+            } if base == x16 => match st.x16() {
                 Addr::SpPlus(o) if o >= self.spill_base => {
                     Some(Inserted::SlotLoad { t: d, off: o })
                 }
@@ -301,7 +218,7 @@ impl Checker<'_> {
                 s,
                 base,
                 off: 0,
-            } if base == x16 => match st.x16 {
+            } if base == x16 => match st.x16() {
                 Addr::SpPlus(o) if o >= self.spill_base => {
                     Some(Inserted::SlotStore { t: s, off: o })
                 }
@@ -332,7 +249,7 @@ impl Checker<'_> {
                 d,
                 imm,
                 hw,
-            } if d == x16 => match st.x16 {
+            } if d == x16 => match st.x16() {
                 Addr::Const(c) => {
                     let m = 0xffffu64 << hw;
                     Some(Inserted::X16(Addr::Const(
@@ -347,7 +264,7 @@ impl Checker<'_> {
                 d,
                 n,
                 m,
-            } if d == x16 && n == Reg::SP && m == x16 => match st.x16 {
+            } if d == x16 && n == Reg::SP && m == x16 => match st.x16() {
                 Addr::Const(c) => Some(Inserted::X16(Addr::SpPlus(c as i64))),
                 _ => None,
             },
@@ -368,8 +285,8 @@ impl Checker<'_> {
                     return self.err(b, j, "a misaligned spill slot");
                 }
                 self.spill_end = self.spill_end.max(off + 8);
-                let s = st.slots.get(&off).cloned().unwrap_or_default();
-                st.set_reg(t, s);
+                let s = st.slot(off);
+                set_reg(st, t, s);
             }
             Inserted::SlotStore { t, off } => {
                 if off % 8 != 0 {
@@ -383,7 +300,8 @@ impl Checker<'_> {
                     );
                 }
                 self.spill_end = self.spill_end.max(off + 8);
-                st.slots.insert(off, st.get(t));
+                let s = get(st, t);
+                st.set_slot(off, s);
             }
             Inserted::SaveStore { r, off } => {
                 // Aligned 8-byte slots wholly below x29 can't overlap each other or x29's own pair.
@@ -398,7 +316,8 @@ impl Checker<'_> {
                     return self.err(b, j, "a save of a register that isn't x0…x30 or d0…d31");
                 }
                 self.save_low = self.save_low.min(off);
-                st.saves.insert(off, st.get(r));
+                let s = get(st, r);
+                st.set_save(off, s);
             }
             Inserted::SaveLoad { r, off } => {
                 if off % 8 != 0 || off > -8 {
@@ -409,12 +328,12 @@ impl Checker<'_> {
                     );
                 }
                 self.save_low = self.save_low.min(off);
-                let s = st.saves.get(&off).cloned().unwrap_or_default();
-                st.set_reg(r, s);
+                let s = st.save(off);
+                set_reg(st, r, s);
             }
             Inserted::X16(a) => {
-                st.set_reg(Reg::x(16), Vec::new());
-                st.x16 = a;
+                set_reg(st, Reg::x(16), Set::EMPTY);
+                st.set_x16(a);
             }
         }
         Ok(())
@@ -524,7 +443,7 @@ impl Checker<'_> {
             j += 1;
         }
         // x16 held a constant or a snapshot of `sp`: no input value, and no spill address.
-        st.set_reg(x16, Vec::new());
+        set_reg(st, x16, Set::EMPTY);
         self.frame = Some(size);
         Ok(j - start)
     }
@@ -586,13 +505,14 @@ impl Checker<'_> {
         }
         for (&a, &c) in ou.iter().zip(tu).chain(implicit.iter().zip(&implicit)) {
             if let Some(v) = val(a)
-                && !st.holds(c, v)
+                && !holds(st, c, v)
             {
                 return self.err(
                     b,
                     j,
                     format!("reads {} from {c}, which holds {:?}", show(v), {
-                        let s: Vec<String> = st.get(c).iter().map(|&x| show(x)).collect();
+                        let s: Vec<String> =
+                            get(st, c).as_slice().iter().map(|&x| show(x)).collect();
                         s
                     }),
                 );
@@ -619,17 +539,17 @@ impl Checker<'_> {
         }
         // Writes. A move copies what its source holds.
         let copied = match (as_move(o), as_move(t)) {
-            (Some(_), Some((_, n))) => st.get(n),
-            _ => Vec::new(),
+            (Some(_), Some((_, n))) => get(st, n),
+            _ => Set::EMPTY,
         };
         for (&a, &c) in od.iter().zip(td) {
             if let Some(v) = val(a) {
                 st.kill(v);
                 let mut s = copied.clone();
-                insert(&mut s, v);
-                st.set_reg(c, s);
+                s.insert(v);
+                set_reg(st, c, s);
             } else {
-                st.set_reg(c, Vec::new());
+                set_reg(st, c, Set::EMPTY);
             }
         }
         // After an input move `d ← n`, `d` has `n`'s value, so every other location holding `n`
@@ -640,11 +560,7 @@ impl Checker<'_> {
             && dv != nv
             && as_move(t).is_some()
         {
-            for s in st.regs.iter_mut().chain(st.slots.values_mut()) {
-                if s.binary_search(&nv).is_ok() {
-                    insert(s, dv);
-                }
-            }
+            st.alias(nv, dv);
         }
         // The exception pseudo-instructions address the exception slot through x16 when emitted
         // (`emit.rs`): x16 holds nothing afterwards, not even a spill address, and can't be
@@ -660,7 +576,7 @@ impl Checker<'_> {
                     "an exception pseudo-instruction's operand is x16, which it clobbers",
                 );
             }
-            st.set_reg(Reg::x(16), Vec::new());
+            set_reg(st, Reg::x(16), Set::EMPTY);
         }
         if o.is_call() {
             let clobbered = CALLER_SAVED
@@ -670,7 +586,7 @@ impl Checker<'_> {
             for r in clobbered {
                 let v = val(r).unwrap();
                 st.kill(v);
-                st.set_reg(r, vec![v]);
+                set_reg(st, r, Set::one(v));
             }
         }
         Ok(())
@@ -813,14 +729,7 @@ impl Checker<'_> {
                         unreachable!()
                     };
                     st.kill(dv);
-                    let mut any = false;
-                    for s in st.regs.iter_mut().chain(st.slots.values_mut()) {
-                        if s.binary_search(&nv).is_ok() {
-                            insert(s, dv);
-                            any = true;
-                        }
-                    }
-                    if !any {
+                    if !st.alias(nv, dv) {
                         return self.err(
                             b,
                             *j,
@@ -992,7 +901,7 @@ fn check(input: &MFunc, out: &MFunc, callees: &[CallShape], own: &CallShape) -> 
         }
     };
     let mut at_start: Vec<Option<State>> = vec![None; nb];
-    at_start[0] = Some(State::entry());
+    at_start[0] = Some(entry_state());
     let mut work = vec![0usize];
     let mut visits = 0usize;
     while let Some(b) = work.pop() {
