@@ -133,8 +133,8 @@ pub struct Accepted<'a> {
 ///
 /// The output is then checked against the body as it was ([`check_output`]): a run that deletes
 /// anything keeps a copy of the body first, and if the result isn't that copy with deletable ops
-/// left out, the copy is put back and the run fails. A run with nothing to delete doesn't touch
-/// the body.
+/// left out, the copy is put back (and the remarks about the deletions dropped) and the run
+/// fails. A run with nothing to delete doesn't touch the body.
 pub fn run(body: &mut Body, remarks: &mut Remarks, policy: Policy) -> Result<u32, String> {
     let candidate = plan(body, policy);
     if candidate.erase.is_empty() {
@@ -142,9 +142,12 @@ pub fn run(body: &mut Body, remarks: &mut Remarks, policy: Policy) -> Result<u32
     }
     let before = body.clone();
     let accepted = check(body, candidate, policy)?;
+    let marks = remarks.list().len();
     let n = apply(accepted, remarks);
     if let Err(e) = check_output(&before, body, policy) {
+        // The deletions are undone, so are their remarks.
         *body = before;
+        remarks.truncate(marks);
         return Err(format!("its output failed the output check: {e}"));
     }
     Ok(n)
@@ -367,8 +370,9 @@ impl OutputCheck<'_> {
         }
         let r = self.region_ops(&t, sr, &mut counts);
         if r.is_ok() {
-            // Every target op was matched and its reads taken off: all zeros again.
-            debug_assert!(counts.iter().all(|&n| n == 0));
+            // Every target op was matched and its reads taken off by the same walk that added
+            // them, so the array is all zeros again. (Not asserted: a scan of the whole array per
+            // region would make debug builds quadratic in a function with many regions.)
             self.pool.push(counts);
         }
         r
@@ -687,6 +691,34 @@ mod tests {
                 b.add_str("other");
             },
             "isn't a version of the source body",
+        );
+    }
+
+    /// A deleted op read only from inside a later op's region: the read counts reach into
+    /// regions, at any depth. (A target like this doesn't verify, so the differential tests
+    /// never give it to the proved checker; this is where it is covered.)
+    #[test]
+    fn the_output_check_sees_reads_inside_regions() {
+        let src = body(
+            "func @f(%x: i32, %p: ptr, %c: i1) {
+  %v: i32 = copy %x @1:3
+  cf.if %c @2:3 {
+    cf.if %c @3:5 {
+      mem.store i32 %v, %p, align 4 @4:7
+      cf.yield
+    }
+    cf.yield
+  }
+  func.ret @7:3
+}
+",
+        );
+        let mut tgt = src.clone();
+        tgt.erase(op_at(&tgt, 1));
+        let e = check_output(&src, &tgt, Policy::VerifiedOnly).unwrap_err();
+        assert!(
+            e.contains("copy @1:3 is missing from the target, and may not be deleted: the target still reads %v"),
+            "{e}"
         );
     }
 

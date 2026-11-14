@@ -268,6 +268,11 @@ impl Remarks {
     pub fn take(&mut self) -> Vec<Remark> {
         std::mem::take(&mut self.list)
     }
+
+    /// Drop the remarks after the first `n` (those about a change that was undone).
+    pub fn truncate(&mut self, n: usize) {
+        self.list.truncate(n);
+    }
 }
 
 /// `@line:col`, or `@?`.
