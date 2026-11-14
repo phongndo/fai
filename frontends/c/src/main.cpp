@@ -36,11 +36,15 @@
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/Tooling/CompilationDatabase.h"
 #include "clang/Tooling/Tooling.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Program.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/xxhash.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +52,8 @@
 #include <optional>
 #include <string>
 #include <vector>
+
+extern char **environ;
 
 #ifndef FCC_RESOURCE_DIR
 #define FCC_RESOURCE_DIR ""
@@ -190,30 +196,188 @@ std::string linker(const Options &o) {
   return std::string(triple(o)) + "-cc";
 }
 
-// The target C compiler's system include directories, without its compiler-specific ones
-// (Clang brings its own).
-std::vector<std::string> systemIncludes(const Options &o) {
-  Step step("fcc: include probe (cc -E -v)");
+// What the target C compiler's include probe found: its system include directories, without its
+// compiler-specific ones (Clang brings its own), and the directories it would search but left out
+// because they don't exist (GCC's "ignoring nonexistent directory").
+struct Probe {
   std::vector<std::string> dirs;
-  std::string cmd = linker(o) + " -E -Wp,-v -x c /dev/null 2>&1";
+  std::vector<std::string> absent;
+  bool complete = false; // the search list was printed in full
+};
+
+Probe runProbe(const std::string &cc) {
+  Step step("fcc: include probe (cc -E -v)");
+  Probe r;
+  std::string cmd = cc + " -E -Wp,-v -x c /dev/null 2>&1";
   FILE *p = popen(cmd.c_str(), "r");
   if (!p)
-    return dirs;
+    return r;
   char line[4096];
   bool in = false;
   while (fgets(line, sizeof line, p)) {
     llvm::StringRef l = llvm::StringRef(line).trim();
-    if (l.starts_with("#include <...>")) {
+    if (l.consume_front("ignoring nonexistent directory \"") && l.consume_back("\"")) {
+      r.absent.push_back(l.str());
+    } else if (l.starts_with("#include <...>")) {
       in = true;
     } else if (l.starts_with("End of search list")) {
       in = false;
+      r.complete = true;
     } else if (in && !l.contains("/lib/gcc/") && !l.contains("/lib/clang/") &&
                !l.contains("/include-fixed")) {
-      dirs.push_back(l.str());
+      r.dirs.push_back(l.str());
     }
   }
   pclose(p);
-  return dirs;
+  return r;
+}
+
+// The probe's result is cached (in $FCC_CACHE_DIR, else the user's cache directory's fcc/; off
+// with FCC_CACHE=0): it costs a process of the target C compiler (7 ms or more) on every
+// compilation, and its answer rarely changes. An entry is used only when everything that could
+// change the answer is as it was: the compiler named, the file it resolves to (its real path,
+// size, and modification time), the target, and the whole environment except variables no
+// compiler reads for its search path (a C compiler's search path depends on the environment:
+// CPATH, GCC_EXEC_PREFIX, Nix's NIX_CFLAGS_COMPILE, ...); and when every directory found still
+// exists and every one left out still doesn't. The key is stored in the entry and compared in
+// full, so a hash collision can't select another entry. Anything unexpected falls back to probing.
+const char *kProbeMagic = "fcc include probe 1";
+
+// The cache key, or nothing when the compiler can't be resolved (then fcc probes, uncached).
+std::optional<std::string> probeKey(const Options &o, const std::string &cc) {
+  llvm::ErrorOr<std::string> prog = llvm::sys::findProgramByName(cc);
+  if (!prog)
+    return std::nullopt;
+  llvm::SmallString<256> real;
+  if (llvm::sys::fs::real_path(*prog, real))
+    return std::nullopt;
+  llvm::sys::fs::file_status st;
+  if (llvm::sys::fs::status(real, st))
+    return std::nullopt;
+  std::string key;
+  llvm::raw_string_ostream k(key);
+  k << kProbeMagic << "\ntarget " << triple(o) << "\ncc " << cc << "\nfile " << real << " "
+    << st.getSize() << " " << st.getLastModificationTime().time_since_epoch().count() << "\n";
+  // Variables that say where a shell is, not what a compiler does.
+  static const char *const ignored[] = {"PWD",      "OLDPWD", "SHLVL",   "_",
+                                        "FIR_TIME", "TERM",   "COLUMNS", "LINES"};
+  std::vector<llvm::StringRef> env;
+  for (char **e = environ; *e; e++) {
+    llvm::StringRef var(*e);
+    llvm::StringRef name = var.split('=').first;
+    if (std::find(std::begin(ignored), std::end(ignored), name) == std::end(ignored))
+      env.push_back(var);
+  }
+  std::sort(env.begin(), env.end());
+  for (llvm::StringRef var : env)
+    k << "env " << var.size() << " " << var << "\n";
+  return key;
+}
+
+std::optional<std::string> probeCacheDir() {
+  const char *off = std::getenv("FCC_CACHE");
+  if (off && llvm::StringRef(off) == "0")
+    return std::nullopt;
+  if (const char *d = std::getenv("FCC_CACHE_DIR"); d && *d)
+    return std::string(d);
+  llvm::SmallString<256> dir;
+  if (!llvm::sys::path::cache_directory(dir))
+    return std::nullopt;
+  llvm::sys::path::append(dir, "fcc");
+  return dir.str().str();
+}
+
+std::string probeCachePath(const std::string &dir, const std::string &key) {
+  llvm::SmallString<256> p(dir);
+  llvm::sys::path::append(p, "include-probe-" + llvm::utohexstr(llvm::xxh3_64bits(key)));
+  return p.str().str();
+}
+
+// The cached probe for `key`, if there is one and it still holds.
+std::optional<Probe> readProbe(const std::string &path, const std::string &key) {
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buf = llvm::MemoryBuffer::getFile(path);
+  if (!buf)
+    return std::nullopt;
+  llvm::StringRef text = (*buf)->getBuffer();
+  // The key, length-prefixed (environment values may hold newlines), then one path per line.
+  size_t n = 0;
+  if (!text.consume_front("key ") || text.consumeInteger(10, n) || !text.consume_front("\n") ||
+      text.size() < n || text.take_front(n) != key)
+    return std::nullopt;
+  text = text.drop_front(n);
+  Probe r;
+  while (!text.empty()) {
+    auto [line, rest] = text.split('\n');
+    text = rest;
+    if (line == "end") {
+      r.complete = true;
+      break;
+    }
+    if (line.consume_front("dir ")) {
+      if (!llvm::sys::fs::is_directory(line))
+        return std::nullopt;
+      r.dirs.push_back(line.str());
+    } else if (line.consume_front("absent ")) {
+      if (llvm::sys::fs::exists(line))
+        return std::nullopt;
+      r.absent.push_back(line.str());
+    } else {
+      return std::nullopt;
+    }
+  }
+  if (!r.complete)
+    return std::nullopt;
+  return r;
+}
+
+// Store `r` for `key`, atomically (a temporary file renamed into place); failures are ignored.
+void writeProbe(const std::string &dir, const std::string &path, const std::string &key,
+                const Probe &r) {
+  for (const std::vector<std::string> *v : {&r.dirs, &r.absent})
+    for (const std::string &d : *v)
+      if (d.find('\n') != std::string::npos)
+        return;
+  if (llvm::sys::fs::create_directories(dir))
+    return;
+  llvm::SmallString<256> tmp;
+  int fd;
+  if (llvm::sys::fs::createUniqueFile(path + ".%%%%%%%%.tmp", fd, tmp))
+    return;
+  {
+    llvm::raw_fd_ostream os(fd, /*shouldClose=*/true);
+    os << "key " << key.size() << "\n" << key;
+    for (const std::string &d : r.dirs)
+      os << "dir " << d << "\n";
+    for (const std::string &d : r.absent)
+      os << "absent " << d << "\n";
+    os << "end\n";
+    if (os.has_error()) {
+      os.clear_error();
+      llvm::sys::fs::remove(tmp);
+      return;
+    }
+  }
+  if (llvm::sys::fs::rename(tmp, path))
+    llvm::sys::fs::remove(tmp);
+}
+
+// The target C compiler's system include directories (see Probe), from the cache when it holds.
+std::vector<std::string> systemIncludes(const Options &o) {
+  std::string cc = linker(o);
+  std::optional<std::string> dir = probeCacheDir();
+  std::optional<std::string> key = dir ? probeKey(o, cc) : std::nullopt;
+  if (!key)
+    return runProbe(cc).dirs;
+  std::string path = probeCachePath(*dir, *key);
+  {
+    Step step("fcc: include probe (cached)");
+    if (std::optional<Probe> cached = readProbe(path, *key))
+      return cached->dirs;
+  }
+  Probe r = runProbe(cc);
+  if (r.complete)
+    writeProbe(*dir, path, *key, r);
+  return r.dirs;
 }
 
 // How long the lowering to HFIR took, to tell it apart from Clang's own time.

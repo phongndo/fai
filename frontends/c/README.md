@@ -55,6 +55,15 @@ fcc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]
   `x86_64-unknown-linux-gnu-cc`, which it has on other Linux hosts). Clang gets that compiler's
   system include directories after its own headers (Clang's resource directory, found when
   `fcc` is built, or `$FCC_RESOURCE_DIR`).
+- Finding those directories runs that compiler (`cc -E -Wp,-v`, 7 ms or more), so `fcc` caches
+  the answer, in `$FCC_CACHE_DIR`, else `fcc/` in the user's cache directory
+  (`$XDG_CACHE_HOME`, `~/.cache`); `FCC_CACHE=0` turns the cache off. An entry is used only while
+  everything that could change the answer is unchanged: the compiler named, the file it resolves
+  to (real path, size, modification time), the target, and the environment (all of it, except
+  `PWD`, `OLDPWD`, `SHLVL`, `_`, `FIR_TIME`, `TERM`, `COLUMNS`, `LINES`); and while every
+  directory found still exists and every directory the compiler left out as nonexistent still
+  doesn't. Otherwise, or if the cache can't be read or written, `fcc` probes as before
+  (`sdk/c/tests/fcc_cache.rs`).
 - Unsupported C is an error with its source location (`file.c:3:7: error: fcc does not support
   variable-length arrays yet`), and nothing is written; `fcc` exits with 1. `FCC_DUMP=1` prints
   the module when the HFIR doesn't verify (a bug in `fcc`).
