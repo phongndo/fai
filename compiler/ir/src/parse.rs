@@ -19,6 +19,10 @@ use crate::ops::{TARGETS, op_kind};
 use crate::types::{Shape, Types};
 
 pub fn parse_module(input: &str) -> Result<Module, String> {
+    crate::timing::time("parse", || parse(input))
+}
+
+fn parse(input: &str) -> Result<Module, String> {
     let mut p = Parser::new(input, true)?;
     match p.module() {
         // Lean resolves names only after parsing, so a syntax error anywhere comes first.

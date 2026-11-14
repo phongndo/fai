@@ -166,7 +166,7 @@ pub fn allocate(
         callees: shapes,
         own,
     };
-    let a = assign(f, &sh);
+    let a = fai_ir::timing::time("aarch64.regalloc.assign", || assign(f, &sh));
     if cfg!(debug_assertions) {
         check(f, &sh, &a)
             .map_err(|e| format!("register allocation of function {} is wrong: {e}", f.index))?;
@@ -227,12 +227,16 @@ pub fn apply_assignment(
     {
         return Err("assignment's frame size overflows".to_owned());
     }
-    let mut out = f.clone();
-    rewrite(&mut out, a);
-    lower_frame(&mut out);
-    super::regcheck::validate(f, out, shapes, own)
-        .map_err(|e| format!("register allocation and frame lowering failed validation: {e}"))?
-        .apply();
+    let out = fai_ir::timing::time("aarch64.regalloc.rewrite", || {
+        let mut out = f.clone();
+        rewrite(&mut out, a);
+        lower_frame(&mut out);
+        out
+    });
+    fai_ir::timing::time("aarch64.regcheck", || {
+        super::regcheck::validate(f, out, shapes, own).map(super::regcheck::Accepted::apply)
+    })
+    .map_err(|e| format!("register allocation and frame lowering failed validation: {e}"))?;
     Ok(())
 }
 

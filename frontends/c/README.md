@@ -41,6 +41,12 @@ fcc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]
   required in `fai verify full` on Linux; the ABI torture test's `-O` builds are not
   checked), and the `FCC_PASSES` build too when it is set. Without the flag, every step's
   output is still checked, by an unproved Rust transcription of the same checker.
+- `FIR_TIME=1` in the environment prints on stderr where the compilation's time went, phase by
+  phase: fcc's own steps (the include probe, Clang, the lowering to HFIR, writing the assembly,
+  the external assembler and linker) and the library's (each verification, the lowering to MFIR,
+  each pass, and the backend's selection, register allocation, its validation, and emission), in
+  one report (`fir_time_record`, `fir_time_report` in the C API). Phases marked `*` ran on worker
+  threads and are CPU time summed over them.
 - `--target` picks the target: `aarch64` (the default) or `x86_64`. `-O`, `--passes`, and
   `--check-dce` run on the MFIR, before the target is involved, so they mean the same for both.
 - The linker is `$FIR_CC`, or `cc` when the host is the target (its CPU, on Linux; macOS's `cc`

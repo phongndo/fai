@@ -55,7 +55,7 @@ pub use fai_codegen as codegen;
 pub use fai_interp as interp;
 pub use fai_transforms as passes;
 
-pub use fai_ir::{builder, dialect, float};
+pub use fai_ir::{builder, dialect, float, timing};
 
 /// Op contracts: what the Lean proofs let the Rust code do with each op kind
 /// ([`fai_ir::contract`]), and which components declare what they do with each

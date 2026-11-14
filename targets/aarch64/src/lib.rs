@@ -55,6 +55,10 @@ pub fn shapes(m: &Module) -> Vec<abi::CallShape> {
 /// Instruction selection for every function of a verified MFIR (or core-op HFIR) module: LFIR
 /// over virtual registers.
 pub fn select(m: &Module) -> Result<MModule, String> {
+    fai_ir::timing::time("aarch64.isel", || select_untimed(m))
+}
+
+fn select_untimed(m: &Module) -> Result<MModule, String> {
     isel::check_module(m)?;
     let cx = isel::ModuleCx::new(m);
     let mut mm = MModule::default();
@@ -69,6 +73,10 @@ pub fn select(m: &Module) -> Result<MModule, String> {
 /// function's result ([`regcheck::validate`]). The first function that fails validation is the
 /// error.
 pub fn allocate(m: &Module, mm: &mut MModule) -> Result<(), String> {
+    fai_ir::timing::time("aarch64.regalloc", || allocate_untimed(m, mm))
+}
+
+fn allocate_untimed(m: &Module, mm: &mut MModule) -> Result<(), String> {
     let shapes = shapes(m);
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let chunk = mm.funcs.len().div_ceil(threads).max(16);

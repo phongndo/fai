@@ -86,7 +86,8 @@ pub fn allocate(m: &Module, mm: &mut MModule) -> Result<(), String> {
 
 /// Compile a verified MFIR module (see `fir::backend::prepare`) to assembly.
 pub fn compile(m: &Module, o: &Options) -> Result<String, String> {
-    let mut mm = select(m)?;
-    allocate(m, &mut mm)?;
-    Ok(emit::emit(m, &mm, o))
+    use fai_ir::timing::time;
+    let mut mm = time("x86_64.isel", || select(m))?;
+    time("x86_64.regalloc", || allocate(m, &mut mm))?;
+    Ok(time("x86_64.emit", || emit::emit(m, &mm, o)))
 }

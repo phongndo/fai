@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 // The API's version: the major version times 65536, plus the minor version.
-#define FIR_API_VERSION ((1 << 16) | 6)
+#define FIR_API_VERSION ((1 << 16) | 7)
 
 // No id: what a call returns when it fails.
 #define FIR_INVALID UINT32_MAX
@@ -609,6 +609,21 @@ FirValue fir_float_const_f64(struct FirBuilder *fb, double value);
 
 // The API version the library was built with: `FIR_API_VERSION`.
 uint32_t fir_api_version(void);
+
+// With `FIR_TIME` set in the environment (to anything but empty or `0`): the report of where
+// the time went since the last report, phase by phase (`fir::timing`: the library's phases,
+// and the caller's own from `fir_time_record`), and recording starts afresh. Null otherwise.
+// Free it with `fir_string_free`.
+char *fir_time_report(void);
+
+// With `FIR_TIME` set: add `seconds` to the caller's phase `name` in the report (a frontend's
+// own steps: parsing, its lowering, the assembler it runs). Otherwise, or if `name` is null or
+// not UTF-8, or `seconds` is negative or not finite, nothing happens.
+//
+// # Safety
+//
+// `name` is null or a NUL-terminated string, read only during the call.
+void fir_time_record(const char *name, double seconds);
 
 // A new, empty module. Free it with `fir_module_free`.
 struct FirModule *fir_module_new(void);

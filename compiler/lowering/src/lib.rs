@@ -173,7 +173,7 @@ pub fn lower_module(m: &Module) -> Result<Module, String> {
 
 /// Lower a verified HFIR module and verify the result (what `fir lower` and `fir-ref lower` do).
 pub fn lower_checked(m: &Module) -> Result<Module, String> {
-    let l = lower_module(m)?;
+    let l = fai_ir::timing::time("lower", || lower_module(m))?;
     match fai_ir::verify_module(&l) {
         Ok(_) => Ok(l),
         Err(e) => Err(format!("the lowering doesn't verify: {e}")),

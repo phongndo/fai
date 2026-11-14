@@ -45,6 +45,7 @@ pub mod ops;
 pub mod parse;
 pub mod print;
 pub mod sem;
+pub mod timing;
 pub mod types;
 pub mod verify;
 

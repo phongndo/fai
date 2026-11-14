@@ -84,7 +84,7 @@ mod ops;
 pub use ops::*;
 
 /// The API's version: the major version times 65536, plus the minor version.
-pub const FIR_API_VERSION: u32 = (1 << 16) | 6;
+pub const FIR_API_VERSION: u32 = (1 << 16) | 7;
 
 /// No id: what a call returns when it fails.
 pub const FIR_INVALID: u32 = u32::MAX;
@@ -900,6 +900,41 @@ pub unsafe extern "C" fn fir_float_const_f64(fb: *mut FirBuilder, value: f64) ->
 #[unsafe(no_mangle)]
 pub extern "C" fn fir_api_version() -> u32 {
     FIR_API_VERSION
+}
+
+// Timing (version 1.7).
+
+/// With `FIR_TIME` set in the environment (to anything but empty or `0`): the report of where
+/// the time went since the last report, phase by phase (`fir::timing`: the library's phases,
+/// and the caller's own from `fir_time_record`), and recording starts afresh. Null otherwise.
+/// Free it with `fir_string_free`.
+#[unsafe(no_mangle)]
+pub extern "C" fn fir_time_report() -> *mut c_char {
+    match catch_unwind(fir::timing::report) {
+        Ok(Some(r)) => c_string(r).into_raw(),
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// With `FIR_TIME` set: add `seconds` to the caller's phase `name` in the report (a frontend's
+/// own steps: parsing, its lowering, the assembler it runs). Otherwise, or if `name` is null or
+/// not UTF-8, or `seconds` is negative or not finite, nothing happens.
+///
+/// # Safety
+///
+/// `name` is null or a NUL-terminated string, read only during the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_time_record(name: *const c_char, seconds: f64) {
+    if !fir::timing::enabled() || !seconds.is_finite() || seconds < 0.0 {
+        return;
+    }
+    // SAFETY: `name` is as this function's `# Safety` section requires.
+    if let Ok(name) = unsafe { cstr(name) } {
+        let name = name.to_owned();
+        let _ = catch_unwind(|| {
+            fir::timing::record(name.into(), std::time::Duration::from_secs_f64(seconds));
+        });
+    }
 }
 
 /// A new, empty module. Free it with `fir_module_free`.

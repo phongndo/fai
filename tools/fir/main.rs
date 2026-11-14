@@ -43,6 +43,10 @@
 //! `fir compile -O` and the C API.
 //! Experimental passes (unproved; `--list-passes` labels each pass) run only with
 //! `--experimental`, and are never in `-O`. A FILE of `-` is standard input.
+//!
+//! `FIR_TIME=1` in the environment prints on stderr where the time went, phase by phase
+//! (`fir::timing`): reading and parsing, each verification, the lowering, each pass, the
+//! backend's selection, allocation, validation, and emission, and the external assembler.
 
 use std::process::ExitCode;
 
@@ -400,7 +404,9 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
         eprintln!("fir compile: -g isn't supported for x86-64 yet");
         return Err(ExitCode::from(2));
     }
-    let m = fir::parse_module(&read(file)?).map_err(fail)?;
+    let text = fir::timing::time("read", || read(file))?;
+    let m = fir::parse_module(&text).map_err(fail)?;
+    drop(text);
     fir::verify_module(&m).map_err(fail)?;
     let m = if let Some(spec) = passes {
         if check_dce.is_some() {
@@ -432,7 +438,7 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
         }
     };
     let write = |text: String| -> Result<(), ExitCode> {
-        match out {
+        fir::timing::time("write", || match out {
             Some(p) => std::fs::write(p, text).map_err(|e| {
                 eprintln!("{p}: {e}");
                 ExitCode::FAILURE
@@ -441,7 +447,7 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
                 print!("{text}");
                 Ok(())
             }
-        }
+        })
     };
     if emit == Some("mfir") {
         return write(m.render(true));
@@ -486,7 +492,7 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     let dir = std::env::temp_dir().join(format!("fir-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| fail(e.to_string()))?;
     let s = dir.join("out.s");
-    std::fs::write(&s, asm).map_err(|e| fail(e.to_string()))?;
+    fir::timing::time("write", || std::fs::write(&s, asm)).map_err(|e| fail(e.to_string()))?;
     let cc = std::env::var("FIR_CC").unwrap_or_else(|_| {
         let (arch, cross) = if x86 {
             (cfg!(target_arch = "x86_64"), "x86_64-unknown-linux-gnu-cc")
@@ -511,7 +517,8 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     if out.ends_with(".o") {
         cmd.arg("-c");
     }
-    let status = cmd.status();
+    // The target's C compiler assembles (and links): another process, outside FIR.
+    let status = fir::timing::time("cc (assemble, link)", || cmd.status());
     let _ = std::fs::remove_dir_all(&dir);
     match status {
         Ok(st) if st.success() => Ok(()),
@@ -523,7 +530,12 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    match run(&args) {
+    let r = run(&args);
+    // `FIR_TIME=1`: where the time went (`fir::timing`).
+    if let Some(report) = fir::timing::report() {
+        eprint!("{report}");
+    }
+    match r {
         Ok(()) => ExitCode::SUCCESS,
         Err(code) => code,
     }

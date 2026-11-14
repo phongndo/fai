@@ -49,7 +49,7 @@ pub fn prepare_observed(
 fn to_mfir(m: &Module) -> Result<Module, String> {
     match m.layer {
         Layer::Hfir => fai_lowering::lower_checked(m),
-        Layer::Mfir => Ok(m.clone()),
+        Layer::Mfir => Ok(fai_ir::timing::time("copy", || m.clone())),
         Layer::Lfir(_) => Err("the module is already LFIR".to_owned()),
     }
 }
@@ -91,9 +91,21 @@ fn run_observed(
 ) -> Result<(), String> {
     let mut pipeline = pipeline.clone();
     pipeline.verify_each |= cfg!(debug_assertions);
-    pipeline
-        .run_observed(m, &mut Remarks::new(false), observer)
-        .map_err(|e| e.to_string())?;
+    fai_ir::timing::time("opt", || {
+        let r = pipeline.run_observed(m, &mut Remarks::new(false), observer);
+        if let Ok(report) = &r
+            && fai_ir::timing::enabled()
+        {
+            // Each pass's own time, from the pipeline's statistics; `opt` keeps the rest (the
+            // observer, such as `--check-dce`'s checker).
+            for p in &report.passes {
+                fai_ir::timing::record(format!("opt.{}", p.name).into(), p.time);
+                fai_ir::timing::exclude(p.time);
+            }
+        }
+        r
+    })
+    .map_err(|e| e.to_string())?;
     fai_ir::verify_module(m)
         .map(drop)
         .map_err(|e| format!("the optimized module doesn't verify: {e}"))

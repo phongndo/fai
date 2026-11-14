@@ -34,6 +34,10 @@ pub fn render_loc(loc: Option<Loc>) -> String {
 
 /// Verify a module. On success, returns the holes it contains, in order.
 pub fn verify_module(m: &Module) -> Result<Vec<Hole>, String> {
+    crate::timing::time("verify", || verify(m))
+}
+
+fn verify(m: &Module) -> Result<Vec<Hole>, String> {
     let sp = &m.space;
     if !(sp.ptr_bits > 0
         && sp.ptr_bits.is_multiple_of(8)

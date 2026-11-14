@@ -22,6 +22,10 @@
 // target's cross compiler (`aarch64-unknown-linux-gnu-cc`, which the dev shell has on x86-64
 // Linux, or `x86_64-unknown-linux-gnu-cc`). Its system include directories are given to Clang
 // (after Clang's own headers), so <stdint.h> and friends are the target's.
+//
+// FIR_TIME=1 prints where the time went on stderr: fcc's own steps (the include probe, Clang,
+// the lowering to HFIR, the external assembler and linker) and the library's phases, in one
+// report (fir_time_record, fir_time_report).
 
 #include "Lower.h"
 #include "fir.h"
@@ -37,6 +41,7 @@
 #include "llvm/Support/Program.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -49,6 +54,23 @@
 #endif
 
 namespace {
+
+// One of fcc's steps, timed into the library's report when FIR_TIME is set (fir_time_record
+// does nothing otherwise).
+class Step {
+public:
+  explicit Step(const char *name) : name(name), start(std::chrono::steady_clock::now()) {}
+  ~Step() { fir_time_record(name, seconds()); }
+  Step(const Step &) = delete;
+  Step &operator=(const Step &) = delete;
+  double seconds() const {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  }
+
+private:
+  const char *name;
+  std::chrono::steady_clock::time_point start;
+};
 
 const char *kUsage =
     "usage: fcc FILE.c [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-o OUT]\n"
@@ -171,6 +193,7 @@ std::string linker(const Options &o) {
 // The target C compiler's system include directories, without its compiler-specific ones
 // (Clang brings its own).
 std::vector<std::string> systemIncludes(const Options &o) {
+  Step step("fcc: include probe (cc -E -v)");
   std::vector<std::string> dirs;
   std::string cmd = linker(o) + " -E -Wp,-v -x c /dev/null 2>&1";
   FILE *p = popen(cmd.c_str(), "r");
@@ -193,13 +216,18 @@ std::vector<std::string> systemIncludes(const Options &o) {
   return dirs;
 }
 
+// How long the lowering to HFIR took, to tell it apart from Clang's own time.
+double lowerSeconds = 0;
+
 class Consumer : public clang::ASTConsumer {
 public:
   Consumer(FirModule *m, bool &lowered) : m(m), lowered(lowered) {}
   void HandleTranslationUnit(clang::ASTContext &ctx) override {
     if (ctx.getDiagnostics().hasErrorOccurred())
       return;
+    Step step("fcc: lower AST to HFIR");
     lowered = fai::lowerTranslationUnit(ctx, m);
+    lowerSeconds = step.seconds();
   }
 
 private:
@@ -291,7 +319,12 @@ int compileAndLink(FirModule *m, const Options &o) {
   }
   std::string s = tmp.str().str();
   int rc = 1;
-  if (writeOut(s, as.str())) {
+  bool written;
+  {
+    Step step("fcc: write assembly");
+    written = writeOut(s, as.str());
+  }
+  if (written) {
     std::string cc = linker(o);
     auto prog = llvm::sys::findProgramByName(cc);
     if (!prog) {
@@ -307,6 +340,7 @@ int compileAndLink(FirModule *m, const Options &o) {
         args.push_back("-c");
       std::vector<llvm::StringRef> refs(args.begin(), args.end());
       std::string err;
+      Step step("fcc: assemble, link (cc)");
       int status = llvm::sys::ExecuteAndWait(*prog, refs, std::nullopt, {}, 0, 0, &err);
       if (status == 0) {
         rc = 0;
@@ -319,9 +353,7 @@ int compileAndLink(FirModule *m, const Options &o) {
   return rc;
 }
 
-} // namespace
-
-int main(int argc, char **argv) {
+int run(int argc, char **argv) {
   Options o;
   if (!parseArgs(argc, argv, o)) {
     llvm::errs() << kUsage;
@@ -349,10 +381,16 @@ int main(int argc, char **argv) {
 
   ModuleHandle mh(fir_module_new());
   bool lowered = false;
-  clang::tooling::FixedCompilationDatabase db(".", args);
-  clang::tooling::ClangTool tool(db, {o.file});
-  Factory factory(mh.m, lowered);
-  int rc = tool.run(&factory);
+  int rc;
+  {
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    clang::tooling::FixedCompilationDatabase db(".", args);
+    clang::tooling::ClangTool tool(db, {o.file});
+    Factory factory(mh.m, lowered);
+    rc = tool.run(&factory);
+    double all = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    fir_time_record("fcc: clang (preprocess, parse, sema)", all - lowerSeconds);
+  }
   if (rc != 0 || !lowered)
     return 1;
 
@@ -392,4 +430,15 @@ int main(int argc, char **argv) {
     return writeOut(o.out, text.str()) ? 0 : 1;
   }
   return compileAndLink(mh.m, o);
+}
+
+} // namespace
+
+int main(int argc, char **argv) {
+  int rc = run(argc, argv);
+  if (char *report = fir_time_report()) {
+    llvm::errs() << report;
+    fir_string_free(report);
+  }
+  return rc;
 }

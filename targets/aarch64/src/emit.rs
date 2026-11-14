@@ -638,18 +638,24 @@ impl Emitter<'_> {
 
     fn globals(&mut self) {
         let darwin = self.o.os == Os::Darwin;
-        let text = fai_codegen::data::globals(
-            self.m,
-            &|name, own| self.sym(name, own),
-            &self.o.extern_prefix,
-            darwin,
-        );
+        let text = fai_ir::timing::time("aarch64.emit.globals", || {
+            fai_codegen::data::globals(
+                self.m,
+                &|name, own| self.sym(name, own),
+                &self.o.extern_prefix,
+                darwin,
+            )
+        });
         self.out.push_str(&text);
     }
 }
 
 /// Assembly for a module whose functions are allocated.
 pub fn emit(m: &Module, mm: &MModule, o: &Options) -> String {
+    fai_ir::timing::time("aarch64.emit", || emit_untimed(m, mm, o))
+}
+
+fn emit_untimed(m: &Module, mm: &MModule, o: &Options) -> String {
     let mut e = Emitter {
         m,
         o,
