@@ -54,6 +54,31 @@ impl Data<'_> {
                 let b = gs.float(i);
                 out.extend((0..f.width() / 8).map(|k| (b >> (8 * k)) as u8));
             }
+            (Init::Int(i), Ty::Ptr) => {
+                let w = sp.ptr_bits;
+                let n = gs.int(i);
+                let m = num_bigint::BigInt::from(1) << w;
+                let v = ((n % &m) + &m) % &m;
+                let (_, mut bytes) = v.to_bytes_le();
+                bytes.resize((w / 8) as usize, 0);
+                out.extend_from_slice(&bytes);
+            }
+            (Init::SymOff(r, i), Ty::Ptr) => {
+                let name = gs.text(r);
+                let s = if gs_has(gs, name) || self.m.funcs.iter().any(|f| f.name == name) {
+                    (self.sym)(name, true)
+                } else {
+                    (self.sym)(&format!("{}{name}", self.extern_prefix), false)
+                };
+                let n = gs.int(i);
+                let sign = if n.sign() == num_bigint::Sign::Minus {
+                    ""
+                } else {
+                    "+"
+                };
+                relocs.push((start, format!("{s}{sign}{n}")));
+                out.resize(start + 8, 0);
+            }
             (Init::Sym(r), Ty::Ptr) => {
                 let name = gs.text(r);
                 let s = if gs_has(gs, name) || self.m.funcs.iter().any(|f| f.name == name) {

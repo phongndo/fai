@@ -1649,6 +1649,7 @@ mutual
   /-- The names an initializer takes the address of, in order. -/
   def Init.syms : Init → List String
     | .sym s => [s]
+    | .symOff s _ => [s]
     | .list items => Init.symsList items
     | _ => []
   def Init.symsList : List Init → List String
@@ -1672,6 +1673,10 @@ mutual
       else List.replicate ((Ty.float f).size sp) .poison
     | .ptr, .null => encodePtr sp (some .null)
     | .ptr, .sym s => encodePtr sp addrs[s]?
+    | .ptr, .symOff s n => encodePtr sp (addrs[s]?.map fun
+      | .rel a t o => .rel a t (o + n)
+      | p => p)
+    | .ptr, .int n => encodePtr sp (some (.abs (n % (2 ^ sp.ptrBits : Nat)).toNat []))
     | _, .bytes bs => bs.map fun b => .bits (BitVec.ofNat 8 b)
     | t@(.struct p fs), .list items =>
       overlay (List.replicate (t.size sp) (.bits 0))

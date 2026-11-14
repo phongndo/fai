@@ -1218,6 +1218,21 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 self.globals.sym_init(name)
             }
+            Tok::Ident("offset") => {
+                self.bump()?;
+                self.expect_sym(Sym::LParen)?;
+                let Tok::Global(name) = self.peek() else {
+                    let found = self.peek().describe();
+                    return self.fail(format!(
+                        "expected a global's or function's name but found {found}"
+                    ));
+                };
+                self.bump()?;
+                self.expect_sym(Sym::Comma)?;
+                let off = int_value(self.int_text()?);
+                self.expect_sym(Sym::RParen)?;
+                self.globals.sym_off_init(name, off)
+            }
             Tok::Sym(Sym::LBrace) => {
                 self.bump()?;
                 let mut items = Vec::new();

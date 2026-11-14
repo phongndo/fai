@@ -2040,7 +2040,7 @@ pub unsafe extern "C" fn fir_init_null(m: *mut FirModule) -> FirInit {
     unsafe { module_id(m, FIR_INVALID, |m| Ok(m.add_init(Init::Null))) }
 }
 
-/// An integer, for an `iN` or `bN`.
+/// An integer, for an `iN` or `bN`; for a `ptr`, an address with no provenance.
 ///
 /// # Safety
 ///
@@ -2156,6 +2156,50 @@ pub unsafe extern "C" fn fir_init_global(m: *mut FirModule, g: FirGlobal) -> Fir
     unsafe {
         module_id(m, FIR_INVALID, |m| {
             let init = m.mb.init_global(GlobalRef::from_raw(g))?;
+            Ok(m.add_init(init))
+        })
+    }
+}
+
+/// `offset(@g, off)`: a global's address plus `off` bytes (C's `&table[2]`).
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+///
+/// Each is used only during the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_init_global_offset(
+    m: *mut FirModule,
+    g: FirGlobal,
+    off: i64,
+) -> FirInit {
+    // SAFETY: `m` are as this function's `# Safety` section requires; they are used only during the
+    // call.
+    unsafe {
+        module_id(m, FIR_INVALID, |m| {
+            let init = m.mb.init_global_offset(GlobalRef::from_raw(g), off)?;
+            Ok(m.add_init(init))
+        })
+    }
+}
+
+/// `offset(@f, off)`: a function's address plus `off` bytes.
+///
+/// # Safety
+///
+/// * `m` is null or a module that hasn't been freed, used by no other thread during
+///   the call.
+///
+/// Each is used only during the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fir_init_func_offset(m: *mut FirModule, f: FirFunc, off: i64) -> FirInit {
+    // SAFETY: `m` are as this function's `# Safety` section requires; they are used only during the
+    // call.
+    unsafe {
+        module_id(m, FIR_INVALID, |m| {
+            let init = m.mb.init_func_offset(FuncRef::from_raw(f), off)?;
             Ok(m.add_init(init))
         })
     }

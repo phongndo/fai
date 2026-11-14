@@ -641,6 +641,14 @@ partial def init (t : Option Ty) : P Init := do
       pure (.bytes bs)
     | t => fail s!"expected a string of hex digits but found {t.describe}"
   | .global s => discard next; pure (.sym s)
+  | .ident "offset" =>
+    discard next
+    expectSym "("
+    let .global s ← next | fail "expected a global's or function's name"
+    expectSym ","
+    let .int n ← next | fail "expected a byte offset"
+    expectSym ")"
+    pure (.symOff s n)
   | .sym "{" =>
     discard next
     let tys : List Ty := match t with

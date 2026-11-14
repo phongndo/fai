@@ -29,7 +29,7 @@ If the DCE checker run by fir-ref check-dce accepts a target function for a Deci
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 2; `Fir` definitions depended on: 2225
+- hypotheses: 2; `Fir` definitions depended on: 2226
 - bound for the Rust side by `Fir.Audit.Bindings.dce_checker`
 
 ## `Fir.Dce.checkFuncL_eq` (binding: proved checker (counting))
@@ -57,7 +57,7 @@ If checkModule (what fir-ref check-dce accepts on) accepts, then for every name 
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 1; `Fir` definitions depended on: 2238
+- hypotheses: 1; `Fir` definitions depended on: 2239
 - bound for the Rust side by `Fir.Audit.Bindings.dce_module_checker`
 
 ## `Fir.Dce.refines` (pass correctness)
@@ -74,7 +74,7 @@ DCE: deleting pure ops whose results no later op of their region reads, anywhere
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 5; `Fir` definitions depended on: 1491
+- hypotheses: 5; `Fir` definitions depended on: 1492
 
 ## `Fir.Dce.freeze_changes_core` (counterexample)
 
@@ -102,7 +102,7 @@ DSE: deleting a store that the next op overwrites through the same pointer varia
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 5; `Fir` definitions depended on: 1471
+- hypotheses: 5; `Fir` definitions depended on: 1472
 
 ## `Fir.Fwd.refines` (pass correctness)
 
@@ -119,7 +119,7 @@ Store-to-load forwarding: a load right after a store of its type through the sam
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 6; `Fir` definitions depended on: 1474
+- hypotheses: 6; `Fir` definitions depended on: 1475
 
 ## `Fir.CopyProp.refines` (pass correctness)
 
@@ -135,7 +135,7 @@ Copy propagation through straight-line code (up to the first op with regions or 
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 5; `Fir` definitions depended on: 1479
+- hypotheses: 5; `Fir` definitions depended on: 1480
 
 ## `Fir.Lower.Proof.Expand.refines` (lowering correctness)
 
@@ -149,7 +149,7 @@ The HFIR lowering's expansion pass (checked arithmetic, ptr.field, ptr.index) re
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 4; `Fir` definitions depended on: 1707
+- hypotheses: 4; `Fir` definitions depended on: 1708
 
 ## `Fir.Lower.Proof.lowerFunc_refines` (lowering correctness (partial))
 
@@ -165,7 +165,7 @@ The whole lowering of a function refines it where scalarizing and lowering cf.tr
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 6; `Fir` definitions depended on: 1825
+- hypotheses: 6; `Fir` definitions depended on: 1826
 
 ## `Fir.Simulation.refines` (proof framework)
 
@@ -184,7 +184,7 @@ A lockstep simulation from every related start gives refinement of Decided funct
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 4; `Fir` definitions depended on: 1470
+- hypotheses: 4; `Fir` definitions depended on: 1471
 
 ## `Fir.SimulationS.refines` (proof framework)
 
@@ -205,7 +205,7 @@ A simulation with stuttering gives refinement of Decided functions.
 ```
 
 - axioms: propext, Classical.choice, Quot.sound
-- hypotheses: 4; `Fir` definitions depended on: 1470
+- hypotheses: 4; `Fir` definitions depended on: 1471
 
 ## `Fir.Rules.mul_two` (rewrite rule)
 

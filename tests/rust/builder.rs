@@ -63,6 +63,15 @@ fn copy_init(g: &Globals, init: Init, mb: &mut ModuleBuilder) -> Result<Init, Bu
                 _ => panic!("@{name} names nothing"),
             }
         }
+        Init::SymOff(r, i) => {
+            let name = g.text(r);
+            let off = i64::try_from(g.int(i)).expect("an offset that fits in 64 bits");
+            match (mb.func_ref(name), mb.global_ref(name)) {
+                (Some(f), _) => mb.init_func_offset(f, off)?,
+                (_, Some(gl)) => mb.init_global_offset(gl, off)?,
+                _ => panic!("@{name} names nothing"),
+            }
+        }
         Init::Bytes(r) => mb.init_bytes(g.bytes(r)),
         Init::List(r) => {
             let items = g

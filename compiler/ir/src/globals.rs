@@ -44,6 +44,8 @@ pub enum Init {
     Null,
     /// `@name`: the address of a global or a function (a run of the names' text).
     Sym(Run),
+    /// `offset(@name, N)`: that address plus `N` bytes (`N` an index into the integers).
+    SymOff(Run, u32),
     /// `bytes "0aff"`: the whole object's bytes.
     Bytes(Run),
     /// `{a, b}`: one initializer per struct field or array element.
@@ -125,6 +127,13 @@ impl Globals {
         Init::Sym(self.add_text(name))
     }
 
+    /// `offset(@name, off)`: a global's or function's address plus `off` bytes.
+    pub fn sym_off_init(&mut self, name: &str, off: BigInt) -> Init {
+        let r = self.add_text(name);
+        self.ints.push(off);
+        Init::SymOff(r, (self.ints.len() - 1) as u32)
+    }
+
     pub fn bytes_init(&mut self, bs: impl IntoIterator<Item = u8>) -> Init {
         Init::Bytes(push_run(&mut self.bytes, bs))
     }
@@ -178,7 +187,7 @@ impl Globals {
     /// The names an initializer takes the address of, in order (Lean's `Init.syms`).
     pub fn syms<'a>(&'a self, init: Init, out: &mut Vec<&'a str>) {
         match init {
-            Init::Sym(r) => out.push(self.text(r)),
+            Init::Sym(r) | Init::SymOff(r, _) => out.push(self.text(r)),
             Init::List(r) => {
                 for &i in self.items(r) {
                     self.syms(i, out);

@@ -230,6 +230,13 @@ fn check_init(
                 return Err(format!("global @{g}: {n} does not fit in {}", show(t)));
             }
         }
+        (Init::Int(i), Ty::Ptr) => {
+            let n = gs.int(i);
+            let w = sp.ptr_bits;
+            if !(fits_signed(w, Int::Big(n)) || fits_unsigned(w, Int::Big(n))) {
+                return Err(format!("global @{g}: {n} does not fit in {}", show(t)));
+            }
+        }
         (Init::Int(_), _) => {
             return Err(format!(
                 "global @{g}: an integer can't initialize {}",
@@ -263,6 +270,23 @@ fn check_init(
         (Init::Sym(r), _) => {
             return Err(format!(
                 "global @{g}: @{} can't initialize {}",
+                gs.text(r),
+                show(t)
+            ));
+        }
+        (Init::SymOff(r, i), Ty::Ptr) => {
+            let s = gs.text(r);
+            if !named(s) {
+                return Err(format!("global @{g}: no global or function @{s}"));
+            }
+            let n = gs.int(i);
+            if !fits_signed(sp.ptr_bits, Int::Big(n)) {
+                return Err(format!("global @{g}: the offset {n} does not fit in a ptr"));
+            }
+        }
+        (Init::SymOff(r, _), _) => {
+            return Err(format!(
+                "global @{g}: offset(@{}, …) can't initialize {}",
                 gs.text(r),
                 show(t)
             ));

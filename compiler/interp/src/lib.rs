@@ -929,6 +929,31 @@ impl<'m> Machine<'m> {
                 let p = self.sym_ptr(gs.text(r));
                 self.push_ptr_bytes(p, out);
             }
+            (Init::SymOff(r, i), Ty::Ptr) => {
+                // The verifier keeps offsets within a pointer's width.
+                let n = i128::try_from(gs.int(i)).expect("an offset the verifier accepted");
+                let p = self
+                    .sym_ptr(gs.text(r))
+                    .map(|p| match self.ptrs[p as usize] {
+                        Ptr::Rel { alloc, tag, off } => self.new_ptr(Ptr::Rel {
+                            alloc,
+                            tag,
+                            off: off + n,
+                        }),
+                        Ptr::Abs { .. } => p,
+                    });
+                self.push_ptr_bytes(p, out);
+            }
+            (Init::Int(i), Ty::Ptr) => {
+                let m = num_bigint::BigInt::from(1) << sp.ptr_bits;
+                let a = ((gs.int(i) % &m) + &m) % &m;
+                let addr = u64::try_from(&a).unwrap_or(0);
+                let p = self.new_ptr(Ptr::Abs {
+                    addr,
+                    cands: Span { start: 0, len: 0 },
+                });
+                self.push_ptr_bytes(Some(p), out);
+            }
             (Init::Bytes(r), _) => out.extend(gs.bytes(r).iter().map(|&b| Byte::Bits(b))),
             (Init::List(r), Ty::Agg(id)) => {
                 let items = gs.items(r);

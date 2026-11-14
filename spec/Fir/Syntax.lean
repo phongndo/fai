@@ -1640,7 +1640,8 @@ def Func.ty (f : Func) : Ty := .func (f.params.map (·.ty)) f.rets f.variadic
 inductive Init where
   /-- `zero`: every byte zero. -/
   | zero
-  /-- An integer, for an `iN` or `bN`. -/
+  /-- An integer, for an `iN` or `bN`; for a `ptr`, an address with no provenance (C's integer
+  converted to a pointer, which `ptr.from_exposed` of no exposed allocation also gives). -/
   | int (n : Int)
   /-- A float of format `t`, for a global of that type: its bits, written as `float.const`
   writes them (`1.5`, `-0.0`, `inf`, `nan(0x1)`; decision: Float text). -/
@@ -1649,6 +1650,9 @@ inductive Init where
   | null
   /-- `@g`: the address of a global or a function. -/
   | sym (name : String)
+  /-- `offset(@g, N)`: that address plus `N` bytes (C's `&table[2]`, `"abc" + 1`); out of the
+  object's bounds is allowed, as for `ptr.offset.wrap`. -/
+  | symOff (name : String) (off : Int)
   /-- `bytes "0aff"`: the whole object's bytes. -/
   | bytes (bs : List Nat)
   /-- `{a, b}`: one initializer per struct field or array element; padding is zero. -/

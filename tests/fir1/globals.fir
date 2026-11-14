@@ -16,12 +16,19 @@
 // Globals are never freed.
 // run: @free_global() -> ub bad-free @2:3 (@counter is a global)
 // run: @bytes() -> returned b32 (0x1, 0x2, 0x3, 0x4)
+// A pointer initializer may point inside its target (C's `&table[1]`), with its provenance.
+// run: @offset_init() -> returned i8 105, i16 513
+// An integer initializing a pointer is an address with no provenance (C's `(void *)4096`).
+// run: @int_ptr_init() -> returned i64 4096, i1 0
 global @counter: i32 = 0
 global @s: struct<C>{i32, i16, i8} = {-5, 513, zero}
 global const @msg: array<3 x i8> = bytes "686900"
 global @p: ptr = @msg
 global @padded: struct<C>{i8, i64} align 16 = {zero, 0}
 global @raw: b32 = 67305985
+global @mid: ptr = offset(@msg, 1)
+global @half: ptr = offset(@s, 4)
+global @np: ptr = 4096
 
 func @read() -> (i32, i16, i8, ptr, i64) {
   %s: ptr = mem.global @s
@@ -111,4 +118,23 @@ func @bytes() -> b32 {
   %g: ptr = mem.global @raw
   %v: b32 = mem.load %g, align 4
   func.ret %v
+}
+
+func @offset_init() -> (i8, i16) {
+  %pp: ptr = mem.global @mid
+  %q: ptr = mem.load %pp, align 8
+  %c: i8 = mem.load %q, align 1
+  %hp: ptr = mem.global @half
+  %h: ptr = mem.load %hp, align 8
+  %v: i16 = mem.load %h, align 2
+  func.ret %c, %v
+}
+
+func @int_ptr_init() -> (i64, i1) {
+  %pp: ptr = mem.global @np
+  %q: ptr = mem.load %pp, align 8
+  %a: i64 = ptr.addr %q
+  %n: ptr = ptr.null
+  %e: i1 = ptr.cmp.eq %q, %n
+  func.ret %a, %e
 }

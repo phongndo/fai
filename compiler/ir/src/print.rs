@@ -551,6 +551,7 @@ fn push_init(out: &mut String, g: &Globals, init: Init) {
             out.push('@');
             out.push_str(g.text(r));
         }
+        Init::SymOff(r, i) => write!(out, "offset(@{}, {})", g.text(r), g.int(i)).unwrap(),
         Init::Bytes(r) => {
             out.push_str("bytes \"");
             for b in g.bytes(r) {

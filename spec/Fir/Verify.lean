@@ -553,6 +553,9 @@ partial def checkInit (g : String) (syms : Std.HashSet String) (sp : SpaceCfg) :
     match t with
     | .int w | .byte w =>
       unless fitsSigned w n || fitsUnsigned w n do throw s!"global @{g}: {n} does not fit in {t}"
+    | .ptr =>
+      unless fitsSigned sp.ptrBits n || fitsUnsigned sp.ptrBits n do
+        throw s!"global @{g}: {n} does not fit in {t}"
     | _ => throw s!"global @{g}: an integer can't initialize {t}"
   | t, .float f b => do
     unless t == Ty.float f do throw s!"global @{g}: an {f.name} can't initialize {t}"
@@ -561,6 +564,10 @@ partial def checkInit (g : String) (syms : Std.HashSet String) (sp : SpaceCfg) :
   | t, .null => throw s!"global @{g}: null can't initialize {t}"
   | .ptr, .sym s => unless syms.contains s do throw s!"global @{g}: no global or function @{s}"
   | t, .sym s => throw s!"global @{g}: @{s} can't initialize {t}"
+  | .ptr, .symOff s n => do
+    unless syms.contains s do throw s!"global @{g}: no global or function @{s}"
+    unless fitsSigned sp.ptrBits n do throw s!"global @{g}: the offset {n} does not fit in a ptr"
+  | t, .symOff s _ => throw s!"global @{g}: offset(@{s}, …) can't initialize {t}"
   | t, .bytes bs =>
     unless bs.length == t.size sp do
       throw s!"global @{g}: {bs.length} bytes can't initialize {t}, which takes {t.size sp}"

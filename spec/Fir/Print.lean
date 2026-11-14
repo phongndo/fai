@@ -242,6 +242,7 @@ partial def Init.render : Init → String
   | .float t b => Float.render (F := t.fmt) (BitVec.ofNat _ b)
   | .null => "null"
   | .sym s => s!"@{s}"
+  | .symOff s n => s!"offset(@{s}, {n})"
   | .bytes bs => s!"bytes \"{String.join (bs.map hexByte)}\""
   | .list items => "{" ++ commas (items.map Init.render) ++ "}"
 

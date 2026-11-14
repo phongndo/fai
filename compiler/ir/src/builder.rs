@@ -727,6 +727,20 @@ impl ModuleBuilder {
         Ok(self.module.globals.sym_init(&name))
     }
 
+    /// `offset(@g, off)`: a global's address plus `off` bytes.
+    pub fn init_global_offset(&mut self, g: GlobalRef, off: i64) -> Result<Init, BuildError> {
+        self.global_check(g)?;
+        let name = self.module.globals.name(g.index()).to_owned();
+        Ok(self.module.globals.sym_off_init(&name, BigInt::from(off)))
+    }
+
+    /// `offset(@f, off)`: a function's address plus `off` bytes.
+    pub fn init_func_offset(&mut self, f: FuncRef, off: i64) -> Result<Init, BuildError> {
+        self.sym(f)?;
+        let name = self.syms[f.index()].name.clone();
+        Ok(self.module.globals.sym_off_init(&name, BigInt::from(off)))
+    }
+
     /// `bytes "…"`: the whole object's bytes.
     pub fn init_bytes(&mut self, bytes: &[u8]) -> Init {
         self.module.globals.bytes_init(bytes.iter().copied())

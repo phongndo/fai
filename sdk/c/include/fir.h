@@ -1096,7 +1096,7 @@ FirInit fir_init_zero(struct FirModule *m);
 // Each is used only during the call.
 FirInit fir_init_null(struct FirModule *m);
 
-// An integer, for an `iN` or `bN`.
+// An integer, for an `iN` or `bN`; for a `ptr`, an address with no provenance.
 //
 // # Safety
 //
@@ -1156,6 +1156,26 @@ FirInit fir_init_func(struct FirModule *m, FirFunc f);
 //
 // Each is used only during the call.
 FirInit fir_init_global(struct FirModule *m, FirGlobal g);
+
+// `offset(@g, off)`: a global's address plus `off` bytes (C's `&table[2]`).
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+//
+// Each is used only during the call.
+FirInit fir_init_global_offset(struct FirModule *m, FirGlobal g, int64_t off);
+
+// `offset(@f, off)`: a function's address plus `off` bytes.
+//
+// # Safety
+//
+// * `m` is null or a module that hasn't been freed, used by no other thread during
+//   the call.
+//
+// Each is used only during the call.
+FirInit fir_init_func_offset(struct FirModule *m, FirFunc f, int64_t off);
 
 // `{…}`: one initializer per struct field or array element.
 //

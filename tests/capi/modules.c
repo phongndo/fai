@@ -260,6 +260,10 @@ static void globals_and_calls(void) {
                                          false, 8, ID(fir_init_zero(m))));
   FirInit links[2] = {ID(fir_init_global(m, self)), ID(fir_init_null(m))};
   OK(fir_global_set_init(m, self, ID(fir_init_list(m, links, 2))));
+  /* Addresses inside an object (C's `&msg[1]`), and of a function plus an offset. */
+  FirGlobal tail =
+      ID(fir_global_declare(m, "tail", ptr, true, 8, ID(fir_init_global_offset(m, msg, 1))));
+  ID(fir_global_declare(m, "incp", ptr, true, 8, ID(fir_init_func_offset(m, inc, 0))));
 
   for (int k = 0; k < 2; k++) {
     FirBuilder *b = fir_func_begin(m, k == 0 ? inc : dec);
@@ -296,6 +300,12 @@ static void globals_and_calls(void) {
   ID(fir_func_ret(b, &dr, 1));
   OK(fir_func_end(b));
 
+  b = fir_func_begin(m, ID(fir_func_declare(m, "second", NULL, 0, &i8, 1)));
+  FirValue tlp = ID(fir_mem_load(b, ptr, ID(fir_mem_global(b, tail)), 8));
+  FirValue ch = ID(fir_mem_load(b, i8, tlp, 1));
+  ID(fir_func_ret(b, &ch, 1));
+  OK(fir_func_end(b));
+
   b = fir_func_begin(m, ID(fir_func_declare(m, "direct", &i32, 1, &i32, 1)));
   x = ID(fir_builder_param(b, 0));
   FirValue ip = ID(fir_func_addr(b, inc));
@@ -310,9 +320,12 @@ static void globals_and_calls(void) {
   expect_run(m, "dispatch", one_ten, 2, "returned i32 9");
   const char *ten[] = {"10"};
   expect_run(m, "direct", ten, 1, "returned i32 11");
+  expect_run(m, "second", NULL, 0, "returned i8 105");
   char *text = fir_module_print(m, false);
   CHECK(text != NULL && strstr(text, "global const @table: array<2 x ptr> = {@inc, @dec}\n"));
   CHECK(text != NULL && strstr(text, "global @self: struct<C>{ptr, ptr} align 8 = {@self, null}\n"));
+  CHECK(text != NULL && strstr(text, "global const @tail: ptr align 8 = offset(@msg, 1)\n"));
+  CHECK(text != NULL && strstr(text, "global const @incp: ptr align 8 = offset(@inc, 0)\n"));
   CHECK(text != NULL &&
         strstr(text, "extern func @puts(ptr) -> i32 effects[read(args)] assume\n"));
   fir_string_free(text);
