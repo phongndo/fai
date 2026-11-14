@@ -170,7 +170,11 @@ fn include_probe_cache_is_used_only_while_it_holds() {
     assert!(with.hfir.contains("7"), "{}", with.hfir);
     assert_eq!(entries(&cache).len(), 2);
     let again = run(&fcc, &marked, &cache, &[("CPATH", inc_s)]);
-    assert!(again.ok && again.cached && !again.probed, "{}", again.stderr);
+    assert!(
+        again.ok && again.cached && !again.probed,
+        "{}",
+        again.stderr
+    );
     // Without it, the header isn't found (the cache doesn't leak one environment's answer
     // into another's).
     let without = run(&fcc, &marked, &cache, &[]);
