@@ -1,12 +1,12 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
 """compilebench: how long fai takes to compile programs, against Clang and GCC.
 
 This measures the compiler's latency on one input (what an edit/compile/test loop waits for), not
 the speed of the code it generates (benchmarks/c/cbench.py, benchmarks/inference/) and not the
 time to rebuild the compiler itself (see docs/performance/compile-speed.md). Run from the
-repository root in the dev shell, on Linux:
+repository root in the dev shell, on Linux (`nix develop -c uv run ...`):
 
-  python3 -B benchmarks/compile/compilebench.py run [--rounds N] [--only W,...] [--out DIR]
+  uv run benchmarks/compile/compilebench.py run [--rounds N] [--only W,...] [--out DIR]
       [--fcc NAME=PATH ...] [--fir NAME=PATH ...] [--configs C,...]
 
 Each workload is compiled by each configuration once per round, after one warmup round, with the
@@ -42,6 +42,7 @@ Output: DIR/results.json (every run) and DIR/report.md (medians, quartiles, rang
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import platform
@@ -50,14 +51,14 @@ import shutil
 import statistics
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
 BENCH = Path(__file__).resolve().parent
 ROOT = BENCH.parents[1]
+# The reference compilers' setup and the C generator, shared with benchmarks/c/cbench.py.
 sys.path.insert(0, str(ROOT / "benchmarks/c"))
-import cbench  # noqa: E402  (the reference compilers' setup, and the C generator)
+cbench = importlib.import_module("cbench")
 
 SMALL = sorted(p.stem for p in (ROOT / "benchmarks/c/programs").glob("*.c"))
 # name: (functions, statements per function)
@@ -69,8 +70,14 @@ GENERATED = {
     "gen-1x1600": (1, 1600),
     "gen-1x6400": (1, 6400),
 }
-SIZE = {"gen-100x10": "medium", "gen-400x10": "medium", "gen-1x400": "medium",
-        "gen-1600x10": "large", "gen-1x1600": "large", "gen-1x6400": "large"}
+SIZE = {
+    "gen-100x10": "medium",
+    "gen-400x10": "medium",
+    "gen-1x400": "medium",
+    "gen-1600x10": "large",
+    "gen-1x1600": "large",
+    "gen-1x6400": "large",
+}
 
 
 def die(msg):
@@ -81,15 +88,22 @@ def die(msg):
 def measure(cmd, env, out_file=None):
     """Run cmd; wall seconds, CPU seconds (with waited-for children), peak RSS in KiB, stderr."""
     t0 = time.perf_counter()
-    p = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                         env=env)
+    p = subprocess.Popen(
+        [str(c) for c in cmd], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env
+    )
     _, status, ru = os.wait4(p.pid, 0)
     wall = time.perf_counter() - t0
+    assert p.stderr is not None
     err = p.stderr.read().decode(errors="replace")
     p.stderr.close()
     code = os.waitstatus_to_exitcode(status)
-    return {"wall": wall, "cpu": ru.ru_utime + ru.ru_stime, "rss_kib": ru.ru_maxrss,
-            "exit": code, "stderr": err if code != 0 or "fir: time:" in err else ""}
+    return {
+        "wall": wall,
+        "cpu": ru.ru_utime + ru.ru_stime,
+        "rss_kib": ru.ru_maxrss,
+        "exit": code,
+        "stderr": err if code != 0 or "fir: time:" in err else "",
+    }
 
 
 def sha256(path):
@@ -105,7 +119,7 @@ def phases(stderr):
     for line in stderr.splitlines():
         if not line.startswith("fir: time:") or "self ms" in line or "summed over" in line:
             continue
-        parts = line[len("fir: time:"):].split()
+        parts = line[len("fir: time:") :].split()
         if not parts:
             continue
         ms = float(parts[0])
@@ -156,16 +170,23 @@ class Bench:
             else:
                 src = ROOT / "benchmarks/c/programs" / f"{n}.c"
             self.work_src[n] = src
-            out[n] = {"src": src, "size": SIZE.get(n, "small"),
-                      "lines": len(src.read_text().splitlines())}
+            out[n] = {
+                "src": src,
+                "size": SIZE.get(n, "small"),
+                "lines": len(src.read_text().splitlines()),
+            }
         return out
 
     def mfir(self, name):
         """The workload's MFIR (unoptimized), from the default fcc: `fir compile`'s input."""
         path = self.work / f"{name}.mfir"
         if not path.exists():
-            r = subprocess.run([self.tools.fcc, self.work_src[name], "--emit", "mfir", "-o", path], env=self.env,
-                               capture_output=True, text=True)
+            r = subprocess.run(
+                [self.tools.fcc, self.work_src[name], "--emit", "mfir", "-o", path],
+                env=self.env,
+                capture_output=True,
+                text=True,
+            )
             if r.returncode != 0:
                 return None
         return path
@@ -181,24 +202,57 @@ class Bench:
         for n, fcc in self.fccs.items():
             env = dict(self.env, FCC_CACHE_DIR=str(self.cache_dirs[n]))
             label = "fcc" if n == "fcc" else f"fcc@{n}"
-            for suffix, flags in (("O0.o", []), ("O.o", ["-O"]), ("O.s", ["-O", "--emit", "asm"]),
-                                  ("x86-O.o", ["--target", "x86_64", "-O"])):
+            for suffix, flags in (
+                ("O0.o", []),
+                ("O.o", ["-O"]),
+                ("O.s", ["-O", "--emit", "asm"]),
+                ("x86-O.o", ["--target", "x86_64", "-O"]),
+            ):
                 out = o / f"{label}-{suffix}"
-                c[f"{label}-{suffix}"] = ("fai", lambda s, w, fcc=fcc, flags=flags, out=out:
-                                      [fcc, s, *flags, "-o", out], env, out, f"fcc {suffix}")
+                c[f"{label}-{suffix}"] = (
+                    "fai",
+                    lambda s, w, fcc=fcc, flags=flags, out=out: [fcc, s, *flags, "-o", out],
+                    env,
+                    out,
+                    f"fcc {suffix}",
+                )
         for n, fir in self.firs.items():
             label = "fir" if n == "fir" else f"fir@{n}"
             out = o / f"{label}.fir-O.s"
-            c[f"{label}-O.s"] = ("fai", lambda s, w, fir=fir, out=out:
-                             (lambda m: m and [fir, "compile", m, "-O", "--emit", "asm", "-o", out])(self.mfir(w)),
-                             self.env, out, "fir O.s")
+            c[f"{label}-O.s"] = (
+                "fai",
+                lambda s, w, fir=fir, out=out: (
+                    lambda m: m and [fir, "compile", m, "-O", "--emit", "asm", "-o", out]
+                )(self.mfir(w)),
+                self.env,
+                out,
+                "fir O.s",
+            )
         for cfg in ("clang-O0", "clang-O2", "gcc-O0", "gcc-O2"):
-            c[f"{cfg}.o"] = ("ref", lambda s, w, cfg=cfg: self.tools.compile_cmd(cfg, s, o / f"{cfg}.o"),
-                             self.env, None, None)
+            c[f"{cfg}.o"] = (
+                "ref",
+                lambda s, w, cfg=cfg: self.tools.compile_cmd(cfg, s, o / f"{cfg}.o"),
+                self.env,
+                None,
+                None,
+            )
         for cc in ("clang", "gcc"):
             if self.x86_cc[cc]:
-                c[f"{cc}-x86-O0.o"] = ("ref", lambda s, w, cc=cc: [self.x86_cc[cc], "-c", "-O0", "-ffp-contract=off",
-                                                                  s, "-o", o / f"{cc}-x86.o"], self.env, None, None)
+                c[f"{cc}-x86-O0.o"] = (
+                    "ref",
+                    lambda s, w, cc=cc: [
+                        self.x86_cc[cc],
+                        "-c",
+                        "-O0",
+                        "-ffp-contract=off",
+                        s,
+                        "-o",
+                        o / f"{cc}-x86.o",
+                    ],
+                    self.env,
+                    None,
+                    None,
+                )
         if self.args.configs:
             want = self.args.configs.split(",")
             c = {k: v for k, v in c.items() if k in want}
@@ -209,18 +263,32 @@ class Bench:
     def run(self):
         identity = self.tools.identity()
         identity["loadavg_start"] = Path("/proc/loadavg").read_text().split()[:3]
-        identity["builds"] = {**{("fcc" if k == "fcc" else f"fcc@{k}"): str(v) for k, v in self.fccs.items()},
-                              **{("fir" if k == "fir" else f"fir@{k}"): str(v) for k, v in self.firs.items()}}
+        identity["builds"] = {
+            **{("fcc" if k == "fcc" else f"fcc@{k}"): str(v) for k, v in self.fccs.items()},
+            **{("fir" if k == "fir" else f"fir@{k}"): str(v) for k, v in self.firs.items()},
+        }
         identity["build_sha256"] = {k: sha256(v) for k, v in identity["builds"].items()}
         work = self.workloads()
         configs = self.configs()
         rounds = self.args.rounds
-        results = {"identity": identity, "rounds": rounds, "workloads": {}, "configs": list(configs)}
+        results = {
+            "identity": identity,
+            "rounds": rounds,
+            "workloads": {},
+            "configs": list(configs),
+        }
         rng = random.Random(1)
         for name, w in work.items():
             src = w["src"]
-            entry = {"size": w["size"], "lines": w["lines"], "runs": {}, "first": {}, "phases": {},
-                     "outputs": {}, "skipped": {}}
+            entry = {
+                "size": w["size"],
+                "lines": w["lines"],
+                "runs": {},
+                "first": {},
+                "phases": {},
+                "outputs": {},
+                "skipped": {},
+            }
             # A configuration that fails on its first try (fcc refusing what it doesn't support,
             # such as floats on x86-64) is skipped for this workload, with its message.
             live = {}
@@ -250,9 +318,10 @@ class Bench:
                     if r["exit"] != 0:
                         die(f"{cname} on {name} failed in round {r_i}: {r['stderr'][-2000:]}")
                     entry["runs"].setdefault(cname, []).append(
-                        {k: r[k] for k in ("wall", "cpu", "rss_kib")})
+                        {k: r[k] for k in ("wall", "cpu", "rss_kib")}
+                    )
             # Phase reports, in their own runs.
-            for cname, (kind, cmd, env, outp) in live.items():
+            for cname, (kind, cmd, env, _outp) in live.items():
                 if kind != "fai":
                     continue
                 reps = []
@@ -262,8 +331,9 @@ class Bench:
                 keys = sorted({k for rep in reps for k in rep})
                 if not keys:
                     continue  # a build without FIR_TIME
-                entry["phases"][cname] = {k: statistics.median(rep.get(k, 0.0) for rep in reps)
-                                          for k in keys}
+                entry["phases"][cname] = {
+                    k: statistics.median(rep.get(k, 0.0) for rep in reps) for k in keys
+                }
             results["workloads"][name] = entry
             print(f"compilebench: {name} done", file=sys.stderr, flush=True)
         identity["loadavg_end"] = Path("/proc/loadavg").read_text().split()[:3]
@@ -282,15 +352,22 @@ def q(xs, f):
 
 def report(res):
     idn = res["identity"]
-    lines = ["# compilebench report", "",
-             f"- revision `{idn['revision'][:12]}`{' (dirty)' if idn['dirty'] else ''}; builds: "
-             + ", ".join(f"`{k}` = {v} (sha256 {idn['build_sha256'][k][:12] if idn['build_sha256'][k] else '?'})" for k, v in idn["builds"].items()),
-             f"- host: {idn['host']}, {idn['host_cpu']}, {idn['host_cpus']} CPUs; load average "
-             f"{' '.join(idn['loadavg_start'])} at the start, {' '.join(idn['loadavg_end'])} at the end",
-             f"- {idn['gcc']}; {idn['clang']}; {idn['rustc']}",
-             f"- {res['rounds']} rounds after a warmup, configurations shuffled per round. Wall and CPU "
-             "in ms: median [quartiles] (min-max); peak RSS in MiB (max). \"first run\" is the warmup: "
-             "fcc's include-probe cache is empty then (a cold cache), and warm after.", ""]
+    lines = [
+        "# compilebench report",
+        "",
+        f"- revision `{idn['revision'][:12]}`{' (dirty)' if idn['dirty'] else ''}; builds: "
+        + ", ".join(
+            f"`{k}` = {v} (sha256 {idn['build_sha256'][k][:12] if idn['build_sha256'][k] else '?'})"
+            for k, v in idn["builds"].items()
+        ),
+        f"- host: {idn['host']}, {idn['host_cpu']}, {idn['host_cpus']} CPUs; load average "
+        f"{' '.join(idn['loadavg_start'])} at the start, {' '.join(idn['loadavg_end'])} at the end",
+        f"- {idn['gcc']}; {idn['clang']}; {idn['rustc']}",
+        f"- {res['rounds']} rounds after a warmup, configurations shuffled per round. Wall and CPU "
+        'in ms: median [quartiles] (min-max); peak RSS in MiB (max). "first run" is the warmup: '
+        "fcc's include-probe cache is empty then (a cold cache), and warm after.",
+        "",
+    ]
     # The overview: median wall time of every configuration on every workload.
     cfgs = []
     for w in res["workloads"].values():
@@ -298,11 +375,21 @@ def report(res):
             if c not in cfgs:
                 cfgs.append(c)
     for metric, title, scale, agg in (
-            ("wall", "Median wall time, ms", 1e3, statistics.median),
-            ("cpu", "Median CPU time (user + system, with waited-for children), ms", 1e3, statistics.median),
-            ("rss_kib", "Peak resident memory, MiB", 1 / 1024, max)):
-        lines += [f"## Overview: {title}", "", "| workload | " + " | ".join(cfgs) + " |",
-                  "|---|" + "---:|" * len(cfgs)]
+        ("wall", "Median wall time, ms", 1e3, statistics.median),
+        (
+            "cpu",
+            "Median CPU time (user + system, with waited-for children), ms",
+            1e3,
+            statistics.median,
+        ),
+        ("rss_kib", "Peak resident memory, MiB", 1 / 1024, max),
+    ):
+        lines += [
+            f"## Overview: {title}",
+            "",
+            "| workload | " + " | ".join(cfgs) + " |",
+            "|---|" + "---:|" * len(cfgs),
+        ]
         for name, w in res["workloads"].items():
             cells = []
             for c in cfgs:
@@ -311,15 +398,23 @@ def report(res):
             lines.append(f"| {name} | " + " | ".join(cells) + " |")
         lines.append("")
     for name, w in res["workloads"].items():
-        lines += [f"## {name} ({w['size']}, {w['lines']} lines)", "",
-                  "| config | wall ms | CPU ms | RSS MiB | first run ms |", "|---|---:|---:|---:|---:|"]
-        for cname, runs in sorted(w["runs"].items(), key=lambda kv: (not kv[0].startswith("f"), kv[0])):
+        lines += [
+            f"## {name} ({w['size']}, {w['lines']} lines)",
+            "",
+            "| config | wall ms | CPU ms | RSS MiB | first run ms |",
+            "|---|---:|---:|---:|---:|",
+        ]
+        for cname, runs in sorted(
+            w["runs"].items(), key=lambda kv: (not kv[0].startswith("f"), kv[0])
+        ):
             wall = [r["wall"] * 1e3 for r in runs]
             cpu = [r["cpu"] * 1e3 for r in runs]
             rss = max(r["rss_kib"] for r in runs) / 1024
-            lines.append(f"| {cname} | {statistics.median(wall):.1f} [{q(wall, 0.25):.1f}, {q(wall, 0.75):.1f}] "
-                         f"({min(wall):.1f}-{max(wall):.1f}) | {statistics.median(cpu):.1f} | {rss:.0f} | "
-                         f"{w['first'][cname]['wall'] * 1e3:.1f} |")
+            lines.append(
+                f"| {cname} | {statistics.median(wall):.1f} [{q(wall, 0.25):.1f}, {q(wall, 0.75):.1f}] "
+                f"({min(wall):.1f}-{max(wall):.1f}) | {statistics.median(cpu):.1f} | {rss:.0f} | "
+                f"{w['first'][cname]['wall'] * 1e3:.1f} |"
+            )
         for cname, why in w["skipped"].items():
             lines.append(f"| {cname} | skipped: {why} | | | |")
         groups = {}
@@ -329,8 +424,13 @@ def report(res):
         differ = [g for g, hs in groups.items() if len(set(hs.values())) > 1]
         lines.append("")
         if same or differ:
-            lines.append("Outputs across builds: " + "; ".join(
-                [f"{g}: identical" for g in same] + [f"{g}: **differ** ({', '.join(groups[g])})" for g in differ]))
+            lines.append(
+                "Outputs across builds: "
+                + "; ".join(
+                    [f"{g}: identical" for g in same]
+                    + [f"{g}: **differ** ({', '.join(groups[g])})" for g in differ]
+                )
+            )
             lines.append("")
         if w["phases"]:
             names = list(w["phases"])
@@ -339,25 +439,42 @@ def report(res):
                 for k in w["phases"][c]:
                     if k not in keys:
                         keys.append(k)
-            lines += ["Phases (FIR_TIME=1, self ms, median of up to 5 runs; `*` summed over threads):", "",
-                      "| phase | " + " | ".join(names) + " |", "|---|" + "---:|" * len(names)]
+            lines += [
+                "Phases (FIR_TIME=1, self ms, median of up to 5 runs; `*` summed over threads):",
+                "",
+                "| phase | " + " | ".join(names) + " |",
+                "|---|" + "---:|" * len(names),
+            ]
             for k in keys:
-                lines.append(f"| {k} | " + " | ".join(
-                    f"{w['phases'][c].get(k, 0):.2f}" if k in w["phases"][c] else "" for c in names) + " |")
+                lines.append(
+                    f"| {k} | "
+                    + " | ".join(
+                        f"{w['phases'][c].get(k, 0):.2f}" if k in w["phases"][c] else ""
+                        for c in names
+                    )
+                    + " |"
+                )
             # What no phase covers: process start (loading Clang's and LLVM's libraries),
             # Clang's setup, exit.
             outside = []
             for c in names:
                 t = w["phases"][c].get("total (main thread)")
-                outside.append(f"{statistics.median(r['wall'] for r in w['runs'][c]) * 1e3 - t:.2f}"
-                               if t is not None and c in w["runs"] else "")
-            lines.append("| outside the phases (median wall - total) | " + " | ".join(outside) + " |")
+                outside.append(
+                    f"{statistics.median(r['wall'] for r in w['runs'][c]) * 1e3 - t:.2f}"
+                    if t is not None and c in w["runs"]
+                    else ""
+                )
+            lines.append(
+                "| outside the phases (median wall - total) | " + " | ".join(outside) + " |"
+            )
             lines.append("")
     return "\n".join(lines) + "\n"
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
     r.add_argument("--rounds", type=int, default=10)
@@ -366,7 +483,9 @@ def main():
     r.add_argument("--out", default=str(ROOT / "target/compilebench"))
     r.add_argument("--fcc", action="append", help="NAME=PATH: another fcc build to measure")
     r.add_argument("--fir", action="append", help="NAME=PATH: another fir build to measure")
-    r.add_argument("--fcc-cold", action="store_true", help="empty the include-probe cache before every fcc run")
+    r.add_argument(
+        "--fcc-cold", action="store_true", help="empty the include-probe cache before every fcc run"
+    )
     rp = sub.add_parser("report")
     rp.add_argument("--out", default=str(ROOT / "target/compilebench"))
     a = ap.parse_args()

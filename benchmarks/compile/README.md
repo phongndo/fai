@@ -8,9 +8,9 @@ not about rebuilding the compiler. The results and what they mean are in
 ```sh
 nix develop
 cargo build --release --bin fir && cmake --build build/fcc      # the builds to measure
-python3 -B benchmarks/compile/compilebench.py run                 # target/compilebench/report.md
-python3 -B benchmarks/compile/compilebench.py run --only small --rounds 20
-python3 -B benchmarks/compile/compilebench.py run \
+uv run benchmarks/compile/compilebench.py run                 # target/compilebench/report.md
+uv run benchmarks/compile/compilebench.py run --only small --rounds 20
+uv run benchmarks/compile/compilebench.py run \
     --fcc base=/path/to/old/build/fcc/fcc --fir base=/path/to/old/target/release/fir
 ```
 

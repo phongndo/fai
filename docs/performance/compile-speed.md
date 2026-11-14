@@ -235,10 +235,11 @@ runs check the same).
   skipped directory that appears, a damaged entry, and that cached, uncached, and `FCC_CACHE=0`
   runs give the same HFIR. With the environment left out of the key, or without the
   skipped-directory check, it fails. The fcc corpus passes with the cache on.
-- **Suites.** `cargo xtask verify fast` passes on the timing and validator commits (11 checks,
-  0 failed; release tests, AddressSanitizer, and complete evidence are skipped by design in fast
-  mode); the AArch64, register-check, ABI, debug-line, C API, and fcc suites pass in release on
-  the final commit. `verify full` was not run.
+- **Suites.** `fai verify fast` passes on the final commit, rebased onto `main` at `283c93a`
+  (release tests, AddressSanitizer, and complete evidence are skipped by design in fast mode).
+  It also passed on the timing and validator commits before the rebase. The AArch64,
+  register-check, ABI, debug-line, C API, and fcc suites pass in release. `verify full` was not
+  run.
 
 ## What verification costs
 
@@ -299,7 +300,7 @@ and fcc from scratch took 11-12 s.
 
 | | Linux host |
 |---|---:|
-| `cargo xtask verify fast` | 4 min 6 s, of which the debug-build test suites 239 s |
+| `fai verify fast` | 4 min 6 s, of which the debug-build test suites 239 s |
 | `cargo test --release -p fir-capi --test fcc` (the C corpus, 3 builds per program, both targets, and the ABI torture) | 14.6 s wall, 150 s CPU |
 | ... with the include-probe cache (3 alternating runs each) | 14.2 s wall (14.10-14.19), 140 s CPU (139.8-140.9), against 14.5-14.7 s and 150.7-152.4 s without |
 
@@ -444,7 +445,7 @@ FIR_TIME=1 target/release/fir compile FILE.mfir -O --emit asm -o /dev/null
 # The tables (target/compilebench/report.md); against a baseline built from 045d398:
 git archive 045d398 | tar -x -C /tmp/base && (cd /tmp/base && cargo build --release --bin fir &&
   cmake -S frontends/c -B build/fcc -G Ninja && cmake --build build/fcc)
-python3 -B benchmarks/compile/compilebench.py run \
+uv run benchmarks/compile/compilebench.py run \
     --fcc base=/tmp/base/build/fcc/fcc --fir base=/tmp/base/target/release/fir
 
 # The validator's model test, with more programs, and the include-probe cache's test
