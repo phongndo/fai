@@ -322,7 +322,11 @@ def cmd_build(args, tools):
         total = 0.0
         for src in corpus:
             cmd = tools.compile_cmd(config, src, out / "corpus.o")
-            cmd = cmd[:2] + inc + cmd[2:] if config.startswith("fcc") else cmd[:1] + inc + cmd[1:]
+            # The standard sdk/c/tests/fcc.rs compiles each corpus file with.
+            flags = [*inc, "-std=c23" if src.name.startswith("c23_") else "-std=gnu17"]
+            cmd = (
+                cmd[:2] + flags + cmd[2:] if config.startswith("fcc") else cmd[:1] + flags + cmd[1:]
+            )
             total += timed(cmd, env, max(1, args.reps // 2))["min"]
         totals[config] = total
     result["corpus_compile"] = {"programs": len(corpus), "seconds": totals}
@@ -450,9 +454,13 @@ def classify(mnemonic, ops):
 def analyze(tools, exe, mapfile, obj, trace):
     """Executed instructions in all and in the program's own code (by class, mnemonic, and
     function), and the program code's memory accesses to the stack and elsewhere."""
+    return analyze_ranges(tools, exe, program_ranges(mapfile, obj), trace)
+
+
+def analyze_ranges(tools, exe, ranges, trace):
+    """analyze, with the program's own code given as address ranges (several objects' code)."""
     import bisect
 
-    ranges = program_ranges(mapfile, obj)
     insns, syms = disassemble(tools, exe, ranges)
 
     def inside(a):

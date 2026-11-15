@@ -120,6 +120,8 @@ match the reference too, and runs the MFIR and allocated LFIR it makes in the in
 stores) against GCC's, and `benchmarks/c/cbench.py` is the end-to-end baseline against GCC and Clang (behavior, executed
 instructions, code size, compile time, and wall time measured on native AArch64 only; results
 in [`docs/performance/c-baseline.md`](../../docs/performance/c-baseline.md)).
+[`benchmarks/projects/`](../../benchmarks/projects/) compares fcc with GCC, Clang, and arocc on
+Lua, SQLite, and the C23 programs ([`docs/performance/compilers.md`](../../docs/performance/compilers.md)).
 
 It runs by default on Linux; on macOS (whose binaries aren't Linux ones) only with `FCC_TESTS=1`
 (given a Linux AArch64 toolchain in `FIR_CC` and a way to run its binaries), and `FCC_TESTS=0`

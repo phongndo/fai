@@ -5,8 +5,9 @@
 //   benchrun RUNS WARMUP EXPECTED_STDOUT_FILE PROGRAM [ARG...]
 //
 // runs PROGRAM WARMUP times untimed and RUNS times timed (each with stdout to a pipe it checks
-// against EXPECTED_STDOUT_FILE), and prints one JSON object: wall, user, and system seconds of
-// every timed run, and the peak resident set size in KiB.
+// against EXPECTED_STDOUT_FILE, or discarded unchecked if it is `-`: for a program that prints
+// its own timings), and prints one JSON object: wall, user, and system seconds of every timed
+// run, and the peak resident set size in KiB.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
@@ -20,6 +21,7 @@
 
 static char expected[1 << 16];
 static size_t expected_len;
+static int unchecked;
 
 static double now(void) {
   struct timespec t;
@@ -98,7 +100,7 @@ static int run_once(char **argv, double *wall, double *user, double *sys, long *
   *rss = ru.ru_maxrss;
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
     return -2;
-  if (differs || pos != expected_len)
+  if (!unchecked && (differs || pos != expected_len))
     return -3;
   return 0;
 }
@@ -115,7 +117,8 @@ int main(int argc, char **argv) {
     return 3;
   }
   int runs = atoi(argv[1]), warmup = atoi(argv[2]);
-  FILE *f = fopen(argv[3], "rb");
+  unchecked = strcmp(argv[3], "-") == 0;
+  FILE *f = unchecked ? fopen("/dev/null", "rb") : fopen(argv[3], "rb");
   if (!f) {
     fprintf(stderr, "benchrun: can't read %s\n", argv[3]);
     return 2;
