@@ -72,10 +72,14 @@ pub fn time<R>(name: &'static str, f: impl FnOnce() -> R) -> R {
     if !enabled() {
         return f();
     }
+    time_with_clock(name, f, Instant::now)
+}
+
+fn time_with_clock<R>(name: &'static str, f: impl FnOnce() -> R, now: impl Fn() -> Instant) -> R {
     let outer = INNER.with(|c| c.replace(Duration::ZERO));
-    let start = Instant::now();
+    let start = now();
     let r = f();
-    let total = start.elapsed();
+    let total = now().duration_since(start);
     let inner = INNER.with(|c| c.replace(outer + total));
     record(Cow::Borrowed(name), total.saturating_sub(inner));
     r
@@ -173,15 +177,21 @@ mod tests {
     fn self_time_excludes_inner_phases() {
         set_enabled(true);
         take();
-        time("outer", || {
-            std::thread::sleep(Duration::from_millis(20));
-            time("inner", || std::thread::sleep(Duration::from_millis(30)));
-        });
+        let clock = Cell::new(Instant::now());
+        let now = || clock.get();
+        let advance = |milliseconds| clock.set(now() + Duration::from_millis(milliseconds));
+        time_with_clock(
+            "outer",
+            || {
+                advance(20);
+                time_with_clock("inner", || advance(30), now);
+            },
+            now,
+        );
         let p = take();
         let get = |n: &str| p.iter().find(|x| x.name == n).unwrap().self_time;
-        assert!(get("inner") >= Duration::from_millis(30));
-        assert!(get("outer") >= Duration::from_millis(20));
-        assert!(get("outer") < Duration::from_millis(30), "{p:?}");
+        assert_eq!(get("inner"), Duration::from_millis(30));
+        assert_eq!(get("outer"), Duration::from_millis(20));
         let r = format_report(&p);
         assert!(
             r.contains("outer") && r.contains("inner") && r.contains("total"),
