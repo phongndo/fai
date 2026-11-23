@@ -23,6 +23,11 @@
 //! On a host with declared gaps (`HOST_GAPS`; the gate needs a host that isn't AArch64) the
 //! best verdict is `accept: HOST PASS ON host`, exit 0, which is not a pass.
 //!
+//! A verdict is of one tree. `accept` reads the tree's identity when it starts and when it
+//! ends, and says `NOT JUDGED` if they differ; so does a tree without an identity, and a second
+//! `accept` in the same checkout (they would share the copy the old tests run in). What it
+//! can't see is a tree that changed and changed back while it ran.
+//!
 //! # `fai status`
 //!
 //! `verify`, `gate`, `mutate`, and `accept` each leave a report under `target/`, and a report
@@ -145,10 +150,14 @@ pub(crate) fn gate_part(report: Option<&Value>, now: &str) -> Part {
     let configs = r["configs"].as_object().map_or(String::new(), |c| {
         c.keys().cloned().collect::<Vec<_>>().join(", ")
     });
+    // A pass of another configuration alone says nothing of `fcc -O`, the compiler as it is.
+    let whole = r["configs"]
+        .as_object()
+        .is_some_and(|c| c.contains_key("fcc-O"));
     Part {
         name: "gate",
         verdict: format!("{verdict} ({configs})"),
-        passed: verdict == "PASS",
+        passed: verdict == "PASS" && whole,
         fresh: fresh(now, r["tree"].as_str(), r["tree_at_end"].as_str()),
     }
 }
@@ -173,14 +182,21 @@ pub(crate) fn mutate_part(report: Option<&Value>, now: &str) -> Part {
             if subset { " (a subset was run)" } else { "" }
         ),
         passed: !subset && all > 0 && caught == all,
-        fresh: fresh(now, r["tree"].as_str(), r["tree"].as_str()),
+        fresh: fresh(now, r["tree"].as_str(), r["tree_at_end"].as_str()),
     }
 }
 
 /// The three verdicts on disk, against the tree `now`.
 pub(crate) fn parts(root: &Path, now: &str) -> [Part; 4] {
     [
-        verify_part(read(&root.join("target/verify/report.json")).as_ref(), now),
+        // The last full verification: a later `quick` or `fast` run writes `report.json` and
+        // leaves this one.
+        verify_part(
+            read(&root.join("target/verify/full.json"))
+                .or_else(|| read(&root.join("target/verify/report.json")))
+                .as_ref(),
+            now,
+        ),
         gate_part(
             read(&root.join("target/projbench/gate-report.json")).as_ref(),
             now,
@@ -224,7 +240,14 @@ pub(crate) fn status(root: &Path) -> i32 {
         .map(|(p, _)| p.name)
         .collect();
     if wrong.is_empty() {
-        println!("status: CURRENT: verify and the gate passed on this tree");
+        if gate_needed {
+            println!("status: CURRENT: verify full and the gate passed on this tree");
+        } else {
+            println!(
+                "status: CURRENT: verify passed on this tree for what {} can run; the gate can't run here",
+                crate::host()
+            );
+        }
         0
     } else {
         let stale = [verify, gate]
@@ -392,10 +415,13 @@ pub(crate) fn decide(
         };
     }
     // What the change moved of what judges it.
+    // A baseline, a checker, and a new file among the tests that existing tests can pick up
+    // (`judging::new_test_is_exempt` left it in the list). An edited test counts below, when
+    // the change fails it as it was.
     let mut moved: BTreeSet<String> = judging
         .changes()
         .iter()
-        .filter(|c| c.kind != Kind::Test)
+        .filter(|c| c.kind != Kind::Test || c.status == 'A')
         .map(|c| c.path.clone())
         .collect();
     match old {
@@ -453,6 +479,41 @@ pub(crate) fn decide(
     }
 }
 
+/// Copy `src` over `dst` when their bytes or their modes differ.
+fn copy_if_different(src: &Path, dst: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let new = std::fs::read(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    let mode = |p: &Path| std::fs::metadata(p).map(|m| m.permissions().mode()).ok();
+    let same = std::fs::symlink_metadata(dst).is_ok_and(|m| m.is_file())
+        && std::fs::read(dst).ok().as_deref() == Some(&new[..])
+        && mode(src) == mode(dst);
+    if same {
+        return Ok(());
+    }
+    // Whatever is there in the way: a directory or a link where the file goes, or a file where
+    // one of its directories goes (the tree changed shape since the last copy).
+    match std::fs::symlink_metadata(dst) {
+        Ok(m) if m.is_dir() => {
+            std::fs::remove_dir_all(dst).map_err(|e| format!("{}: {e}", dst.display()))?
+        }
+        Ok(m) if !m.is_file() => {
+            std::fs::remove_file(dst).map_err(|e| format!("{}: {e}", dst.display()))?
+        }
+        _ => {}
+    }
+    let parent = dst.parent().unwrap();
+    if std::fs::create_dir_all(parent).is_err() {
+        for a in parent.ancestors() {
+            if std::fs::symlink_metadata(a).is_ok_and(|m| !m.is_dir()) {
+                let _ = std::fs::remove_file(a);
+            }
+        }
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    std::fs::copy(src, dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+    Ok(())
+}
+
 /// Make `tree` the files of `root` as they are now (tracked, and untracked ones that aren't
 /// ignored), writing only what differs so that a later build there rebuilds only what changed.
 fn sync_copy(root: &Path, tree: &Path) -> Result<(), String> {
@@ -474,18 +535,14 @@ fn sync_copy(root: &Path, tree: &Path) -> Result<(), String> {
     for f in list.stdout.split(|&b| b == 0).filter(|f| !f.is_empty()) {
         let rel = PathBuf::from(String::from_utf8_lossy(f).into_owned());
         let src = root.join(&rel);
-        if !src.is_file() {
+        if !std::fs::symlink_metadata(&src).is_ok_and(|m| m.is_file()) {
             continue;
         }
-        let dst = tree.join(&rel);
-        let new = std::fs::read(&src).map_err(|e| format!("{}: {e}", src.display()))?;
-        if std::fs::read(&dst).ok().as_deref() != Some(&new[..]) {
-            std::fs::create_dir_all(dst.parent().unwrap()).map_err(|e| e.to_string())?;
-            std::fs::copy(&src, &dst).map_err(|e| format!("{}: {e}", dst.display()))?;
-        }
+        copy_if_different(&src, &tree.join(&rel))?;
         keep.insert(rel);
     }
-    // Files the copy has and the tree no longer does.
+    // Files and links the copy has and the tree no longer does.
+    let lake = tree.join("spec/.lake");
     let mut dirs = vec![tree.to_path_buf()];
     while let Some(d) = dirs.pop() {
         for e in std::fs::read_dir(&d).map_err(|e| e.to_string())?.flatten() {
@@ -497,7 +554,7 @@ fn sync_copy(root: &Path, tree: &Path) -> Result<(), String> {
                     continue;
                 }
                 dirs.push(p);
-            } else if kind.is_file()
+            } else if p != lake
                 && let Ok(rel) = p.strip_prefix(tree)
                 && !keep.contains(rel)
             {
@@ -506,31 +563,27 @@ fn sync_copy(root: &Path, tree: &Path) -> Result<(), String> {
         }
     }
     // The Lean reference the tests compare with is the working tree's build.
-    let lake = tree.join("spec/.lake");
     if std::fs::symlink_metadata(&lake).is_err() {
         std::os::unix::fs::symlink(root.join("spec/.lake"), &lake).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
-/// Run the tests of `files` as they were at `base` against the tree as it is now: in a copy
-/// (`target/accept/tree`, built in its own `target/`), put the base's version of each file
-/// back, and run the suites that read them, each file's by itself where it has one.
-///
-/// Nothing runs the old tests against the old code: a test that failed at the base fails here
-/// too, and is laid on the change.
-pub(crate) fn run_old_tests(root: &Path, base: &str, files: &[String]) -> OldTests {
-    if files.is_empty() {
-        return OldTests::NotNeeded;
+/// Put `files` in the copy as they are in `root` now (gone, if they are gone there).
+fn put_current(root: &Path, tree: &Path, files: &[String]) -> Result<(), String> {
+    for f in files {
+        let (src, dst) = (root.join(f), tree.join(f));
+        if std::fs::symlink_metadata(&src).is_ok_and(|m| m.is_file()) {
+            copy_if_different(&src, &dst)?;
+        } else {
+            let _ = std::fs::remove_file(&dst);
+        }
     }
-    let dir = root.join("target/accept");
-    let tree = dir.join("tree");
-    if let Err(e) = std::fs::create_dir_all(&tree).map_err(|e| e.to_string()) {
-        return OldTests::NotRun(e);
-    }
-    if let Err(e) = sync_copy(root, &tree) {
-        return OldTests::NotRun(e);
-    }
+    Ok(())
+}
+
+/// Put `files` in the copy as they were at `base`.
+fn put_base(root: &Path, tree: &Path, base: &str, files: &[String]) -> Result<(), String> {
     for f in files {
         let old = Command::new("git")
             .args(["show", &format!("{base}:{f}")])
@@ -540,15 +593,52 @@ pub(crate) fn run_old_tests(root: &Path, base: &str, files: &[String]) -> OldTes
             Ok(o) if o.status.success() => {
                 let dst = tree.join(f);
                 let _ = std::fs::create_dir_all(dst.parent().unwrap());
-                if let Err(e) = std::fs::write(&dst, &o.stdout) {
-                    return OldTests::NotRun(format!("{}: {e}", dst.display()));
-                }
+                std::fs::write(&dst, &o.stdout).map_err(|e| format!("{}: {e}", dst.display()))?;
             }
-            _ => return OldTests::NotRun(format!("git can't show {base}:{f}")),
+            _ => return Err(format!("git can't show {base}:{f}")),
         }
+    }
+    Ok(())
+}
+
+/// Run the tests of `files` as they were at `base` against the tree as it is now, in a copy
+/// (`target/accept/tree`, built in its own `target/`). Each run puts back the base's version of
+/// only the files it speaks for, with every other file as it is now, so that a failure is laid
+/// on those files and on no other. The tests run as `fai verify` runs them: with their own
+/// counts of random programs, and with nothing between cargo and the test binaries.
+///
+/// Nothing runs the old tests against the old code: a test that failed at the base fails here
+/// too, and is laid on the change.
+pub(crate) fn run_old_tests(root: &Path, base: &str, files: &[String]) -> OldTests {
+    if files.is_empty() {
+        return OldTests::NotNeeded;
+    }
+    let tree = root.join("target/accept/tree");
+    if let Err(e) = std::fs::create_dir_all(&tree).map_err(|e| e.to_string()) {
+        return OldTests::NotRun(e);
+    }
+    if let Err(e) = sync_copy(root, &tree) {
+        return OldTests::NotRun(e);
+    }
+    // The reference tool the tests compare with is the working tree's build, through a link:
+    // if another run cleans it meanwhile, the tests fail for that and not for the change.
+    let reference = root.join("spec/.lake/build/bin/fir-ref");
+    let gone = || {
+        OldTests::NotRun(format!(
+            "{} is missing: another run may have cleaned the Lean build",
+            reference.display()
+        ))
+    };
+    if !reference.exists() {
+        return gone();
     }
     let (mut failed, mut passed, mut failures) = (Vec::new(), Vec::new(), Vec::new());
     for (speaks_for, args) in old_test_commands(files) {
+        if let Err(e) =
+            put_current(root, &tree, files).and_then(|()| put_base(root, &tree, base, &speaks_for))
+        {
+            return OldTests::NotRun(e);
+        }
         eprintln!("accept: the tests as they were: cargo {}", args.join(" "));
         let mut c = Command::new("cargo");
         // Cargo's own target directory in the copy, as in a checkout: an old test may assume
@@ -563,8 +653,12 @@ pub(crate) fn run_old_tests(root: &Path, base: &str, files: &[String]) -> OldTes
         for v in ["FIR_REQUIRE_FULL", "FIR_EVIDENCE", "FIR_EVIDENCE_RUN"] {
             c.env_remove(v);
         }
-        // The old tests look for what the change broke, not for coverage.
-        c.env("FIR_FUZZ", "40");
+        // A runner between cargo and the test binaries could skip them: none is inherited.
+        for (k, _) in std::env::vars() {
+            if k.starts_with("CARGO_TARGET_") && k.ends_with("_RUNNER") {
+                c.env_remove(k);
+            }
+        }
         let out = match c.output() {
             Ok(o) => o,
             Err(e) => return OldTests::NotRun(format!("can't run cargo: {e}")),
@@ -572,6 +666,9 @@ pub(crate) fn run_old_tests(root: &Path, base: &str, files: &[String]) -> OldTes
         if out.status.success() {
             passed.extend(speaks_for);
             continue;
+        }
+        if !reference.exists() {
+            return gone();
         }
         let text = format!(
             "{}\n{}",
@@ -594,6 +691,54 @@ pub(crate) fn run_old_tests(root: &Path, base: &str, files: &[String]) -> OldTes
             failures,
         }
     }
+}
+
+/// One `fai accept` at a time in a checkout: two would share the copy the old tests run in.
+/// The lock is a file that names the process holding it, and is taken over when that process
+/// is gone.
+struct Lock(PathBuf);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn lock(root: &Path) -> Result<Lock, String> {
+    use std::io::Write as _;
+    let dir = root.join("target/fai");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = dir.join("accept.lock");
+    for _ in 0..2 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                let _ = write!(f, "{}", std::process::id());
+                return Ok(Lock(path));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let holder = std::fs::read_to_string(&path).unwrap_or_default();
+                let alive = !holder.trim().is_empty()
+                    && Command::new("kill")
+                        .args(["-0", holder.trim()])
+                        .stderr(Stdio::null())
+                        .status()
+                        .is_ok_and(|s| s.success());
+                if alive {
+                    return Err(format!(
+                        "another `fai accept` is running in this checkout (process {})",
+                        holder.trim()
+                    ));
+                }
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+    Err(format!("{} can't be taken", path.display()))
 }
 
 /// Run this binary's `fai ARGS` and give its exit code.
@@ -622,7 +767,20 @@ pub(crate) fn accept(root: &Path, rest: &[String]) -> i32 {
             }
         }
     }
-    let tree = judging::tree_hash(root).unwrap_or_default();
+    // A verdict is of a tree: without the tree's identity, or with another run in the same
+    // copy, there is none to give.
+    let not_judged = |why: String| {
+        println!("accept: NOT JUDGED: {why}");
+        2
+    };
+    let tree = match judging::tree_hash(root) {
+        Ok(t) => t,
+        Err(e) => return not_judged(format!("this tree has no identity ({e})")),
+    };
+    let _lock = match lock(root) {
+        Ok(l) => l,
+        Err(e) => return not_judged(e),
+    };
     let host = crate::host();
     eprintln!("accept: fai verify full");
     let mut verify_args = vec!["verify", "full"];
@@ -658,8 +816,14 @@ pub(crate) fn accept(root: &Path, rest: &[String]) -> i32 {
         Judging::Against { base, changes, .. } => run_old_tests(root, base, &moved_tests(changes)),
         Judging::NoBase(_) => OldTests::NotNeeded,
     };
-    let d = decide(verified, gated, &judging, &old, &host);
+    let mut d = decide(verified, gated, &judging, &old, &host);
     let tree_at_end = judging::tree_hash(root).unwrap_or_default();
+    if tree_at_end != tree && d.code != 1 {
+        // The parts ran on different trees: there is no tree this could be a verdict of. (A
+        // failure stays a failure.)
+        d.code = 2;
+        d.line = "accept: NOT JUDGED: the tree changed while this ran".to_owned();
+    }
     let dir = root.join("target/accept");
     let _ = std::fs::create_dir_all(&dir);
     let report = json!({
@@ -681,9 +845,6 @@ pub(crate) fn accept(root: &Path, rest: &[String]) -> i32 {
     println!("{}", judging.listing());
     for n in &d.notes {
         println!("{n}");
-    }
-    if tree_at_end != tree {
-        println!("accept: the tree changed while this ran: the verdict is of no tree");
     }
     println!("{}", d.line);
     d.code
@@ -753,6 +914,10 @@ mod tests {
         assert!(gate_part(Some(&g("PASS")), "aa").holds());
         assert!(!gate_part(Some(&g("PARTIAL")), "aa").holds());
         assert!(!gate_part(Some(&g("FAIL")), "aa").holds());
+        // A pass of another configuration alone is not a pass of `fcc -O`.
+        let other = json!({"verdict": "PASS", "configs": {"fcc-promo": {}},
+                           "tree": "aa", "tree_at_end": "aa"});
+        assert!(!gate_part(Some(&other), "aa").holds());
         // A report written before reports named their tree (or not through `fai`).
         let old = json!({"verdict": "PASS", "configs": {}});
         assert_eq!(gate_part(Some(&old), "aa").fresh, Fresh::Unbound);
@@ -889,6 +1054,26 @@ mod tests {
     }
 
     #[test]
+    fn a_new_file_that_existing_tests_can_pick_up_is_named() {
+        // A new header among the tests is no test of its own: it is in the list, and nothing
+        // can be replayed for it.
+        let j = against(&[('A', "frontends/c/tests/fai_test.h")]);
+        assert_eq!(moved_tests(j.changes()), Vec::<String>::new());
+        let d = decide(
+            Verified::Full,
+            Gated::Pass,
+            &j,
+            &OldTests::NotNeeded,
+            "x86_64-linux",
+        );
+        assert_eq!(d.code, 3);
+        assert_eq!(
+            d.line,
+            "accept: PASS, JUDGING FILES CHANGED (1): frontends/c/tests/fai_test.h"
+        );
+    }
+
+    #[test]
     fn a_host_with_gaps_never_passes() {
         let none = against(&[]);
         for (v, g) in [
@@ -963,12 +1148,16 @@ mod tests {
     #[test]
     fn mutate_passes_only_when_everything_ran_and_was_caught() {
         let m = |passed: &[bool], subset: bool| {
-            json!({"tree": "aa", "subset": subset,
+            json!({"tree": "aa", "tree_at_end": "aa", "subset": subset,
                    "mutations": passed.iter().map(|p| json!({"passed": p})).collect::<Vec<_>>()})
         };
         assert!(mutate_part(Some(&m(&[true, true], false)), "aa").holds());
         assert!(!mutate_part(Some(&m(&[true, false], false)), "aa").holds());
         assert!(!mutate_part(Some(&m(&[true], true)), "aa").holds());
         assert!(!mutate_part(Some(&m(&[], false)), "aa").holds());
+        // A run during which the tree changed is of no tree, even if it changed back.
+        let mut moved = m(&[true, true], false);
+        moved["tree_at_end"] = json!("bb");
+        assert!(!mutate_part(Some(&moved), "aa").holds());
     }
 }

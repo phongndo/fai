@@ -777,7 +777,9 @@ impl Verify {
         }
         if self.quick {
             env.push(("FIR_ABI", QUICK_ABI.to_owned()));
-            args.push("--");
+            // `--exact`: each name leaves out that one test, not every test whose name
+            // contains it.
+            args.extend(["--", "--exact"]);
             for (test, _) in QUICK_SKIPS {
                 args.extend(["--skip", test]);
             }
@@ -786,8 +788,25 @@ impl Verify {
         let name = format!("rust tests ({profile})");
         let out = self.command(&name, &root, "cargo", &args, &env);
         if self.quick {
-            // Tests were left out on purpose, and the verdict says which.
-            return out.is_some();
+            // Tests were left out on purpose, and the verdict says which: exactly those.
+            let Some(stdout) = out else { return false };
+            let left_out: u64 = stdout
+                .lines()
+                .filter(|l| l.starts_with("test result:"))
+                .map(filtered_out)
+                .sum();
+            if left_out != QUICK_SKIPS.len() as u64 {
+                self.fail(
+                    &format!("{name}: only the named tests left out"),
+                    format!(
+                        "{left_out} tests were left out, not the {} that quick names",
+                        QUICK_SKIPS.len()
+                    ),
+                    vec![],
+                );
+                return false;
+            }
+            return true;
         }
         self.none_filtered(&name, out.as_deref())
     }
@@ -1285,37 +1304,72 @@ fn gate(root: &Path, rest: &[String]) -> i32 {
     // The harness prints the judging line above its verdict and keeps it in its report.
     let judging = judging::judging(root, None, None);
     let tree = judging::tree_hash(root).unwrap_or_default();
-    let status = Command::new("uv")
-        .args(["run", "benchmarks/projects/projbench.py", "gate"])
+    // What marks a report as this run's: the report under `--out` may be an earlier run's (a
+    // run that writes none leaves it there).
+    let run = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    );
+    let mut cmd = Command::new("uv");
+    cmd.args(["run", "benchmarks/projects/projbench.py", "gate"])
         .args(rest)
+        .current_dir(root);
+    // The compiler is measured as `fai verify` tests it: nothing inherited changes what it
+    // does (`FIR_REGCHECK_BUDGET=0` would take the validator's budget away).
+    for v in CLEARED {
+        cmd.env_remove(v);
+    }
+    for (k, _) in std::env::vars() {
+        if k.starts_with("CARGO_TARGET_") && k.ends_with("_RUNNER") {
+            cmd.env_remove(k);
+        }
+    }
+    let status = cmd
         .env("FAI_JUDGING", judging.line())
         .env("FAI_JUDGING_JSON", judging.json().to_string())
         .env("FAI_TREE", &tree)
-        .current_dir(root)
+        .env("FAI_RUN", &run)
         .status();
-    // The tree at the end goes into the harness's report: a tree that changed while the gate
-    // ran was not the tree it judged (`fai status`).
-    let out = rest
-        .iter()
-        .position(|a| a == "--out")
-        .and_then(|i| rest.get(i + 1))
-        .map_or_else(|| root.join("target/projbench"), PathBuf::from);
-    let report = out.join("gate-report.json");
-    if let Some(mut r) = std::fs::read(&report)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        && r["tree"] == json!(tree)
-    {
-        r["tree_at_end"] = json!(judging::tree_hash(root).unwrap_or_default());
-        let _ = std::fs::write(&report, serde_json::to_string_pretty(&r).unwrap());
-    }
-    match status {
+    let code = match status {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
             eprintln!("fai gate: uv: {e}");
             1
         }
+    };
+    // The tree at the end goes into the harness's report: a tree that changed while the gate
+    // ran was not the tree it judged (`fai status`). Only into the report this run wrote, and
+    // only if the harness ended with a verdict.
+    let report = gate_out(root, rest).join("gate-report.json");
+    if (code == 0 || code == 1)
+        && let Some(mut r) = std::fs::read(&report)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        && r["run"] == json!(run)
+    {
+        r["tree_at_end"] = json!(judging::tree_hash(root).unwrap_or_default());
+        let _ = std::fs::write(&report, serde_json::to_string_pretty(&r).unwrap());
     }
+    code
+}
+
+/// Where `projbench.py gate ARGS` writes: `--out DIR`, `--out=DIR`, or `target/projbench`.
+fn gate_out(root: &Path, rest: &[String]) -> PathBuf {
+    let mut out = root.join("target/projbench");
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        if a == "--out" {
+            if let Some(dir) = it.next() {
+                out = root.join(dir);
+            }
+        } else if let Some(dir) = a.strip_prefix("--out=") {
+            out = root.join(dir);
+        }
+    }
+    out
 }
 
 /// The repository this binary was built from: `tools/fai/../..`.
@@ -1652,6 +1706,15 @@ fn main() {
         serde_json::to_string_pretty(&report).unwrap(),
     )
     .unwrap();
+    if full {
+        // `fai status` reads the last full verification here: a later `quick` or `fast` run
+        // replaces `report.json` and says nothing about it.
+        std::fs::write(
+            out_dir.join("full.json"),
+            serde_json::to_string_pretty(&report).unwrap(),
+        )
+        .unwrap();
+    }
     let mut md = format!(
         "# Verification report\n\n**{verdict}** ({:.0} s)\n\n",
         start.elapsed().as_secs_f64()
@@ -1716,6 +1779,13 @@ fn main() {
         eprintln!(
             "  all but {QUICK_ABI} of the ABI test's signatures, the release tests, the sanitizer run, and the evidence check"
         );
+        // What the tests that did run skipped for want of a tool (the Lean reference, a native
+        // runner): `full` refuses such a run, and quick says it.
+        for (suite, ev) in load_evidence(&ev_debug) {
+            for why in ev["skipped"].as_array().into_iter().flatten() {
+                eprintln!("  in {suite}: {}", why.as_str().unwrap_or("?"));
+            }
+        }
     }
     eprintln!("\n{}", judging.line());
     eprintln!(

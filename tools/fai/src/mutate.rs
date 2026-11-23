@@ -10,10 +10,13 @@
 //! Every command is also run on the unmutated tree first and must pass, so a failure can't be
 //! blamed on the environment.
 //!
-//! `fai mutate --quick [NAME…]` measures the quick tier instead: each defect is planted the same
-//! way, and `fai verify quick` runs in place of the narrow command. It reports how many of the
-//! defects quick catches (and writes `target/mutate/quick.json`); a miss is a finding, not a
-//! failure, since quick leaves tests out on purpose.
+//! `fai mutate --quick [NAME…]` measures the quick tier instead: each defect that is planted in
+//! the tree is planted the same way, and `fai verify quick` runs in place of the narrow command.
+//! It reports on how many of them quick fails (and writes `target/mutate/quick.json`), by any
+//! of its checks: the diagnostic is not asked for. A defect quick passes with is a finding, not
+//! a failure, since quick leaves tests out on purpose. Entries that plant nothing in the tree
+//! (their fault is in their command: a missing reference, a missing runner, altered evidence)
+//! are not run.
 //!
 //! The mutations run in a copy of the repository under `target/mutate/tree` (the working tree's
 //! tracked files, and Lean's build directory so that only what a mutation touches rebuilds),
@@ -559,7 +562,7 @@ fn mutations() -> Vec<Mutation> {
             steps: vec![gate_self_test()],
             expect: vec![
                 "gate self-test: FAILED",
-                "1% more instructions on one workload fails",
+                "1% more instructions on one workload fails, and names it: the verdict is PASS, not FAIL",
             ],
             in_decl: None,
         },
@@ -574,7 +577,7 @@ fn mutations() -> Vec<Mutation> {
             steps: vec![gate_self_test()],
             expect: vec![
                 "gate self-test: FAILED",
-                "a partial build that is otherwise fine is PARTIAL",
+                "a partial build that is otherwise fine is PARTIAL, not a pass: the verdict is PASS, not PARTIAL",
             ],
             in_decl: None,
         },
@@ -583,11 +586,14 @@ fn mutations() -> Vec<Mutation> {
             what: "`gate --update` writes whatever it measured, so a count inside the tolerance creeps up run by run; the gate's self-test refuses it",
             edits: vec![edit(
                 "benchmarks/projects/projbench.py",
-                "new[\"instructions\"][w] = n if n < b * (1 - GATE_SAME) else b",
-                "new[\"instructions\"][w] = n",
+                "new[dim][w] = n if n < b * (1 - GATE_SAME) else b",
+                "new[dim][w] = n",
             )],
             steps: vec![gate_self_test()],
-            expect: vec!["gate self-test: FAILED", "the baseline only moves down"],
+            expect: vec![
+                "gate self-test: FAILED",
+                "the baseline only moves down: --update raised an instruction count",
+            ],
             in_decl: None,
         },
         Mutation {
@@ -631,6 +637,7 @@ fn mutations() -> Vec<Mutation> {
             expect: vec![
                 "differences:",
                 "not compiled: register allocation of function",
+                "which holds something else",
             ],
             in_decl: None,
         },
@@ -643,21 +650,27 @@ fn mutations() -> Vec<Mutation> {
                 "        if self.cx.eager && r.is_virtual() && !r.is_fp() && (1..64).contains(&width) {",
             )],
             // One command, so that the run on the unchanged copy does the same: the copy
-            // shares the sources the tree fetched, if it has (the gate fetches them
-            // otherwise), and then the gate runs.
+            // shares the sources the tree has prepared (nothing in the copy can fetch or
+            // prepare them: nix won't take a flake in an ignored directory, and a half-prepared
+            // cache would be written through the link), and then the gate runs.
             steps: vec![cmd(
                 "sh",
                 &[
                     "-c",
-                    "mkdir -p target/projbench && if [ -d \"$FAI_MUTATE_FROM/target/projbench/src\" ] && [ ! -e target/projbench/src ]; then ln -s \"$FAI_MUTATE_FROM/target/projbench/src\" target/projbench/src; fi; exec cargo fai gate",
+                    "if [ ! -f \"$FAI_MUTATE_FROM/target/projbench/src/sqlite-src-3530300.digest\" ]; then echo 'slower-code needs the sources of the gate prepared in the tree: run fai gate there once' >&2; exit 1; fi; mkdir -p target/projbench && if [ ! -e target/projbench/src ]; then ln -s \"$FAI_MUTATE_FROM/target/projbench/src\" target/projbench/src; fi; exec cargo fai gate",
                 ],
             )],
-            expect: vec!["WORSE   instructions: lua-", "gate: FAIL"],
+            // A workload that ran, and executed more: not one that was not run.
+            expect: vec![
+                "WORSE   instructions: lua-fib executes",
+                "more than",
+                "gate: FAIL",
+            ],
             in_decl: None,
         },
         Mutation {
             name: "struct-parameter-lowered-apart",
-            what: "the lowering takes a struct parameter apart in the signature, where calls pass it whole, in Lean and in Rust alike, so the two print the same text; where the function has a caller in its module the lowering's output no longer verifies, and where it has none (tests/blocks/lone-composite-parameters.fir) only running it on its arguments' encoding shows that it doesn't take them",
+            what: "the lowering takes a struct parameter apart in the signature, where calls pass it whole, in Lean and in Rust alike, so the two print the same text; where the function has a caller in its module the lowering's output no longer verifies, and where it has none (tests/blocks/lone-composite-parameters.fir) only giving it its arguments as their encoding has them shows that it doesn't take them (it takes another number of them, so it is not even run)",
             edits: vec![
                 edit(
                     "spec/Fir/Lower.lean",
@@ -693,7 +706,8 @@ fn mutations() -> Vec<Mutation> {
                 "dirs.split('/').any(|c| c == \"no tests\").then_some(Kind::Test)",
             )],
             steps: vec![test(&["-p", "fai-tools", "judging"])],
-            expect: vec!["tests/rust/regcheck.rs", "panicked"],
+            // The list says the file is no judging file at all (not that it is another kind).
+            expect: vec!["tests/rust/regcheck.rs", "left: None"],
             in_decl: None,
         },
     ]
@@ -781,6 +795,18 @@ pub fn main(root: &Path, names: &[String]) -> i32 {
         .iter()
         .filter(|m| names.is_empty() || names.iter().any(|n| n == m.name))
         .collect();
+    // The quick tier is measured on defects planted in the tree. An entry without an edit
+    // plants its fault in its command (no Lean reference, no native runner, evidence altered),
+    // which `--quick` replaces: there is nothing left for quick to catch or miss.
+    let not_planted: Vec<&str> = chosen
+        .iter()
+        .filter(|m| quick && m.edits.is_empty())
+        .map(|m| m.name)
+        .collect();
+    let chosen: Vec<&Mutation> = chosen
+        .into_iter()
+        .filter(|m| !(quick && m.edits.is_empty()))
+        .collect();
     if chosen.is_empty() {
         eprintln!("no such mutation; the mutations are:");
         for m in &all {
@@ -814,7 +840,7 @@ pub fn main(root: &Path, names: &[String]) -> i32 {
         };
         let key = format!("{} {} {:?}", last.prog, last.args.join(" "), last.env);
         let baseline_ok = *baselines.entry(key.clone()).or_insert_with(|| {
-            if m.name == "evidence-suite-missing" {
+            if m.name == "evidence-suite-missing" && !quick {
                 // Its baseline is the real evidence, which `fai verify` checks.
                 return true;
             }
@@ -908,9 +934,12 @@ pub fn main(root: &Path, names: &[String]) -> i32 {
     }
     let report = json!({
         "tree": judged,
+        // The copy was made at the start; a tree that changed since is another tree.
+        "tree_at_end": crate::judging::tree_hash(root).unwrap_or_default(),
         "subset": !names.is_empty(),
         "mutations": results,
         "all_caught_for_the_intended_reason": ok_all,
+        "not_planted_in_the_tree": not_planted,
     });
     if quick {
         let caught = results
@@ -928,14 +957,20 @@ pub fn main(root: &Path, names: &[String]) -> i32 {
         )
         .unwrap();
         eprintln!(
-            "\nfai verify quick catches {caught} of {} planted defects{}",
+            "\nfai verify quick fails on {caught} of {} defects planted in the tree{}",
             results.len(),
             if missed.is_empty() {
                 String::new()
             } else {
-                format!("; it misses: {}", missed.join(", "))
+                format!("; it passes with: {}", missed.join(", "))
             }
         );
+        if !not_planted.is_empty() {
+            eprintln!(
+                "not run (their fault is in their command, not in the tree): {}",
+                not_planted.join(", ")
+            );
+        }
         return if ok_all { 0 } else { 1 };
     }
     std::fs::write(
