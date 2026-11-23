@@ -225,8 +225,11 @@ fn darwin_limit(e: &str) -> Option<&'static str> {
     .map(|(_, why)| why)
 }
 
-/// The LFIR of a module, before and after register allocation, verified.
-fn lfir_modules(m: &Module) -> Result<[Module; 2], String> {
+/// The LFIR of a module, before and after register allocation, and after allocation with
+/// selection in the reference mode (`select_eager`: a register for every value, no operand
+/// folded), each verified. All three must run as the source does, so what the default
+/// selection folds or remembers is checked against code that folds and remembers nothing.
+fn lfir_modules(m: &Module) -> Result<[Module; 3], String> {
     let mut mm = a64::select(m)?;
     let before = a64::lfir::to_module(m, &mm);
     fir::verify_module(&before)
@@ -234,7 +237,12 @@ fn lfir_modules(m: &Module) -> Result<[Module; 2], String> {
     a64::allocate(m, &mut mm)?;
     let after = a64::lfir::to_module(m, &mm);
     fir::verify_module(&after).map_err(|e| format!("LFIR after allocation doesn't verify: {e}"))?;
-    Ok([before, after])
+    let mut em = a64::select_eager(m).map_err(|e| format!("the reference selection: {e}"))?;
+    a64::allocate(m, &mut em).map_err(|e| format!("the reference selection: {e}"))?;
+    let eager = a64::lfir::to_module(m, &em);
+    fir::verify_module(&eager)
+        .map_err(|e| format!("LFIR of the reference selection doesn't verify: {e}"))?;
+    Ok([before, after, eager])
 }
 
 /// The machine code takes more steps than the source: give it plenty.
@@ -530,7 +538,10 @@ fn check_module(
                         }
                     }
                 }
-                for (stage, g) in ["vregs", "allocated"].iter().zip(&got) {
+                for (stage, g) in ["vregs", "allocated", "reference selection"]
+                    .iter()
+                    .zip(&got)
+                {
                     let g = normalize(&g.line)
                         .map(|x| x.0)
                         .unwrap_or_else(|_| g.line.clone());

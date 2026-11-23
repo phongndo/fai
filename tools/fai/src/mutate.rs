@@ -613,6 +613,23 @@ fn mutations() -> Vec<Mutation> {
             in_decl: None,
         },
         Mutation {
+            name: "lazy-value-reused-across-blocks",
+            what: "selection reuses a lazy value's register in a block other than the one that built it, so a path that never ran the first block reads a register nothing wrote; the fixtures' code must not run as the source does",
+            edits: vec![edit(
+                "targets/aarch64/src/isel.rs",
+                "            && b == self.cur\n",
+                "            && (b == self.cur || b != self.cur)\n",
+            )],
+            steps: vec![test(&["-p", "fir", "--test", "aarch64", "fixtures"])],
+            // In two fixtures the allocator's own check of its assignment sees the read of a
+            // register that no path wrote.
+            expect: vec![
+                "differences:",
+                "not compiled: register allocation of function",
+            ],
+            in_decl: None,
+        },
+        Mutation {
             name: "judging-list-drops-the-tests",
             what: "the judging list stops counting files under a `tests` directory, so an edited fixture would go unnamed; the list's own unit test refuses it (it needs no git, which this copy doesn't have)",
             edits: vec![edit(

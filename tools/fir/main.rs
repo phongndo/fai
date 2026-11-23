@@ -132,7 +132,7 @@ fn run(args: &[&str]) -> Result<(), ExitCode> {
         }
         _ => {
             eprintln!(
-                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each] [--no-locs]\n         [--print-before P,...] [--print-after P,...] [--print-changed] [--dump-dir DIR] [--check-dce FIR-REF]\n  fir opt --list-passes\n  fir compile FILE [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-g] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin] [--target aarch64|x86_64]\n  fir lower FILE [--no-locs]\n  fir measure FILE [-O | --none | --passes P,... [--experimental]] [--fuel N]"
+                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each] [--no-locs]\n         [--print-before P,...] [--print-after P,...] [--print-changed] [--dump-dir DIR] [--check-dce FIR-REF]\n  fir opt --list-passes\n  fir compile FILE [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-g] [--reference-selection] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin] [--target aarch64|x86_64]\n  fir lower FILE [--no-locs]\n  fir measure FILE [-O | --none | --passes P,... [--experimental]] [--fuel N]"
             );
             Err(ExitCode::from(2))
         }
@@ -352,6 +352,9 @@ fn opt(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
 /// the proved Lean checker, as `fir opt --check-dce` does, fails if it refuses one, and prints a
 /// summary on stderr; so does `FIR_CHECK_DCE=FIR-REF` in the environment
 /// (`fir::backend::optimize`). Both run on the MFIR, so they apply to either target.
+/// `--reference-selection` (AArch64) selects in the reference mode (`select_eager`): a register
+/// for every value where it is defined, and no operand folded. It is slower code that means the
+/// same, to compare the default's with when a miscompile is suspected in selection.
 fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     use fir::backend::aarch64 as a64;
     use fir::backend::x86_64 as x64;
@@ -365,6 +368,7 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     let mut check_dce = None;
     let (mut passes, mut experimental) = (None, false);
     let mut x86 = false;
+    let mut reference = false;
     let mut o = a64::Options::default();
     let mut os_given = false;
     let mut it = opts.iter();
@@ -379,6 +383,10 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
         }
         if opt == "-g" {
             o.debug_lines = true;
+            continue;
+        }
+        if opt == "--reference-selection" {
+            reference = true;
             continue;
         }
         match (opt, it.next()) {
@@ -402,6 +410,10 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     }
     if x86 && o.debug_lines {
         eprintln!("fir compile: -g isn't supported for x86-64 yet");
+        return Err(ExitCode::from(2));
+    }
+    if x86 && reference {
+        eprintln!("fir compile: --reference-selection is AArch64's");
         return Err(ExitCode::from(2));
     }
     let text = fir::timing::time("read", || read(file))?;
@@ -468,7 +480,12 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
         }
         x64::compile(&m, &x64::Options::default()).map_err(fail)?
     } else {
-        let mut mm = a64::select(&m).map_err(fail)?;
+        let mut mm = if reference {
+            a64::select_eager(&m)
+        } else {
+            a64::select(&m)
+        }
+        .map_err(fail)?;
         if emit == Some("lfir-vregs") {
             return write(a64::lfir::to_module(&m, &mm).render(true));
         }

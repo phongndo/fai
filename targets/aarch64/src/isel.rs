@@ -104,6 +104,13 @@ pub struct ModuleCx<'a> {
     /// Which of the module's functions may return with an exception pending
     /// ([`may_throw`]); external functions never do.
     pub throws: Vec<bool>,
+    /// Selection's reference mode: every value gets a register where it is defined, no
+    /// operand is folded into the op that uses it, and nothing is remembered about a
+    /// register's high bits ([`Lazy`], [`Sel::note_ext`]). It is what selection did before
+    /// lazy values, kept because it is simple enough to trust by reading: the tests run both
+    /// modes against the source, so a value built in the wrong place or from a stale operand
+    /// shows as a difference. The default is off.
+    pub eager: bool,
 }
 
 impl<'a> ModuleCx<'a> {
@@ -123,6 +130,7 @@ impl<'a> ModuleCx<'a> {
             funcs,
             globals,
             throws: may_throw(m),
+            eager: false,
         }
     }
 
@@ -735,6 +743,18 @@ impl Sel<'_, '_> {
         }
     }
 
+    /// Record a lazy value: it gets no register here, and each use builds or folds it
+    /// ([`Sel::build`]). In the reference mode ([`ModuleCx::eager`]) it is built here, once,
+    /// like any other value.
+    fn set_lazy(&mut self, v: ValueId, l: Lazy) {
+        if self.cx.eager {
+            let r = self.build(v, l);
+            self.vreg[v.index()] = r.virt_index();
+        } else {
+            self.lazy.insert(v.index() as u32, l);
+        }
+    }
+
     /// A lazy value in a register, built in the current block unless this block built it
     /// already (code is only ever added at a block's end, so that register is still good).
     fn build(&mut self, v: ValueId, l: Lazy) -> Reg {
@@ -828,14 +848,14 @@ impl Sel<'_, '_> {
                 }
             },
         };
-        self.lazy.insert(v.index() as u32, l);
+        self.set_lazy(v, l);
         Ok(())
     }
 
     /// `r`'s bits above `width` are known from here on: copies of bit `width - 1` if `signed`,
     /// zeros if not. Only for a register written once, where this is called.
     fn note_ext(&mut self, r: Reg, signed: bool, width: u32) {
-        if r.is_virtual() && !r.is_fp() && (1..64).contains(&width) {
+        if !self.cx.eager && r.is_virtual() && !r.is_fp() && (1..64).contains(&width) {
             self.ext.insert(r, (signed, width as u8));
         }
     }
@@ -2014,7 +2034,7 @@ impl Sel<'_, '_> {
                 let v = body.results(op).next().unwrap();
                 let w = width_bits(body.ty(v));
                 let bits = int_low_bits(body.int(n)) & mask(w);
-                self.lazy.insert(v.index() as u32, Lazy::Const { bits, w });
+                self.set_lazy(v, Lazy::Const { bits, w });
             }
             OpKind::Poison | OpKind::PtrNull => {
                 let v = body.results(op).next().unwrap();
@@ -2023,8 +2043,7 @@ impl Sel<'_, '_> {
                     self.fmov(FSize::D, d, Reg::XZR);
                 } else {
                     let w = width_bits(body.ty(v));
-                    self.lazy
-                        .insert(v.index() as u32, Lazy::Const { bits: 0, w });
+                    self.set_lazy(v, Lazy::Const { bits: 0, w });
                 }
             }
             OpKind::Freeze
@@ -2040,10 +2059,10 @@ impl Sel<'_, '_> {
                     Some(Lazy::Const { bits, .. }) => {
                         let w = width_bits(body.ty(v));
                         let bits = bits & mask(w);
-                        self.lazy.insert(v.index() as u32, Lazy::Const { bits, w });
+                        self.set_lazy(v, Lazy::Const { bits, w });
                     }
                     Some(l) => {
-                        self.lazy.insert(v.index() as u32, l);
+                        self.set_lazy(v, l);
                     }
                     None => {
                         let a = self.operand(op, 0)?;
@@ -2162,7 +2181,7 @@ impl Sel<'_, '_> {
                 match (body.operands(op)[0].get(), body.operands(op)[1].get()) {
                     (OperandKind::Value(a), OperandKind::Value(b)) => {
                         let v = body.results(op).next().unwrap();
-                        self.lazy.insert(v.index() as u32, Lazy::Cmp { p, a, b, w });
+                        self.set_lazy(v, Lazy::Cmp { p, a, b, w });
                     }
                     _ => {
                         self.operand(op, 0)?;
@@ -2182,8 +2201,7 @@ impl Sel<'_, '_> {
                     };
                     let dw = width_bits(body.ty(v));
                     let bits = x & mask(dw);
-                    self.lazy
-                        .insert(v.index() as u32, Lazy::Const { bits, w: dw });
+                    self.set_lazy(v, Lazy::Const { bits, w: dw });
                 } else {
                     let a = self.operand(op, 0)?;
                     if w >= 64 || self.is_ext(a, signed, w) {
@@ -2206,8 +2224,7 @@ impl Sel<'_, '_> {
                 let off = self.local(size, u64::from(align));
                 let v = body.results(op).next().unwrap();
                 let hi = off + size.max(1) as i64;
-                self.lazy
-                    .insert(v.index() as u32, Lazy::Slot { off, lo: off, hi });
+                self.set_lazy(v, Lazy::Slot { off, lo: off, hi });
             }
             OpKind::MemStackOf { ty, align } => {
                 let size = self.type_size(ty);
@@ -2215,8 +2232,7 @@ impl Sel<'_, '_> {
                 let off = self.local(size, a);
                 let v = body.results(op).next().unwrap();
                 let hi = off + size.max(1) as i64;
-                self.lazy
-                    .insert(v.index() as u32, Lazy::Slot { off, lo: off, hi });
+                self.set_lazy(v, Lazy::Slot { off, lo: off, hi });
             }
             OpKind::MemAlloc {
                 fail,

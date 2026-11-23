@@ -190,7 +190,7 @@ values passed as AAPCS64 says. **Defined only by the tests** (`tests/aarch64.rs`
 
 | Item | What happens |
 |---|---|
-| UB and `poison` | UB modifiers become a concrete choice: `.nsw`/`.nuw`/`.ub` wrap, and `poison` is 0. Each choice is one the source allows. Soundness for `freeze` relies on each value being computed into one register once |
+| UB and `poison` | UB modifiers become a concrete choice: `.nsw`/`.nuw`/`.ub` wrap, and `poison` is 0. Each choice is one the source allows. Soundness for `freeze` relies on a value being the same wherever it is read. Most values are computed into one register once. A lazy value (a constant, a frame slot's address, a pointer plus a constant, a comparison: `isel.rs`, `Lazy`) is built again in each block that needs it in a register, from constants, `sp`, and registers written once, so every build gives the same value; `poison` is the constant 0. Selection's reference mode (`select_eager`, `fir compile --reference-selection`) builds every value once where it is defined, and the tests run both modes against the source |
 | Facts | Dropped, `check` included (G6). A violated fact, which is UB in MFIR, does whatever the code does (`facts.fir`'s `@percent(200)` returns 200) |
 | Bounds, lifetimes, provenance | Stack slots merge into one frame, already in the LFIR machine, so an out-of-bounds stack read that is UB in MFIR reads the neighbouring slot. Heap and global bounds, lifetimes, and provenance are kept in the LFIR machine and gone in the assembly |
 | Alignment | Not checked by the LFIR machine. Natively, it is the hardware's |

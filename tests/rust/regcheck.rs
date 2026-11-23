@@ -19,6 +19,17 @@ use common::evidence::Evidence;
 
 /// 32 values live across a call and a `cf.if`, then summed.
 fn source() -> String {
+    source_with(|k| (k + 1) * 1_000_003)
+}
+
+/// The fixture as it was before selection gave constants no register: `1` to `32`, each an
+/// `add`'s immediate today. In selection's reference mode each still gets its register, so
+/// the tests run on it too ([`original_fixture`]).
+fn original_source() -> String {
+    source_with(|k| k + 1)
+}
+
+fn source_with(constant: impl Fn(i64) -> i64) -> String {
     let mut s = String::from(
         "extern func @g(i64) -> i64 effects[] assume\n\nfunc @f(%x: i64, %c: i1) -> i64 {\n",
     );
@@ -26,7 +37,7 @@ fn source() -> String {
     for k in 0..32 {
         s += &format!(
             "  %k{k}: i64 = int.const {}\n  %a{k}: i64 = int.add.wrap %x, %k{k}\n",
-            (k + 1) * 1_000_003
+            constant(k)
         );
     }
     s += "  %r: i64 = func.call @g(%x)\n";
@@ -43,16 +54,36 @@ struct Fixture {
     m: fir::Module,
     input: MFunc,
     shapes: Vec<a64::abi::CallShape>,
+    /// Selected in the reference mode (`select_eager`).
+    eager: bool,
 }
 
 fn fixture() -> Fixture {
-    let m = fir::parse_module(&source()).unwrap();
+    fixture_of(&source(), false)
+}
+
+/// The original fixture, selected in the reference mode, where a constant has a register.
+fn original_fixture() -> Fixture {
+    fixture_of(&original_source(), true)
+}
+
+fn fixture_of(source: &str, eager: bool) -> Fixture {
+    let m = fir::parse_module(source).unwrap();
     fir::verify_module(&m).unwrap();
-    let mm = a64::select(&m).unwrap();
+    let mm = f_select(&m, eager);
     Fixture {
         shapes: a64::shapes(&m),
         input: mm.funcs[0].clone(),
         m,
+        eager,
+    }
+}
+
+fn f_select(m: &fir::Module, eager: bool) -> a64::mir::MModule {
+    if eager {
+        a64::select_eager(m).unwrap()
+    } else {
+        a64::select(m).unwrap()
     }
 }
 
@@ -97,7 +128,11 @@ fn refused(r: Result<(), String>, why: &str, ev: &Evidence, what: &str) {
 
 #[test]
 fn honest_allocation_is_accepted() {
-    let f = fixture();
+    honest_allocation(fixture());
+    honest_allocation(original_fixture());
+}
+
+fn honest_allocation(f: Fixture) {
     let (a, out) = f.honest();
     assert!(a.slots > 0, "the fixture should spill");
     assert!(
@@ -106,7 +141,7 @@ fn honest_allocation_is_accepted() {
     );
     assert!(f.validate(&out).is_ok());
     // And it runs as the source does.
-    let mut mm = a64::select(&f.m).unwrap();
+    let mut mm = f_select(&f.m, f.eager);
     a64::allocate(&f.m, &mut mm).unwrap();
     let lm = a64::lfir::to_module(&f.m, &mm);
     for c in ["0", "1"] {
@@ -246,7 +281,12 @@ fn validation_keeps_function_identity_and_call_context() {
 #[test]
 fn corrupted_allocations_are_refused() {
     let ev = Evidence::new("regcheck_adversarial");
-    let f = fixture();
+    corrupted_allocations(fixture(), &ev);
+    corrupted_allocations(original_fixture(), &ev);
+    ev.write();
+}
+
+fn corrupted_allocations(f: Fixture, ev: &Evidence) {
     let (a, out) = f.honest();
     let regs: Vec<(usize, Reg)> = a
         .homes
@@ -267,7 +307,7 @@ fn corrupted_allocations_are_refused() {
     refused(
         f.with_assignment(&bad),
         "reads",
-        &ev,
+        ev,
         "two live values share a register",
     );
 
@@ -282,7 +322,7 @@ fn corrupted_allocations_are_refused() {
     refused(
         f.with_assignment(&bad),
         "reads",
-        &ev,
+        ev,
         "a value across a call in x9",
     );
 
@@ -300,7 +340,7 @@ fn corrupted_allocations_are_refused() {
     refused(
         f.validate(&o),
         "its value at entry",
-        &ev,
+        ev,
         "a callee-saved register not saved",
     );
 
@@ -319,7 +359,7 @@ fn corrupted_allocations_are_refused() {
             *b -= 1;
         }
     }
-    refused(f.validate(&o), "reads", &ev, "a spill store left out");
+    refused(f.validate(&o), "reads", ev, "a spill store left out");
 
     // A reload from the wrong slot.
     let mut o = out.clone();
@@ -330,7 +370,7 @@ fn corrupted_allocations_are_refused() {
     if let Inst::Ldr { off, .. } = &mut o.insts[ld] {
         *off += 8;
     }
-    refused(f.validate(&o), "reads", &ev, "a reload from the wrong slot");
+    refused(f.validate(&o), "reads", ev, "a reload from the wrong slot");
 
     // An operand renamed to a register that holds something else.
     let mut o = out.clone();
@@ -346,7 +386,7 @@ fn corrupted_allocations_are_refused() {
     refused(
         f.validate(&o),
         "reads",
-        &ev,
+        ev,
         "an operand from the wrong register",
     );
 
@@ -358,7 +398,7 @@ fn corrupted_allocations_are_refused() {
     refused(
         f.validate(&o),
         "has no counterpart",
-        &ev,
+        ev,
         "an add became a sub",
     );
     let mut o = out.clone();
@@ -369,7 +409,7 @@ fn corrupted_allocations_are_refused() {
     refused(
         f.validate(&o),
         "has no counterpart",
-        &ev,
+        ev,
         "a constant changed",
     );
 
@@ -382,7 +422,7 @@ fn corrupted_allocations_are_refused() {
     if let Inst::AluImm { imm, .. } = &mut o.insts[sub] {
         *imm -= 16;
     }
-    refused(f.validate(&o), "the frame is", &ev, "a frame too small");
+    refused(f.validate(&o), "the frame is", ev, "a frame too small");
 
     // An instruction the input doesn't have.
     let mut o = out.clone();
@@ -396,7 +436,7 @@ fn corrupted_allocations_are_refused() {
         },
     );
     o.locs.insert(at, None);
-    refused(f.validate(&o), "", &ev, "an extra instruction");
+    refused(f.validate(&o), "", ev, "an extra instruction");
 
     // A branch retargeted.
     let mut o = out.clone();
@@ -407,8 +447,7 @@ fn corrupted_allocations_are_refused() {
     refused(
         f.validate(&o),
         "BCond { c: Ne, t: 1, f: 2 }) has no counterpart",
-        &ev,
+        ev,
         "a branch retargeted",
     );
-    ev.write();
 }

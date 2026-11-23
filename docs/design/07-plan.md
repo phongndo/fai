@@ -193,6 +193,12 @@ Steps 2 and 4 run with the steps that use them (7, 12, 16).
 |---|---|
 | 9 | **Passed.** The verdict is a function of its parts, with unit tests for the four exit codes, their order, a host with gaps, and an edited test whose old version still passes. On this tree `fai accept` took about 7 minutes and ended `PASS, JUDGING FILES CHANGED`, exit 3: verification passed (16 checks), the gate was the same as its baseline, and the change **fails the tests as they were at the base**: `line_zero_escaped_file_names_and_modules_without_files` in `tests/rust/debug_lines.rs` and `corrupted_allocations_are_refused` in `tests/rust/regcheck.rs`, the two fixtures `ab20520` edited. The `fai mutate` entry is step 9's last part, below |
 
+### Stage C
+
+| # | Result |
+|---|---|
+| 16 | **Passed.** `select_eager`, `compile_eager`, and `fir compile --reference-selection` select with a register for every value where it is defined, no operand folded, and nothing remembered of a register's high bits. The native suite now runs the LFIR of every fixture and random program selected that way against the source too: 502 fixture runs match, as many as the default's. It adds a second to the suite (32 s to 33 s). The two original fixtures of decision 1 run again in that mode beside the edited ones, and pass. Defect (b), a lazy value's register reused in a block that didn't build it, is `fai mutate`'s `lazy-value-reused-across-blocks`: it is caught in 2 of 55 fixture modules, by the allocator's own check of its assignment in debug builds ("reads v2 from x1, which holds something else"); the always-on validator can't see it, since its input already has the bug. The gate's numbers are unchanged (the default selection is) |
+
 ### Measured before the round
 
 At `313855a`:

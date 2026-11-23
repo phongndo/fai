@@ -174,6 +174,19 @@ fn check(
     name: &str,
     give_files: bool,
 ) -> Result<Option<(u64, u64)>, String> {
+    check_how(m, optimize, cc, dir, name, give_files, false)
+}
+
+/// [`check`], with selection in the reference mode when `eager` (`compile_eager`).
+fn check_how(
+    m: &fir::Module,
+    optimize: bool,
+    cc: &str,
+    dir: &Path,
+    name: &str,
+    give_files: bool,
+    eager: bool,
+) -> Result<Option<(u64, u64)>, String> {
     let mut m = m.clone();
     if give_files {
         for f in &mut m.funcs {
@@ -189,7 +202,12 @@ fn check(
         extern_prefix: String::new(),
         debug_lines: true,
     };
-    let Ok(asm) = a64::compile(&lowered, &o) else {
+    let asm = if eager {
+        a64::compile_eager(&lowered, &o)
+    } else {
+        a64::compile(&lowered, &o)
+    };
+    let Ok(asm) = asm else {
         return Ok(None);
     };
     let (s, obj) = (dir.join(format!("{name}.s")), dir.join(format!("{name}.o")));
@@ -322,23 +340,34 @@ fn line_zero_escaped_file_names_and_modules_without_files() {
   func.ret %c @11:1
 }
 "#;
+    // The body as it was before selection gave a constant no instruction: the add is on line
+    // 0, and the constant's own instruction is the located one. Selection's reference mode
+    // still gives it that instruction, so the original runs there.
+    let original = body.replace("%x, %a @10:4", "%x, %a @0:2");
+    assert_ne!(original, body);
     // Set directly: a name the `.fir` text can't spell, but a front end can hand over.
     let cases = [
         ("escaped", Some("dir\\sub\"q\"\n\t\u{1}.c"), true),
         ("no-files", None, false),
     ];
-    for (name, file, located) in cases {
-        let mut m = fir::parse_module(&format!("func @f{}", body.replace("FILE", "")))
-            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
-        m.funcs[0].file = file.map(str::to_owned);
-        for optimize in [false, true] {
-            let n = format!("{name}{}", if optimize { "-O" } else { "" });
-            let (got, total) = check(&m, optimize, &cc, &dir, &n, false)
-                .unwrap_or_else(|e| panic!("{e}"))
-                .unwrap_or_else(|| panic!("{n}: the backend refused it"));
-            assert!(total > 0, "{n}");
-            assert_eq!(got > 0, located, "{n}: {got} of {total} located");
-            ev.count("modules", 1);
+    for (body, eager) in [(body, false), (original.as_str(), true)] {
+        for (name, file, located) in cases {
+            let mut m = fir::parse_module(&format!("func @f{}", body.replace("FILE", "")))
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            m.funcs[0].file = file.map(str::to_owned);
+            for optimize in [false, true] {
+                let n = format!(
+                    "{name}{}{}",
+                    if optimize { "-O" } else { "" },
+                    if eager { "-eager" } else { "" }
+                );
+                let (got, total) = check_how(&m, optimize, &cc, &dir, &n, false, eager)
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .unwrap_or_else(|| panic!("{n}: the backend refused it"));
+                assert!(total > 0, "{n}");
+                assert_eq!(got > 0, located, "{n}: {got} of {total} located");
+                ev.count("modules", 1);
+            }
         }
     }
     ev.write();

@@ -55,12 +55,19 @@ pub fn shapes(m: &Module) -> Vec<abi::CallShape> {
 /// Instruction selection for every function of a verified MFIR (or core-op HFIR) module: LFIR
 /// over virtual registers.
 pub fn select(m: &Module) -> Result<MModule, String> {
-    fai_ir::timing::time("aarch64.isel", || select_untimed(m))
+    fai_ir::timing::time("aarch64.isel", || select_untimed(m, false))
 }
 
-fn select_untimed(m: &Module) -> Result<MModule, String> {
+/// [`select`] in the reference mode ([`isel::ModuleCx::eager`]): a register for every value
+/// where it is defined, and no operand folded. Slower code that means the same.
+pub fn select_eager(m: &Module) -> Result<MModule, String> {
+    select_untimed(m, true)
+}
+
+fn select_untimed(m: &Module, eager: bool) -> Result<MModule, String> {
     isel::check_module(m)?;
-    let cx = isel::ModuleCx::new(m);
+    let mut cx = isel::ModuleCx::new(m);
+    cx.eager = eager;
     let mut mm = MModule::default();
     for i in 0..m.funcs.len() {
         let f = isel::select_func(&cx, i as u32, &mut mm.families)?;
@@ -179,6 +186,17 @@ fn stack_composites(m: &Module) -> Option<String> {
 
 /// Compile a verified module to assembly.
 pub fn compile(m: &Module, o: &Options) -> Result<String, String> {
+    compile_how(m, o, false)
+}
+
+/// [`compile`] with selection in the reference mode ([`select_eager`]): the same program in
+/// slower code. The tests compile both ways, so what the default selection folds or
+/// remembers is checked against code that folds and remembers nothing.
+pub fn compile_eager(m: &Module, o: &Options) -> Result<String, String> {
+    compile_how(m, o, true)
+}
+
+fn compile_how(m: &Module, o: &Options, eager: bool) -> Result<String, String> {
     if o.os == Os::Darwin
         && let Some(what) = uses_varargs(m)
     {
@@ -195,7 +213,7 @@ pub fn compile(m: &Module, o: &Options) -> Result<String, String> {
             "{what} passes a struct or array on the stack, which isn't supported on macOS yet"
         ));
     }
-    let mut mm = select(m)?;
+    let mut mm = if eager { select_eager(m)? } else { select(m)? };
     allocate(m, &mut mm)?;
     Ok(emit::emit(m, &mm, o))
 }
