@@ -41,9 +41,11 @@ file per step and report.md.
 """
 
 import argparse
+import fcntl
 import hashlib
 import importlib
 import json
+import math
 import os
 import random
 import re
@@ -549,9 +551,15 @@ def arocc_revision(path):
 # check: behavior under qemu
 
 
+def guest_env():
+    """The environment the behavior checks run in: the host's, without what changes what Lua
+    or QEMU does (`LUA_INIT` runs code before every script; `QEMU_*` sets QEMU's options)."""
+    return {k: v for k, v in os.environ.items() if not k.startswith(("LUA_", "QEMU_"))}
+
+
 def qemu(exe, args, cwd=None, timeout=900):
     cmd = ([] if s_native() else ["qemu-aarch64"]) + [str(exe), *map(str, args)]
-    p = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=timeout)
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=timeout, env=guest_env())
     return p.returncode, p.stdout
 
 
@@ -685,6 +693,8 @@ def cmd_count(s):
                 if prog != exe_name:
                     continue
                 trace = work / f"{name}.{c}.trace"
+                # A trace left by an earlier run must not be read as this run's.
+                trace.unlink(missing_ok=True)
                 plug = (
                     f"{so},outfile={trace},below={cbench.STACK_BELOW},"
                     f"above={cbench.STACK_ABOVE},deep={cbench.STACK_DEEP}"
@@ -702,6 +712,8 @@ def cmd_count(s):
                     *args,
                 ]
                 p = run(cmd, check=False, timeout=3600, cwd=work)
+                if not trace.exists():
+                    die(f"{name} {c}: the plugin wrote no trace (exit {p.returncode})")
                 a = cbench.analyze_ranges(tools, exe, ranges, trace)
                 lo, hi = a.pop("window")
                 if any(x < hi and lo < y for x, y in cbench.mappings(p.stderr)):
@@ -950,6 +962,8 @@ def cmd_forms(s):
                 if prog != exe_name:
                     continue
                 trace = work / f"{name}.{c}.trace"
+                # A trace left by an earlier run must not be read as this run's.
+                trace.unlink(missing_ok=True)
                 plug = (
                     f"{so},outfile={trace},below={cbench.STACK_BELOW},"
                     f"above={cbench.STACK_ABOVE},deep={cbench.STACK_DEEP}"
@@ -963,6 +977,8 @@ def cmd_forms(s):
                 )
                 if p.returncode != 0:
                     die(f"forms: {name} {c} exited with {p.returncode}")
+                if not trace.exists():
+                    die(f"forms: {name} {c}: the plugin wrote no trace")
                 result["programs"].setdefault(name, {})[c] = forms_of_run(tools, exe, ranges, trace)
                 trace.unlink()
                 print(f"forms: {name} {c}", file=sys.stderr)
@@ -1081,6 +1097,25 @@ def gate_measure(s, configs):
     return out
 
 
+def gate_expected():
+    """What every measurement must cover, on both sides: each workload (`count`) and each
+    project (`build`). A side that lacks one wasn't measured, whatever the other side lacks."""
+    workloads = {f"lua-{n}" for n in LUA_SCRIPTS} | {"speedtest1"}
+    projects = {"lua", "sqlite"}
+    return {
+        "instructions": workloads,
+        "total_instructions": workloads,
+        "text": projects,
+        "compile_cpu_seconds": projects,
+        "compile_rss_kib": projects,
+    }
+
+
+def gate_number(x):
+    """Whether `x` is a measurement: a finite number above zero."""
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x > 0
+
+
 # What a baseline holds per configuration besides behavior, each by workload or by project.
 GATE_DIMENSIONS = (
     "instructions",
@@ -1108,28 +1143,38 @@ def gate_compare(now, base, first=False):
         if now["behavior"][k] != v:
             worse.append(f"behavior: {k}: {now['behavior'][k]}, not {v}")
     counted = ("instructions", "total_instructions")
+    expected = gate_expected()
     for dim in GATE_DIMENSIONS:
-        have = now.get(dim) or {}
-        if not have:
-            worse.append(f"{dim}: nothing was measured")
+        have = now.get(dim)
+        have = have if isinstance(have, dict) else {}
+        for k in sorted(expected[dim] - have.keys()):
+            worse.append(f"{dim}: {k} was not " + ("run" if dim in counted else "measured"))
         for k, n in have.items():
-            if n is None or n <= 0:
+            if not gate_number(n):
                 worse.append(f"{dim}: {k} measured {n}: the measurement is broken")
         if first:
             continue
-        if dim not in base:
+        b = base.get(dim)
+        if not isinstance(b, dict):
             worse.append(f"{dim}: the baseline has none: make the baseline again")
             continue
-        for k in sorted(base[dim].keys() - have.keys()):
-            worse.append(f"{dim}: {k} was not " + ("run" if dim in counted else "measured"))
-        for k in sorted(have.keys() - base[dim].keys()):
+        for k in sorted(expected[dim] - b.keys()):
             worse.append(f"{dim}: {k} has no baseline: add it to gate.json")
+        for k in sorted(have.keys() - b.keys() - expected[dim]):
+            worse.append(f"{dim}: {k} has no baseline: add it to gate.json")
+        for k, n in b.items():
+            if not gate_number(n):
+                worse.append(f"{dim}: the baseline's {k} is {n}: make the baseline again")
     if first:
         return worse, better
 
     def both(dim):
-        have = now.get(dim) or {}
-        return [(k, have[k], b) for k, b in base.get(dim, {}).items() if (have.get(k) or 0) > 0]
+        have, b = now.get(dim), base.get(dim)
+        if not isinstance(have, dict) or not isinstance(b, dict):
+            return []
+        return [
+            (k, have[k], v) for k, v in b.items() if gate_number(v) and gate_number(have.get(k))
+        ]
 
     def by(n, b):
         return f"{n / b - 1:+.2%}" if b else "from nothing"
@@ -1153,6 +1198,15 @@ def gate_compare(now, base, first=False):
             worse.append(
                 f"instructions in all: {w} executes {n:,} with libc, more than {b:,} ({by(n, b)})"
             )
+            for f, after, before in gate_slower_functions(now, base, w):
+                worse.append(
+                    f"    in {f}: {after:,}, "
+                    + (
+                        f"{after - before:+,} ({by(after, before)})"
+                        if before
+                        else "new among the ten busiest"
+                    )
+                )
         elif n < b * (1 - GATE_SAME):
             better.append(
                 f"instructions in all: {w} executes {n:,} with libc, fewer than {b:,} ({by(n, b)})"
@@ -1247,13 +1301,50 @@ def gate_updated(configs, now, gated):
             for dim in ("text", "compile_cpu_seconds", "compile_rss_kib"):
                 for p, n in new[dim].items():
                     new[dim][p] = min(n, held.get(dim, {}).get(p, n))
-        if own:
-            # The per-function counts explain and don't gate: they go with the count kept.
+        if held:
+            # The per-function counts explain and don't gate: they go with the count kept,
+            # whichever baseline it was kept from.
             for w, n in new["instructions"].items():
-                if n == own["instructions"].get(w) and w in (own.get("functions") or {}):
-                    new["functions"][w] = own["functions"][w]
+                if n == held["instructions"].get(w) and w in (held.get("functions") or {}):
+                    new["functions"][w] = held["functions"][w]
         configs[c] = new
     return configs
+
+
+def gate_check_baseline(baseline):
+    """Raise if `baseline` isn't shaped as `--update` writes it: configurations of
+    dimensions of numbers (each number is judged in `gate_compare`)."""
+    configs = baseline["configs"]
+    if not isinstance(configs, dict):
+        raise TypeError("configs is not an object")
+    for c, v in configs.items():
+        if not isinstance(v, dict):
+            raise TypeError(f"{c} is not an object")
+        for dim in GATE_DIMENSIONS:
+            if dim in v and not isinstance(v[dim], dict):
+                raise TypeError(f"{c}'s {dim} is not an object")
+
+
+def gate_lua_sources(unpacked):
+    """The digests of Lua's sources and tests, which are unpacked from pinned archives and so
+    the same everywhere. (SQLite's tree also holds the amalgamation its build generates, whose
+    bytes needn't be the same on every host: it is checked against its own record only.)"""
+    return {k: v for k, v in unpacked.items() if k.startswith("lua-")}
+
+
+def gate_check_sources(s, before, baseline):
+    """Stop the gate if the sources changed during the run, or aren't those the baseline was
+    measured on."""
+    for name, digest in (before or {}).items():
+        if source_digest(s.src / name) != digest:
+            die(f"{s.src / name} changed while the gate ran")
+    want = (baseline or {}).get("sources") or {}
+    for name, digest in want.items():
+        if (before or {}).get(name) != digest:
+            die(
+                f"{s.src / name} is not what the baseline was measured on: remove it and its "
+                ".digest to unpack it again"
+            )
 
 
 def gate_self_test():
@@ -1266,8 +1357,17 @@ def gate_self_test():
             "lua suite files passed": len(LUA_SUITE),
             "speedtest1 verifies": True,
         },
-        "instructions": {"lua-fib": 14_000_000, "speedtest1": 2_800_000_000},
-        "total_instructions": {"lua-fib": 14_250_000, "speedtest1": 2_900_000_000},
+        # Every workload the gate expects; lua-fib and speedtest1 are the ones the cases use.
+        "instructions": {
+            **{w: 50_000_000 for w in gate_expected()["instructions"]},
+            "lua-fib": 14_000_000,
+            "speedtest1": 2_800_000_000,
+        },
+        "total_instructions": {
+            **{w: 51_000_000 for w in gate_expected()["total_instructions"]},
+            "lua-fib": 14_250_000,
+            "speedtest1": 2_900_000_000,
+        },
         "functions": {
             "lua-fib": {"luaV_execute.l8bbbcbfa": 9_000_000, "luaD_precall": 2_000_000},
             "speedtest1": {"sqlite3VdbeExec": 900_000_000},
@@ -1324,6 +1424,47 @@ def gate_self_test():
             verdict(changed(("text", "sqlite"), None)),
             "FAIL",
             "text: sqlite was not measured",
+        ),
+        (
+            "a workload neither side has fails",
+            verdict(
+                changed(
+                    ("total_instructions", "speedtest1"),
+                    None,
+                    changed(("instructions", "speedtest1"), None),
+                ),
+                base=changed(
+                    ("total_instructions", "speedtest1"),
+                    None,
+                    changed(("instructions", "speedtest1"), None),
+                ),
+            ),
+            "FAIL",
+            "instructions: speedtest1 was not run",
+        ),
+        (
+            "a first baseline of a partial run fails",
+            verdict(changed(("text", "sqlite"), None), base=None),
+            "FAIL",
+            "text: sqlite was not measured",
+        ),
+        (
+            "a baseline number that isn't finite fails",
+            verdict(changed(fib, 40_000_000), base=changed(fib, float("inf"))),
+            "FAIL",
+            "the baseline's lua-fib is inf",
+        ),
+        (
+            "more instructions in all names the function that rose",
+            verdict(
+                changed(
+                    ("functions", "lua-fib"),
+                    {"luaV_execute.l8bbbcbfa": 9_400_000, "luaD_precall": 2_000_000},
+                    changed(("total_instructions", "lua-fib"), 14_700_000),
+                )
+            ),
+            "FAIL",
+            "in luaV_execute: 9,400,000",
         ),
         (
             "a baseline without one of the measurements fails",
@@ -1526,6 +1667,23 @@ def gate_self_test():
         and moved["compile_cpu_seconds"]["lua"] == 1.5,
         "the baseline moves down: --update didn't take a better number",
     )
+    # A baseline that isn't what --update writes is refused before the run.
+    for bad in ({"configs": None}, {"configs": {"fcc-O": {"text": None}}}, {}):
+        try:
+            gate_check_baseline(bad)
+            ok = False
+        except TypeError, KeyError:
+            ok = True
+        check(ok, f"a malformed baseline is refused: {bad}")
+    # A count kept from the baseline it was held to keeps that baseline's functions.
+    inherited = gate_updated(old, {"fcc-promo": changed(fib, 14_000_090)}, ["fcc-promo"])[
+        "fcc-promo"
+    ]
+    check(
+        inherited["instructions"]["lua-fib"] == 14_000_000
+        and inherited["functions"]["lua-fib"] == good["functions"]["lua-fib"],
+        "an inherited count keeps the functions it was counted with",
+    )
     # A configuration's first baseline is no looser than fcc -O's, which it passed against
     # with slack.
     slow = changed(("compile_cpu_seconds", "lua"), 3.2)
@@ -1581,8 +1739,17 @@ def cmd_gate(s):
     for where in (ROOT, s.out):
         if any(ch.isspace() or ch == "," for ch in str(where)):
             not_run(f"{where}: a path with a space or a comma can't be measured")
-    baseline = json.loads(GATE.read_text()) if GATE.exists() else None
-    if baseline is None and not s.args.update:
+    # One gate at a time in a checkout: two would share the measurement files under --out,
+    # the sources, and the baseline an update writes. Held until the process ends.
+    lock_dir = ROOT / "target/fai"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock = open(lock_dir / "gate.lock", "w")  # noqa: SIM115 (held for the whole run)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        not_run("another gate is running in this checkout")
+    baseline_text = GATE.read_bytes() if GATE.exists() else None
+    if baseline_text is None and not s.args.update:
         not_run(f"no baseline at {GATE}; make one with `gate --update`")
     if s.plain and s.args.update:
         not_run("--update with --plain: a baseline is of whole builds")
@@ -1600,22 +1767,41 @@ def cmd_gate(s):
     # with the tree later), the run that wrote it, the baseline, and how the gate was run.
     report["tree"] = os.environ.get("FAI_TREE")
     report["run"] = os.environ.get("FAI_RUN")
-    report["baseline_sha256"] = sha256(GATE) if GATE.exists() else None
+    report["baseline_sha256"] = (
+        hashlib.sha256(baseline_text).hexdigest() if baseline_text is not None else None
+    )
     report["update"] = bool(s.args.update)
     # The harness stops (`die`) when a file doesn't compile, takes too long, or a counted run
     # goes wrong, and a run can also end in an error of its own (a workload over its time, a
     # trace that was never written): each is the tree failing, and still gets a verdict and a
     # report.
+    # The baseline, read once, is checked first: one that isn't what the gate wrote fails here,
+    # with a report, and not with a crash later.
     stopped = None
-    try:
-        cmd_prepare(s)
-        cmd_build(s)
-        cmd_check(s)
-        cmd_count(s)
-    except SystemExit:
-        stopped = STOPPED[-1] if STOPPED else "the harness stopped (see above)"
-    except Exception as e:
-        stopped = f"{type(e).__name__}: {e}"
+    baseline = None
+    if baseline_text is not None:
+        try:
+            baseline = json.loads(baseline_text)
+            gate_check_baseline(baseline)
+        except (ValueError, TypeError, KeyError) as e:
+            stopped = f"{GATE} is not a baseline the gate can read ({e}): make it again"
+    now = None
+    if stopped is None:
+        try:
+            cmd_prepare(s)
+            before = load(s.out, "prepare").get("unpacked")
+            cmd_build(s)
+            cmd_check(s)
+            cmd_count(s)
+            # The sources are ignored by git: they must be as they were before the run, and
+            # those the baseline was measured on.
+            gate_check_sources(s, before, baseline)
+            now = gate_measure(s, gated)
+            verdict = gate_verdict(now, baseline, gated, s.plain)
+        except SystemExit:
+            stopped = STOPPED[-1] if STOPPED else "the harness stopped (see above)"
+        except Exception as e:
+            stopped = f"{type(e).__name__}: {e}"
     if stopped is not None:
         report["verdict"] = "FAIL"
         report["stopped"] = stopped
@@ -1626,8 +1812,7 @@ def cmd_gate(s):
         print("gate: FAIL")
         sys.exit(GATE_FAIL)
     report["sources"] = load(s.out, "prepare").get("unpacked")
-    now = gate_measure(s, gated)
-    report.update(gate_verdict(now, baseline, gated, s.plain))
+    report.update(verdict)
     save(s.out, "gate-report", report)
     for c, r in report["configs"].items():
         if r["against"] is None:
@@ -1652,7 +1837,11 @@ def cmd_gate(s):
     if s.args.update:
         # The verdict was against the baseline as it was when the gate started.
         if (sha256(GATE) if GATE.exists() else None) != report["baseline_sha256"]:
+            report["verdict"] = "FAIL"
+            report["stopped"] = f"{GATE} changed while the gate ran"
+            save(s.out, "gate-report", report)
             print(f"gate: {GATE} changed while the gate ran: it was not written")
+            print("gate: FAIL")
             sys.exit(GATE_FAIL)
         configs = gate_updated(baseline["configs"] if baseline else {}, now, gated)
         text = json.dumps(
@@ -1661,6 +1850,9 @@ def cmd_gate(s):
                 "what a change may not make worse. Written by `fai gate --update`, which "
                 "refuses unless the gate passes, and then only moves a number down.",
                 "configs": configs,
+                # The Lua sources the baseline was measured on (`source_digest`): a later run
+                # on other sources measures something else.
+                "sources": gate_lua_sources(load(s.out, "prepare").get("unpacked") or {}),
             },
             indent=1,
             sort_keys=True,

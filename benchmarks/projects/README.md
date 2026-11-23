@@ -49,13 +49,22 @@ It measures the compiler built from the tree as it is: the C API library is buil
 where cargo builds now, and fcc is configured against exactly that file every time, so a
 build directory left from another target directory can't put an older compiler under the
 gate. The fetched sources are ignored by git, so the gate checks them itself: each unpacked
-source's digest is recorded when it is prepared and compared on every later run.
+source's digest is recorded when it is prepared and compared on every later run and again
+after the run, and Lua's (unpacked from pinned archives, so the same everywhere) must be the
+ones `gate.json` was measured on. SQLite's tree holds the amalgamation its build generates,
+which is checked against its own record only: whoever rewrites that record by hand can change
+it unseen. One gate runs at a time in a checkout (`target/fai/gate.lock`), so two can't
+share measurements or race to write the baseline.
 
 It fails if:
 
 - a file doesn't compile, or takes more than `--timeout` seconds (300 unless given);
-- a build's behavior differs from GCC `-O2`'s (a workload's output, a file of Lua's suite,
-  speedtest1's hash, which counts only if the reference build verified too);
+- a Lua workload's output differs from GCC `-O2`'s build's, a file of Lua's suite fails (each
+  run as the suite's portable mode, `_port=true`, runs it), or speedtest1's hash differs from
+  the reference's, which counts only if the reference verified too. The checks run without
+  `LUA_*` and `QEMU_*` variables, which would change what they run. speedtest1's hash covers
+  each result's type and its integer and text values, not a floating-point value: a wrong
+  `REAL` result goes unseen there (Lua's `nbody` and `spectral` print theirs);
 - a workload executes more instructions than the baseline's, in the project's own code or in
   the whole run with libc (work moved into libc is still work), by more than one part in
   100,000. The Lua counts repeat exactly and speedtest1's to within a few dozen (it reads the
@@ -64,10 +73,10 @@ It fails if:
   function and paces its collector by memory: its arguments and environment then don't
   depend on where the tree or the output directory is. Its working directory still does,
   which these programs don't read;
-- anything that should have been measured wasn't, on either side: a workload or a project
-  the baseline has and the run doesn't or the reverse, a count that isn't above zero, a
-  baseline without one of the measurements, or one with neither the configuration nor
-  `fcc -O`;
+- anything that should have been measured wasn't, on either side: one of the eight workloads
+  or two projects is missing from the run or the baseline, a number isn't finite and above
+  zero, the baseline lacks one of the measurements or isn't shaped as `--update` writes it,
+  or it has neither the configuration nor `fcc -O`;
 - a run ends in an error (a workload over its time, a trace that was never written);
 - a project's `.text` is larger than the baseline's, at all;
 - a project compiles in more than twice the baseline's CPU time plus a second, or peaks at

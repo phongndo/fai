@@ -12,7 +12,7 @@
     "sqlite": 1.56
    },
    "compile_rss_kib": {
-    "lua": 99560,
+    "lua": 99080,
     "sqlite": 230492
    },
    "functions": {
@@ -138,5 +138,9 @@
     "speedtest1": 2935019111
    }
   }
+ },
+ "sources": {
+  "lua-5.4.7": "5c7b5498978f74778de87776702bbc062eefffde4efb0d522bd911a43cdb0110",
+  "lua-5.4.7-tests": "edcb8579069e516dd3b6babd695bffbfdca70fe8094b3e10d823a6bf2c949494"
  }
 }

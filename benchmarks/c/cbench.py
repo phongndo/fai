@@ -138,9 +138,18 @@ class Tools:
         # to GCC's code and not to fcc's.
         self.env = dict(os.environ, NIX_HARDENING_ENABLE="")
         self.fcc = ROOT / "build/fcc/fcc"
-        # Where cargo builds: its default, or what the caller set (`fai mutate` builds its copy
+        # Where cargo builds, as cargo itself says: `CARGO_TARGET_DIR`, `build.target-dir` in
+        # a config file, `CARGO_BUILD_TARGET_DIR`, or its default (`fai mutate` builds its copy
         # of the tree in a target directory of its own).
-        self.target = Path(os.environ.get("CARGO_TARGET_DIR") or ROOT / "target").resolve()
+        meta = subprocess.run(
+            ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        if meta.returncode != 0:
+            die(f"cargo metadata failed: {meta.stderr.strip()}")
+        self.target = Path(json.loads(meta.stdout)["target_directory"]).resolve()
         self.fir = self.target / "release/fir"
         self.clang, self.clang_flags = self._clang()
 
@@ -393,7 +402,7 @@ def program_ranges(mapfile, obj):
     ranges, pending = [], None
     lines = mapfile.read_text().splitlines()
     for line in lines:
-        m = re.match(r"^ (\.text[\w.$]*)\s+0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+(\S+)$", line)
+        m = re.match(r"^ (\.text\S*)\s+0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+(\S+)$", line)
         if m:
             _, addr, size, path = m.groups()
         elif pending:
@@ -403,7 +412,7 @@ def program_ranges(mapfile, obj):
                 continue
             addr, size, path = m.groups()
         else:
-            m = re.match(r"^ (\.text[\w.$]*)$", line)
+            m = re.match(r"^ (\.text\S*)$", line)
             if m:
                 pending = m.group(1)
             continue

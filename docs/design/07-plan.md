@@ -219,7 +219,7 @@ Steps 2 and 4 run with the steps that use them (7, 12, 16).
 | 4a | **Passed.** With every counted run started in its work directory, two gate runs into `target/pb-a` and `target/projbench-with-a-much-longer-name-for-this-test` counted the same instructions for all 8 workloads in both configurations, to the instruction |
 | 5 | **Passed.** `fai judging --base origin/main --head 313855a` names the eight files below and exits 3; `--base 313855a --head 69137c8` (a commit of two plan files) exits 0; an unknown base exits 2. `fai mutate judging-list-drops-the-tests` is caught |
 | 6 | **Passed.** `verify`, `gate`, `mutate`, and `accept` record the tree's hash at their start and end (`mutate` only its start, until the review). After `fai accept`, `fai status` says `CURRENT` and exits 0; with one byte appended to `README.md` it says `STALE: verify, gate` and exits 1; with the byte removed, 0 again; the same with an untracked file added and removed. A gate run with `--update` is stale by its own doing: it changes the baseline, which is part of the tree |
-| 7 | **Passed.** `projbench.py gate --self-test` makes 38 checks (22 before the review) in well under a second, and `fai verify` runs it. `gate-tolerance-widened`, `gate-passes-a-partial-build`, and `gate-baseline-moves-up` are each caught by it. `slower-code` plants a real slowdown (selection forgets what it knows of a register's high bits) and runs the gate itself in `fai mutate`'s copy: the gate passes the unchanged copy, in a third directory, and fails the planted one in 2 minutes with every Lua workload worse (5.48% for lua-sort to 11.65%). The defect is larger than the 1% first aimed at; the gate's verdict at 1% is the self-test's. The harness now builds where `CARGO_TARGET_DIR` says, which the copy needed |
+| 7 | **Passed.** `projbench.py gate --self-test` makes 46 checks (22 before the review, 38 after its first round) in well under a second, and `fai verify` runs it. `gate-tolerance-widened`, `gate-passes-a-partial-build`, and `gate-baseline-moves-up` are each caught by it. `slower-code` plants a real slowdown (selection forgets what it knows of a register's high bits) and runs the gate itself in `fai mutate`'s copy: the gate passes the unchanged copy, in a third directory, and fails the planted one in 2 minutes with every Lua workload worse (5.48% for lua-sort to 11.65%). The defect is larger than the 1% first aimed at; the gate's verdict at 1% is the self-test's. The harness now builds where `CARGO_TARGET_DIR` says, which the copy needed |
 | 8 | **Passed.** The budget is 2^20 units of work and 4,096 per input instruction, and 2^29 in all. With `-O`, Lua and SQLite (2,376 validations) need at most 632 per instruction and 17.6 million in all, both for `luaV_execute`. With the promotion passes, `lvm.c` is refused in 4.75 s at 479 MB (it had passed 4 billion units after 100 s), and 13 of SQLite's functions need more than 4,000 per instruction (up to 169,774), so `sqlite3.c` no longer compiles with them either: 06's step 7 now has a number to get under. `.text` of both projects is unchanged, the gate passes, and `validator-budget-removed` is caught |
 
 ### Stage B
@@ -272,6 +272,24 @@ provider before they reported. What the three found, and what was done:
 | CI: the matrix job's glob no longer matched after the upload paths changed; a push to `main` was compared with itself | the verify job is as it was before the round; acceptance is a job of its own, compared with what `main` was before the push |
 | `fai mutate`: several expected messages admitted another failure; `slower-code` could not prepare sources in its copy | the messages are narrower; it needs the sources prepared in the tree, and says so |
 | Claims in this file | corrected in the rows above |
+
+A second round of five reviewers: the backend and the IR verifier reviewers were cut off by
+the provider again before they reported, though the second found, before it stopped, that G11
+is only narrowed (above). The gate's reviewer said round one's fixes partly held, and found
+more:
+
+| Found | Done |
+|---|---|
+| Cargo's target directory can also come from `CARGO_BUILD_TARGET_DIR` or a config file, which the harness didn't read: an older compiler again | the harness asks cargo (`cargo metadata`) |
+| Two gates with one `--out`, or two `--update`s, could share measurements or race to write the baseline | one gate at a time in a checkout (`target/fai/gate.lock`) |
+| `LUA_INIT` in the environment ran code before every behavior check, so the suite "passed" without running | the behavior checks run without `LUA_*` and `QEMU_*` |
+| A source edited after it was prepared, or with its digest record rewritten, was measured | digests are checked again after the run, and Lua's against `gate.json` |
+| A trace left by an earlier run could be read as this run's; a `.text` section with a `-` in its name wasn't found in the map | each run removes its trace first and stops if none is written; any `.text…` section is read |
+| A workload or project missing on both sides, a first baseline of a partial run, a baseline number that is infinite, and a malformed baseline passed or crashed before the verdict | every measurement must cover the eight workloads and two projects, every number be finite and above zero, and the baseline be shaped as `--update` writes it, or the gate fails with its report |
+| A failure in the whole run's count named no functions; a count kept from `fcc -O`'s baseline was saved with the functions of another run | both explained; a kept count keeps its functions |
+| speedtest1's hash leaves floating-point values out | a limit of the workload, now in the README |
+
+The gate's self-test has 46 checks.
 
 Known and left: a hole read only by an op that lowering erases still disappears (G11, narrowed by step 15, not closed); a tree that changes and changes back between two readings is not seen; the
 evidence checks added this round require counts above zero, not the counts themselves; the
