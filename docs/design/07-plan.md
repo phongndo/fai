@@ -191,12 +191,15 @@ Steps 2 and 4 run with the steps that use them (7, 12, 16).
 
 | # | Result |
 |---|---|
+| 10 | **Passed.** `fai verify quick` takes 46 s (57 s with another job running), against a warm `fast` at 212 s: it is `fast` without `fcc_corpus`, `fcc_x86_64_corpus`, and `fcc_abi_torture`, and with 20 of the ABI test's signatures, and it prints that list. Most of the gain is not from leaving tests out: the fixture tests ran one file at a time, and now use every core (native AArch64 32 s to 4 s, x86-64 14 s to 3 s, lowering 12 s to 7 s, each with the counts it had), which `fast` and `full` get too. What it catches of the planted defects is measured by `fai mutate --quick`, below |
 | 9 | **Passed.** The verdict is a function of its parts, with unit tests for the four exit codes, their order, a host with gaps, and an edited test whose old version still passes. On this tree `fai accept` took about 7 minutes and ended `PASS, JUDGING FILES CHANGED`, exit 3: verification passed (16 checks), the gate was the same as its baseline, and the change **fails the tests as they were at the base**: `line_zero_escaped_file_names_and_modules_without_files` in `tests/rust/debug_lines.rs` and `corrupted_allocations_are_refused` in `tests/rust/regcheck.rs`, the two fixtures `ab20520` edited. The `fai mutate` entry is step 9's last part, below |
 
 ### Stage C
 
 | # | Result |
 |---|---|
+| 13 | **Passed.** Both verifiers refuse, outside HFIR, a struct or array as a block's parameter, a loop's state, a result of `cf.if`, `cf.loop`, or `cf.blocks`, or a hole, with one message. The Lean build took 13 s after the change and no proof needed touching; the audit reports 44 claims and no change needing review, so the proof lock did not move after all. No existing fixture relied on it. Five new error fixtures (`tests/layers/errors/mfir-composite-*.fir`) pin the messages in both tools |
+| 15 | **Passed (decision 4, as recommended).** Both verifiers refuse a hole of a type with no scalars. The gap's program is `tests/fir0/errors/hole-of-nothing.fir`. The lowering test still compares every run that ends at a hole |
 | 16 | **Passed.** `select_eager`, `compile_eager`, and `fir compile --reference-selection` select with a register for every value where it is defined, no operand folded, and nothing remembered of a register's high bits. The native suite now runs the LFIR of every fixture and random program selected that way against the source too: 502 fixture runs match, as many as the default's. It adds a second to the suite (32 s to 33 s). The two original fixtures of decision 1 run again in that mode beside the edited ones, and pass. Defect (b), a lazy value's register reused in a block that didn't build it, is `fai mutate`'s `lazy-value-reused-across-blocks`: it is caught in 2 of 55 fixture modules, by the allocator's own check of its assignment in debug builds ("reads v2 from x1, which holds something else"); the always-on validator can't see it, since its input already has the bug. The gate's numbers are unchanged (the default selection is) |
 
 ### Measured before the round

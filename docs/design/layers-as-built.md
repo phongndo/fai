@@ -104,7 +104,7 @@ The verifier (`Fir.Verify`, `verify.rs`) checks a module against its layer befor
 
   | | Composite (struct, array) values | Integers | Other limits |
   |---|---|---|---|
-  | The verifier accepts | Anywhere a value can be, except loads, stores, and `select`: also loop state, `cf.if` and `cf.blocks` results, block arguments, and holes | Any width | — |
+  | The verifier accepts | Where calls pass them whole, in `agg.*`, and in `copy`, `freeze`, and `poison`; not as loop state, a `cf.if`, `cf.loop`, or `cf.blocks` result, a block parameter, or a hole | Any width | — |
   | The lowering produces | Only where calls pass them whole: parameters, call arguments and results, `va.arg` results, a function's only result. They are made by `agg.make` and taken apart by `agg.extract` | Wider than the source's: one more bit for checked `add`/`sub`, twice the width for checked `mul`, twice the address size for `ptr.index.inbounds` | Temporaries `%.s*`, `%.x*`, `%.e*` |
   | AArch64 selection accepts | What the lowering produces, minus composites whose pointers a register word would split: `struct<packed>{i8, ptr}` lowers, and selection refuses it | Over 64 bits only in ops whose low 64 bits depend only on the operands' low 64 bits | AAPCS64's layout. No holes. For macOS, `backend::aarch64::compile` also refuses variadics and composites passed on the stack, but `fir compile` calls selection directly and skips that check (G12) |
 
@@ -234,15 +234,15 @@ under qemu.
 | | Gap | Status |
 |---|---|---|
 | G1, G2 | Layouts other than AAPCS64's miscompiled C calls and overran `va_list` | fixed: refused by `isel::check_module` |
-| G3 | An MFIR `cf.if` yielding a struct verifies, then selection refuses it as "HFIR only" | open; the cause is G9 |
+| G3 | An MFIR `cf.if` yielding a struct verifies, then selection refuses it as "HFIR only" | fixed with G9 |
 | G4 | `int.add.overflow.s` on `i64` lowers to `i65` ops that verify, then selection refuses them | open |
 | G5 | A source name the lowering also makes breaks it ("defined more than once"). That covers temporaries like `%.e0`, and also a scalar name: `%s.1: i32` next to `%s: struct<C>{i32, i32}` verifies and runs as HFIR, and its lowering doesn't verify. `fcc` renames clashing locals to this same form (`x.1`, `nameValue`). The corpus doesn't hit it | open (refused, not miscompiled) |
 | G6 | Facts are dropped by selection, and no trust level means anything to the compiler | open |
 | G7 | `tests/lower.rs` skips runs whose arguments don't parse at both layers, so it never compares functions whose signatures scalarization changes | open |
 | G8 | **HFIR and MFIR stacks are unbounded; LFIR's and native code's are not.** A recursive MFIR function with a 64-byte slot returns `100000` for `@deep(100000)` in `fir run`. The LFIR machine gives `ub out-of-bounds (offset -8, …, allocation size 1048576)`, and qemu crashes with a segfault. The target is less defined than its source. No test exercises it: fixtures don't recurse that deep | open (P6) |
-| G9 | **MFIR's verifier accepts composite loop state, `cf.if`/`cf.blocks` results, and holes,** which decision Aggregates says stay scalar outside HFIR. `cf.loop iter(%s: struct<C>{i32, i32} = %s0)` verifies and runs as MFIR | open (P1) |
+| G9 | **MFIR's verifier accepted composite loop state, `cf.if`/`cf.blocks` results, and holes,** which decision Aggregates says stay scalar outside HFIR | fixed: both verifiers refuse them outside HFIR (`checkScalarState`; `tests/layers/errors/mfir-composite-*.fir`) |
 | G10 | `fir check` prints a composite hole's type as `type#0` (`bin/fir.rs:99` prints a `Ty` without the module's type table) | open, cosmetic |
-| G11 | **The lowering drops holes of empty composites.** `%s: struct<C>{} = copy ?h: struct<C>{}`, then returning 7, runs as `hole ?h` in HFIR and returns 7 after lowering, which doesn't refine it: an empty composite has no scalars to carry the hole (`Lower.lean`, scalarizing) | open |
+| G11 | **The lowering dropped holes of empty composites.** `%s: struct<C>{} = copy ?h: struct<C>{}`, then returning 7, ran as `hole ?h` in HFIR and returned 7 after lowering | fixed: both verifiers refuse a hole of a type with no scalars (`tests/fir0/errors/hole-of-nothing.fir`) |
 | G12 | **`fir compile --os darwin` skips the macOS checks.** The CLI calls `select` and `allocate` itself (`bin/fir.rs`), not `backend::aarch64::compile`, so it emits a variadic function for macOS that the library refuses | open |
 
 ## 7. Proposed shared-IR changes
@@ -252,7 +252,7 @@ layer. Each must land in Lean and Rust together, as the verifier and the lowerin
 
 | | Change | Closes | Cost |
 |---|---|---|---|
-| P1 | **Enforce decision Aggregates in both verifiers.** Outside HFIR, the parameters of every region but a function's entry, region results, block arguments, and holes must be scalars. Composites stay legal only where calls pass them whole (function parameters and results included) and in `agg.*` | G3, G9 | Small: `Verify.lean`, `verify.rs`, and a `tests/layers/errors` fixture. The lowering already produces only this |
+| P1 (done) | **Enforce decision Aggregates in both verifiers.** Outside HFIR, the parameters of every region but a function's entry, region results, block arguments, and holes must be scalars. Composites stay legal only where calls pass them whole (function parameters and results included) and in `agg.*` | G3, G9 | Small: `Verify.lean`, `verify.rs`, and a `tests/layers/errors` fixture. The lowering already produces only this |
 | P2 | **Make the lowering's names unable to clash.** Reserve names starting with `.` in HFIR (the verifier rejects them; temporaries keep them), and give a part `%n.i` a fresh suffix when the source already uses that name, in `Lower.lean` and `lower.rs` alike | G5. `Expand.refines`'s `NoTemps` hypothesis then follows from verification | Small. The reservation also rejects HFIR that lowers today (`%.e0 = int.const 7`, returned). The alternative, fresh names for temporaries too, rejects nothing but means restating `NoTemps` |
 | P3 | **Target legality as data.** One predicate per target, generated for Rust like the op contracts: which integer widths and composite positions each op takes. `fir check --target aarch64` would run it, and selection would use it for its refusals | G4 reported at MFIR, not as a selection failure. This is the design's "target legality rule", in its smallest form | Medium |
 | P4 | **Refinement through a value encoding.** `Func.RefinesVia enc` (arguments encoded and results decoded as the lowered signature takes them: `sigParams`/`sigRets`, with `lowerValue` for the parts that become scalars) and `Module.Refines` (every function replaced at once, so calls go to the target's callees) | Makes items 2 and 4 of section 5 statable. `Func.Refines` stays the case `enc = id` | Medium (definitions only); the proofs are the open obligations |
