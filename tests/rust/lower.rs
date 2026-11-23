@@ -10,6 +10,8 @@
 mod common;
 
 use std::path::Path;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 use common::{display_name, fir_files, reference};
 
@@ -17,17 +19,19 @@ use common::{display_name, fir_files, reference};
 fn lowering_matches_reference_and_refines() {
     let fir = Path::new(env!("CARGO_BIN_EXE_fir"));
     let tool = reference();
-    let mut fails = Vec::new();
-    let mut lowered = 0;
-    let mut runs = 0;
-    for file in &fir_files() {
+    // One file per step, on every core: each file is lowered and run by itself.
+    let fails = Mutex::new(Vec::new());
+    let (lowered, runs) = (AtomicU64::new(0), AtomicU64::new(0));
+    let files = fir_files();
+    let next = AtomicUsize::new(0);
+    let one = |file: &Path| {
         let name = display_name(file);
         let text = std::fs::read_to_string(file).unwrap();
         let Ok(m) = fir::parse_module(&text) else {
-            continue;
+            return;
         };
         if fir::verify_module(&m).is_err() {
-            continue;
+            return;
         }
         if let Some(tool) = &tool {
             let (a, b) = (
@@ -35,7 +39,7 @@ fn lowering_matches_reference_and_refines() {
                 common::run(tool, "lower", file, &[]),
             );
             if (&a.stdout, &a.stderr, a.status.code()) != (&b.stdout, &b.stderr, b.status.code()) {
-                fails.push(format!(
+                fails.lock().unwrap().push(format!(
                     "{name}: fir lower printed {:?} {:?}, fir-ref lower {:?} {:?}",
                     String::from_utf8_lossy(&a.stdout),
                     String::from_utf8_lossy(&a.stderr),
@@ -45,7 +49,7 @@ fn lowering_matches_reference_and_refines() {
             }
         }
         if m.layer != fir::Layer::Hfir {
-            continue;
+            return;
         }
         let expected: Vec<&str> = text
             .lines()
@@ -55,25 +59,28 @@ fn lowering_matches_reference_and_refines() {
         let l = match fir::lower_checked(&m) {
             Ok(l) => {
                 if let Some(t) = expected.first() {
-                    fails.push(format!("{name}: expected lowering to fail with '{t}'"));
+                    fails
+                        .lock()
+                        .unwrap()
+                        .push(format!("{name}: expected lowering to fail with '{t}'"));
                 }
                 l
             }
             Err(e) => {
                 if expected.is_empty() {
-                    fails.push(format!("{name}: {e}"));
+                    fails.lock().unwrap().push(format!("{name}: {e}"));
                 }
                 for t in &expected {
                     if !e.contains(t) {
-                        fails.push(format!(
+                        fails.lock().unwrap().push(format!(
                             "{name}: lowering error '{e}' does not contain '{t}'"
                         ));
                     }
                 }
-                continue;
+                return;
             }
         };
-        lowered += 1;
+        lowered.fetch_add(1, Relaxed);
         for line in text.lines() {
             let Some(body) = line.trim().strip_prefix("// run:") else {
                 continue;
@@ -93,9 +100,9 @@ fn lowering_matches_reference_and_refines() {
             ) else {
                 continue;
             };
-            runs += 1;
+            runs.fetch_add(1, Relaxed);
             if !src.lowers_to(&tgt) {
-                fails.push(format!(
+                fails.lock().unwrap().push(format!(
                     "{name}: @{func}({}): HFIR '{}', lowered '{}'",
                     args.join(", "),
                     src.line,
@@ -103,7 +110,23 @@ fn lowering_matches_reference_and_refines() {
                 ));
             }
         }
-    }
+    };
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                loop {
+                    let Some(file) = files.get(next.fetch_add(1, Relaxed)) else {
+                        return;
+                    };
+                    one(file);
+                }
+            });
+        }
+    });
+    let mut fails = fails.into_inner().unwrap();
+    fails.sort();
+    let (lowered, runs) = (lowered.into_inner(), runs.into_inner());
     let ev = common::evidence::Evidence::new("lower_fixtures");
     ev.count("modules lowered", lowered);
     ev.count("runs compared (HFIR against its lowering)", runs);

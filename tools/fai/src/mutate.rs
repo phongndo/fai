@@ -10,6 +10,11 @@
 //! Every command is also run on the unmutated tree first and must pass, so a failure can't be
 //! blamed on the environment.
 //!
+//! `fai mutate --quick [NAME…]` measures the quick tier instead: each defect is planted the same
+//! way, and `fai verify quick` runs in place of the narrow command. It reports how many of the
+//! defects quick catches (and writes `target/mutate/quick.json`); a miss is a finding, not a
+//! failure, since quick leaves tests out on purpose.
+//!
 //! The mutations run in a copy of the repository under `target/mutate/tree` (the working tree's
 //! tracked files, and Lean's build directory so that only what a mutation touches rebuilds),
 //! with its own Cargo target directory. The original tree is never changed. Results go to
@@ -706,6 +711,12 @@ fn run(c: &Cmd, tree: &Path, target: &Path) -> (bool, String) {
 }
 
 pub fn main(root: &Path, names: &[String]) -> i32 {
+    // `--quick`: measure the quick tier. Each defect is planted as usual, and then
+    // `fai verify quick` runs in place of the command that is known to catch it. Nothing is
+    // required of the result: the count of defects quick catches is what its verdict is worth.
+    let quick = names.iter().any(|n| n == "--quick");
+    let names: Vec<String> = names.iter().filter(|n| *n != "--quick").cloned().collect();
+    let names = &names[..];
     let base = root.join("target/mutate");
     let tree = base.join("tree");
     let target = base.join("target");
@@ -740,7 +751,12 @@ pub fn main(root: &Path, names: &[String]) -> i32 {
         for e in &m.edits {
             std::fs::write(tree.join(e.file), &pristine[e.file]).unwrap();
         }
-        let last = m.steps.last().unwrap();
+        let quick_cmd = cmd("cargo", &["fai", "verify", "quick"]);
+        let last = if quick {
+            &quick_cmd
+        } else {
+            m.steps.last().unwrap()
+        };
         let key = format!("{} {} {:?}", last.prog, last.args.join(" "), last.env);
         let baseline_ok = *baselines.entry(key.clone()).or_insert_with(|| {
             if m.name == "evidence-suite-missing" {
@@ -773,17 +789,21 @@ pub fn main(root: &Path, names: &[String]) -> i32 {
         let mut reason_ok = false;
         if problem.is_none() {
             for (i, step) in m.steps.iter().enumerate() {
+                let is_last = i + 1 == m.steps.len();
+                let step = if is_last { last } else { step };
                 let (ok, out) = run(step, &tree, &target);
                 output = out;
-                if i + 1 < m.steps.len() && !ok {
+                if !is_last && !ok {
                     problem = Some(format!("setup step {} failed: {}", i + 1, tail(&output)));
                     break;
                 }
-                if i + 1 == m.steps.len() {
+                if is_last {
                     caught = !ok;
-                    reason_ok = m.expect.iter().all(|x| output.contains(x))
-                        && m.in_decl
-                            .is_none_or(|(f, d)| error_in_decl(&tree, f, d, &output));
+                    // The quick tier is not asked for the diagnostic, only to fail.
+                    reason_ok = quick
+                        || (m.expect.iter().all(|x| output.contains(x))
+                            && m.in_decl
+                                .is_none_or(|(f, d)| error_in_decl(&tree, f, d, &output)));
                 }
             }
         }
@@ -795,7 +815,8 @@ pub fn main(root: &Path, names: &[String]) -> i32 {
             let _ = run(&regen_ops(), &tree, &target);
         }
         let passed = baseline_ok && problem.is_none() && caught && reason_ok;
-        ok_all &= passed;
+        // In a `--quick` run a defect the quick tier misses is a finding, not a failure.
+        ok_all &= passed || (quick && baseline_ok && problem.is_none());
         let verdict = if !baseline_ok {
             "baseline failed".to_owned()
         } else if let Some(p) = &problem {
@@ -836,6 +857,32 @@ pub fn main(root: &Path, names: &[String]) -> i32 {
         "mutations": results,
         "all_caught_for_the_intended_reason": ok_all,
     });
+    if quick {
+        let caught = results
+            .iter()
+            .filter(|r| r["passed"] == json!(true))
+            .count();
+        let missed: Vec<&str> = results
+            .iter()
+            .filter(|r| r["passed"] != json!(true))
+            .filter_map(|r| r["name"].as_str())
+            .collect();
+        std::fs::write(
+            base.join("quick.json"),
+            serde_json::to_string_pretty(&report).unwrap(),
+        )
+        .unwrap();
+        eprintln!(
+            "\nfai verify quick catches {caught} of {} planted defects{}",
+            results.len(),
+            if missed.is_empty() {
+                String::new()
+            } else {
+                format!("; it misses: {}", missed.join(", "))
+            }
+        );
+        return if ok_all { 0 } else { 1 };
+    }
     std::fs::write(
         base.join("report.json"),
         serde_json::to_string_pretty(&report).unwrap(),

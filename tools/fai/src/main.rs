@@ -1,8 +1,9 @@
 //! `fai`: the repository's command for verifying it and for experimenting on its compiler.
 //!
 //! ```text
-//! fai verify [fast|full] [--no-lean-clean] [--report-dir DIR]   the required check (below)
-//! fai mutate [NAME...]           the checkers' adversarial tests (mutate.rs)
+//! fai verify [quick|fast|full] [--no-lean-clean] [--report-dir DIR]   the required check (below)
+//! fai mutate [--quick] [NAME...] the checkers' adversarial tests (mutate.rs); with --quick, how
+//!                                many of them `verify quick` catches
 //! fai evidence DIR               check one evidence directory as `verify full` would
 //! fai experiment NAME [OPTIONS]  propose, test, and measure a compiler change (experiment.rs)
 //! fai judging [--base REV] [--head REV] [--json]
@@ -33,6 +34,10 @@
 //!
 //! **fast** runs the same static checks and the debug tests with whatever is available, and
 //! reports what it skipped. It never reports full verification.
+//!
+//! **quick** is fast without the tests that take minutes (`QUICK_SKIPS`: the C corpus), in
+//! under a minute: the tier to run after every edit. It says `QUICK PASSED: not a
+//! verification` and lists what it left out, the same list every time.
 //!
 //! Both write `target/verify/report.json` and `target/verify/report.md` (revision, toolchains,
 //! each check with its status, time, and counts, coverage, and the exclusions), and print a
@@ -252,6 +257,29 @@ const SUITES: &[&str] = &[
     "abi_torture",
 ];
 
+/// The tests `fai verify quick` leaves out, each with why: the same ones every time, so that
+/// what a quick pass covers doesn't depend on what changed. Everything else runs: every other
+/// suite's fixtures and random programs, the Lean build (what changed), the proof audit, the
+/// generated files, the lints, and the gate's self-test.
+const QUICK_SKIPS: &[(&str, &str)] = &[
+    (
+        "fcc_corpus",
+        "the C corpus at every layer and natively: about 100 s",
+    ),
+    (
+        "fcc_x86_64_corpus",
+        "the C corpus on x86-64: it runs beside fcc_corpus",
+    ),
+    (
+        "fcc_abi_torture",
+        "random C struct passing against the C compiler: it runs beside fcc_corpus",
+    ),
+];
+
+/// How many signatures the ABI test (`tests/rust/abi.rs`) draws in the quick tier: it takes
+/// 11 s at its default and 1 s at this.
+const QUICK_ABI: &str = "20";
+
 /// Op constructors no differential test can exercise, and why. Every other constructor that a
 /// component claims to support must appear in that component's comparisons.
 const COVERAGE_EXCLUSIONS: &[(&str, &str, &str)] = &[];
@@ -275,6 +303,8 @@ struct Verify {
     run_id: String,
     root: PathBuf,
     full: bool,
+    /// The quick tier: the debug tests without [`QUICK_SKIPS`].
+    quick: bool,
     out_dir: PathBuf,
     checks: Vec<Check>,
     identity: BTreeMap<String, String>,
@@ -744,9 +774,20 @@ impl Verify {
         if profile == "release" {
             args.push("--release");
         }
+        if self.quick {
+            env.push(("FIR_ABI", QUICK_ABI.to_owned()));
+            args.push("--");
+            for (test, _) in QUICK_SKIPS {
+                args.extend(["--skip", test]);
+            }
+        }
         let root = self.root.clone();
         let name = format!("rust tests ({profile})");
         let out = self.command(&name, &root, "cargo", &args, &env);
+        if self.quick {
+            // Tests were left out on purpose, and the verdict says which.
+            return out.is_some();
+        }
         self.none_filtered(&name, out.as_deref())
     }
 
@@ -1196,8 +1237,10 @@ fn check_evidence(
     (bad, Value::Object(table))
 }
 
-const USAGE: &str = "usage: fai verify [fast|full] [--no-lean-clean] [--report-dir DIR]
-       fai mutate [NAME...]
+const USAGE: &str = "usage: fai verify [quick|fast|full] [--no-lean-clean] [--report-dir DIR]
+                                       (quick: under a minute, without the C corpus;
+                                        full: the required check)
+       fai mutate [--quick] [NAME...]  (--quick: how many planted defects verify quick catches)
        fai evidence DIR
        fai experiment NAME [OPTIONS]   (see tools/fai/src/experiment.rs)
        fai gate [--update] [--configs C,...] [--timeout SECONDS]
@@ -1336,9 +1379,10 @@ fn main() {
             std::process::exit(2);
         }
     }
+    let quick = args.get(1).map(String::as_str) == Some("quick");
     let full = match args.get(1).map(String::as_str) {
         Some("full") => true,
-        Some("fast") | None => false,
+        Some("fast" | "quick") | None => false,
         Some(m) if m.starts_with("--") => false,
         Some(m) => {
             eprintln!("unknown mode {m}\n{usage}");
@@ -1369,6 +1413,7 @@ fn main() {
         ),
         root: root.clone(),
         full,
+        quick,
         out_dir: out_dir.clone(),
         checks: Vec::new(),
         identity: BTreeMap::new(),
@@ -1376,7 +1421,16 @@ fn main() {
         unverified: Vec::new(),
     };
     let start = Instant::now();
-    eprintln!("fai verify {}", if full { "full" } else { "fast" });
+    eprintln!(
+        "fai verify {}",
+        if full {
+            "full"
+        } else if quick {
+            "quick"
+        } else {
+            "fast"
+        }
+    );
     v.identity();
     let tools = v.tools();
     v.env_guard();
@@ -1470,9 +1524,13 @@ fn main() {
         v.coverage = Value::Object(coverage);
         v.unverified = unverified.into_iter().collect();
     } else {
-        v.skip("rust tests (release)", "fast mode");
-        v.skip("C API under AddressSanitizer", "fast mode");
-        v.skip("evidence", "fast mode doesn't require complete evidence");
+        let mode = if quick { "quick mode" } else { "fast mode" };
+        v.skip("rust tests (release)", mode);
+        v.skip("C API under AddressSanitizer", mode);
+        v.skip(
+            "evidence",
+            &format!("{mode} doesn't require complete evidence"),
+        );
         let evs = load_evidence(&ev_debug);
         let (bad, table) = check_evidence(&root, &evs, None, Some(&v.run_id));
         let (bad, excused) = excuse_host_gaps(bad, &evs, Some(&v.run_id));
@@ -1507,6 +1565,10 @@ fn main() {
         host_verdict.as_str()
     } else if full {
         "FULL VERIFICATION FAILED"
+    } else if quick && failed == 0 {
+        "QUICK PASSED: not a verification"
+    } else if quick {
+        "QUICK FAILED"
     } else if failed == 0 {
         "PARTIAL (fast mode): not a full verification"
     } else {
@@ -1534,7 +1596,18 @@ fn main() {
         })
         .collect();
     let report = json!({
-        "mode": if full { "full" } else { "fast" },
+        "mode": if full {
+            "full"
+        } else if quick {
+            "quick"
+        } else {
+            "fast"
+        },
+        "left_out": if quick {
+            QUICK_SKIPS.iter().map(|(t, why)| json!({"test": t, "why": why})).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        },
         "verdict": verdict,
         "full_verification": verified,
         "host_verification": host_verified,
@@ -1616,6 +1689,15 @@ fn main() {
     )
     .unwrap();
     std::fs::write(out_dir.join("report.md"), md).unwrap();
+    if quick {
+        eprintln!("\nquick left out:");
+        for (test, why) in QUICK_SKIPS {
+            eprintln!("  {test}: {why}");
+        }
+        eprintln!(
+            "  all but {QUICK_ABI} of the ABI test's signatures, the release tests, the sanitizer run, and the evidence check"
+        );
+    }
     eprintln!("\n{}", judging.line());
     eprintln!(
         "{verdict}: {} checks, {failed} failed, {skipped} skipped; report: {}",

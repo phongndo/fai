@@ -423,23 +423,26 @@ fn fixtures_run_natively() {
         return;
     };
     let tally = Mutex::new(Tally::default());
-    let mut modules = 0;
-    for file in common::fir_files() {
-        let text = std::fs::read_to_string(&file).unwrap();
+    // One fixture file per step, on every core: each file is compiled and run by itself.
+    let modules = std::sync::atomic::AtomicU64::new(0);
+    let files = common::fir_files();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let one = |file: &Path| {
+        let text = std::fs::read_to_string(file).unwrap();
         let runs = run_lines(&text);
         if runs.is_empty() {
-            continue;
+            return;
         }
-        let name = common::display_name(&file);
+        let name = common::display_name(file);
         let Ok(m) = fir::parse_module(&text) else {
-            continue;
+            return;
         };
         if fir::verify_module(&m).is_err() {
-            continue;
+            return;
         }
         if let fir::Layer::Lfir(_) = m.layer {
             tally.lock().unwrap().count("module skipped: already LFIR");
-            continue;
+            return;
         }
         // Each run needs the functions it reaches to compile; the others are left out.
         let compiles =
@@ -458,18 +461,31 @@ fn fixtures_run_natively() {
             }
         }
         if kept.is_empty() {
-            continue;
+            return;
         }
         let roots: Vec<&str> = kept.iter().map(|(f, _)| f.as_str()).collect();
         let m = prune(&m, &roots);
-        modules += 1;
+        modules.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let runs: Vec<_> = kept
             .into_iter()
             .map(|(f, a)| (f, a, fir::interp::DEFAULT_FUEL))
             .collect();
         let stem = name.replace(['/', '.'], "_");
         check_module(&tc, &m, &runs, &dir, &stem, &tally, &ev);
-    }
+    };
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(file) = files.get(i) else { return };
+                    one(file);
+                }
+            });
+        }
+    });
+    let modules = modules.into_inner();
     eprintln!("{modules} fixture modules compiled");
     ev.count("fixture modules compiled", modules);
     report("x86-64 fixtures", tally.into_inner().unwrap(), &ev);
