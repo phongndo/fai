@@ -20,7 +20,8 @@ fai experiment my-fwd-change --baseline-rev main        # a code change: this tr
 # 3. Read target/experiments/NAME/report.md (or report.json). Exit 1 means REJECTED.
 
 # 4. Before anything lands: the required check, which knows nothing of experiments.
-fai accept               # verify full, the gate, and the tests as they were: PASS or FAIL
+fai accept               # verify full, the gate, and the tests as they were
+                         # exit 0 PASS, 1 FAIL, 2 NOT JUDGED, 3 PASS with judging files changed
 ```
 
 `fai accept` is `fai verify full` (correct: proofs, generated files, every suite), then

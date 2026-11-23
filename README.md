@@ -73,9 +73,9 @@ No verdict here is read from output and judged: each is one command with an exit
 
 | Command | Time | Says |
 |---|---|---|
-| `fai verify quick` | under a minute | `QUICK PASSED: not a verification`, or what failed. Everything but the C corpus tests, the release build, and the sanitizer run; the list of what it left out is printed and never varies |
-| `fai accept` | about 8 minutes | `accept: PASS` (0), `FAIL` (1), `NOT JUDGED` (2), or `PASS, JUDGING FILES CHANGED` with the files (3). It runs `fai verify full` and `fai gate`, and, when the change edits tests that existed at the base, those tests **as they were** against the changed code |
-| `fai status` | a second | whether the last `verify full` and `gate` are of the tree as it is now (`CURRENT`, exit 0) or of another (`STALE`) |
+| `fai verify quick` | under a minute | `QUICK PASSED: not a verification`, or what failed. Everything but the three C corpus tests, most of the ABI test's random signatures (20 run), the release build, the sanitizer run, and the check that no test skipped work; what it left out is printed, and the named tests never vary |
+| `fai accept` | about 8 minutes | `accept: PASS` (0), `FAIL` (1), `NOT JUDGED` (2: a part could not run, or the tree changed meanwhile), or `PASS, JUDGING FILES CHANGED` with the files (3). It runs `fai verify full` and `fai gate`, and, when the change edits or removes tests that existed at the base, those tests **as they were** against the changed code. On a host that can't run everything (the gate needs one that isn't AArch64) the best it says is `HOST PASS ON host` |
+| `fai status` | a second | whether the last `verify full` and the last `gate` of `fcc -O` are of the tree as it is now and passed (`CURRENT`, exit 0), or not (`STALE`, `NOT VERIFIED`, exit 1). A `quick` or `fast` run doesn't change the answer |
 | `fai judging` | a second | the tests, baselines, and checkers the change touches, against the merge base with `origin/main` |
 | `fir check FILE --target aarch64` | a moment | whether `fir compile` will accept a module, in the words it would use |
 
