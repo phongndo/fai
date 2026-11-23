@@ -21,14 +21,19 @@ fn enabled() -> bool {
     }
 }
 
+/// `libfir_capi.a`, built as `fcc.rs` builds it: into a target directory of its own under this
+/// build's, so the path doesn't depend on where Cargo's target directory is (it once assumed
+/// `target/` in the repository, which is wrong under `CARGO_TARGET_DIR`).
 fn static_lib() -> PathBuf {
+    let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("capi-target");
     let status = Command::new(env!("CARGO"))
-        .args(["build", "--release", "-q", "-p", "fir-capi"])
+        .args(["build", "--release", "-q", "-p", "fir-capi", "--target-dir"])
+        .arg(&target)
         .current_dir(repo())
         .status()
         .expect("running cargo");
     assert!(status.success(), "building the C API failed");
-    repo().join("target/release/libfir_capi.a")
+    target.join("release/libfir_capi.a")
 }
 
 /// fcc, built as `fcc.rs` builds it (the same directory, so one build serves both).
