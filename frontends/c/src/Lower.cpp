@@ -189,6 +189,8 @@ private:
   // The labels whose address the function takes (`&&L`), numbered from 1 in source order.
   llvm::DenseMap<const LabelDecl *, int64_t> labelIds;
   std::vector<const LabelDecl *> addrLabels;
+  // The block every `goto *` of the function jumps to, with the label number: it switches.
+  FirRegion dispatchBlock = FIR_INVALID;
   llvm::DenseMap<const SwitchCase *, FirRegion> caseBlocks;
   std::vector<Jump> jumps;
   std::set<std::string> valueNames;
@@ -3690,18 +3692,18 @@ private:
       br(labelBlock(cast<GotoStmt>(s)->getLabel()));
       return;
     case Stmt::IndirectGotoStmtClass: {
-      // `goto *p`: a switch on the label number `p` holds, over the labels whose address the
-      // function takes (to any of them when `p` holds none of them: that is UB in C).
+      // `goto *p`: a jump, with the label number `p` holds, to the function's one dispatch
+      // block, which switches on it over the labels whose address the function takes (to any
+      // of them when `p` holds none of them: that is UB in C). One switch for the function,
+      // not one per `goto *`: an interpreter's loop jumps from every case, and a switch at
+      // each would give it an edge from every case to every case.
       FirValue p = rvalue(cast<IndirectGotoStmt>(s)->getTarget());
       numberLabels();
       if (addrLabels.empty())
         unsupported(loc, "'goto *' in a function that takes no label's address");
       FirValue x = ck(fir_ptr_addr(b, p), "ptr.addr");
-      std::vector<FirCase> cases;
-      for (const LabelDecl *ld : addrLabels)
-        cases.push_back({labelIds[ld], {labelBlock(ld), nullptr, 0}});
-      FirTarget d = {labelBlock(addrLabels.front()), nullptr, 0};
-      ck(fir_cf_switch(b, x, d, cases.data(), cases.size()), "cf.switch");
+      FirTarget t = {dispatch(), &x, 1};
+      ck(fir_cf_br(b, t), "cf.br");
       term = true;
       return;
     }
@@ -3735,6 +3737,24 @@ private:
         labelIds[ld] = (int64_t)addrLabels.size() + 1;
         addrLabels.push_back(ld);
       }
+  }
+  // The dispatch block, made at the function's first `goto *`: it takes the label number and
+  // switches on it. Code goes on being added where it was.
+  FirRegion dispatch() {
+    if (dispatchBlock != FIR_INVALID)
+      return dispatchBlock;
+    FirType num = fir_type_int(64);
+    dispatchBlock = ck(fir_block_new(b, blocksOp, nullptr, &num, 1), "fir_block_new");
+    FirRegion saved = region;
+    enter(dispatchBlock);
+    FirValue x = ck(fir_region_param(b, dispatchBlock, 0), "fir_region_param");
+    std::vector<FirCase> cases;
+    for (const LabelDecl *ld : addrLabels)
+      cases.push_back({labelIds[ld], {labelBlock(ld), nullptr, 0}});
+    FirTarget d = {labelBlock(addrLabels.front()), nullptr, 0};
+    ck(fir_cf_switch(b, x, d, cases.data(), cases.size()), "cf.switch");
+    enter(saved);
+    return dispatchBlock;
   }
   FirValue labelAddr(const LabelDecl *ld) {
     numberLabels();
@@ -4128,6 +4148,7 @@ private:
     labels.clear();
     labelIds.clear();
     addrLabels.clear();
+    dispatchBlock = FIR_INVALID;
     caseBlocks.clear();
     jumps.clear();
     valueNames.clear();

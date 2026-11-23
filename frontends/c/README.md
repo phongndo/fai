@@ -236,8 +236,10 @@ extensions Clang accepts, such as case ranges and `__extension__`):
   object (the world's allocations are exposed) and every later one return it again, which is
   what the GOT does. Not in global initializers.
 - **Labels as values** (GNU C): `&&L` is a pointer whose address is L's number in its function
-  (`ptr.with_addr` of `ptr.null`, pointing into no object), and `goto *p` a `cf.switch` on it
-  over the labels the function takes the address of. A static local table of them (an
+  (`ptr.with_addr` of `ptr.null`, pointing into no object), and `goto *p` a jump with that
+  number to the function's one dispatch block, a `cf.switch` over the labels the function takes
+  the address of (one switch for the function, not one at each `goto *`, which would give an
+  interpreter's loop an edge from every case to every case). A static local table of them (an
   interpreter's dispatch table, as Lua's `disptab`) is a zeroed global that the function fills
   when it first starts (a flag says whether it has), since FIR's initializers can't hold label
   addresses: before any of its code, so no jump skips it, and one object for the whole run.
