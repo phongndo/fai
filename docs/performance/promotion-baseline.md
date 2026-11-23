@@ -6,6 +6,8 @@ This measures the same pipelines on the two real projects of [compilers.md](comp
 5.4.7 and SQLite 3.53.3, before any work of the promotion round
 ([06-plan.md](../design/06-plan.md)) starts. It is a baseline to measure that round against.
 Every number comes from `benchmarks/projects/projbench.py`; the commands are at the end.
+[selection.md](selection.md) is what the round's first steps did about `-O`, and the same
+measurements after them.
 
 ## Summary
 
@@ -50,7 +52,7 @@ SQLite slower. The round's first track is the allocator
 | Toolchain | the dev shell: Clang/LLVM 23.1.3 (fcc's frontend and the reference Clang), the AArch64 cross GCC 16.2.0, qemu-user 11.1.2 |
 | Configurations | `fcc-O`: `fcc -O`. `fcc-m2r`: `fcc --passes mem2reg,fwd,copyprop,dse,dce --experimental`. `fcc-promo`: the same with `stackdce` after `mem2reg` (`fir::passes::EXPERIMENTAL_O`). GCC and Clang at `-O0`, GCC `-O2` as the behavior reference |
 | `lvm.c` | compiled by `fcc -O` in `fcc-m2r` and `fcc-promo` (`--plain lvm`): it does not compile with either in practical time |
-| Counts | executed instructions under `qemu-aarch64` with cbench's plugin, in the project's own code (libc excluded by the linker map). Exact and the same on every run |
+| Counts | executed instructions under `qemu-aarch64` with cbench's plugin, in the project's own code (libc excluded by the linker map). Exact, and the same on every run except `lua-nbody`'s, which vary by a few percent (Lua seeds its hash tables from an address and the time) |
 | Compile time | one round (`--reps 1`), wall time and peak RSS from `wait4`, on a loaded host: read the ratios, not the digits |
 
 ## Executed instructions (millions, the project's own code)

@@ -14,6 +14,9 @@ changes since then (the experimental promotion passes, the proved DCE checker) a
 hold here unchanged. Compile times and code size were measured at this revision. The full
 generated tables are in [c-baseline-report.md](c-baseline-report.md).
 
+**Since this was measured**, bottleneck 2 (instruction selection) was worked on, against Lua
+and SQLite: [selection.md](selection.md). The 12 kernels here were not measured again.
+
 ## Summary
 
 - **Behavior: no differences found.** The 67-program differential corpus matches GCC with and
