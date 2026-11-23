@@ -169,7 +169,7 @@ lowering gives the same outcome as the HFIR run, or the same events before HFIR 
 | Slices | `slice.get`/`set` become a compare and `cf.check.bounds` (`.trap`), then `ptr.offset.inbounds` and the access | No |
 | Checked arithmetic | Becomes arithmetic one bit wider (twice the width for `mul`): `i64` overflow needs `i65`/`i128` (G4) | No; the backend can't take it |
 | `cf.try` | Becomes a `cf.blocks` with the handler as a block; calls that may throw become `func.invoke` | Information only: which `cf.blocks` was a `try` |
-| Holes | Become the same hole at each scalar type. A hole of an empty struct or array has no scalars, so it disappears: a run that stops at it in HFIR goes on in MFIR (G11) | **Yes**, for empty composites |
+| Holes | Become the same hole at each scalar type. A hole of an empty struct or array has no scalars, so it would disappear; both verifiers now refuse one. A hole that does have scalars still disappears when the op reading it is lowered to nothing: `agg.extract ?h: struct<C>{struct<C>{}, i32}, 0` gives an empty struct, so no op remains to read `?h`, and a run that stops at it in HFIR goes on in MFIR (G11) | **Yes**, for a hole read only by an op lowered to nothing |
 
 ## 4. MFIR → LFIR: what selection and allocation keep, change, and lose
 
@@ -242,7 +242,7 @@ under qemu.
 | G8 | **HFIR and MFIR stacks are unbounded; LFIR's and native code's are not.** A recursive MFIR function with a 64-byte slot returns `100000` for `@deep(100000)` in `fir run`. The LFIR machine gives `ub out-of-bounds (offset -8, …, allocation size 1048576)`, and qemu crashes with a segfault. The target is less defined than its source. No test exercises it: fixtures don't recurse that deep | open (P6) |
 | G9 | **MFIR's verifier accepted composite loop state, `cf.if`/`cf.blocks` results, and holes,** which decision Aggregates says stay scalar outside HFIR | fixed: both verifiers refuse them outside HFIR (`checkScalarState`; `tests/layers/errors/mfir-composite-*.fir`) |
 | G10 | `fir check` prints a composite hole's type as `type#0` (`bin/fir.rs:99` prints a `Ty` without the module's type table) | open, cosmetic |
-| G11 | **The lowering dropped holes of empty composites.** `%s: struct<C>{} = copy ?h: struct<C>{}`, then returning 7, ran as `hole ?h` in HFIR and returned 7 after lowering | fixed: both verifiers refuse a hole of a type with no scalars (`tests/fir0/errors/hole-of-nothing.fir`) |
+| G11 | **The lowering dropped holes of empty composites.** `%s: struct<C>{} = copy ?h: struct<C>{}`, then returning 7, ran as `hole ?h` in HFIR and returned 7 after lowering | **narrowed, open**: both verifiers refuse a hole of a type with no scalars (`tests/fir0/errors/hole-of-nothing.fir`). A hole with scalars that an op lowered to nothing reads still disappears: `%e: struct<C>{} = agg.extract ?h: struct<C>{struct<C>{}, i32}, 0`, then returning 7, stops at `hole ?h` in HFIR and returns 7 after lowering (found by review). Closing it needs scalarization, in Lean and Rust, to keep a hole that an op lowered to nothing reads |
 | G12 | **`fir compile --os darwin` skipped the macOS checks.** The CLI called `select` and `allocate` itself, not `backend::aarch64::compile`, so it emitted a variadic function for macOS that the library refused | fixed: the CLI and the library share `aarch64::os_limits` |
 
 ## 7. Proposed shared-IR changes
