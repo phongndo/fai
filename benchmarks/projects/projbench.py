@@ -581,6 +581,31 @@ def code_ranges(mapfile, obj):
         return []
 
 
+def counted_workloads(work):
+    """The workloads `count` and `forms` run under the plugin: (program, name, arguments), each to
+    be run in `work` as `./PROGRAM.CONFIG ARGUMENTS`, with Lua's scripts copied there.
+
+    A counted run names its program and its script without a directory, because what a program
+    is told is part of what it does: Lua keeps the script's path in every function it loads, so
+    a longer path is more memory, and its collector, which is paced by memory, then runs at
+    other points. With the paths as they were (absolute), lua-trees executed 2.3% fewer
+    instructions in an output directory five letters shorter. A count must not depend on where
+    the tree or the output directory is."""
+    for n in LUA_SCRIPTS:
+        shutil.copyfile(BENCH / "lua" / f"{n}.lua", work / f"{n}.lua")
+    workloads: list[tuple[str, str, list[Any]]] = [
+        ("lua", f"lua-{n}", [f"{n}.lua", a[0]]) for n, a in LUA_SCRIPTS.items()
+    ]
+    workloads.append(
+        (
+            "speedtest1",
+            "speedtest1",
+            ["--size", SPEEDTEST_SIZE[0], "--memdb", "--testset", SPEEDTEST_SET],
+        )
+    )
+    return workloads
+
+
 def cmd_count(s):
     """Every workload of every build under cbench's QEMU plugin: executed instructions in the
     project's own code and in libc, their mix, and the own code's memory accesses. The binaries
@@ -595,16 +620,7 @@ def cmd_count(s):
     work = s.out / "count"
     work.mkdir(exist_ok=True)
     obj = s.out / "obj"
-    workloads: list[tuple[str, str, list[Any]]] = [
-        ("lua", f"lua-{n}", [BENCH / "lua" / f"{n}.lua", a[0]]) for n, a in LUA_SCRIPTS.items()
-    ]
-    workloads.append(
-        (
-            "speedtest1",
-            "speedtest1",
-            ["--size", SPEEDTEST_SIZE[0], "--memdb", "--testset", SPEEDTEST_SET],
-        )
-    )
+    workloads = counted_workloads(work)
     tus = {
         "lua": [("lua", t) for t in LUA_TUS],
         "speedtest1": [("sqlite", "sqlite3"), ("sqlite", "speedtest1")],
@@ -648,10 +664,10 @@ def cmd_count(s):
                     "-strace",
                     "-plugin",
                     plug,
-                    exe,
+                    f"./{exe.name}",
                     *args,
                 ]
-                p = run(cmd, check=False, timeout=3600)
+                p = run(cmd, check=False, timeout=3600, cwd=work)
                 a = cbench.analyze_ranges(tools, exe, ranges, trace)
                 lo, hi = a.pop("window")
                 if any(x < hi and lo < y for x, y in cbench.mappings(p.stderr)):
@@ -880,16 +896,7 @@ def cmd_forms(s):
     work = s.out / "forms"
     work.mkdir(exist_ok=True)
     obj = s.out / "obj"
-    workloads: list[tuple[str, str, list[Any]]] = [
-        ("lua", f"lua-{n}", [BENCH / "lua" / f"{n}.lua", a[0]]) for n, a in LUA_SCRIPTS.items()
-    ]
-    workloads.append(
-        (
-            "speedtest1",
-            "speedtest1",
-            ["--size", SPEEDTEST_SIZE[0], "--memdb", "--testset", SPEEDTEST_SET],
-        )
-    )
+    workloads = counted_workloads(work)
     tus = {
         "lua": [("lua", t) for t in LUA_TUS],
         "speedtest1": [("sqlite", "sqlite3"), ("sqlite", "speedtest1")],
@@ -912,7 +919,12 @@ def cmd_forms(s):
                     f"above={cbench.STACK_ABOVE},deep={cbench.STACK_DEEP}"
                 )
                 qemu_cmd = ["env", "-i", shutil.which("qemu-aarch64"), "-s", cbench.QEMU_STACK]
-                p = run([*qemu_cmd, "-plugin", plug, exe, *args], check=False, timeout=3600)
+                p = run(
+                    [*qemu_cmd, "-plugin", plug, f"./{exe.name}", *args],
+                    check=False,
+                    timeout=3600,
+                    cwd=work,
+                )
                 if p.returncode != 0:
                     die(f"forms: {name} {c} exited with {p.returncode}")
                 result["programs"].setdefault(name, {})[c] = forms_of_run(tools, exe, ranges, trace)
@@ -1070,6 +1082,207 @@ def gate_compare(now, base):
     return worse, better
 
 
+def gate_verdict(now, baseline, gated, plain):
+    """The verdict and its reasons, from the measurements alone: per gated configuration, what
+    is worse and what is better than the baseline it is held to (its own, or `fcc -O`'s when it
+    has none: a pipeline proposed for `-O` must not be worse than `-O`). FAIL if anything is
+    worse. With `plain` (files compiled another way, which were therefore not judged) the best
+    verdict is PARTIAL, which is not a pass."""
+    report: dict[str, Any] = {"verdict": "PASS", "configs": {}}
+    for c in gated:
+        base_of = c if baseline and c in baseline["configs"] else "fcc-O"
+        base = baseline["configs"].get(base_of) if baseline else None
+        if base is None:
+            # The first baseline: behavior must still be right.
+            base = {
+                k: {} for k in ("instructions", "text", "compile_cpu_seconds", "compile_rss_kib")
+            }
+        worse, better = gate_compare(now[c], base)
+        report["configs"][c] = {"against": base_of, "worse": worse, "better": better}
+        if worse:
+            report["verdict"] = "FAIL"
+    if report["verdict"] == "PASS" and plain:
+        report["verdict"] = "PARTIAL"
+        report["plain"] = sorted(plain)
+    return report
+
+
+def gate_updated(configs, now, gated):
+    """The baseline's configurations after `--update` (which runs only on a PASS): the gated
+    ones take the new measurements, except that the baseline only ever gets better. A count
+    that is the same (within GATE_SAME) keeps its old value, and the time and memory keep the
+    lower one."""
+    configs = dict(configs)
+    for c in gated:
+        old = configs.get(c)
+        new = json.loads(json.dumps(now[c]))
+        if old:
+            for w, n in new["instructions"].items():
+                b = old["instructions"].get(w, n)
+                new["instructions"][w] = n if n < b * (1 - GATE_SAME) else b
+            for key in ("compile_cpu_seconds", "compile_rss_kib"):
+                for p, n in new[key].items():
+                    new[key][p] = min(n, old[key].get(p, n))
+        configs[c] = new
+    return configs
+
+
+def gate_self_test():
+    """`gate --self-test`: the gate's verdict on made-up measurements, where the right verdict
+    is known. It runs no compiler and takes no time, so `fai verify` runs it every time, and
+    `fai mutate` weakens the gate and requires this to notice. Returns the exit status."""
+    good = {
+        "behavior": {
+            "lua workloads match": True,
+            "lua suite files passed": len(LUA_SUITE),
+            "speedtest1 verifies": True,
+        },
+        "instructions": {"lua-fib": 14_000_000, "speedtest1": 2_800_000_000},
+        "text": {"lua": 377_000, "sqlite": 1_216_000},
+        "compile_cpu_seconds": {"lua": 2.0, "sqlite": 3.0},
+        "compile_rss_kib": {"lua": 100 << 10, "sqlite": 900 << 10},
+    }
+
+    def changed(path, value, src=good):
+        new = json.loads(json.dumps(src))
+        at = new
+        for k in path[:-1]:
+            at = at[k]
+        if value is None:
+            del at[path[-1]]
+        else:
+            at[path[-1]] = value
+        return new
+
+    def verdict(now, base=good, config="fcc-O", plain=()):
+        baseline = {"configs": {"fcc-O": base}} if base else None
+        return gate_verdict({config: now}, baseline, [config], set(plain))
+
+    fib = ("instructions", "lua-fib")
+    cases = [
+        ("the baseline's own measurements pass", verdict(good), "PASS", None),
+        (
+            "a count within one part in 100,000 is the same",
+            verdict(changed(fib, 14_000_100)),
+            "PASS",
+            None,
+        ),
+        (
+            "1% more instructions on one workload fails, and names it",
+            verdict(changed(fib, 14_140_000)),
+            "FAIL",
+            "lua-fib executes 14,140,000, more than 14,000,000",
+        ),
+        (
+            "one part in 10,000 more instructions fails",
+            verdict(changed(fib, 14_001_400)),
+            "FAIL",
+            "lua-fib",
+        ),
+        ("fewer instructions pass", verdict(changed(fib, 13_000_000)), "PASS", None),
+        (
+            "a workload that was not run fails",
+            verdict(changed(fib, None)),
+            "FAIL",
+            "lua-fib was not run",
+        ),
+        (
+            "a Lua workload whose output differs fails",
+            verdict(changed(("behavior", "lua workloads match"), False)),
+            "FAIL",
+            "behavior: lua workloads match",
+        ),
+        (
+            "one file of Lua's suite failing fails",
+            verdict(changed(("behavior", "lua suite files passed"), len(LUA_SUITE) - 1)),
+            "FAIL",
+            "behavior: lua suite files passed",
+        ),
+        (
+            "speedtest1 not verifying fails",
+            verdict(changed(("behavior", "speedtest1 verifies"), False)),
+            "FAIL",
+            "behavior: speedtest1 verifies",
+        ),
+        (
+            "one more byte of code fails",
+            verdict(changed(("text", "lua"), 377_001)),
+            "FAIL",
+            "code size: lua",
+        ),
+        (
+            "compile time within twice the baseline's passes",
+            verdict(changed(("compile_cpu_seconds", "sqlite"), 5.9)),
+            "PASS",
+            None,
+        ),
+        (
+            "compile time over twice the baseline's fails",
+            verdict(changed(("compile_cpu_seconds", "sqlite"), 7.5)),
+            "FAIL",
+            "compile time: sqlite",
+        ),
+        (
+            "compile memory over twice the baseline's fails",
+            verdict(changed(("compile_rss_kib", "sqlite"), 2000 << 10)),
+            "FAIL",
+            "compile memory: sqlite",
+        ),
+        (
+            "a partial build that is otherwise fine is PARTIAL, not a pass",
+            verdict(good, plain=["lvm"]),
+            "PARTIAL",
+            None,
+        ),
+        (
+            "a partial build that is worse fails",
+            verdict(changed(fib, 15_000_000), plain=["lvm"]),
+            "FAIL",
+            "lua-fib",
+        ),
+        (
+            "a configuration without a baseline is held to fcc -O's",
+            verdict(changed(fib, 15_000_000), config="fcc-promo"),
+            "FAIL",
+            "lua-fib",
+        ),
+        ("with no baseline at all, right behavior passes", verdict(good, base=None), "PASS", None),
+        (
+            "with no baseline at all, wrong behavior fails",
+            verdict(changed(("behavior", "speedtest1 verifies"), False), base=None),
+            "FAIL",
+            "behavior: speedtest1 verifies",
+        ),
+    ]
+    failed = []
+    for what, report, want, reason in cases:
+        reasons = [line for r in report["configs"].values() for line in r["worse"]]
+        if report["verdict"] != want:
+            failed.append(f"{what}: the verdict is {report['verdict']}, not {want}")
+        elif reason and not any(reason in line for line in reasons):
+            failed.append(f"{what}: no reason mentions '{reason}' (reasons: {reasons})")
+        elif want != "FAIL" and reasons:
+            failed.append(f"{what}: {want}, with reasons to fail: {reasons}")
+    # The baseline moves one way.
+    old = {"fcc-O": good}
+    worse_now = changed(("compile_cpu_seconds", "lua"), 3.5, changed(fib, 14_000_050))
+    kept = gate_updated(old, {"fcc-O": worse_now}, ["fcc-O"])["fcc-O"]
+    if kept["instructions"]["lua-fib"] != 14_000_000 or kept["compile_cpu_seconds"]["lua"] != 2.0:
+        failed.append("the baseline only moves down: --update raised a number")
+    better_now = changed(("compile_cpu_seconds", "lua"), 1.5, changed(fib, 13_000_000))
+    moved = gate_updated(old, {"fcc-O": better_now}, ["fcc-O"])["fcc-O"]
+    if moved["instructions"]["lua-fib"] != 13_000_000 or moved["compile_cpu_seconds"]["lua"] != 1.5:
+        failed.append("the baseline moves down: --update didn't take a better number")
+    checks = len(cases) + 2
+    if failed:
+        print(f"gate self-test: FAILED ({len(failed)} of {checks} checks)")
+        for f in failed:
+            print(f"  {f}")
+        return 1
+    print(f"gate self-test: passed ({checks} checks)")
+    return 0
+
+
 def cmd_gate(s):
     """One verdict for a change to the compiler, on Lua and SQLite: build both with fcc (`-O`, or
     the fcc configurations of --configs), check that they behave as GCC -O2's builds do, count
@@ -1106,6 +1319,16 @@ def cmd_gate(s):
     if s.args.timeout is None:
         s.args.timeout = 300
     report: dict[str, Any] = {"verdict": "PASS", "configs": {}}
+    # From `fai gate`: which tests, baselines, and checkers the change touches (tools/fai's
+    # judging.rs). It is said above every verdict, and decides none here.
+    judging = os.environ.get("FAI_JUDGING")
+    if judging:
+        report["judging"] = json.loads(os.environ.get("FAI_JUDGING_JSON", "null"))
+    # What this verdict is of: the tree (`fai gate` gives its hash, and `fai status` compares it
+    # with the tree later), the baseline, and how the gate was run.
+    report["tree"] = os.environ.get("FAI_TREE")
+    report["baseline_sha256"] = sha256(GATE) if GATE.exists() else None
+    report["update"] = bool(s.args.update)
     # The harness stops (`die`) when a file doesn't compile, takes too long, or a counted run
     # goes wrong: each is the tree failing, and still gets a verdict and a report.
     try:
@@ -1118,25 +1341,12 @@ def cmd_gate(s):
         report["stopped"] = STOPPED[-1] if STOPPED else "the harness stopped (see above)"
         save(s.out, "gate-report", report)
         print(f"gate: stopped: {report['stopped']}")
+        if judging:
+            print(judging)
         print("gate: FAIL")
         sys.exit(GATE_FAIL)
     now = gate_measure(s, gated)
-    for c in gated:
-        base_of = c if baseline and c in baseline["configs"] else "fcc-O"
-        base = baseline["configs"].get(base_of) if baseline else None
-        if base is None:
-            # The first baseline: behavior must still be right.
-            base = {
-                k: {} for k in ("instructions", "text", "compile_cpu_seconds", "compile_rss_kib")
-            }
-        worse, better = gate_compare(now[c], base)
-        report["configs"][c] = {"against": base_of, "worse": worse, "better": better}
-        if worse:
-            report["verdict"] = "FAIL"
-    if report["verdict"] == "PASS" and s.plain:
-        # Files compiled another way were not judged: this is never a pass.
-        report["verdict"] = "PARTIAL"
-        report["plain"] = sorted(s.plain)
+    report.update(gate_verdict(now, baseline, gated, s.plain))
     save(s.out, "gate-report", report)
     for c, r in report["configs"].items():
         print(f"gate: {c}, against the baseline of {r['against']}:")
@@ -1146,6 +1356,8 @@ def cmd_gate(s):
             print(f"  better  {line}")
         if not r["worse"] and not r["better"]:
             print("  the same as the baseline")
+    if judging:
+        print(judging)
     if report["verdict"] == "PARTIAL":
         files = ", ".join(report["plain"])
         print(f"gate: PARTIAL, not a pass: {files} compiled with fcc -O (--plain)")
@@ -1154,20 +1366,7 @@ def cmd_gate(s):
     if report["verdict"] != "PASS":
         sys.exit(GATE_FAIL)
     if s.args.update:
-        configs = dict(baseline["configs"]) if baseline else {}
-        for c in gated:
-            old = configs.get(c)
-            new = now[c]
-            if old:
-                # The baseline only ever gets better: a count that is the same (within
-                # GATE_SAME) keeps its old value, and the time and memory keep the lower one.
-                for w, n in new["instructions"].items():
-                    b = old["instructions"].get(w, n)
-                    new["instructions"][w] = n if n < b * (1 - GATE_SAME) else b
-                for key in ("compile_cpu_seconds", "compile_rss_kib"):
-                    for p, n in new[key].items():
-                        new[key][p] = min(n, old[key].get(p, n))
-            configs[c] = new
+        configs = gate_updated(baseline["configs"] if baseline else {}, now, gated)
         text = json.dumps(
             {
                 "about": "The accepted results of `fai gate` (benchmarks/projects/README.md): "
@@ -1712,12 +1911,21 @@ def main():
         help="gate: write the baseline (benchmarks/projects/gate.json), if the gate passes",
     )
     ap.add_argument(
+        "--self-test",
+        action="store_true",
+        help="gate: check the gate's verdict on made-up measurements (no compiler runs)",
+    )
+    ap.add_argument(
         "--plain",
         help="comma-separated source files (by stem: lvm) that the experimental fcc "
         "configurations compile with `fcc -O` instead, for files the backend can't compile "
         "under an experimental pipeline in practical time",
     )
     args = ap.parse_args()
+    if args.self_test:
+        if args.step != "gate":
+            die("--self-test is the gate's")
+        sys.exit(gate_self_test())
     if args.configs:
         BUILD_CONFIGS = args.configs.split(",")
         known = [*cbench.CONFIGS, *cbench.FCC_EXPERIMENTAL]

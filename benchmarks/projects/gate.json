@@ -8,22 +8,22 @@
     "speedtest1 verifies": true
    },
    "compile_cpu_seconds": {
-    "lua": 1.14,
-    "sqlite": 1.54
+    "lua": 1.15,
+    "sqlite": 1.56
    },
    "compile_rss_kib": {
-    "lua": 100164,
-    "sqlite": 230796
+    "lua": 99316,
+    "sqlite": 230968
    },
    "instructions": {
-    "lua-fannkuch": 82775144,
-    "lua-fib": 13877359,
-    "lua-nbody": 176910506,
-    "lua-sort": 101048325,
-    "lua-spectral": 108478803,
-    "lua-strings": 32723288,
-    "lua-trees": 71459371,
-    "speedtest1": 2834378114
+    "lua-fannkuch": 82776388,
+    "lua-fib": 13878259,
+    "lua-nbody": 176911474,
+    "lua-sort": 101049394,
+    "lua-spectral": 108480122,
+    "lua-strings": 32722258,
+    "lua-trees": 71124602,
+    "speedtest1": 2834378072
    },
    "text": {
     "lua": 377020,

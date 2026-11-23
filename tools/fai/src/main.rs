@@ -5,13 +5,19 @@
 //! fai mutate [NAME...]           the checkers' adversarial tests (mutate.rs)
 //! fai evidence DIR               check one evidence directory as `verify full` would
 //! fai experiment NAME [OPTIONS]  propose, test, and measure a compiler change (experiment.rs)
+//! fai judging [--base REV] [--head REV] [--json]
+//!                                the tests, baselines, and checkers a change touches (judging.rs)
+//! fai accept [--base REV]        one verdict for a change: verify full, the gate, and whether
+//!                                it moved what judges it (accept.rs)
+//! fai status                     which of those verdicts are of the tree as it is now (accept.rs)
 //! fai matrix REPORT.json...      what each host's verification ran, side by side
 //! fai help                       this list
 //! ```
 //!
 //! In a checkout, `cargo fai …` builds and runs it (`.cargo/config.toml`), and so does `fai …` in
 //! the dev shell; `cargo xtask …`, its old name, is the same binary. Exit codes: 0 for success,
-//! 1 for a failed check (or a rejected experiment), 2 for bad usage.
+//! 1 for a failed check (or a rejected experiment), 2 for bad usage or a verdict that could not
+//! be reached, 3 (from `judging`) when a change touches the files that judge it.
 //!
 //! `fai verify [fast|full]`: the repository's one required verification command.
 //!
@@ -41,7 +47,9 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
+mod accept;
 mod experiment;
+mod judging;
 mod mutate;
 
 /// How many random programs each fuzzing suite runs in a full verification (the suites'
@@ -208,6 +216,7 @@ pub(crate) const CLEARED: &[&str] = &[
     "FIR_ABI",
     "FIR_ABI_SEED",
     "FIR_SHOW_ADDRESS_DIFFS",
+    "FIR_REGCHECK_BUDGET",
     "FIR_CHECK_DCE",
     "FCC_ONLY",
     "CBINDGEN",
@@ -423,6 +432,8 @@ impl Verify {
             .map(|o| !o.stdout.is_empty())
             .unwrap_or(true);
         let id = &mut self.identity;
+        // The tree this run judges: `fai status` compares it with the tree later.
+        id.insert("tree".into(), judging::tree_hash(&root).unwrap_or_default());
         id.insert("revision".into(), git(&["rev-parse", "HEAD"]));
         id.insert("branch".into(), git(&["rev-parse", "--abbrev-ref", "HEAD"]));
         id.insert("dirty".into(), dirty.to_string());
@@ -1192,6 +1203,15 @@ const USAGE: &str = "usage: fai verify [fast|full] [--no-lean-clean] [--report-d
        fai gate [--update] [--configs C,...] [--timeout SECONDS]
                                        (Lua and SQLite against the accepted baseline:
                                         benchmarks/projects/README.md)
+       fai judging [--base REV] [--head REV] [--json]
+                                       (the tests, baselines, and checkers a change touches;
+                                        exit 3 when it touches any)
+       fai accept [--base REV] [--no-lean-clean]
+                                       (one verdict for a change: verify full, the gate, and the
+                                        tests as they were; exit 0 PASS, 1 FAIL, 2 NOT JUDGED,
+                                        3 PASS with judging files changed)
+       fai status                      (which verdicts are of the tree as it is now; exit 0 when
+                                        verify full and the gate both passed on it)
        fai matrix REPORT.json...
        fai help
 In a checkout, `cargo fai ...` (or `fai ...` in the dev shell) builds and runs it; `cargo xtask ...` is its old name.";
@@ -1200,11 +1220,33 @@ In a checkout, `cargo fai ...` (or `fai ...` in the dev shell) builds and runs i
 /// root, with its verdict as the exit status. It is its own harness (uv, the pinned Python), so
 /// this only gives it the one name every other check here has.
 fn gate(root: &Path, rest: &[String]) -> i32 {
+    // The harness prints the judging line above its verdict and keeps it in its report.
+    let judging = judging::judging(root, None, None);
+    let tree = judging::tree_hash(root).unwrap_or_default();
     let status = Command::new("uv")
         .args(["run", "benchmarks/projects/projbench.py", "gate"])
         .args(rest)
+        .env("FAI_JUDGING", judging.line())
+        .env("FAI_JUDGING_JSON", judging.json().to_string())
+        .env("FAI_TREE", &tree)
         .current_dir(root)
         .status();
+    // The tree at the end goes into the harness's report: a tree that changed while the gate
+    // ran was not the tree it judged (`fai status`).
+    let out = rest
+        .iter()
+        .position(|a| a == "--out")
+        .and_then(|i| rest.get(i + 1))
+        .map_or_else(|| root.join("target/projbench"), PathBuf::from);
+    let report = out.join("gate-report.json");
+    if let Some(mut r) = std::fs::read(&report)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        && r["tree"] == json!(tree)
+    {
+        r["tree_at_end"] = json!(judging::tree_hash(root).unwrap_or_default());
+        let _ = std::fs::write(&report, serde_json::to_string_pretty(&r).unwrap());
+    }
     match status {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
@@ -1232,6 +1274,12 @@ enum Cli<'a> {
     Experiment(&'a [String]),
     /// `gate`: `projbench.py gate` with the rest of the line.
     Gate(&'a [String]),
+    /// `judging`: the judging files a change touches (judging.rs).
+    Judging(&'a [String]),
+    /// `accept`: one verdict for a change (accept.rs).
+    Accept(&'a [String]),
+    /// `status`: which verdicts hold for this tree (accept.rs).
+    Status,
     Matrix(&'a [String]),
     /// `help`, `--help`, `-h`: the usage on stdout, exit 0.
     Help,
@@ -1245,6 +1293,9 @@ fn command(args: &[String]) -> Cli<'_> {
         Some("mutate") => Cli::Mutate(&args[1..]),
         Some("experiment") => Cli::Experiment(&args[1..]),
         Some("gate") => Cli::Gate(&args[1..]),
+        Some("judging") => Cli::Judging(&args[1..]),
+        Some("accept") => Cli::Accept(&args[1..]),
+        Some("status") if args.len() == 1 => Cli::Status,
         Some("matrix") if args.len() > 1 => Cli::Matrix(&args[1..]),
         Some("evidence") if args.len() == 2 => Cli::Evidence(&args[1]),
         Some("help" | "--help" | "-h") => Cli::Help,
@@ -1261,6 +1312,9 @@ fn main() {
         Cli::Mutate(names) => std::process::exit(mutate::main(&root, names)),
         Cli::Experiment(rest) => std::process::exit(experiment::main(&root, rest)),
         Cli::Gate(rest) => std::process::exit(gate(&root, rest)),
+        Cli::Judging(rest) => std::process::exit(judging::main(&root, rest)),
+        Cli::Accept(rest) => std::process::exit(accept::accept(&root, rest)),
+        Cli::Status => std::process::exit(accept::status(&root)),
         Cli::Matrix(paths) => std::process::exit(matrix(paths)),
         Cli::Help => {
             println!("{usage}");
@@ -1365,6 +1419,15 @@ fn main() {
     );
     v.command("ruff check", &root, "uv", &uv_run(&["ruff", "check"]), &[]);
     v.command("ty", &root, "uv", &uv_run(&["ty", "check"]), &[]);
+    // The gate's verdict on made-up measurements, where the right one is known: no compiler
+    // runs, so the checker of speed is itself checked every time (and `fai mutate` weakens it).
+    v.command(
+        "gate self-test",
+        &root,
+        "uv",
+        &uv_run(&["benchmarks/projects/projbench.py", "gate", "--self-test"]),
+        &[],
+    );
     let ev_debug = out_dir.join("evidence/debug");
     v.tests("debug", &ev_debug);
     let ev_release = out_dir.join("evidence/release");
@@ -1449,6 +1512,14 @@ fn main() {
     } else {
         "PARTIAL (fast mode) FAILED"
     };
+    // What the change touches of the files that judge it: said with every verdict, and it
+    // changes none (`fai accept` is where it counts).
+    let judging = judging::judging(&root, None, None);
+    // A tree that changed while this ran was not the tree it judged.
+    v.identity.insert(
+        "tree_at_end".into(),
+        judging::tree_hash(&root).unwrap_or_default(),
+    );
     // The report.
     let checks: Vec<Value> = v
         .checks
@@ -1473,6 +1544,7 @@ fn main() {
         "execution": execution(&load_evidence(&ev_debug)),
         "seconds": start.elapsed().as_secs_f64(),
         "identity": v.identity,
+        "judging": judging.json(),
         "checks": checks,
         "coverage": v.coverage,
         "coverage_exclusions": COVERAGE_EXCLUSIONS.iter().map(|(c, k, w)| json!({"component": c, "op": k, "why": w})).collect::<Vec<_>>(),
@@ -1496,6 +1568,7 @@ fn main() {
     for (k, val) in &v.identity {
         writeln!(md, "| {k} | `{}` |", val.replace('|', "/")).unwrap();
     }
+    writeln!(md, "\n{}", judging.listing().replace("\n", "\n\n")).unwrap();
     md += "\n| Check | Status | Time | Notes |\n|---|---|---|---|\n";
     for c in &v.checks {
         let (s, why) = match &c.status {
@@ -1543,8 +1616,9 @@ fn main() {
     )
     .unwrap();
     std::fs::write(out_dir.join("report.md"), md).unwrap();
+    eprintln!("\n{}", judging.line());
     eprintln!(
-        "\n{verdict}: {} checks, {failed} failed, {skipped} skipped; report: {}",
+        "{verdict}: {} checks, {failed} failed, {skipped} skipped; report: {}",
         v.checks.len(),
         out_dir.join("report.md").display()
     );
@@ -1742,6 +1816,11 @@ mod evidence_tests {
         assert_eq!(command(&mx), Cli::Matrix(&mx[1..]));
         let g = a("gate --update");
         assert_eq!(command(&g), Cli::Gate(&g[1..]));
+        let j = a("judging --base main");
+        assert_eq!(command(&j), Cli::Judging(&j[1..]));
+        assert_eq!(command(&a("status")), Cli::Status);
+        let acc = a("accept --base main");
+        assert_eq!(command(&acc), Cli::Accept(&acc[1..]));
         assert_eq!(command(&a("gate")), Cli::Gate(&[]));
         for h in ["help", "--help", "-h"] {
             assert_eq!(command(&a(h)), Cli::Help);

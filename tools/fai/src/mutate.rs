@@ -106,6 +106,20 @@ fn regen_ops() -> Cmd {
     )
 }
 
+/// The gate's verdict on made-up measurements (`projbench.py gate --self-test`).
+fn gate_self_test() -> Cmd {
+    cmd(
+        "uv",
+        &[
+            "run",
+            "--locked",
+            "benchmarks/projects/projbench.py",
+            "gate",
+            "--self-test",
+        ],
+    )
+}
+
 fn test(args: &[&'static str]) -> Cmd {
     let mut a = vec!["test"];
     a.extend_from_slice(args);
@@ -529,6 +543,87 @@ fn mutations() -> Vec<Mutation> {
             ],
             in_decl: None,
         },
+        Mutation {
+            name: "gate-tolerance-widened",
+            what: "the gate calls a count the same when it is within 5% (it was one part in 100,000), so a 1% slowdown would pass; the gate's self-test refuses it",
+            edits: vec![edit(
+                "benchmarks/projects/projbench.py",
+                "GATE_SAME = 1e-5",
+                "GATE_SAME = 5e-2",
+            )],
+            steps: vec![gate_self_test()],
+            expect: vec![
+                "gate self-test: FAILED",
+                "1% more instructions on one workload fails",
+            ],
+            in_decl: None,
+        },
+        Mutation {
+            name: "gate-passes-a-partial-build",
+            what: "a build with files compiled another way (`--plain`), which were not judged, gets PASS; the gate's self-test refuses it",
+            edits: vec![edit(
+                "benchmarks/projects/projbench.py",
+                "        report[\"verdict\"] = \"PARTIAL\"\n",
+                "        report[\"verdict\"] = \"PASS\"\n",
+            )],
+            steps: vec![gate_self_test()],
+            expect: vec![
+                "gate self-test: FAILED",
+                "a partial build that is otherwise fine is PARTIAL",
+            ],
+            in_decl: None,
+        },
+        Mutation {
+            name: "gate-baseline-moves-up",
+            what: "`gate --update` writes whatever it measured, so a count inside the tolerance creeps up run by run; the gate's self-test refuses it",
+            edits: vec![edit(
+                "benchmarks/projects/projbench.py",
+                "new[\"instructions\"][w] = n if n < b * (1 - GATE_SAME) else b",
+                "new[\"instructions\"][w] = n",
+            )],
+            steps: vec![gate_self_test()],
+            expect: vec!["gate self-test: FAILED", "the baseline only moves down"],
+            in_decl: None,
+        },
+        Mutation {
+            name: "validator-budget-removed",
+            what: "the allocation validator never checks its budget, so it runs for as long as an input takes (minutes and gigabytes on the promotion passes' output); its test refuses a validation over budget that isn't refused",
+            edits: vec![edit(
+                "targets/aarch64/src/regcheck.rs",
+                "        if state::work() > limit {",
+                "        if state::work() > limit && limit == 0 {",
+            )],
+            steps: vec![test(&["-p", "fir", "--test", "regcheck", "budget"])],
+            expect: vec![
+                "a_validation_over_its_budget_is_refused",
+                "one unit of work can't validate a function",
+            ],
+            in_decl: None,
+        },
+        Mutation {
+            name: "accept-ignores-the-gate",
+            what: "`fai accept` fails only when verification failed too, so a change that the gate refuses is accepted; the verdict's unit test refuses it",
+            edits: vec![edit(
+                "tools/fai/src/accept.rs",
+                "    if gated == Gated::Fail {",
+                "    if gated == Gated::Fail && verified == Verified::Failed {",
+            )],
+            steps: vec![test(&["-p", "fai-tools", "the_four_verdicts"])],
+            expect: vec!["the_four_verdicts_and_their_order", "Full Fail"],
+            in_decl: None,
+        },
+        Mutation {
+            name: "judging-list-drops-the-tests",
+            what: "the judging list stops counting files under a `tests` directory, so an edited fixture would go unnamed; the list's own unit test refuses it (it needs no git, which this copy doesn't have)",
+            edits: vec![edit(
+                "tools/fai/src/judging.rs",
+                "dirs.split('/').any(|c| c == \"tests\").then_some(Kind::Test)",
+                "dirs.split('/').any(|c| c == \"no tests\").then_some(Kind::Test)",
+            )],
+            steps: vec![test(&["-p", "fai-tools", "judging"])],
+            expect: vec!["tests/rust/regcheck.rs", "panicked"],
+            in_decl: None,
+        },
     ]
 }
 
@@ -611,6 +706,8 @@ pub fn main(root: &Path, names: &[String]) -> i32 {
         return 2;
     }
     eprintln!("copying the tree to {}", tree.display());
+    // The tree these results are of (`fai status`).
+    let judged = crate::judging::tree_hash(root).unwrap_or_default();
     make_copy(root, &tree);
     let pristine: BTreeMap<&str, String> = all
         .iter()
@@ -716,7 +813,12 @@ pub fn main(root: &Path, names: &[String]) -> i32 {
             "output_tail": if passed { String::new() } else { tail(&output) },
         }));
     }
-    let report = json!({"mutations": results, "all_caught_for_the_intended_reason": ok_all});
+    let report = json!({
+        "tree": judged,
+        "subset": !names.is_empty(),
+        "mutations": results,
+        "all_caught_for_the_intended_reason": ok_all,
+    });
     std::fs::write(
         base.join("report.json"),
         serde_json::to_string_pretty(&report).unwrap(),
