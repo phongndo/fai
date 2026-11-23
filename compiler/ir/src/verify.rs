@@ -487,6 +487,32 @@ fn has_layout(types: &Types, t: Ty) -> bool {
     }
 }
 
+/// Outside HFIR a struct or an array is a value only where calls pass it whole (decision:
+/// Aggregates): a function's parameters and results, a call's arguments and results, `va.arg`,
+/// and `agg.*`. A region's state stays scalar there, which is all the lowering produces and all
+/// a backend takes: `what` (a block's parameter, a loop's state, a result of a region op, a
+/// hole) can't be one. Lean's `checkScalarState`.
+#[inline]
+fn check_scalar_state(
+    types: &Types,
+    layer: Layer,
+    loc: Option<Loc>,
+    what: impl FnOnce() -> String,
+    t: Ty,
+) -> VResult<()> {
+    if layer != Layer::Hfir && matches!(t, Ty::Agg(_)) && types.is_composite(t) {
+        return verr(
+            loc,
+            format!(
+                "{} can't be {} in layer {layer}: outside HFIR only calls pass a struct or an array whole",
+                types.show(t),
+                what()
+            ),
+        );
+    }
+    Ok(())
+}
+
 /// Check that a value's type is a well-formed value type of the layer.
 #[inline]
 fn check_value_ty(
@@ -1172,6 +1198,21 @@ impl<'a> FuncVerifier<'a> {
         self.ops(entry, None)
     }
 
+    /// The results of a region op (`cf.if`, `cf.loop`, `cf.blocks`) are scalars outside HFIR
+    /// ([`check_scalar_state`]).
+    fn scalar_results(&self, loc: Option<Loc>, op: &str, outs: &[Ty]) -> VResult<()> {
+        for &t in outs {
+            check_scalar_state(
+                self.body.types(),
+                self.cx.layer,
+                loc,
+                || format!("a result of {op}"),
+                t,
+            )?;
+        }
+        Ok(())
+    }
+
     fn define(&mut self, loc: Option<Loc>, v: ValueId, is_param: bool) -> VResult<()> {
         let body = self.body;
         let (name, ty) = (body.name(v), body.ty(v));
@@ -1206,6 +1247,13 @@ impl<'a> FuncVerifier<'a> {
             OperandKind::Hole(h) => {
                 let ty = self.body.hole_ty(h);
                 check_value_ty(self.body.types(), self.cx.space, self.cx.layer, loc, ty)?;
+                check_scalar_state(
+                    self.body.types(),
+                    self.cx.layer,
+                    loc,
+                    || format!("the hole ?{}", self.body.hole_name(h)),
+                    ty,
+                )?;
                 self.holes.push(Hole {
                     name: self.body.hole_name(h).to_owned(),
                     ty,
@@ -1386,6 +1434,7 @@ impl<'a> FuncVerifier<'a> {
         if body.params(entry).len() != 0 {
             return verr(loc, "the entry block of cf.blocks has no parameters");
         }
+        self.scalar_results(loc, "cf.blocks", outs)?;
         self.ctx.push(RegionCtx::Block {
             blocks,
             results: outs.to_vec(),
@@ -1393,6 +1442,13 @@ impl<'a> FuncVerifier<'a> {
         for &r in rs {
             let mark = self.scope.len();
             for v in body.params(r) {
+                check_scalar_state(
+                    body.types(),
+                    self.cx.layer,
+                    loc,
+                    || format!("the block parameter %{}", body.name(v)),
+                    body.ty(v),
+                )?;
                 self.define(loc, v, false)?;
             }
             self.ops(r, loc)?;
@@ -1528,6 +1584,7 @@ impl<'a> FuncVerifier<'a> {
             (OpKind::Blocks { .. }, rs) => self.blocks(loc, &ins, &outs, rs)?,
             (OpKind::If, &[thn, els]) => {
                 expect_tys(body.types(), loc, "cf.if condition", &ins, &[Ty::Int(1)])?;
+                self.scalar_results(loc, "cf.if", &outs)?;
                 for r in [thn, els] {
                     if body.params(r).len() != 0 {
                         return verr(loc, "cf.if regions have no parameters");
@@ -1608,8 +1665,16 @@ impl<'a> FuncVerifier<'a> {
                 }
                 let ps: Vec<Ty> = body.params(inner).map(|v| body.ty(v)).collect();
                 expect_tys(body.types(), loc, "cf.loop initial values", &ins, &ps)?;
+                self.scalar_results(loc, "cf.loop", &outs)?;
                 let mark = self.scope.len();
                 for v in body.params(inner) {
+                    check_scalar_state(
+                        body.types(),
+                        self.cx.layer,
+                        loc,
+                        || format!("the loop parameter %{}", body.name(v)),
+                        body.ty(v),
+                    )?;
                     self.define(loc, v, false)?;
                 }
                 self.ctx.push(RegionCtx::LoopBody {

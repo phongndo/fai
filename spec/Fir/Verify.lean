@@ -53,7 +53,9 @@ interpreter.
   such scalars and composites (`SpaceCfg.isVararg`), which is also what `va.arg` reads;
   `va.start` is only in a variadic function.
 * Composites (decision: C ABI for aggregates): outside HFIR, values may also be structs and
-  arrays of scalars and composites (`Ty.isComposite`), which calls pass whole; a function,
+  arrays of scalars and composites (`Ty.isComposite`), which calls pass whole, and only there:
+  a block's parameter, a loop's state, a result of `cf.if`, `cf.loop`, or `cf.blocks`, and a
+  hole stay scalar (`checkScalarState`); a function,
   external function, or function type with such a result has no other. Loads and stores of them
   are HFIR only. External functions take and give scalars and composites in every layer.
   `va_list` is a memory type: no value, parameter, or part of a value has it.
@@ -158,6 +160,16 @@ def checkValueTy (loc : Option Loc) (t : Ty) : VM Unit := do
   checkTy loc t
   unless (← get).layer.valueTy t && !t.hasVaList do verr loc s!"{t} is not a value type"
 
+/-- Outside HFIR a struct or an array is a value only where calls pass it whole (decision:
+Aggregates): a function's parameters and results, a call's arguments and results, `va.arg`, and
+`agg.*`. A region's state stays scalar there, which is all the lowering produces and all a
+backend takes: `what` (a block's parameter, a loop's state, a result of a region op, a hole)
+can't be one. -/
+def checkScalarState (loc : Option Loc) (what : String) (t : Ty) : VM Unit := do
+  let l := (← get).layer
+  if l != .hfir && t.isComposite then
+    verr loc s!"{t} can't be {what} in layer {l.render}: outside HFIR only calls pass a struct or an array whole"
+
 /-- Check that a type is well formed and has a layout. -/
 def checkSized (loc : Option Loc) (t : Ty) : VM Unit := do
   checkTy loc t
@@ -197,6 +209,7 @@ def operandTy (loc : Option Loc) (scope : VScope) : Operand → VM Ty
     | none => verr loc s!"%{n} is not defined here"
   | .hole n t => do
     checkValueTy loc t
+    checkScalarState loc s!"the hole ?{n}" t
     modify fun s => { s with holes := s.holes.push { name := n, ty := t, loc } }
     pure t
 
@@ -466,12 +479,16 @@ mutual
         if (bs.lookup l).isSome then verr loc s!"block ^{l} is defined more than once"
         bs := bs ++ [(l, r.params.map (·.ty))]
       unless entry.params.isEmpty do verr loc "the entry block of cf.blocks has no parameters"
+      for t in outs do checkScalarState loc "a result of cf.blocks" t
       for r in rs do
         let mut inner := scope
-        for p in r.params do inner ← define loc inner p
+        for p in r.params do
+          checkScalarState loc s!"the block parameter %{p.name}" p.ty
+          inner ← define loc inner p
         verifyOps (.block bs outs :: ctx) inner loc r.ops
     | .if_, [thn, els] =>
       expectTys loc "cf.if condition" ins [.int 1]
+      for t in outs do checkScalarState loc "a result of cf.if" t
       for r in [thn, els] do
         unless r.params.isEmpty do verr loc "cf.if regions have no parameters"
         unless r.label.isNone do verr loc "only blocks of cf.blocks have labels"
@@ -500,8 +517,11 @@ mutual
       unless body.label.isNone do verr loc "only blocks of cf.blocks have labels"
       let ps := body.params.map (·.ty)
       expectTys loc "cf.loop initial values" ins ps
+      for t in outs do checkScalarState loc "a result of cf.loop" t
       let mut inner := scope
-      for r in body.params do inner ← define loc inner r
+      for r in body.params do
+        checkScalarState loc s!"the loop parameter %{r.name}" r.ty
+        inner ← define loc inner r
       verifyOps (.loopBody ps outs :: ctx) inner loc body.ops
     | .vaStart, [] =>
       unless (← get).variadic do verr loc "va.start is only allowed in a variadic function"
