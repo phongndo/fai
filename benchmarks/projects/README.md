@@ -36,8 +36,11 @@ better, and always ends with one of three lines:
 | `gate: FAIL` (or `gate: PARTIAL, not a pass`) | 1 | the change is not accepted; the lines above say why |
 | `gate: NOT RUN: …` | 2 | the gate could not judge the tree: no baseline yet, or the wrong host |
 
-The same verdict and reasons are in `gate-report.json` under `--out`. It takes about five
-minutes, and runs where `count` does: on x86-64 Linux in the dev shell, under `qemu-aarch64`.
+The same verdict and reasons are in `gate-report.json` under `--out`, with the tree the verdict
+is of (its content hash, which `fai status` compares with the tree later), the baseline's
+hash, and the judging files the change touches. It takes about five minutes from nothing and
+a little over one once the sources and the reference build exist, and runs where `count`
+does: on x86-64 Linux in the dev shell, under `qemu-aarch64`.
 On an AArch64 host the instruction-counting plugin doesn't run, and the gate says `NOT RUN`.
 
 It fails if:
@@ -46,7 +49,10 @@ It fails if:
 - a build's behavior differs from GCC `-O2`'s (a workload's output, a file of Lua's suite,
   speedtest1's hash);
 - a workload executes more instructions than the baseline's (by more than one part in
-  100,000: the counts repeat to within a few dozen instructions);
+  100,000: the counts repeat to within a few dozen instructions, and don't depend on where
+  the tree or the output directory is: every counted run starts in its work directory and
+  names its program and script without a directory, because Lua keeps the script's path in
+  each function and paces its collector by memory);
 - a project's `.text` is larger than the baseline's, at all;
 - a project compiles in more than twice the baseline's CPU time plus a second, or peaks at
   more than twice its memory plus 64 MiB (these two are measured once on a shared host, so
@@ -59,6 +65,11 @@ moves one way: an improvement is kept by committing the new `gate.json` with the
 made it. To accept a trade (more
 instructions for something the gate doesn't measure), edit `gate.json` by hand, where the
 diff says what was given up.
+
+`gate --self-test` checks the verdict itself on made-up measurements where the right one is
+known (the same, 1% more instructions, wrong behavior, a workload not run, a partial build,
+the baseline's update): no compiler runs, `fai verify` runs it every time, and `fai mutate`
+weakens the gate three ways and requires it to notice.
 
 `--configs fcc-promo` (or any fcc configuration) gates that configuration instead. One with no
 baseline of its own is held to `fcc -O`'s: a pipeline proposed for `-O` must be right and no

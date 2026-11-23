@@ -19,12 +19,16 @@ fai experiment my-fwd-change --baseline-rev main        # a code change: this tr
 
 # 3. Read target/experiments/NAME/report.md (or report.json). Exit 1 means REJECTED.
 
-# 4. Before anything lands: the required checks, which know nothing of experiments.
-fai verify full          # correct: proofs, generated files, every suite
-fai gate                 # no worse on Lua and SQLite than the accepted baseline (PASS or FAIL)
+# 4. Before anything lands: the required check, which knows nothing of experiments.
+fai accept               # verify full, the gate, and the tests as they were: PASS or FAIL
 ```
 
-A change that fails either is not accepted. `fai gate` is what the corpus can't say: the corpus
+`fai accept` is `fai verify full` (correct: proofs, generated files, every suite), then
+`fai gate` (no worse on Lua and SQLite than the accepted baseline), then, when the change
+edits tests that existed at the base, those tests as they were against the changed code. A
+change that fails is not accepted, and one that passes only by moving what judges it exits 3
+and names the files. `fai verify quick` is the same checks without the minutes-long ones, for
+after every edit. `fai gate` is what the corpus can't say: the corpus
 measured the experimental promotion pipeline as 32% better, and on Lua and SQLite it is
 several times worse ([benchmarks/projects/README.md](../benchmarks/projects/README.md#the-gate),
 [selection.md](performance/selection.md)).
@@ -140,7 +144,8 @@ is the gate, which runs what each host can (below).
 
 ## What runs where
 
-`fai verify full` runs on both hosts in CI (`.github/workflows/verify.yml`), and
+`fai accept` (which runs `fai verify full`) runs on both hosts in CI
+(`.github/workflows/verify.yml`), and
 `fai matrix REPORT.json…` puts their reports side by side.
 
 | | x86-64 Linux | Apple-silicon macOS |

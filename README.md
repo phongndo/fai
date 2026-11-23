@@ -56,9 +56,9 @@ cargo run --bin fir -- run tests/fir0/loops.fir @countdown 5   # interpret a fun
 cargo run --bin fir -- compile FILE.fir -O -o out              # --target x86_64 for x86-64
 cmake -S frontends/c -B build/fcc -G Ninja                     # fcc: configure,
 cmake --build build/fcc                                        # and build
-fai verify fast                                                # local; says what it skipped
-fai verify full                                                # the required check (CI)
-fai gate                                                       # Lua and SQLite: right, and no worse than the baseline
+fai verify quick                                               # after every edit: under a minute; says what it left out
+fai accept                                                     # the required check (CI): verify full, the gate, the old tests
+fai status                                                     # which verdicts are of the tree as it is now
 fai experiment NAME --passes P,Q [--experimental]              # propose, test, and measure a change
 fai help                                                       # every `fai` command
 ```
@@ -66,6 +66,24 @@ fai help                                                       # every `fai` com
 `fai` is the repository's own command (`tools/fai`): the dev shell builds and runs it from the
 checkout you're in, and `cargo fai …` does the same anywhere cargo runs. `cargo xtask …`, its
 old name, still works.
+
+### Checking a change
+
+No verdict here is read from output and judged: each is one command with an exit code.
+
+| Command | Time | Says |
+|---|---|---|
+| `fai verify quick` | under a minute | `QUICK PASSED: not a verification`, or what failed. Everything but the C corpus tests, the release build, and the sanitizer run; the list of what it left out is printed and never varies |
+| `fai accept` | about 8 minutes | `accept: PASS` (0), `FAIL` (1), `NOT JUDGED` (2), or `PASS, JUDGING FILES CHANGED` with the files (3). It runs `fai verify full` and `fai gate`, and, when the change edits tests that existed at the base, those tests **as they were** against the changed code |
+| `fai status` | a second | whether the last `verify full` and `gate` are of the tree as it is now (`CURRENT`, exit 0) or of another (`STALE`) |
+| `fai judging` | a second | the tests, baselines, and checkers the change touches, against the merge base with `origin/main` |
+| `fir check FILE --target aarch64` | a moment | whether `fir compile` will accept a module, in the words it would use |
+
+A change that fails its test is taken out, not kept with an explanation. A change that can
+only pass by editing what judges it (a test, a baseline, a checker) says so: `fai accept` exits
+3 and names the files, and merging is the owner's yes. The parts are also commands of their
+own: `fai verify fast|full`, `fai gate` (Lua and SQLite, right and no worse than the accepted
+baseline), and `fai mutate` (the checkers checked against planted defects).
 
 [frontends/c/README.md](frontends/c/README.md) covers fcc,
 [docs/assurance/README.md](docs/assurance/README.md) covers what `verify full` requires, and
