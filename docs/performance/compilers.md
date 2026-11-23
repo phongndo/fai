@@ -12,7 +12,7 @@ time, phase by phase). This one adds two real projects, Lua 5.4.7 and SQLite 3.5
 arocc, and re-measures the rest at the current revision.
 
 **Since this was measured**, instruction selection changed
-([selection.md](selection.md)): `fcc -O` executes 1.22× GCC `-O0`'s instructions on Lua and
+([selection.md](selection.md)): `fcc -O` executes 1.20× GCC `-O0`'s instructions on Lua and
 0.63× on SQLite's speedtest1, from 2.27× and 1.16×. The times below were not measured again.
 
 ## Summary
