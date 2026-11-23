@@ -26,6 +26,13 @@ uv run benchmarks/projects/projbench.py report             # target/projbench/re
   objects with cbench's setup (`cbench.Tools`: the same headers, `-ffp-contract=off`, no Nix
   hardening), linked statically by the cross GCC. `frontend` runs `-fsyntax-only` on GCC, Clang,
   and arocc, and reads fcc's own Clang and lowering phases from `FIR_TIME=1`.
+- **Other configurations:** `--configs A,B,…` replaces the list for `build`, `check`, and
+  `count` (it must keep `gcc-O2`, the reference), and may name fcc with an experimental
+  pipeline: `fcc-m2r` (`mem2reg,fwd,copyprop,dse,dce`) or `fcc-promo` (the same with
+  `stackdce`), both `--experimental`. `--plain lvm` makes those two compile the named files
+  with `fcc -O`: `lvm.c` does not compile with promotion in practical time
+  ([promotion-baseline.md](../../docs/performance/promotion-baseline.md)). `report` and `time`
+  keep the published list.
 - **Behavior:** `check` runs Lua's own test suite (28 files that run alone, portable and soft
   mode) and the Lua scripts in `lua/` with every build, and speedtest1 with `--verify` (a hash
   of every query result), against GCC `-O2`'s build. `c23` compiles, links, and runs each

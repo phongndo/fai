@@ -227,6 +227,7 @@ class Setup:
         self.out = Path(args.out).resolve()
         self.src = self.out / "src"
         self.arocc = args.arocc or os.environ.get("AROCC")
+        self.plain = set(args.plain.split(",")) if args.plain else set()
         self.env = self.tools.env
 
     def lua_dir(self):
@@ -247,7 +248,10 @@ class Setup:
         return {"lua": lua, "sqlite": sqlite}
 
     def compile_cmd(self, config, src, flags, obj):
-        """cbench's command for config, with the project's flags."""
+        """cbench's command for config, with the project's flags. A file named in --plain is
+        compiled with `fcc -O` under every experimental fcc configuration."""
+        if config in cbench.FCC_EXPERIMENTAL and Path(src).stem in self.plain:
+            config = "fcc-O"
         cmd = [str(c) for c in self.tools.compile_cmd(config, src, obj)]
         at = 2 if config.startswith("fcc") else 1
         return cmd[:at] + list(flags) + cmd[at:]
@@ -1138,6 +1142,7 @@ def cmd_report(s):
 
 
 def main():
+    global BUILD_CONFIGS
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -1152,7 +1157,29 @@ def main():
     ap.add_argument("--ssh")
     ap.add_argument("--docker")
     ap.add_argument("--docker-bin", default="docker")
+    ap.add_argument(
+        "--configs",
+        help="comma-separated configurations for build, check, and count, in place of the "
+        f"default {','.join(BUILD_CONFIGS)}; must include {REFERENCE}, and may name "
+        f"{', '.join(cbench.FCC_EXPERIMENTAL)} (fcc with an experimental pipeline). "
+        "`report` and `time` are for the default set",
+    )
+    ap.add_argument(
+        "--plain",
+        help="comma-separated source files (by stem: lvm) that the experimental fcc "
+        "configurations compile with `fcc -O` instead, for files the backend can't compile "
+        "under an experimental pipeline in practical time",
+    )
     args = ap.parse_args()
+    if args.configs:
+        BUILD_CONFIGS = args.configs.split(",")
+        known = [*cbench.CONFIGS, *cbench.FCC_EXPERIMENTAL]
+        if bad := [c for c in BUILD_CONFIGS if c not in known]:
+            die(f"--configs: unknown {', '.join(bad)} (known: {', '.join(known)})")
+        if REFERENCE not in BUILD_CONFIGS:
+            die(f"--configs must include {REFERENCE}, which the others are checked against")
+        if args.step in ("report", "time", "all"):
+            die(f"--configs is for build, check, and count; `{args.step}` uses the default set")
     s = Setup(args)
     s.out.mkdir(parents=True, exist_ok=True)
     steps = {

@@ -59,6 +59,12 @@ SIZES = {
 }
 
 CONFIGS = ["fcc", "fcc-O", "gcc-O0", "gcc-O1", "gcc-O2", "clang-O0", "clang-O2"]
+# fcc with an experimental (unproved, opt-in) pipeline, for harnesses that ask for one by name
+# (projbench's --configs). They are never in CONFIGS: the published tables are -O's.
+FCC_EXPERIMENTAL = {
+    "fcc-m2r": "mem2reg,fwd,copyprop,dse,dce",
+    "fcc-promo": "mem2reg,stackdce,fwd,copyprop,dse,dce",
+}
 REFERENCE = "gcc-O2"
 SCALING_SIZES = [25, 100, 400, 1600]
 
@@ -184,6 +190,9 @@ class Tools:
         run(["cargo", "build", "--release", "-q", "-p", "fir"], cwd=ROOT, capture=False)
 
     def compile_cmd(self, config, src, obj):
+        if config in FCC_EXPERIMENTAL:
+            passes = ["--passes", FCC_EXPERIMENTAL[config], "--experimental"]
+            return [self.fcc, src, *passes, "-o", obj]
         if config.startswith("fcc"):
             return [self.fcc, src] + (["-O"] if config == "fcc-O" else []) + ["-o", obj]
         compiler, level = config.split("-")
