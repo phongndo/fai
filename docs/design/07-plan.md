@@ -167,6 +167,37 @@ and may shrink a later step to a `fai mutate` entry.
 The owner said "execute", which is taken as a yes to the five recommendations above; each is
 in a commit of its own, and none is written into `decisions.md`.
 
+### Where the round stands
+
+Every step has run. Whether the tree is verified is not written here, because a document
+can't know: `fai status` says it for the tree as it is.
+
+| Done when | Status |
+|---|---|
+| 1. One command | **Met.** `fai accept`, four exit codes; CI runs it (the workflow is not tried: it can only run on GitHub) |
+| 2. Bound to the tree | **Met.** `fai status` |
+| 3. The checkers are checked | **Met.** `fai mutate` has 37 entries, 9 of them new: a real slowdown through the gate, the gate weakened three ways, the judging list without its tests, `accept` ignoring the gate, the validator without its budget, a lazy value's register reused across blocks, and a struct parameter lowered apart in Lean and Rust alike |
+| 4. A tier in seconds | **Met.** `fai verify quick`: 46 s, and it catches 33 of the 37 planted defects (8 of them run through it, the rest by construction) |
+| 5. The allocation validator can't hang | **Met.** 4,096 units of work per instruction, 2^29 in all |
+| 6. One MFIR | **Met in a narrower form than written.** The verifier accepts composites only where lowering makes them, and `fir check --target T` is the backend's own refusals, so it can't disagree with `fir compile`. The MFIR verifier alone still accepts integers no backend takes: that rule stays in the backends |
+
+What was not done, or was done another way:
+
+- **Step 11's run on the rejected change** (`bc57886` applied in a scratch worktree, to see the
+  failure name `luaV_execute`): not run. The self-test covers the naming.
+- **Step 14's test on the random programs and the C corpus**: not run. They are covered by
+  construction (the check is the compile, short of writing the assembly).
+- **Step 10's count** is measured for 8 of the 37 planted defects.
+- **Defect (c) is not 1%**: the planted slowdown costs 5% to 11%. The gate's verdict at 1% is
+  the self-test's, on made-up numbers.
+- **Nothing here ran on macOS.** `accept`'s verdict on a host with gaps is unit-tested only.
+- **Found on the way, and fixed:** the gate's counts depended on the output directory's name
+  (step 4a); `fir compile --os darwin` skipped the macOS limits; `fcc_cache.rs` looked for the
+  C API under `target/` whatever Cargo's target directory was; the fixture tests ran one file
+  at a time.
+- **Found on the way, and left:** with the promotion passes `sqlite3.c` no longer compiles
+  (13 functions are over the validator's budget), where it took 20 s. That is 06's step 7.
+
 ### Stage 0
 
 | # | Result |
@@ -184,21 +215,22 @@ Steps 2 and 4 run with the steps that use them (7, 12, 16).
 | 4a | **Passed.** With every counted run started in its work directory, two gate runs into `target/pb-a` and `target/projbench-with-a-much-longer-name-for-this-test` counted the same instructions for all 8 workloads in both configurations, to the instruction |
 | 5 | **Passed.** `fai judging --base origin/main --head 313855a` names the eight files below and exits 3; `--base 313855a --head 69137c8` (a commit of two plan files) exits 0; an unknown base exits 2. `fai mutate judging-list-drops-the-tests` is caught |
 | 6 | **Passed.** `verify`, `gate`, `mutate`, and `accept` record the tree's hash at their start and end. After `fai accept`, `fai status` says `CURRENT` and exits 0; with one byte appended to `README.md` it says `STALE: verify, gate` and exits 1; with the byte removed, 0 again; the same with an untracked file added and removed. A gate run with `--update` is stale by its own doing: it changes the baseline, which is part of the tree |
-| 7 | **Passed, but for `slower-code`, which is not built yet.** `projbench.py gate --self-test` makes 20 checks in well under a second, and `fai verify` runs it. `gate-tolerance-widened`, `gate-passes-a-partial-build`, and `gate-baseline-moves-up` are each caught by it |
+| 7 | **Passed.** `projbench.py gate --self-test` makes 22 checks in well under a second, and `fai verify` runs it. `gate-tolerance-widened`, `gate-passes-a-partial-build`, and `gate-baseline-moves-up` are each caught by it. `slower-code` plants a real slowdown (selection forgets what it knows of a register's high bits) and runs the gate itself in `fai mutate`'s copy: the gate passes the unchanged copy, in a third directory, and fails the planted one in 2 minutes with every Lua workload worse (lua-fannkuch +11.19%, lua-fib +10.34%, lua-sort +5.48%). The defect is larger than the 1% first aimed at; the gate's verdict at 1% is the self-test's. The harness now builds where `CARGO_TARGET_DIR` says, which the copy needed |
 | 8 | **Passed.** The budget is 4,096 units of work per input instruction and 2^29 in all. With `-O`, Lua and SQLite (2,376 validations) need at most 632 per instruction and 17.6 million in all, both for `luaV_execute`. With the promotion passes, `lvm.c` is refused in 4.75 s at 479 MB (it had passed 4 billion units after 100 s), and 13 of SQLite's functions need more than 4,000 per instruction (up to 169,774), so `sqlite3.c` no longer compiles with them either: 06's step 7 now has a number to get under. `.text` of both projects is unchanged, the gate passes, and `validator-budget-removed` is caught |
 
 ### Stage B
 
 | # | Result |
 |---|---|
-| 10 | **Passed.** `fai verify quick` takes 46 s (57 s with another job running), against a warm `fast` at 212 s: it is `fast` without `fcc_corpus`, `fcc_x86_64_corpus`, and `fcc_abi_torture`, and with 20 of the ABI test's signatures, and it prints that list. Most of the gain is not from leaving tests out: the fixture tests ran one file at a time, and now use every core (native AArch64 32 s to 4 s, x86-64 14 s to 3 s, lowering 12 s to 7 s, each with the counts it had), which `fast` and `full` get too. What it catches of the planted defects is measured by `fai mutate --quick`, below |
+| 10 | **Passed.** `fai verify quick` takes 46 s (57 s with another job running), against a warm `fast` at 212 s: it is `fast` without `fcc_corpus`, `fcc_x86_64_corpus`, and `fcc_abi_torture`, and with 20 of the ABI test's signatures, and it prints that list. Most of the gain is not from leaving tests out: the fixture tests ran one file at a time, and now use every core (native AArch64 32 s to 4 s, x86-64 14 s to 3 s, lowering 12 s to 7 s, each with the counts it had), which `fast` and `full` get too. `fai mutate --quick` plants each defect and runs the quick tier in place of the command known to catch it. Run on 8 of them it caught 5 and missed 3, and those 3 plant nothing in the compiler: they take away the Lean reference, the native runner, or a suite's evidence, which only `full` refuses. The other planted defects are caught by tests the quick tier runs unchanged, and `slower-code` needs the gate, which quick doesn't run. So quick catches 33 of 37, by measurement for 8 and by construction for the rest (running all 37 through it takes about two hours and was stopped after four) |
+| 11 | **Passed in the self-test; the run on `bc57886` was not done.** A failing workload's line is followed by the functions among its ten busiest that execute more than in the baseline, most first, with a local function's file hash dropped from its name. The baseline keeps those counts, and they decide nothing. The self-test checks that a failure names the function that rose and no other |
 | 9 | **Passed.** The verdict is a function of its parts, with unit tests for the four exit codes, their order, a host with gaps, and an edited test whose old version still passes. On this tree `fai accept` took about 7 minutes and ended `PASS, JUDGING FILES CHANGED`, exit 3: verification passed (16 checks), the gate was the same as its baseline, and the change **fails the tests as they were at the base**: `line_zero_escaped_file_names_and_modules_without_files` in `tests/rust/debug_lines.rs` and `corrupted_allocations_are_refused` in `tests/rust/regcheck.rs`, the two fixtures `ab20520` edited. The `fai mutate` entry is step 9's last part, below |
 
 ### Stage C
 
 | # | Result |
 |---|---|
-| 12 | **Passed, but for its `fai mutate` entry (below).** `fir::interp::run_lowering_pair` runs a function on generated values and its lowering on the same values encoded as the lowered signature takes them (a struct or array whole, anything else as its scalars, `poison` for a union's other variants). The lowering test does that for every fixture function with a composite parameter: 15 functions, 8 sets of arguments each, 120 runs, of which 112 return a result and 8 end in UB; all match. `verify full` requires both counts. No function was left out for a type that isn't generated |
+| 12 | **Passed, and its planted defect shows the gap was narrower than thought.** `fir::interp::run_lowering_pair` runs a function on generated values and its lowering on the same values encoded as the lowered signature takes them (a struct or array whole, anything else as its scalars, `poison` for a union's other variants). The lowering test does that for every fixture function with a composite parameter: 15 functions, 8 sets of arguments each, 120 runs, of which 112 return a result and 8 end in UB; all match. `verify full` requires both counts. No function was left out for a type that isn't generated. Defect (a) is `fai mutate`'s `struct-parameter-lowered-apart`: the lowering takes a struct parameter apart in the signature, in Lean and Rust alike, so their texts still agree. It is caught, but not by the new comparison: every fixture function with a struct parameter has a caller in its module, so the lowered module no longer verifies (four fixtures), which the test checked before this round. The new comparison is direct coverage of 15 functions that had only indirect coverage; no planted defect yet needs it |
 | 13 | **Passed.** Both verifiers refuse, outside HFIR, a struct or array as a block's parameter, a loop's state, a result of `cf.if`, `cf.loop`, or `cf.blocks`, or a hole, with one message. The Lean build took 13 s after the change and no proof needed touching; the audit reports 44 claims and no change needing review, so the proof lock did not move after all. No existing fixture relied on it. Five new error fixtures (`tests/layers/errors/mfir-composite-*.fir`) pin the messages in both tools |
 | 14 | **Passed (decision 5, and smaller than planned).** `fir check FILE --target aarch64|x86_64 [--os linux|darwin]` says whether `fir compile` for the target accepts the module. It is not a second rule: it runs the backend's own lowering, selection, and allocation short of writing the assembly (`aarch64::check`, `x86_64::check`), so the two can't drift. `tests/rust/check_target.rs` holds it to that on every fixture that verifies, for both targets: 87 pairs both accept and 55 both refuse, each refusal in the same words, and `verify full` requires both counts. Checked `i64` addition is refused at the check with the backend's message and a note naming the op: `int.add.overflow.s on i64 is lowered to arithmetic on i65`. The random programs and the C corpus are covered only by construction, not by a run. On the way, `fir compile --os darwin` now refuses what the library refuses (it skipped the macOS checks) |
 | 15 | **Passed (decision 4, as recommended).** Both verifiers refuse a hole of a type with no scalars. The gap's program is `tests/fir0/errors/hole-of-nothing.fir`. The lowering test still compares every run that ends at a hole |

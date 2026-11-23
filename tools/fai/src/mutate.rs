@@ -635,6 +635,56 @@ fn mutations() -> Vec<Mutation> {
             in_decl: None,
         },
         Mutation {
+            name: "slower-code",
+            what: "selection forgets what it knows of a register's high bits, so it extends again what is already extended: the same behavior in more instructions; the gate, run for real on Lua and SQLite, refuses it",
+            edits: vec![edit(
+                "targets/aarch64/src/isel.rs",
+                "        if !self.cx.eager && r.is_virtual() && !r.is_fp() && (1..64).contains(&width) {",
+                "        if self.cx.eager && r.is_virtual() && !r.is_fp() && (1..64).contains(&width) {",
+            )],
+            // One command, so that the run on the unchanged copy does the same: the copy
+            // shares the sources the tree fetched, if it has (the gate fetches them
+            // otherwise), and then the gate runs.
+            steps: vec![cmd(
+                "sh",
+                &[
+                    "-c",
+                    "mkdir -p target/projbench && if [ -d \"$FAI_MUTATE_FROM/target/projbench/src\" ] && [ ! -e target/projbench/src ]; then ln -s \"$FAI_MUTATE_FROM/target/projbench/src\" target/projbench/src; fi; exec cargo fai gate",
+                ],
+            )],
+            expect: vec!["WORSE   instructions: lua-", "gate: FAIL"],
+            in_decl: None,
+        },
+        Mutation {
+            name: "struct-parameter-lowered-apart",
+            what: "the lowering takes a struct parameter apart in the signature, where calls pass it whole, in Lean and in Rust alike, so the two print the same text; the lowered module's own callers then pass what the callee no longer takes, and the lowering's output doesn't verify",
+            edits: vec![
+                edit(
+                    "spec/Fir/Lower.lean",
+                    "    if p.ty.isComposite then\n      let (o, _) ← extractWhole",
+                    "    if p.ty.isComposite && ps.isEmpty then\n      let (o, _) ← extractWhole",
+                ),
+                edit(
+                    "compiler/lowering/src/lib.rs",
+                    "        if src.types().is_composite(src.ty(v)) {",
+                    "        if src.types().is_composite(src.ty(v)) && params.is_empty() {",
+                ),
+                edit(
+                    "compiler/lowering/src/lib.rs",
+                    "        if src.types().is_composite(src.ty(v)) {",
+                    "        if src.types().is_composite(src.ty(v)) && params.is_empty() {",
+                ),
+            ],
+            steps: vec![lake_build(), test(&["-p", "fir", "--test", "lower"])],
+            // Every fixture function with a struct parameter has a caller in its module, so
+            // the verifier sees this before the comparison on generated arguments does.
+            expect: vec![
+                "the lowering doesn't verify",
+                "arguments of @swap: expected (i8, i32) but got (struct<C>{i8, i32})",
+            ],
+            in_decl: None,
+        },
+        Mutation {
             name: "judging-list-drops-the-tests",
             what: "the judging list stops counting files under a `tests` directory, so an edited fixture would go unnamed; the list's own unit test refuses it (it needs no git, which this copy doesn't have)",
             edits: vec![edit(
@@ -694,6 +744,11 @@ fn run(c: &Cmd, tree: &Path, target: &Path) -> (bool, String) {
     }
     // Small fuzz counts: these runs look for one planted defect, not for coverage.
     p.env("FIR_FUZZ", "40");
+    // The tree this is a copy of (`target/mutate/tree` in it), for what a command may share
+    // with it and can't change: the gate's fetched sources.
+    if let Some(from) = tree.ancestors().nth(3) {
+        p.env("FAI_MUTATE_FROM", from);
+    }
     for (k, v) in &c.env {
         p.env(k, v);
     }

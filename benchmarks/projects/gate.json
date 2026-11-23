@@ -15,6 +15,104 @@
     "lua": 99316,
     "sqlite": 230968
    },
+   "functions": {
+    "lua-fannkuch": {
+     "__fcc_vload32": 352926,
+     "forlimit.la10f6740": 534300,
+     "forprep.la10f6740": 1137100,
+     "hashint.l97981412": 3257215,
+     "l_strton.la10f6740": 301400,
+     "luaH_getint": 4488578,
+     "luaV_equalobj": 372722,
+     "luaV_execute": 70607185,
+     "luaV_tointeger": 301400,
+     "luaV_tointegerns": 369900
+    },
+    "lua-fib": {
+     "__fcc_vload32": 109580,
+     "internshrstr.l8bbbcbfa": 23525,
+     "luaD_precall": 1795673,
+     "luaH_getshortstr": 20030,
+     "luaH_newkey.l97981412": 34379,
+     "luaS_hash": 44198,
+     "luaS_new": 35613,
+     "luaV_execute": 10443384,
+     "mainpositionTV.l97981412": 19222,
+     "prepCallInfo.l3e31019f": 963952
+    },
+    "lua-nbody": {
+     "forprep.la10f6740": 1127043,
+     "index2value.l8c91bfb4": 633002,
+     "luaD_poscall": 781872,
+     "luaD_precall": 766066,
+     "luaH_getshortstr": 26426003,
+     "luaV_execute": 138341407,
+     "lua_tonumberx": 780858,
+     "moveresults.l3e31019f": 1002841,
+     "precallC.l3e31019f": 1182793,
+     "prepCallInfo.l3e31019f": 970412
+    },
+    "lua-sort": {
+     "ccall.l3e31019f": 3172309,
+     "index2value.l8c91bfb4": 13844629,
+     "luaD_precall": 5745214,
+     "luaV_execute": 28955245,
+     "lua_geti": 5948693,
+     "lua_pushvalue": 6700365,
+     "lua_seti": 3055192,
+     "lua_settop": 4686014,
+     "prepCallInfo.l3e31019f": 3222860,
+     "sort_comp.ld5aea097": 2781944
+    },
+    "lua-spectral": {
+     "__fcc_vload32": 387976,
+     "forlimit.la10f6740": 64077,
+     "forprep.la10f6740": 136369,
+     "llex.l90d66bc1": 39535,
+     "luaD_precall": 5253591,
+     "luaH_newkey.l97981412": 47387,
+     "luaS_hash": 59862,
+     "luaV_execute": 98722869,
+     "luaV_tointegerns": 44361,
+     "prepCallInfo.l3e31019f": 2819510
+    },
+    "lua-strings": {
+     "classend.l2c4e9605": 782432,
+     "index2value.l8c91bfb4": 887471,
+     "internshrstr.l8bbbcbfa": 1101567,
+     "luaS_hash": 1673408,
+     "luaV_concat": 1068000,
+     "luaV_execute": 4548612,
+     "match.l2c4e9605": 2834480,
+     "match_class.l2c4e9605": 1562811,
+     "singlematch.l2c4e9605": 1353862,
+     "str_gsub.l2c4e9605": 792082
+    },
+    "lua-trees": {
+     "l_alloc.lf3961eb1": 1955320,
+     "luaD_precall": 3975971,
+     "luaH_realasize": 2133456,
+     "luaH_resize": 2034778,
+     "luaM_free_": 1372560,
+     "luaV_execute": 32462535,
+     "prepCallInfo.l3e31019f": 2133544,
+     "setnodevector.l97981412": 1410924,
+     "traversestrongtable.l707e2d20": 2561640,
+     "traversetable.l707e2d20": 1183008
+    },
+    "speedtest1": {
+     "balance_nonroot.l38dac3ea": 48802763,
+     "btreeParseCellPtr.l38dac3ea": 37557626,
+     "jsonTranslateTextToBlob.l38dac3ea": 114506451,
+     "jsonbPayloadSize.l38dac3ea": 36497880,
+     "sqlite3BtreeIndexMoveto.l38dac3ea": 96177427,
+     "sqlite3VdbeExec.l38dac3ea": 734395760,
+     "sqlite3VdbeSerialGet.l38dac3ea": 39270049,
+     "sqlite3_str_vappendf": 44173635,
+     "substrFunc.l38dac3ea": 116353328,
+     "vdbeRecordCompareInt.l38dac3ea": 40670545
+    }
+   },
    "instructions": {
     "lua-fannkuch": 82776388,
     "lua-fib": 13878259,

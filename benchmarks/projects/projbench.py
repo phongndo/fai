@@ -1019,6 +1019,11 @@ def gate_measure(s, configs):
                 and bool(ref_hash),
             },
             "instructions": {w: count["programs"][w][c]["program"] for w in count["programs"]},
+            # The ten functions that execute most, per workload: they explain a failure
+            # (gate_slower_functions) and decide nothing.
+            "functions": {
+                w: count["programs"][w][c].get("functions", {}) for w in count["programs"]
+            },
             "text": {
                 p: sum(v["text"] for k, v in tus.items() if k.startswith(f"{p}/")) for p in projects
             },
@@ -1055,6 +1060,15 @@ def gate_compare(now, base):
             worse.append(f"instructions: {w} was not run")
         elif n > b * (1 + tol):
             worse.append(f"instructions: {w} executes {n:,}, more than {b:,} ({n / b - 1:+.2%})")
+            for f, after, before in gate_slower_functions(now, base, w):
+                worse.append(
+                    f"    in {f}: {after:,}, "
+                    + (
+                        f"{after - before:+,} ({after / before - 1:+.2%})"
+                        if before
+                        else "which was not among the ten busiest"
+                    )
+                )
         elif n < b * (1 - tol):
             better.append(f"instructions: {w} executes {n:,}, fewer than {b:,} ({n / b - 1:+.2%})")
     for p, b in base["text"].items():
@@ -1080,6 +1094,25 @@ def gate_compare(now, base):
                 f"compile memory: {p} peaks at {n >> 10} MiB, over {GATE_SLACK:g} times {b >> 10} MiB"
             )
     return worse, better
+
+
+def gate_slower_functions(now, base, workload, most=5):
+    """Where a workload's extra instructions are: the functions among its ten busiest that
+    execute more than in the baseline, most first, as (name, now, before); `before` is None for
+    one that wasn't among the baseline's ten. A local function's name ends in a hash of its
+    file (`f.l8bbbcbfa`), which is dropped: it differs between trees. This explains a failure
+    and never decides one: the verdict is on the workload's total."""
+
+    def plain(funcs):
+        return {re.sub(r"\.l[0-9a-f]{8}$", "", f): n for f, n in funcs.items()}
+
+    after = plain(now.get("functions", {}).get(workload, {}))
+    before = plain(base.get("functions", {}).get(workload, {}))
+    if not after or not before:
+        return []
+    rose = [(f, n, before.get(f)) for f, n in after.items() if n > before.get(f, 0)]
+    rose.sort(key=lambda r: -(r[1] - (r[2] or 0)))
+    return rose[:most]
 
 
 def gate_verdict(now, baseline, gated, plain):
@@ -1123,6 +1156,10 @@ def gate_updated(configs, now, gated):
             for key in ("compile_cpu_seconds", "compile_rss_kib"):
                 for p, n in new[key].items():
                     new[key][p] = min(n, old[key].get(p, n))
+            # The per-function counts explain and don't gate: they go with the count kept.
+            for w, n in new["instructions"].items():
+                if n == old["instructions"].get(w) and w in old.get("functions", {}):
+                    new["functions"][w] = old["functions"][w]
         configs[c] = new
     return configs
 
@@ -1138,6 +1175,10 @@ def gate_self_test():
             "speedtest1 verifies": True,
         },
         "instructions": {"lua-fib": 14_000_000, "speedtest1": 2_800_000_000},
+        "functions": {
+            "lua-fib": {"luaV_execute.l8bbbcbfa": 9_000_000, "luaD_precall": 2_000_000},
+            "speedtest1": {"sqlite3VdbeExec": 900_000_000},
+        },
         "text": {"lua": 377_000, "sqlite": 1_216_000},
         "compile_cpu_seconds": {"lua": 2.0, "sqlite": 3.0},
         "compile_rss_kib": {"lua": 100 << 10, "sqlite": 900 << 10},
@@ -1263,6 +1304,17 @@ def gate_self_test():
             failed.append(f"{what}: no reason mentions '{reason}' (reasons: {reasons})")
         elif want != "FAIL" and reasons:
             failed.append(f"{what}: {want}, with reasons to fail: {reasons}")
+    # A failure says where: the function that executes more, by its name without the hash.
+    slower = changed(
+        ("functions", "lua-fib"),
+        {"luaV_execute.l00000000": 9_140_000, "luaD_precall": 2_000_000},
+        changed(fib, 14_140_000),
+    )
+    reasons = verdict(slower)["configs"]["fcc-O"]["worse"]
+    if not any("in luaV_execute: 9,140,000, +140,000 (+1.56%)" in r for r in reasons):
+        failed.append(f"a failure names the function that got slower (reasons: {reasons})")
+    if any("luaD_precall" in r for r in reasons):
+        failed.append("a failure names only functions that execute more")
     # The baseline moves one way.
     old = {"fcc-O": good}
     worse_now = changed(("compile_cpu_seconds", "lua"), 3.5, changed(fib, 14_000_050))
@@ -1273,7 +1325,7 @@ def gate_self_test():
     moved = gate_updated(old, {"fcc-O": better_now}, ["fcc-O"])["fcc-O"]
     if moved["instructions"]["lua-fib"] != 13_000_000 or moved["compile_cpu_seconds"]["lua"] != 1.5:
         failed.append("the baseline moves down: --update didn't take a better number")
-    checks = len(cases) + 2
+    checks = len(cases) + 4
     if failed:
         print(f"gate self-test: FAILED ({len(failed)} of {checks} checks)")
         for f in failed:

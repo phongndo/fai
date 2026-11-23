@@ -138,7 +138,10 @@ class Tools:
         # to GCC's code and not to fcc's.
         self.env = dict(os.environ, NIX_HARDENING_ENABLE="")
         self.fcc = ROOT / "build/fcc/fcc"
-        self.fir = ROOT / "target/release/fir"
+        # Where cargo builds: its default, or what the caller set (`fai mutate` builds its copy
+        # of the tree in a target directory of its own).
+        self.target = Path(os.environ.get("CARGO_TARGET_DIR") or ROOT / "target").resolve()
+        self.fir = self.target / "release/fir"
         self.clang, self.clang_flags = self._clang()
 
     def _clang(self):
@@ -183,6 +186,8 @@ class Tools:
                     "-G",
                     "Ninja",
                     "-DCMAKE_BUILD_TYPE=Release",
+                    # The library fcc links is the one cargo builds here.
+                    f"-DFIR_CAPI_LIB={self.target / 'release/libfir_capi.a'}",
                 ],
                 capture=False,
             )
