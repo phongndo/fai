@@ -22,6 +22,7 @@ import Fir.CodeRel
 import Fir.Dse
 import Fir.Space
 import Fir.Fwd
+import Fir.Slot
 import Fir.CopyProp
 import Fir.Dce
 import Fir.DceKinds

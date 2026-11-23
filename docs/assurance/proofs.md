@@ -5,7 +5,7 @@ of the Lean development, with its statement as Lean prints it, its transitive ax
 many `Fir` definitions its meaning depends on. A claim is only as strong as its statement:
 read the hypotheses. Open obligations are listed in `docs/assurance/README.md`.
 
-40 claims; 26 supporting lemmas registered; 0 errors; 0 changes needing review.
+44 claims; 26 supporting lemmas registered; 0 errors; 0 changes needing review.
 
 ## `Fir.Dce.dcePerm_sound` (binding: Rust permissions)
 
@@ -120,6 +120,78 @@ Store-to-load forwarding: a load right after a store of its type through the sam
 
 - axioms: propext, Classical.choice, Quot.sound
 - hypotheses: 6; `Fir` definitions depended on: 1475
+
+## `Fir.Slot.load_tracked` (promotion: one op (mem2reg is not proved))
+
+A load through a pointer into an allocation no noalias or readonly scope watches, whose bytes at that offset encode a value of the load's exact type, is UB or gives that value and leaves the core exactly as it was. One op only: that nothing else reaches a promoted slot is not proved.
+
+```lean
+∀ {loc : Option Fir.Loc} {T : Fir.Ty} {A a t : Nat} {off : Int} {c : Fir.Core} {v : Fir.RVal},
+  Fir.Fwd.Exact T →
+    v.hasTy T = true →
+      0 < c.space.ptrBits / 8 →
+        Fir.Slot.Quiet a c →
+          Fir.readBytes (c.mem.getD a ∅) off.toNat (Fir.Ty.size c.space T) =
+              Fir.RVal.encode c.space v →
+            (∃ h,
+                Fir.loadC loc T A (some (Fir.Ptr.rel a t off)) c = Except.error h ∧
+                  Fir.Dse.Escape h) ∨
+              Fir.loadC loc T A (some (Fir.Ptr.rel a t off)) c = Except.ok (v, c)
+```
+
+- axioms: propext, Classical.choice, Quot.sound
+- hypotheses: 5; `Fir` definitions depended on: 389
+
+## `Fir.Slot.store_tracked` (promotion: one op (mem2reg is not proved))
+
+A scalar store through a pointer into an allocation no scope watches leaves that offset holding the stored value's encoding, the allocation unwatched, and the memory space unchanged.
+
+```lean
+∀ {loc : Option Fir.Loc} {T : Fir.Ty} {A a t : Nat} {off : Int} {c c' : Fir.Core} {v : Fir.RVal},
+  T.isValue = true →
+    Fir.Slot.Quiet a c →
+      Fir.storeC loc T A v (some (Fir.Ptr.rel a t off)) c = Except.ok ((), c') →
+        v.hasTy T = true ∧
+          Fir.readBytes (c'.mem.getD a ∅) off.toNat (Fir.Ty.size c'.space T) =
+              Fir.RVal.encode c'.space v ∧
+            Fir.Slot.Quiet a c' ∧ c'.space = c.space
+```
+
+- axioms: propext, Classical.choice, Quot.sound
+- hypotheses: 3; `Fir` definitions depended on: 298
+
+## `Fir.Slot.load_keeps` (promotion: one op (mem2reg is not proved))
+
+A scalar load through any pointer changes no allocation's bytes, no scope, and not the memory space.
+
+```lean
+∀ {loc : Option Fir.Loc} {T : Fir.Ty} {A : Nat} {p : Option Fir.Ptr} {c c' : Fir.Core}
+  {out : Fir.RVal},
+  Fir.loadC loc T A p c = Except.ok (out, c') →
+    c'.mem = c.mem ∧ c'.scopes = c.scopes ∧ c'.space = c.space
+```
+
+- axioms: propext, Classical.choice, Quot.sound
+- hypotheses: 1; `Fir` definitions depended on: 333
+
+## `Fir.Slot.fresh_tracks` (promotion: one op (mem2reg is not proved))
+
+At a promoted field's type (whole-byte integers, pointers, floats), the poison op gives one value of that type without changing the core, and fresh bytes are its encoding: a field nothing was stored to holds poison.
+
+```lean
+∀ {loc : Option Fir.Loc} {r : Fir.Result} {c c' : Fir.Core} {vs : List Fir.RVal},
+  Fir.Slot.Field r.ty →
+    Fir.evalSimple loc Fir.OpKind.poison [r] [] c = Except.ok (vs, c') →
+      ∀ (off : Nat),
+        ∃ v,
+          vs = [v] ∧
+            c' = c ∧
+              v.hasTy r.ty = true ∧
+                Fir.readBytes ∅ off (Fir.Ty.size c.space r.ty) = Fir.RVal.encode c.space v
+```
+
+- axioms: propext, Classical.choice, Quot.sound
+- hypotheses: 2; `Fir` definitions depended on: 940
 
 ## `Fir.CopyProp.refines` (pass correctness)
 

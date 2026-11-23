@@ -1172,6 +1172,10 @@
   "Fir.SpaceCfg.intAlign": "a55acb5b9b544553",
   "Fir.SpaceCfg.addrBits": "32b180509d63747b",
   "Fir.SpaceCfg": "7022613f100cf097",
+  "Fir.Slot.Quiet": "16d427bbc7622ddf",
+  "Fir.Slot.Field.match_1": "0d5f98726b60bcb2",
+  "Fir.Slot.Field._sparseCasesOn_1": "298977d7175b82ca",
+  "Fir.Slot.Field": "c417055a4c68bee1",
   "Fir.SimulationS": "07ae064e213894f5",
   "Fir.Simulation": "d0ffef080cde0700",
   "Fir.ShiftOp.shrU": "000000002597c52d",
@@ -2271,6 +2275,7 @@
   "Fir.Edge": "6cb13e9433c5cdbe",
   "Fir.Dse.Pat": "ccc84373c772e4f1",
   "Fir.Dse.L": "41a3d87bf0f5e721",
+  "Fir.Dse.Escape": "d77c8c0f063ec1cf",
   "Fir.DivOp.signed.match_1": "4b537ce39e385d06",
   "Fir.DivOp.signed": "aceeda4720b67400",
   "Fir.DivOp.remU": "00000000350fe752",
@@ -2626,7 +2631,59 @@
   "Fir.AArch64.Byte.isBits": "c8a15206f2d8cda7",
   "Fir.AArch64.Agrees": "1eaedd77040d8337"},
  "claims":
- {"Fir.SimulationS.refines":
+ {"Fir.Slot.store_tracked":
+  {"summary":
+   "A scalar store through a pointer into an allocation no scope watches leaves that offset holding the stored value's encoding, the allocation unwatched, and the memory space unchanged.",
+   "statement_hash": "000000003685417d",
+   "statement":
+   "∀ {loc : Option Fir.Loc} {T : Fir.Ty} {A a t : Nat} {off : Int} {c c' : Fir.Core} {v : Fir.RVal},\n  T.isValue = true →\n    Fir.Slot.Quiet a c →\n      Fir.storeC loc T A v (some (Fir.Ptr.rel a t off)) c = Except.ok ((), c') →\n        v.hasTy T = true ∧\n          Fir.readBytes (c'.mem.getD a ∅) off.toNat (Fir.Ty.size c'.space T) =\n              Fir.RVal.encode c'.space v ∧\n            Fir.Slot.Quiet a c' ∧ c'.space = c.space",
+   "role": "promotion: one op (mem2reg is not proved)",
+   "name": "Fir.Slot.store_tracked",
+   "hypotheses": 3,
+   "dependencies_hash": "54d9367b4db2eefa",
+   "dependencies": 298,
+   "binding": null,
+   "axioms": ["propext", "Classical.choice", "Quot.sound"]},
+  "Fir.Slot.load_tracked":
+  {"summary":
+   "A load through a pointer into an allocation no noalias or readonly scope watches, whose bytes at that offset encode a value of the load's exact type, is UB or gives that value and leaves the core exactly as it was. One op only: that nothing else reaches a promoted slot is not proved.",
+   "statement_hash": "00000000cf852a2e",
+   "statement":
+   "∀ {loc : Option Fir.Loc} {T : Fir.Ty} {A a t : Nat} {off : Int} {c : Fir.Core} {v : Fir.RVal},\n  Fir.Fwd.Exact T →\n    v.hasTy T = true →\n      0 < c.space.ptrBits / 8 →\n        Fir.Slot.Quiet a c →\n          Fir.readBytes (c.mem.getD a ∅) off.toNat (Fir.Ty.size c.space T) =\n              Fir.RVal.encode c.space v →\n            (∃ h,\n                Fir.loadC loc T A (some (Fir.Ptr.rel a t off)) c = Except.error h ∧\n                  Fir.Dse.Escape h) ∨\n              Fir.loadC loc T A (some (Fir.Ptr.rel a t off)) c = Except.ok (v, c)",
+   "role": "promotion: one op (mem2reg is not proved)",
+   "name": "Fir.Slot.load_tracked",
+   "hypotheses": 5,
+   "dependencies_hash": "11a983fc3831807c",
+   "dependencies": 389,
+   "binding": null,
+   "axioms": ["propext", "Classical.choice", "Quot.sound"]},
+  "Fir.Slot.load_keeps":
+  {"summary":
+   "A scalar load through any pointer changes no allocation's bytes, no scope, and not the memory space.",
+   "statement_hash": "00000000e580e896",
+   "statement":
+   "∀ {loc : Option Fir.Loc} {T : Fir.Ty} {A : Nat} {p : Option Fir.Ptr} {c c' : Fir.Core}\n  {out : Fir.RVal},\n  Fir.loadC loc T A p c = Except.ok (out, c') →\n    c'.mem = c.mem ∧ c'.scopes = c.scopes ∧ c'.space = c.space",
+   "role": "promotion: one op (mem2reg is not proved)",
+   "name": "Fir.Slot.load_keeps",
+   "hypotheses": 1,
+   "dependencies_hash": "5e820e7cf5cca5fa",
+   "dependencies": 333,
+   "binding": null,
+   "axioms": ["propext", "Classical.choice", "Quot.sound"]},
+  "Fir.Slot.fresh_tracks":
+  {"summary":
+   "At a promoted field's type (whole-byte integers, pointers, floats), the poison op gives one value of that type without changing the core, and fresh bytes are its encoding: a field nothing was stored to holds poison.",
+   "statement_hash": "000000009655b26c",
+   "statement":
+   "∀ {loc : Option Fir.Loc} {r : Fir.Result} {c c' : Fir.Core} {vs : List Fir.RVal},\n  Fir.Slot.Field r.ty →\n    Fir.evalSimple loc Fir.OpKind.poison [r] [] c = Except.ok (vs, c') →\n      ∀ (off : Nat),\n        ∃ v,\n          vs = [v] ∧\n            c' = c ∧\n              v.hasTy r.ty = true ∧\n                Fir.readBytes ∅ off (Fir.Ty.size c.space r.ty) = Fir.RVal.encode c.space v",
+   "role": "promotion: one op (mem2reg is not proved)",
+   "name": "Fir.Slot.fresh_tracks",
+   "hypotheses": 2,
+   "dependencies_hash": "02629c0201e912fd",
+   "dependencies": 940,
+   "binding": null,
+   "axioms": ["propext", "Classical.choice", "Quot.sound"]},
+  "Fir.SimulationS.refines":
   {"summary": "A simulation with stuttering gives refinement of Decided functions.",
    "statement_hash": "00000000de40f1b5",
    "statement":

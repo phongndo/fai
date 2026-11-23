@@ -19,7 +19,7 @@ Files here:
 | `dce.md` | Dead code elimination from the theorem to the binary, link by link: what is proved, checked, tested, assumed, and trusted | by hand |
 | `layer-audit.md` | The HFIR → MFIR → LFIR boundaries audited, a vertical slice, the DCE checkers compared and measured, the observation tooling, and source lines in native code | by hand |
 | `op-contracts.json` | Per op kind (536 kinds, modifiers included): identity, fields, modifiers, layers, typing, declared effects, and the DCE permission with its evidence | `lake exe gen-rust manifest` |
-| `proofs.lock.json` | Reviewed fingerprints of the 40 registered claims: statement, hypothesis count, axioms, and fingerprints of the `Fir` definitions they depend on | `lake exe fir-audit --update` |
+| `proofs.lock.json` | Reviewed fingerprints of the 44 registered claims: statement, hypothesis count, axioms, and fingerprints of the `Fir` definitions they depend on | `lake exe fir-audit --update` |
 | `proofs.md` | The claims as Lean prints them, with axioms and dependency counts | `lake exe fir-audit --report` |
 | `adversarial.md` | The last `fai mutate` run: each planted defect and the diagnostic that caught it | `fai mutate` |
 
@@ -272,6 +272,7 @@ under AddressSanitizer in the full one. No noisy lint groups were enabled.
 | DCE: the Rust pass's output on any input | checked by default: the candidate (`passes::dce::check`) and the **output** (`passes::dce::check_output`, a transcription of `Fir.Dce.checkFuncL`), both unproved; **by the proved checker on request** | every run that deletes something; with `fir compile`/`fcc`/`fir opt --check-dce FIR-REF` or `FIR_CHECK_DCE` (`backend::optimize`, `passes::reference`), every step of that run ([dce.md](dce.md#without---check-dce-every-compilation-by-default)) |
 | DCE: the Rust checkers' verdicts against the proved checker's | tested | `the_rust_and_lean_checkers_agree_on_random_candidates` (candidates, and the targets they give, plus operand swaps), `the_pass_is_validated_by_the_proved_checker`; mutations `dce-checker-weaker-than-proved`, `dce-output-check-weaker-than-proved`, `dce-apply-deletes-more` ([layer-audit.md](layer-audit.md#3-the-dce-checker-lean-and-rust)) |
 | DSE, forwarding, copy propagation | proved relations; Rust passes tested | `Fir.Dse/Fwd/CopyProp.refines`; `tests/opt.rs` |
+| `mem2reg`, `stackdce` (experimental, never in `-O`) | **unproved**; tested. Proved so far: what one load or store does to a slot no scope watches, and that a fresh slot holds `poison` (single ops, under hypotheses a simulation must supply) | `Fir.Slot.load_tracked`, `store_tracked`, `load_keeps`, `fresh_tracks`; `tests/mem2reg.rs`; [06-plan.md](../design/06-plan.md#track-p-promotion-proved) |
 | Composing passes, optimizing a whole module | **open** | intermediate programs' `Decided`ness and refinement over calls are not proved |
 | HFIR lowering: expansion | proved (per function) | `Fir.Lower.Proof.Expand.refines`, `lowerFunc_refines` |
 | HFIR lowering: scalarization, `cf.try`, the module | **open**; tested | `tests/lower.rs` against `fir-ref lower` and runs |
