@@ -175,7 +175,12 @@ FRONTENDS = ["gcc", "clang", "arocc"]
 REFERENCE = "gcc-O2"
 
 
+# Why the last `die` stopped the run, for the gate's report.
+STOPPED: list[str] = []
+
+
 def die(msg):
+    STOPPED.append(msg)
     print(f"projbench: {msg}", file=sys.stderr)
     sys.exit(1)
 
@@ -974,6 +979,8 @@ GATE = Path(__file__).resolve().parent / "gate.json"
 # A build may take this many times the baseline's compile time and memory, plus a second: they
 # are measured once, on whatever else the host is doing.
 GATE_SLACK = 2.0
+# The gate's exit statuses: the tree passed, the tree failed, or the gate could not judge it.
+GATE_PASS, GATE_FAIL, GATE_NOT_RUN = 0, 1, 2
 # How far a workload's instruction count may sit from the baseline's and still be the same:
 # one part in 100,000. With Lua's hash seed fixed (LUA_FLAGS), every workload's count repeats to
 # within a few dozen instructions, in tens of millions to billions.
@@ -1003,8 +1010,9 @@ def gate_measure(s, configs):
             "text": {
                 p: sum(v["text"] for k, v in tus.items() if k.startswith(f"{p}/")) for p in projects
             },
-            "compile_seconds": {
-                p: round(sum(v["wall_min"] for k, v in tus.items() if k.startswith(f"{p}/")), 2)
+            # CPU time, the compiler's and its children's: wall time doubles on a busy host.
+            "compile_cpu_seconds": {
+                p: round(sum(v["cpu_min"] for k, v in tus.items() if k.startswith(f"{p}/")), 2)
                 for p in projects
             },
             "compile_rss_kib": {
@@ -1047,10 +1055,12 @@ def gate_compare(now, base):
             better.append(
                 f"code size: {p}'s .text is {n:,} bytes, less than {b:,} ({n / b - 1:+.2%})"
             )
-    for p, b in base["compile_seconds"].items():
-        n = now["compile_seconds"][p]
+    for p, b in base["compile_cpu_seconds"].items():
+        n = now["compile_cpu_seconds"][p]
         if n > GATE_SLACK * b + 1.0:
-            worse.append(f"compile time: {p} takes {n:.2f} s, over {GATE_SLACK:g} times {b:.2f} s")
+            worse.append(
+                f"compile time: {p} takes {n:.2f} s of CPU, over {GATE_SLACK:g} times {b:.2f} s"
+            )
     for p, b in base["compile_rss_kib"].items():
         n = now["compile_rss_kib"][p]
         if n > GATE_SLACK * b + (64 << 10):
@@ -1068,38 +1078,66 @@ def cmd_gate(s):
     seconds), behavior differs, or anything is worse than the baseline: a workload's
     instructions, a project's code size, or (beyond twice) its compile time or memory. A
     configuration with no baseline of its own is held to `fcc -O`'s: a pipeline proposed for
-    `-O` must not be worse than `-O`.
+    `-O` must not be worse than `-O`. With --plain the best verdict is PARTIAL, which is not a
+    pass. NOT RUN, and exit 2, when the gate can't judge the tree at all (no baseline, or an
+    AArch64 host, where the instruction-counting plugin doesn't run). The verdict and its
+    reasons are also in gate-report.json, in --out.
 
     --update writes the baseline, and only when the verdict is PASS: the baseline moves one way.
     To accept a trade, edit gate.json by hand, where the diff shows it."""
     global BUILD_CONFIGS
+
+    def not_run(why):
+        print(f"gate: NOT RUN: {why}")
+        sys.exit(GATE_NOT_RUN)
+
     gated = [c for c in BUILD_CONFIGS if c.startswith("fcc")] if s.args.configs else ["fcc-O"]
     if not gated:
-        die("gate: --configs names no fcc configuration")
+        not_run("--configs names no fcc configuration")
+    if s_native():
+        not_run("counting instructions needs qemu-aarch64's plugin: run it off AArch64")
+    baseline = json.loads(GATE.read_text()) if GATE.exists() else None
+    if baseline is None and not s.args.update:
+        not_run(f"no baseline at {GATE}; make one with `gate --update`")
+    if s.plain and s.args.update:
+        not_run("--update with --plain: a baseline is of whole builds")
     BUILD_CONFIGS = [*gated, REFERENCE]
     s.args.reps = 1
     if s.args.timeout is None:
         s.args.timeout = 300
-    baseline = json.loads(GATE.read_text()) if GATE.exists() else None
-    if baseline is None and not s.args.update:
-        die(f"gate: no baseline at {GATE}; make one with `gate --update`")
-    cmd_prepare(s)
-    cmd_build(s)
-    cmd_check(s)
-    cmd_count(s)
-    now = gate_measure(s, gated)
     report: dict[str, Any] = {"verdict": "PASS", "configs": {}}
+    # The harness stops (`die`) when a file doesn't compile, takes too long, or a counted run
+    # goes wrong: each is the tree failing, and still gets a verdict and a report.
+    try:
+        cmd_prepare(s)
+        cmd_build(s)
+        cmd_check(s)
+        cmd_count(s)
+    except SystemExit:
+        report["verdict"] = "FAIL"
+        report["stopped"] = STOPPED[-1] if STOPPED else "the harness stopped (see above)"
+        save(s.out, "gate-report", report)
+        print(f"gate: stopped: {report['stopped']}")
+        print("gate: FAIL")
+        sys.exit(GATE_FAIL)
+    now = gate_measure(s, gated)
     for c in gated:
         base_of = c if baseline and c in baseline["configs"] else "fcc-O"
         base = baseline["configs"].get(base_of) if baseline else None
         if base is None:
             # The first baseline: behavior must still be right.
-            base = {k: {} for k in ("instructions", "text", "compile_seconds", "compile_rss_kib")}
+            base = {
+                k: {} for k in ("instructions", "text", "compile_cpu_seconds", "compile_rss_kib")
+            }
         worse, better = gate_compare(now[c], base)
         report["configs"][c] = {"against": base_of, "worse": worse, "better": better}
         if worse:
             report["verdict"] = "FAIL"
-    save(s.out, "gate", report)
+    if report["verdict"] == "PASS" and s.plain:
+        # Files compiled another way were not judged: this is never a pass.
+        report["verdict"] = "PARTIAL"
+        report["plain"] = sorted(s.plain)
+    save(s.out, "gate-report", report)
     for c, r in report["configs"].items():
         print(f"gate: {c}, against the baseline of {r['against']}:")
         for line in r["worse"]:
@@ -1108,9 +1146,13 @@ def cmd_gate(s):
             print(f"  better  {line}")
         if not r["worse"] and not r["better"]:
             print("  the same as the baseline")
+    if report["verdict"] == "PARTIAL":
+        files = ", ".join(report["plain"])
+        print(f"gate: PARTIAL, not a pass: {files} compiled with fcc -O (--plain)")
+        sys.exit(GATE_FAIL)
     print(f"gate: {report['verdict']}")
     if report["verdict"] != "PASS":
-        sys.exit(1)
+        sys.exit(GATE_FAIL)
     if s.args.update:
         configs = dict(baseline["configs"]) if baseline else {}
         for c in gated:
@@ -1122,7 +1164,7 @@ def cmd_gate(s):
                 for w, n in new["instructions"].items():
                     b = old["instructions"].get(w, n)
                     new["instructions"][w] = n if n < b * (1 - GATE_SAME) else b
-                for key in ("compile_seconds", "compile_rss_kib"):
+                for key in ("compile_cpu_seconds", "compile_rss_kib"):
                     for p, n in new[key].items():
                         new[key][p] = min(n, old[key].get(p, n))
             configs[c] = new

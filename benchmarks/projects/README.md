@@ -28,7 +28,17 @@ and SQLite still right, and no worse than what was accepted? It fetches the sour
 builds both projects with `fcc -O` and with GCC `-O2`, runs Lua's suite, the Lua workloads, and
 speedtest1 `--verify`, counts the instructions every workload executes, and compares with
 `gate.json`, the accepted baseline, which is tracked. It prints what is worse and what is
-better, then `gate: PASS` or `gate: FAIL`, and exits 0 or 1. It takes about five minutes.
+better, and always ends with one of three lines:
+
+| Last line | Exit | Means |
+|---|---:|---|
+| `gate: PASS` | 0 | right, and nothing worse than the baseline |
+| `gate: FAIL` (or `gate: PARTIAL, not a pass`) | 1 | the change is not accepted; the lines above say why |
+| `gate: NOT RUN: …` | 2 | the gate could not judge the tree: no baseline yet, or the wrong host |
+
+The same verdict and reasons are in `gate-report.json` under `--out`. It takes about five
+minutes, and runs where `count` does: on x86-64 Linux in the dev shell, under `qemu-aarch64`.
+On an AArch64 host the instruction-counting plugin doesn't run, and the gate says `NOT RUN`.
 
 It fails if:
 
@@ -38,9 +48,10 @@ It fails if:
 - a workload executes more instructions than the baseline's (by more than one part in
   100,000: the counts repeat to within a few dozen instructions);
 - a project's `.text` is larger than the baseline's, at all;
-- a project compiles in more than twice the baseline's time plus a second, or peaks at more
-  than twice its memory plus 64 MiB (these two are measured once on a shared host, so they get
-  slack; nothing else does).
+- a project compiles in more than twice the baseline's CPU time plus a second, or peaks at
+  more than twice its memory plus 64 MiB (these two are measured once on a shared host, so
+  they get slack; nothing else does. CPU time, not wall time, so a busy host doesn't fail a
+  change).
 
 **A change that fails is not accepted**, whatever else it improves. `fai gate --update` writes
 `gate.json`, and only when the gate passes, and then only lowers a number, so the baseline
@@ -51,7 +62,15 @@ diff says what was given up.
 
 `--configs fcc-promo` (or any fcc configuration) gates that configuration instead. One with no
 baseline of its own is held to `fcc -O`'s: a pipeline proposed for `-O` must be right and no
-worse than `-O` on these programs. `--plain` and `--out` work as for `build`.
+worse than `-O` on these programs. `--out` works as for `build`. With `--plain FILE,…` the
+named files are compiled with `fcc -O` and so not judged: the best verdict is then
+`PARTIAL, not a pass`, and `--update` is refused.
+
+What the gate does not cover: run time on hardware (it counts instructions under qemu), x86-64
+output, the 12 kernels of `benchmarks/c`, and anything but these two projects. It is not part
+of `fai verify full` or of CI yet, and `fai mutate` doesn't plant defects against it: that it
+fails what it should was checked by hand
+([selection.md](../../docs/performance/selection.md#the-gate)).
 
 - **Projects:** Lua 5.4.7 (33 files, `-std=c23 -DLUA_COMPAT_5_3 -DLUA_USE_POSIX`, and
   `-Dluai_makeseed(L)=0u`: Lua seeds its string hashes from the time and from addresses, which

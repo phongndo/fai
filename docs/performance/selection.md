@@ -140,13 +140,17 @@ value takes its own slot.
 `fai gate` ([benchmarks/projects/README.md](../../benchmarks/projects/README.md#the-gate)) is
 that rule as a command: it builds Lua and SQLite, checks their behavior, counts every
 workload's instructions, and compares with the tracked baseline
-`benchmarks/projects/gate.json`. Run on what this round has:
+`benchmarks/projects/gate.json`. Its first version failed the unchanged tree: Lua's counts
+moved between runs, because Lua seeded its string hashes from the time and from addresses.
+The harness now fixes the seed, and the counts repeat to within a few dozen instructions. Run
+on what this round has (the rejections by hand: nothing plants them automatically yet):
 
 | Tree | Verdict |
 |---|---|
-| As it is, three times | **PASS**, "the same as the baseline" each time |
+| As it is, five times, once while `fai verify full` was running | **PASS**, "the same as the baseline" each time |
 | With step 4's change | **FAIL**: all 7 Lua workloads execute more (`lua-spectral` +1.91%, `lua-fannkuch` +1.88%, down to `lua-strings` +0.34%); Lua's `.text` is 18.5% smaller, which doesn't buy a pass |
-| `--configs fcc-promo --timeout 60` | **FAIL**: `lvm.c` did not compile in 60 s |
+| `--configs fcc-promo --timeout 60` | **FAIL**: stopped, `lvm.c` did not compile in 60 s |
+| `--plain lvm` (`fcc -O`, one file left out of the judgment) | **PARTIAL, not a pass** (exit 1); with `--update`, **NOT RUN** (exit 2) |
 | `--configs fcc-promo --plain lvm` | **FAIL**: speedtest1 executes 244% more than `-O`, `lua-fib` 5.2%, `lua-strings` 3.7%, and `lua-spectral` 2.0% more; SQLite's `.text` is 96% larger; it compiles in 21 s against 1.1 s and peaks at 1,669 MiB against 226 MiB. (`lua-sort` executes 6.2% fewer, `lua-nbody` 3.3%, `lua-trees` 1.9%, `lua-fannkuch` 1.5%) |
 
 ## The validator on promoted code (step 3)
