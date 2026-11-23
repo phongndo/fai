@@ -22,10 +22,11 @@ fn source() -> String {
     let mut s = String::from(
         "extern func @g(i64) -> i64 effects[] assume\n\nfunc @f(%x: i64, %c: i1) -> i64 {\n",
     );
+    // Constants no `add` takes as an immediate, so each is in a register (`movz`, `movk`).
     for k in 0..32 {
         s += &format!(
             "  %k{k}: i64 = int.const {}\n  %a{k}: i64 = int.add.wrap %x, %k{k}\n",
-            k + 1
+            (k + 1) * 1_000_003
         );
     }
     s += "  %r: i64 = func.call @g(%x)\n";

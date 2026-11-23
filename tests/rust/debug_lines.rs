@@ -312,9 +312,12 @@ fn line_zero_escaped_file_names_and_modules_without_files() {
     };
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("debug-lines-edges");
     std::fs::create_dir_all(&dir).unwrap();
+    // The constant gets no instruction of its own (it is the add's immediate), and neither
+    // does the return (its value is where it goes already): the add is the located one, and
+    // the multiply after it is on line 0.
     let body = r#"(%x: i64) -> i64 FILE {
   %a: i64 = int.const 2 @10:2
-  %b: i64 = int.add.wrap %x, %a @0:2
+  %b: i64 = int.add.wrap %x, %a @10:4
   %c: i64 = int.mul.wrap %b, %b @0:5
   func.ret %c @11:1
 }

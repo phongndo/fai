@@ -521,6 +521,30 @@ pub fn is_mem_off(off: i64, size: MemSize) -> bool {
     (off >= 0 && off % s == 0 && off / s < 4096) || (-256..256).contains(&off)
 }
 
+/// A value that gets no register where it is defined, because most of its uses can do without
+/// one: a constant is an immediate of the op that reads it, a frame slot's address or a pointer
+/// plus a constant is the address of a load or store, and a comparison is the condition of the
+/// branch it decides. A use that does need the register builds it there ([`Sel::build`]), which
+/// is right wherever the use is: an op's operands are defined on every path to it, and a
+/// virtual register is written only where its value is defined.
+#[derive(Clone, Copy)]
+enum Lazy {
+    /// An integer constant of width `w`: its low bits (the low `w`, or 64).
+    Const { bits: u64, w: u32 },
+    /// The address `sp + off`, made from the frame slot at `sp + lo` up to `sp + hi`. It may
+    /// lie outside the slot (an access there is UB in the source).
+    Slot { off: i64, lo: i64, hi: i64 },
+    /// `base + off`. The base isn't itself a `Slot` or an `Offset`: those are folded in.
+    Offset { base: ValueId, off: i64 },
+    /// `a pred b` at width `w` (64 for pointers): an `i1`.
+    Cmp {
+        p: Pred,
+        a: ValueId,
+        b: ValueId,
+        w: u32,
+    },
+}
+
 struct Sel<'a, 'c> {
     cx: &'c ModuleCx<'a>,
     body: &'a Body,
@@ -540,6 +564,12 @@ struct Sel<'a, 'c> {
     vreg: Vec<u32>,
     /// Each composite value's leaves' registers (decision: C ABI for aggregates), by value.
     agg: FxHashMap<u32, Vec<Reg>>,
+    /// The values that get no register where they are defined ([`Lazy`]), by value.
+    lazy: FxHashMap<u32, Lazy>,
+    /// A lazy value's register in the block that last built it: good for the rest of that block.
+    built: FxHashMap<u32, (u32, Reg)>,
+    /// What is known of a register's bits above a width ([`Sel::note_ext`]), by register.
+    ext: FxHashMap<Reg, (bool, u8)>,
     nv: u32,
     ctx: Vec<Ctx>,
     sigs: Vec<(Vec<Ty>, Vec<Ty>)>,
@@ -622,6 +652,9 @@ pub fn select_func(cx: &ModuleCx<'_>, index: u32, families: &mut Vec<String>) ->
         done: false,
         vreg: vec![NONE; body.num_values()],
         agg: FxHashMap::default(),
+        lazy: FxHashMap::default(),
+        built: FxHashMap::default(),
+        ext: FxHashMap::default(),
         nv: 0,
         ctx: Vec::new(),
         sigs: Vec::new(),
@@ -685,8 +718,11 @@ impl Sel<'_, '_> {
         }
     }
 
-    /// A value's register: an FP one for a float.
+    /// A value's register: an FP one for a float. A lazy value's is built here.
     fn val(&mut self, v: ValueId) -> Reg {
+        if let Some(&l) = self.lazy.get(&(v.index() as u32)) {
+            return self.build(v, l);
+        }
         if self.vreg[v.index()] == NONE {
             self.nv += 1;
             self.vreg[v.index()] = self.nv - 1;
@@ -697,6 +733,199 @@ impl Sel<'_, '_> {
         } else {
             Reg::virt(i)
         }
+    }
+
+    /// A lazy value in a register, built in the current block unless this block built it
+    /// already (code is only ever added at a block's end, so that register is still good).
+    fn build(&mut self, v: ValueId, l: Lazy) -> Reg {
+        let key = v.index() as u32;
+        if let Some(&(b, r)) = self.built.get(&key)
+            && b == self.cur
+        {
+            return r;
+        }
+        let r = self.fresh();
+        match l {
+            Lazy::Const { bits, w } => {
+                let x = self.mov_int(r, w, bits);
+                if x >> 63 == 0 {
+                    self.note_ext(r, false, (64 - x.leading_zeros()).max(1));
+                } else {
+                    self.note_ext(r, true, w);
+                }
+            }
+            Lazy::Slot { off, .. } => self.add_imm(r, Reg::SP, off),
+            Lazy::Offset { base, off } => {
+                let b = self.val(base);
+                self.add_imm(r, b, off);
+            }
+            Lazy::Cmp { p, a, b, w } => {
+                let c = self.compare(p, a, b, w);
+                self.cset(r, c);
+                self.note_ext(r, false, 1);
+            }
+        }
+        self.built.insert(key, (self.cur, r));
+        r
+    }
+
+    /// What an op's `i`th operand is, if it is a lazy value.
+    fn lazy_operand(&self, op: OpId, i: usize) -> Option<Lazy> {
+        match self.body.operands(op)[i].get() {
+            OperandKind::Value(v) => self.lazy.get(&(v.index() as u32)).copied(),
+            OperandKind::Hole(_) => None,
+        }
+    }
+
+    /// An op's `i`th operand as a constant: its low bits and its width.
+    fn const_operand(&self, op: OpId, i: usize) -> Option<(u64, u32)> {
+        match self.lazy_operand(op, i) {
+            Some(Lazy::Const { bits, w }) => Some((bits, w)),
+            _ => None,
+        }
+    }
+
+    /// An op's `i`th operand as the address of a `size`-byte access: a base register and a
+    /// constant offset. A frame slot is addressed from `sp` only when the access stays inside
+    /// it: outside is UB in the source, but the frame holds the spill and save slots too, and
+    /// the allocation validator refuses code that names them.
+    fn address(&mut self, op: OpId, i: usize, size: u64) -> Result<(Reg, i64)> {
+        match self.lazy_operand(op, i) {
+            Some(Lazy::Slot { off, lo, hi })
+                if lo <= off && off.saturating_add(size as i64) <= hi =>
+            {
+                Ok((Reg::SP, off))
+            }
+            Some(Lazy::Offset { base, off }) => Ok((self.val(base), off)),
+            _ => Ok((self.operand(op, i)?, 0)),
+        }
+    }
+
+    /// Make an op's result its `i`th operand plus `k`, lazily: the offset joins the operand's
+    /// own when that is a frame slot or a pointer plus a constant.
+    fn offset_result(&mut self, op: OpId, i: usize, k: i64) -> Result<()> {
+        let v = self.body.results(op).next().unwrap();
+        let l = match self.lazy_operand(op, i) {
+            Some(Lazy::Slot { off, lo, hi }) => Lazy::Slot {
+                off: off.wrapping_add(k),
+                lo,
+                hi,
+            },
+            Some(Lazy::Offset { base, off }) => Lazy::Offset {
+                base,
+                off: off.wrapping_add(k),
+            },
+            // Any other lazy operand is built here once, and the result is an offset from that.
+            _ => match self.body.operands(op)[i].get() {
+                OperandKind::Value(base) if self.lazy_operand(op, i).is_none() => {
+                    Lazy::Offset { base, off: k }
+                }
+                _ => {
+                    let p = self.operand(op, i)?;
+                    let d = self.result(op, 0);
+                    self.add_imm(d, p, k);
+                    return Ok(());
+                }
+            },
+        };
+        self.lazy.insert(v.index() as u32, l);
+        Ok(())
+    }
+
+    /// `r`'s bits above `width` are known from here on: copies of bit `width - 1` if `signed`,
+    /// zeros if not. Only for a register written once, where this is called.
+    fn note_ext(&mut self, r: Reg, signed: bool, width: u32) {
+        if r.is_virtual() && !r.is_fp() && (1..64).contains(&width) {
+            self.ext.insert(r, (signed, width as u8));
+        }
+    }
+
+    /// Whether `r` is known zero-extended (or, with `signed`, sign-extended) from `w` bits.
+    fn is_ext(&self, r: Reg, signed: bool, w: u32) -> bool {
+        match self.ext.get(&r) {
+            // Zeros above k are zeros above any w >= k, and sign copies above any w > k.
+            Some(&(false, k)) => u32::from(k) <= w && (!signed || u32::from(k) < w),
+            Some(&(true, k)) => signed && u32::from(k) <= w,
+            None => false,
+        }
+    }
+
+    /// Set the flags for `a pred b` at width `w`, and give the condition that then holds
+    /// exactly when the comparison does. A 32-bit comparison compares the registers' low
+    /// halves, a narrower one extends both first, and a constant right operand is an immediate.
+    fn compare(&mut self, p: Pred, a: ValueId, b: ValueId, w: u32) -> Cond {
+        let signed = is_signed(p);
+        let k = match self.lazy.get(&(b.index() as u32)) {
+            Some(&Lazy::Const { bits, w: cw }) => Some(if signed {
+                sext(cw.min(w), bits)
+            } else {
+                (bits & mask(cw.min(w))) as i64
+            }),
+            _ => None,
+        };
+        let ra = self.val(a);
+        if w == 32 {
+            // The low halves: an immediate is taken as 32 bits.
+            let k32 = k.map(|k| i64::from(k as i32));
+            match k32 {
+                Some(k) if is_arith_imm(k) => self.emit(Inst::AluImm {
+                    op: AluImmOp::Subs,
+                    sf: Sf::W,
+                    d: Reg::XZR,
+                    n: ra,
+                    imm: k,
+                }),
+                Some(k) if is_arith_imm(k.wrapping_neg()) => self.emit(Inst::AluImm {
+                    op: AluImmOp::Adds,
+                    sf: Sf::W,
+                    d: Reg::XZR,
+                    n: ra,
+                    imm: k.wrapping_neg(),
+                }),
+                _ => {
+                    let rb = self.val(b);
+                    self.emit(Inst::Alu {
+                        op: AluOp::Subs,
+                        sf: Sf::W,
+                        d: Reg::XZR,
+                        n: ra,
+                        m: rb,
+                    });
+                }
+            }
+            return cond_of(p);
+        }
+        let xa = if signed {
+            self.sx(ra, w)
+        } else {
+            self.zx(ra, w)
+        };
+        match k {
+            Some(k) => self.cmp_imm(xa, k),
+            None => {
+                let rb = self.val(b);
+                let xb = if signed {
+                    self.sx(rb, w)
+                } else {
+                    self.zx(rb, w)
+                };
+                self.alu(AluOp::Subs, Reg::XZR, xa, xb);
+            }
+        }
+        cond_of(p)
+    }
+
+    /// Branch to `t` if an op's `i`th operand (an `i1`) is true, otherwise to `f`: on the
+    /// flags of the comparison it is, when it is one, and on its bit 0 otherwise.
+    fn branch_on(&mut self, op: OpId, i: usize, t: u32, f: u32) -> Result<()> {
+        if let Some(Lazy::Cmp { p, a, b, w }) = self.lazy_operand(op, i) {
+            let c = self.compare(p, a, b, w);
+            self.emit(Inst::BCond { c, t, f });
+        } else {
+            let c = self.operand(op, i)?;
+            self.branch_bit(c, t, f);
+        }
+        Ok(())
     }
 
     /// The type of an op's `i`th operand.
@@ -821,17 +1050,21 @@ impl Sel<'_, '_> {
         d
     }
 
-    /// An `iN` constant's cheaper 64-bit form: its bits zero- or sign-extended.
-    fn mov_int(&mut self, d: Reg, w: u32, bits: u64) {
+    /// An `iN` constant's cheaper 64-bit form: its bits zero- or sign-extended. Gives the form
+    /// it chose.
+    fn mov_int(&mut self, d: Reg, w: u32, bits: u64) -> u64 {
         let z = bits & mask(w);
         let s = sext(w, z) as u64;
         let cost = |x: u64| mov_plan(x).3.len();
-        self.mov_imm(d, if cost(s) < cost(z) { s } else { z });
+        let x = if cost(s) < cost(z) { s } else { z };
+        self.mov_imm(d, x);
+        x
     }
 
-    /// The low `w` bits of `r`, zero-extended (`r` itself when `w` is 64).
+    /// The low `w` bits of `r`, zero-extended (`r` itself when `w` is 64, or when it is
+    /// known to be zero-extended already).
     fn zx(&mut self, r: Reg, w: u32) -> Reg {
-        if w >= 64 {
+        if w >= 64 || self.is_ext(r, false, w) {
             return r;
         }
         let d = self.fresh();
@@ -842,12 +1075,13 @@ impl Sel<'_, '_> {
             n: r,
             width: w as u8,
         });
+        self.note_ext(d, false, w);
         d
     }
 
-    /// The low `w` bits of `r`, sign-extended.
+    /// The low `w` bits of `r`, sign-extended (`r` itself when it is known to be already).
     fn sx(&mut self, r: Reg, w: u32) -> Reg {
-        if w >= 64 {
+        if w >= 64 || self.is_ext(r, true, w) {
             return r;
         }
         let d = self.fresh();
@@ -858,6 +1092,7 @@ impl Sel<'_, '_> {
             n: r,
             width: w as u8,
         });
+        self.note_ext(d, true, w);
         d
     }
 
@@ -1776,17 +2011,20 @@ impl Sel<'_, '_> {
                 self.set_regs(v, a);
             }
             OpKind::Const(n) => {
-                let w = width_bits(body.ty(body.results(op).next().unwrap()));
-                let bits = int_low_bits(body.int(n));
-                let d = self.result(op, 0);
-                self.mov_int(d, w, bits);
+                let v = body.results(op).next().unwrap();
+                let w = width_bits(body.ty(v));
+                let bits = int_low_bits(body.int(n)) & mask(w);
+                self.lazy.insert(v.index() as u32, Lazy::Const { bits, w });
             }
             OpKind::Poison | OpKind::PtrNull => {
-                let d = self.result(op, 0);
-                if d.is_fp() {
+                let v = body.results(op).next().unwrap();
+                if body.ty(v).is_float() {
+                    let d = self.result(op, 0);
                     self.fmov(FSize::D, d, Reg::XZR);
                 } else {
-                    self.mov_imm(d, 0);
+                    let w = width_bits(body.ty(v));
+                    self.lazy
+                        .insert(v.index() as u32, Lazy::Const { bits: 0, w });
                 }
             }
             OpKind::Freeze
@@ -1796,10 +2034,22 @@ impl Sel<'_, '_> {
             | OpKind::PtrExpose
             | OpKind::PtrFromExposed => {
                 // The same register: `freeze` has a value already, and the others change no
-                // bits that matter.
-                let a = self.operand(op, 0)?;
+                // bits that matter. A lazy operand stays lazy (a constant at the result's width).
                 let v = body.results(op).next().unwrap();
-                self.vreg[v.index()] = a.virt_index();
+                match self.lazy_operand(op, 0) {
+                    Some(Lazy::Const { bits, .. }) => {
+                        let w = width_bits(body.ty(v));
+                        let bits = bits & mask(w);
+                        self.lazy.insert(v.index() as u32, Lazy::Const { bits, w });
+                    }
+                    Some(l) => {
+                        self.lazy.insert(v.index() as u32, l);
+                    }
+                    None => {
+                        let a = self.operand(op, 0)?;
+                        self.vreg[v.index()] = a.virt_index();
+                    }
+                }
             }
             OpKind::PtrWithAddr => {
                 let a = self.operand(op, 1)?;
@@ -1841,19 +2091,42 @@ impl Sel<'_, '_> {
             }
             OpKind::Arith(aop, ovf) => {
                 let w = self.width_of(op, 0);
-                let (a, b) = (self.operand(op, 0)?, self.operand(op, 1)?);
-                let d = self.result(op, 0);
-                self.arith(aop, ovf, w, d, a, b);
+                let plain = !matches!(ovf, Ovf::Trap(_) | Ovf::Sat(_));
+                if !(plain && self.arith_const(op, aop, w)?) {
+                    let (a, b) = (self.operand(op, 0)?, self.operand(op, 1)?);
+                    let d = self.result(op, 0);
+                    self.arith(aop, ovf, w, d, a, b);
+                }
             }
             OpKind::Bit(bop) => {
-                let (a, b) = (self.operand(op, 0)?, self.operand(op, 1)?);
-                let d = self.result(op, 0);
-                let o = match bop {
-                    BitOp::And => AluOp::And,
-                    BitOp::Or => AluOp::Orr,
-                    BitOp::Xor => AluOp::Eor,
-                };
-                self.alu(o, d, a, b);
+                if let Some((i, imm)) = self.logical_const(op) {
+                    let a = self.operand(op, i)?;
+                    let d = self.result(op, 0);
+                    let o = match bop {
+                        BitOp::And => AluImmOp::And,
+                        BitOp::Or => AluImmOp::Orr,
+                        BitOp::Xor => AluImmOp::Eor,
+                    };
+                    self.emit(Inst::AluImm {
+                        op: o,
+                        sf: Sf::X,
+                        d,
+                        n: a,
+                        imm: imm as i64,
+                    });
+                    if bop == BitOp::And && imm >> 63 == 0 {
+                        self.note_ext(d, false, (64 - imm.leading_zeros()).max(1));
+                    }
+                } else {
+                    let (a, b) = (self.operand(op, 0)?, self.operand(op, 1)?);
+                    let d = self.result(op, 0);
+                    let o = match bop {
+                        BitOp::And => AluOp::And,
+                        BitOp::Or => AluOp::Orr,
+                        BitOp::Xor => AluOp::Eor,
+                    };
+                    self.alu(o, d, a, b);
+                }
             }
             OpKind::Div(dop, zero, ovf) => {
                 let w = self.width_of(op, 0);
@@ -1863,51 +2136,87 @@ impl Sel<'_, '_> {
             }
             OpKind::Shift(sop, edge) => {
                 let w = self.width_of(op, 0);
-                let (a, b) = (self.operand(op, 0)?, self.operand(op, 1)?);
-                let d = self.result(op, 0);
-                self.shift(sop, edge, w, d, a, b);
-            }
-            OpKind::Cmp(p) => {
-                let w = self.width_of(op, 0);
-                let (a, b) = (self.operand(op, 0)?, self.operand(op, 1)?);
-                let d = self.result(op, 0);
-                let (a, b) = if is_signed(p) {
-                    (self.sx(a, w), self.sx(b, w))
+                let by = self
+                    .const_operand(op, 1)
+                    .map(|(bits, cw)| bits & mask(cw.min(w)))
+                    .filter(|&k| k < u64::from(w.min(64)));
+                if let Some(k) = by {
+                    // A constant amount below the width: no edge case can happen.
+                    let a = self.operand(op, 0)?;
+                    let d = self.result(op, 0);
+                    self.shift_const(sop, w, d, a, k as u8);
                 } else {
-                    (self.zx(a, w), self.zx(b, w))
-                };
-                self.alu(AluOp::Subs, Reg::XZR, a, b);
-                self.cset(d, cond_of(p));
+                    let (a, b) = (self.operand(op, 0)?, self.operand(op, 1)?);
+                    let d = self.result(op, 0);
+                    self.shift(sop, edge, w, d, a, b);
+                }
             }
-            OpKind::PtrCmp(p) => {
-                let (a, b) = (self.operand(op, 0)?, self.operand(op, 1)?);
-                let d = self.result(op, 0);
-                self.alu(AluOp::Subs, Reg::XZR, a, b);
-                self.cset(d, cond_of(p));
+            OpKind::Cmp(p) | OpKind::PtrCmp(p) => {
+                // Not computed here: the branch it decides compares, or a use that needs the
+                // `i1` in a register does.
+                let w = if matches!(kind, OpKind::PtrCmp(_)) {
+                    64
+                } else {
+                    self.width_of(op, 0)
+                };
+                match (body.operands(op)[0].get(), body.operands(op)[1].get()) {
+                    (OperandKind::Value(a), OperandKind::Value(b)) => {
+                        let v = body.results(op).next().unwrap();
+                        self.lazy.insert(v.index() as u32, Lazy::Cmp { p, a, b, w });
+                    }
+                    _ => {
+                        self.operand(op, 0)?;
+                        self.operand(op, 1)?;
+                    }
+                }
             }
             OpKind::Zext | OpKind::Sext => {
                 let w = self.width_of(op, 0);
-                let a = self.operand(op, 0)?;
-                let d = self.result(op, 0);
-                self.emit(Inst::Ext {
-                    signed: kind == OpKind::Sext,
-                    sf: Sf::X,
-                    d,
-                    n: a,
-                    width: w as u8,
-                });
+                let signed = kind == OpKind::Sext;
+                let v = body.results(op).next().unwrap();
+                if let Some((bits, cw)) = self.const_operand(op, 0) {
+                    let x = if signed {
+                        sext(cw, bits) as u64
+                    } else {
+                        bits & mask(cw)
+                    };
+                    let dw = width_bits(body.ty(v));
+                    let bits = x & mask(dw);
+                    self.lazy
+                        .insert(v.index() as u32, Lazy::Const { bits, w: dw });
+                } else {
+                    let a = self.operand(op, 0)?;
+                    if w >= 64 || self.is_ext(a, signed, w) {
+                        // Nothing to extend: the same register.
+                        self.vreg[v.index()] = a.virt_index();
+                    } else {
+                        let d = self.result(op, 0);
+                        self.emit(Inst::Ext {
+                            signed,
+                            sf: Sf::X,
+                            d,
+                            n: a,
+                            width: w as u8,
+                        });
+                        self.note_ext(d, signed, w);
+                    }
+                }
             }
             OpKind::MemStack { size, align } => {
                 let off = self.local(size, u64::from(align));
-                let d = self.result(op, 0);
-                self.add_imm(d, Reg::SP, off);
+                let v = body.results(op).next().unwrap();
+                let hi = off + size.max(1) as i64;
+                self.lazy
+                    .insert(v.index() as u32, Lazy::Slot { off, lo: off, hi });
             }
             OpKind::MemStackOf { ty, align } => {
                 let size = self.type_size(ty);
                 let a = u64::from(align).max(body.types().align(self.sp, ty));
                 let off = self.local(size, a);
-                let d = self.result(op, 0);
-                self.add_imm(d, Reg::SP, off);
+                let v = body.results(op).next().unwrap();
+                let hi = off + size.max(1) as i64;
+                self.lazy
+                    .insert(v.index() as u32, Lazy::Slot { off, lo: off, hi });
             }
             OpKind::MemAlloc {
                 fail,
@@ -1932,23 +2241,28 @@ impl Sel<'_, '_> {
                 self.emit(Inst::BlFree { family });
             }
             OpKind::Load { .. } => {
-                let p = self.operand(op, 0)?;
                 let v = body.results(op).next().unwrap();
                 let size = self.type_size(body.ty(v));
+                let (p, off) = self.address(op, 0, size)?;
                 let d = self.val(v);
                 if d.is_fp() {
-                    self.ldr(MemSize::of_bytes(size).unwrap(), d, p, 0);
+                    self.ldr(MemSize::of_bytes(size).unwrap(), d, p, off);
                 } else {
-                    self.load(d, p, 0, size);
+                    self.load(d, p, off, size);
+                    // One `ldr` of fewer than 8 bytes zeroes the rest of the register.
+                    if matches!(size, 1 | 2 | 4) {
+                        self.note_ext(d, false, 8 * size as u32);
+                    }
                 }
             }
             OpKind::Store { ty, .. } => {
-                let (v, p) = (self.operand(op, 0)?, self.operand(op, 1)?);
+                let v = self.operand(op, 0)?;
                 let size = self.type_size(ty);
+                let (p, off) = self.address(op, 1, size)?;
                 if v.is_fp() {
-                    self.str_(MemSize::of_bytes(size).unwrap(), v, p, 0);
+                    self.str_(MemSize::of_bytes(size).unwrap(), v, p, off);
                 } else {
-                    self.store(v, p, 0, size);
+                    self.store(v, p, off, size);
                 }
             }
             OpKind::VaStart => {
@@ -1975,15 +2289,17 @@ impl Sel<'_, '_> {
                 self.copy(d, s, size);
             }
             OpKind::PtrOffset { .. } => {
-                let (p, n) = (self.operand(op, 0)?, self.operand(op, 1)?);
-                let d = self.result(op, 0);
-                self.alu(AluOp::Add, d, p, n);
+                if let Some((bits, cw)) = self.const_operand(op, 1) {
+                    self.offset_result(op, 0, sext(cw, bits))?;
+                } else {
+                    let (p, n) = (self.operand(op, 0)?, self.operand(op, 1)?);
+                    let d = self.result(op, 0);
+                    self.alu(AluOp::Add, d, p, n);
+                }
             }
             OpKind::PtrField { ty, index, .. } => {
-                let p = self.operand(op, 0)?;
-                let d = self.result(op, 0);
                 let off = body.types().field_offset(self.sp, ty, index).unwrap_or(0) as i64;
-                self.add_imm(d, p, off);
+                self.offset_result(op, 0, off)?;
             }
             OpKind::PtrIndex { ty, .. } => {
                 let (p, i) = (self.operand(op, 0)?, self.operand(op, 1)?);
@@ -2087,7 +2403,6 @@ impl Sel<'_, '_> {
                 self.emit(Inst::B { t: self.exit });
             }
             OpKind::If => {
-                let c = self.operand(op, 0)?;
                 let &[thn, els] = body.regions(op) else {
                     return Err("malformed cf.if".to_owned());
                 };
@@ -2099,7 +2414,7 @@ impl Sel<'_, '_> {
                     self.new_block(false),
                     self.new_block(false),
                 );
-                self.branch_bit(c, t, e);
+                self.branch_on(op, 0, t, e)?;
                 self.ctx.push(Ctx::If { results, join });
                 self.switch_to(t);
                 self.region(thn)?;
@@ -2215,12 +2530,14 @@ impl Sel<'_, '_> {
             }
             OpKind::CondBr { t, f } => {
                 let (t, f) = (body.succ(t), body.succ(f));
-                let all = self.operands(op)?;
-                let c = all[0];
-                let (ta, fa) = all[1..].split_at(t.nargs as usize);
+                // The arguments first: the comparison goes right before the branch.
+                let args = (1..body.operands(op).len())
+                    .map(|i| self.operand(op, i))
+                    .collect::<Result<Vec<Reg>>>()?;
+                let (ta, fa) = args.split_at(t.nargs as usize);
                 let tb = self.edge(body.str(t.label), ta);
                 let fb = self.edge(body.str(f.label), fa);
-                self.branch_bit(c, tb, fb);
+                self.branch_on(op, 0, tb, fb)?;
             }
             OpKind::Switch { dflt, cases } => {
                 let w = self.width_of(op, 0);
@@ -3015,6 +3332,90 @@ impl Sel<'_, '_> {
     }
 
     /// `int.add`, `int.sub`, `int.mul` with an overflow modifier.
+    /// `a + k`, `a - k`, `k + a`, or a product with a power of two, for a constant operand,
+    /// without a register for the constant: an immediate, or a shift. Whether it applied
+    /// (the op must not trap or saturate: this computes the low bits only).
+    fn arith_const(&mut self, op: OpId, aop: ArithOp, w: u32) -> Result<bool> {
+        // The constant is the second operand, or the first of `add` and `mul`.
+        let (i, bits, cw) = match (self.const_operand(op, 1), self.const_operand(op, 0)) {
+            (Some((bits, cw)), _) => (0, bits, cw),
+            (None, Some((bits, cw))) if aop != ArithOp::Sub => (1, bits, cw),
+            _ => return Ok(false),
+        };
+        match aop {
+            ArithOp::Add | ArithOp::Sub => {
+                let k = sext(cw.min(w), bits);
+                let k = if aop == ArithOp::Sub {
+                    k.wrapping_neg()
+                } else {
+                    k
+                };
+                if !(is_arith_imm(k) || is_arith_imm(k.wrapping_neg())) {
+                    return Ok(false);
+                }
+                let a = self.operand(op, i)?;
+                let d = self.result(op, 0);
+                self.add_imm(d, a, k);
+            }
+            ArithOp::Mul => {
+                let z = bits & mask(cw.min(w));
+                if !z.is_power_of_two() {
+                    return Ok(false);
+                }
+                let a = self.operand(op, i)?;
+                let d = self.result(op, 0);
+                match z.trailing_zeros() as u8 {
+                    0 => self.mov(d, a),
+                    amount => self.emit(Inst::ShiftImm {
+                        op: ShiftImmOp::Lsl,
+                        sf: Sf::X,
+                        d,
+                        n: a,
+                        amount,
+                    }),
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// A bitwise op's constant operand, when it is a logical immediate: which operand the
+    /// other is, and the constant as 64 bits (zero-extended, or sign-extended if only that
+    /// encodes: the op's low bits are the same).
+    fn logical_const(&self, op: OpId) -> Option<(usize, u64)> {
+        let (i, bits, cw) = match (self.const_operand(op, 1), self.const_operand(op, 0)) {
+            (Some((bits, cw)), _) => (0, bits, cw),
+            (None, Some((bits, cw))) => (1, bits, cw),
+            _ => return None,
+        };
+        let z = bits & mask(cw);
+        let s = sext(cw, z) as u64;
+        [z, s]
+            .into_iter()
+            .find(|&x| is_logical_imm(x, Sf::X))
+            .map(|x| (i, x))
+    }
+
+    /// `d = a shifted by k`, for a constant `k` below the width `w`.
+    fn shift_const(&mut self, sop: ShiftOp, w: u32, d: Reg, a: Reg, k: u8) {
+        let (op, n) = match sop {
+            ShiftOp::Shl => (ShiftImmOp::Lsl, a),
+            ShiftOp::ShrU => (ShiftImmOp::Lsr, self.zx(a, w)),
+            ShiftOp::ShrS => (ShiftImmOp::Asr, self.sx(a, w)),
+        };
+        if k == 0 {
+            self.mov(d, n);
+        } else {
+            self.emit(Inst::ShiftImm {
+                op,
+                sf: Sf::X,
+                d,
+                n,
+                amount: k,
+            });
+        }
+    }
+
     fn arith(&mut self, aop: ArithOp, ovf: Ovf, w: u32, d: Reg, a: Reg, b: Reg) {
         let op = match aop {
             ArithOp::Add => AluOp::Add,
