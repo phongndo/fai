@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! fir run FILE [@FUNC] [ARG...] [--fuel N]   run a function (default @main)
-//! fir check FILE                             verify; list holes
+//! fir check FILE [--target T [--os OS]]     verify; list holes; with a target, whether
+//!                                            `fir compile` for it accepts the module
 //! fir fmt FILE [--no-locs] [--unverified]     print canonical text (--unverified: parse only)
 //! fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each]
 //!              [--no-locs] [--print-before P,...] [--print-after P,...] [--print-changed]
@@ -101,16 +102,41 @@ fn run(args: &[&str]) -> Result<(), ExitCode> {
                 }
             }
         }
-        ["check", file] => {
+        ["check", file, opts @ ..] => {
             let m = fir::parse_module(&read(file)?).map_err(|e| fail(file, e))?;
             let holes = fir::verify_module(&m).map_err(|e| fail(file, e))?;
-            if holes.is_empty() {
+            let target = check_target(opts)?;
+            if holes.is_empty() && target.is_none() {
                 println!("ok");
             }
             for h in holes {
                 println!("hole ?{}: {} {}", h.name, h.ty, fir::render_loc(h.loc));
             }
-            Ok(())
+            let Some((x86, o)) = target else {
+                return Ok(());
+            };
+            // What `fir compile` for the target does, short of writing the assembly: the same
+            // lowering, selection, and allocation, so the same refusal in the same words.
+            let refusal = fir::backend::prepare(&m, false).and_then(|l| {
+                if x86 {
+                    fir::backend::x86_64::check(&l)
+                } else {
+                    fir::backend::aarch64::check(&l, &o)
+                }
+            });
+            match refusal {
+                Ok(()) => {
+                    println!("ok");
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("{file}: {e}");
+                    for note in widening_notes(&m) {
+                        eprintln!("{file}: note: {note}");
+                    }
+                    Err(ExitCode::FAILURE)
+                }
+            }
         }
         ["fmt", file, opts @ ..] => {
             let m = fir::parse_module(&read(file)?).map_err(|e| fail(file, e))?;
@@ -132,7 +158,7 @@ fn run(args: &[&str]) -> Result<(), ExitCode> {
         }
         _ => {
             eprintln!(
-                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each] [--no-locs]\n         [--print-before P,...] [--print-after P,...] [--print-changed] [--dump-dir DIR] [--check-dce FIR-REF]\n  fir opt --list-passes\n  fir compile FILE [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-g] [--reference-selection] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin] [--target aarch64|x86_64]\n  fir lower FILE [--no-locs]\n  fir measure FILE [-O | --none | --passes P,... [--experimental]] [--fuel N]"
+                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE [--target aarch64|x86_64 [--os linux|darwin]]\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each] [--no-locs]\n         [--print-before P,...] [--print-after P,...] [--print-changed] [--dump-dir DIR] [--check-dce FIR-REF]\n  fir opt --list-passes\n  fir compile FILE [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-g] [--reference-selection] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin] [--target aarch64|x86_64]\n  fir lower FILE [--no-locs]\n  fir measure FILE [-O | --none | --passes P,... [--experimental]] [--fuel N]"
             );
             Err(ExitCode::from(2))
         }
@@ -352,9 +378,72 @@ fn opt(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
 /// the proved Lean checker, as `fir opt --check-dce` does, fails if it refuses one, and prints a
 /// summary on stderr; so does `FIR_CHECK_DCE=FIR-REF` in the environment
 /// (`fir::backend::optimize`). Both run on the MFIR, so they apply to either target.
+/// `fir check FILE --target T` says beforehand whether this accepts the module, in the words it
+/// would use.
 /// `--reference-selection` (AArch64) selects in the reference mode (`select_eager`): a register
 /// for every value where it is defined, and no operand folded. It is slower code that means the
 /// same, to compare the default's with when a miscompile is suspected in selection.
+/// `fir check`'s options: `--target aarch64|x86_64` and, for AArch64, `--os linux|darwin`. With a
+/// target the check also says whether `fir compile` for it accepts the module.
+fn check_target(opts: &[&str]) -> Result<Option<(bool, fir::backend::aarch64::Options)>, ExitCode> {
+    use fir::backend::aarch64 as a64;
+    let mut target = None;
+    let mut o = a64::Options::default();
+    let mut it = opts.iter();
+    while let Some(&opt) = it.next() {
+        match (opt, it.next()) {
+            ("--target", Some(&"aarch64")) => target = Some(false),
+            ("--target", Some(&"x86_64")) => target = Some(true),
+            ("--os", Some(&"linux")) => o.os = a64::Os::Linux,
+            ("--os", Some(&"darwin")) => o.os = a64::Os::Darwin,
+            _ => {
+                eprintln!("fir check: bad option '{opt}'");
+                return Err(ExitCode::from(2));
+            }
+        }
+    }
+    Ok(target.map(|x86| (x86, o)))
+}
+
+/// The HFIR ops whose lowering works in integers wider than the source's: checked `add` and
+/// `sub` take one more bit, checked `mul` twice the width. When a backend refuses the lowered
+/// module for a wide integer, these are the ops to look at: the refusal names a type (`i65`)
+/// the source never wrote. They are notes beside the refusal, and decide nothing.
+fn widening_notes(m: &fir::Module) -> Vec<String> {
+    fn walk(f: &fir::Func, r: fir::RegionId, out: &mut Vec<String>) {
+        let body = &f.body;
+        for op in body.ops(r) {
+            if let fir::OpKind::Overflow { op: arith, .. } = body.kind(op)
+                && let Some(fir::Ty::Int(w)) = body.results(op).next().map(|v| body.ty(v))
+            {
+                let wide = if arith == fir::ArithOp::Mul {
+                    2 * w
+                } else {
+                    w + 1
+                };
+                if wide > 64 {
+                    out.push(format!(
+                        "@{}: {}: {} on i{w} is lowered to arithmetic on i{wide}",
+                        f.name,
+                        fir::render_loc(body.loc(op)),
+                        body.kind(op).mnemonic()
+                    ));
+                }
+            }
+            for &inner in body.regions(op) {
+                walk(f, inner, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if m.layer == fir::Layer::Hfir {
+        for f in &m.funcs {
+            walk(f, f.body.entry(), &mut out);
+        }
+    }
+    out
+}
+
 fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
     use fir::backend::aarch64 as a64;
     use fir::backend::x86_64 as x64;
@@ -480,6 +569,8 @@ fn compile(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
         }
         x64::compile(&m, &x64::Options::default()).map_err(fail)?
     } else {
+        // What the operating system can't take yet, as `a64::compile` refuses it.
+        a64::os_limits(&m, &o).map_err(fail)?;
         let mut mm = if reference {
             a64::select_eager(&m)
         } else {

@@ -196,7 +196,8 @@ pub fn compile_eager(m: &Module, o: &Options) -> Result<String, String> {
     compile_how(m, o, true)
 }
 
-fn compile_how(m: &Module, o: &Options, eager: bool) -> Result<String, String> {
+/// What `o`'s operating system can't take of `m` yet, if anything.
+pub fn os_limits(m: &Module, o: &Options) -> Result<(), String> {
     if o.os == Os::Darwin
         && let Some(what) = uses_varargs(m)
     {
@@ -213,6 +214,20 @@ fn compile_how(m: &Module, o: &Options, eager: bool) -> Result<String, String> {
             "{what} passes a struct or array on the stack, which isn't supported on macOS yet"
         ));
     }
+    Ok(())
+}
+
+/// Whether [`compile`] accepts `m`: everything it does but write the assembly. `fir check
+/// --target aarch64` is this, so a module is refused at the check exactly when it is refused at
+/// the compile, in the same words: there is no second rule to keep in step with selection.
+pub fn check(m: &Module, o: &Options) -> Result<(), String> {
+    os_limits(m, o)?;
+    let mut mm = select(m)?;
+    allocate(m, &mut mm)
+}
+
+fn compile_how(m: &Module, o: &Options, eager: bool) -> Result<String, String> {
+    os_limits(m, o)?;
     let mut mm = if eager { select_eager(m)? } else { select(m)? };
     allocate(m, &mut mm)?;
     Ok(emit::emit(m, &mm, o))

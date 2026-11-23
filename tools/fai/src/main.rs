@@ -252,6 +252,7 @@ const SUITES: &[&str] = &[
     "opt_fixtures",
     "opt_fuzz",
     "text_fixtures",
+    "check_target",
     "capi_programs",
     "capi_e2e",
     "abi_torture",
@@ -968,6 +969,16 @@ fn check_evidence(
         None,
     );
     need(&mut bad, "debug_lines_edges", "modules", None);
+    // `fir check --target` and `fir compile` must have agreed both ways: on modules both
+    // accept and on modules both refuse.
+    for answer in ["accept", "refuse"] {
+        need(
+            &mut bad,
+            "check_target",
+            &format!("modules the check and the compile both {answer}"),
+            None,
+        );
+    }
     // The Rust and Lean DCE checkers must each have judged candidates both ways.
     // The compiler's own entry points run the proved checker when asked, and fail on its
     // objections.

@@ -107,6 +107,10 @@ name = "text"
 path = "../../tests/rust/text.rs"
 
 [[test]]
+name = "check_target"
+path = "../../tests/rust/check_target.rs"
+
+[[test]]
 name = "verify"
 path = "../../tests/rust/verify.rs"
 
