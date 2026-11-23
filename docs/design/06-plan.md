@@ -89,7 +89,9 @@ measured on Lua. Steps 7 and 8 are next.
 | 10 | **A jump table for `cf.switch`**: the one selection item that needs a new LFIR op (an indirect branch) with Lean semantics, both interpreters, and the emitter. Its ceiling on Lua is about 10% of fcc's instructions: every `b.eq`, `b.cs`, and `cmp` together is 117M of 1,135M, and some of those are ordinary branches | Lua's instructions down, and track S's gate still met | parked until after checkpoint 1 |
 | 11 | **Track V**: the validator proved | its track's | after steps 7 and 8 settle its state |
 
-Steps 7 and 8 can run side by side, and are the next thing to do. Step 8 has grown: besides
+Steps 7 and 8 can run side by side, and are the next thing to do in this plan. Before them come
+stages 0 and A of [07-plan.md](07-plan.md), which make the verdicts these steps are judged by
+harder to fool, and bound the validator so that step 7's own test can't hang. Step 8 has grown: besides
 one home for a block parameter and its arguments and split intervals, spilled values must
 share slots. While step 4's change was in and `lvm.c` compiled with promotion, the promoted
 `luaV_execute`'s frame was 129 KB, and Lua's deep-recursion tests overflowed the stack with it.
