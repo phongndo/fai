@@ -725,7 +725,12 @@ fn run_full(
     }
     mach.lower_rets = lower_rets;
     mach.nan = nan;
-    Ok(match mach.init(fi as u32, &vals) {
+    Ok(call(mach, fi as u32, &vals, fuel))
+}
+
+/// Call function `f` of `mach`'s module with `vals` and run it.
+fn call(mut mach: Machine<'_>, f: u32, vals: &[Value], fuel: u64) -> RunOutput {
+    match mach.init(f, vals) {
         Err(h) => RunOutput {
             line: h.render(),
             events: String::new(),
@@ -734,7 +739,188 @@ fn run_full(
             profile: mach.profile,
         },
         Ok(()) => mach.drive(fuel),
+    }
+}
+
+/// A value that belongs to no machine: what [`run_lowering_pair`] generates for the source
+/// function and hands, encoded, to its lowering.
+#[derive(Clone, Debug)]
+enum Portable {
+    Int {
+        w: u32,
+        bits: u64,
+    },
+    IntPoison(u32),
+    Null,
+    PtrPoison,
+    Float {
+        f: FloatTy,
+        bits: u64,
+    },
+    FloatPoison(FloatTy),
+    /// A struct's or array's parts, a union's tag and payload, a slice's pointer and length.
+    Agg(Vec<Portable>),
+}
+
+/// The next number of a small generator (splitmix64).
+fn next_random(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// A value of type `t`: integers at the edges of their range and a few inside, a few floats,
+/// null pointers, any variant of a union, short slices. `None` for a type this doesn't make
+/// (`bN`, an integer over 64 bits, an array of more than 64 elements, a function).
+fn generate(types: &Types, aw: u32, t: Ty, rng: &mut u64) -> Option<Portable> {
+    let pick = |rng: &mut u64, n: u64| next_random(rng) % n;
+    Some(match t {
+        Ty::Int(w) if w <= 64 => {
+            let mask = if w == 64 { u64::MAX } else { (1 << w) - 1 };
+            let bits = match pick(rng, 6) {
+                0 => 0,
+                1 => 1,
+                2 => u64::MAX,
+                3 => 1 << (w - 1),
+                4 => (1u64 << (w - 1)).wrapping_sub(1),
+                _ => pick(rng, 100),
+            };
+            Portable::Int {
+                w,
+                bits: bits & mask,
+            }
+        }
+        Ty::Ptr => Portable::Null,
+        Ty::Float(f) => {
+            let x = [0.0, 1.5, -2.0, 1e9][pick(rng, 4) as usize];
+            let bits = match f {
+                FloatTy::F32 => u64::from((x as f32).to_bits()),
+                FloatTy::F64 => f64::to_bits(x),
+            };
+            Portable::Float { f, bits }
+        }
+        Ty::Slice => Portable::Agg(vec![
+            Portable::Null,
+            Portable::Int {
+                w: aw,
+                bits: pick(rng, 3),
+            },
+        ]),
+        Ty::Agg(id) => match types.shape(id) {
+            Shape::Struct(_, fs) => Portable::Agg(
+                fs.iter()
+                    .map(|&f| generate(types, aw, f, rng))
+                    .collect::<Option<_>>()?,
+            ),
+            Shape::Array(n, e) if n <= 64 => Portable::Agg(
+                (0..n)
+                    .map(|_| generate(types, aw, e, rng))
+                    .collect::<Option<_>>()?,
+            ),
+            Shape::Union(vs) if !vs.is_empty() => {
+                let i = pick(rng, vs.len() as u64);
+                Portable::Agg(vec![
+                    Portable::Int { w: 32, bits: i },
+                    generate(types, aw, vs[i as usize], rng)?,
+                ])
+            }
+            _ => return None,
+        },
+        _ => return None,
     })
+}
+
+/// Run `name` in `src`, an HFIR module, on generated arguments, and in `tgt`, its lowering, on
+/// the same arguments as the lowered signature takes them (Lean's `sigParams` and
+/// `lowerValue`): a struct or an array whole, anything else as its scalars, with `poison` for
+/// the variants a union doesn't hold. The source's results are shown as the lowering returns
+/// them, so the two outcomes compare with [`RunOutput::lowers_to`].
+///
+/// A `// run:` line can only give scalars, so a function with a struct, union, or slice
+/// parameter is otherwise run only through its callers: this is what checks the lowered
+/// signature itself against the encoding the refinement statement uses.
+///
+/// `Ok(None)` when the function is variadic or takes a parameter of a type that isn't
+/// generated. An error when the lowered function doesn't take what the encoding gives.
+pub fn run_lowering_pair(
+    src: &Module,
+    tgt: &Module,
+    name: &str,
+    seed: u64,
+    fuel: u64,
+) -> Result<Option<(RunOutput, RunOutput)>, String> {
+    let find = |m: &Module| {
+        m.funcs
+            .iter()
+            .position(|f| f.name == name)
+            .ok_or_else(|| format!("no function @{name}"))
+    };
+    let (sf, tf) = (find(src)?, find(tgt)?);
+    let f = &src.funcs[sf];
+    if f.variadic {
+        return Ok(None);
+    }
+    let types = f.body.types();
+    let aw = src.space.addr_bits;
+    let mut rng = seed;
+    let mut made = Vec::new();
+    for p in f.body.params(f.body.entry()) {
+        let t = f.body.ty(p);
+        match generate(types, aw, t, &mut rng) {
+            Some(g) => made.push((t, g)),
+            None => return Ok(None),
+        }
+    }
+    // The source's arguments, and what the lowering is given for each: the value whole when it
+    // is a composite, and its scalars otherwise.
+    let mut mach = Machine::new(src);
+    let mut vals = Vec::new();
+    let mut encoded: Vec<Portable> = Vec::new();
+    for (t, g) in &made {
+        let v = mach.import(g);
+        vals.push(v);
+        if types.is_composite(*t) {
+            encoded.push(g.clone());
+        } else {
+            let mut scalars = Vec::new();
+            mach.lower_value(types, *t, v, &mut scalars);
+            for s in scalars {
+                let Some(p) = mach.export(s) else {
+                    return Ok(None);
+                };
+                encoded.push(p);
+            }
+        }
+    }
+    mach.lower_rets = true;
+    let source = call(mach, sf as u32, &vals, fuel);
+    let g = &tgt.funcs[tf];
+    let params: Vec<Ty> = g
+        .body
+        .params(g.body.entry())
+        .map(|p| g.body.ty(p))
+        .collect();
+    if params.len() != encoded.len() {
+        return Err(format!(
+            "@{name} is lowered to {} parameters, and its arguments' encoding has {} values",
+            params.len(),
+            encoded.len()
+        ));
+    }
+    let mut mach = Machine::new(tgt);
+    let vals: Vec<Value> = encoded.iter().map(|p| mach.import(p)).collect();
+    for (i, (&v, &t)) in vals.iter().zip(&params).enumerate() {
+        if !mach.has_ty_in(g.body.types(), v, t) {
+            return Err(format!(
+                "@{name}: lowered parameter {i} is {}, and the encoding gives it another type",
+                g.body.types().show(t)
+            ));
+        }
+    }
+    let lowered = call(mach, tf as u32, &vals, fuel.saturating_mul(16));
+    Ok(Some((source, lowered)))
 }
 
 struct Machine<'m> {
@@ -1159,6 +1345,36 @@ impl<'m> Machine<'m> {
             Value::Agg { start, len } => Some(&self.agg_vals[Span { start, len }.range()]),
             _ => None,
         }
+    }
+
+    /// A generated value in this machine.
+    fn import(&mut self, p: &Portable) -> Value {
+        match p {
+            Portable::Int { w, bits } => Value::Int { w: *w, bits: *bits },
+            Portable::IntPoison(w) => Value::Poison { w: *w },
+            Portable::Null => Value::Ptr(NULL),
+            Portable::PtrPoison => Value::PtrPoison,
+            Portable::Float { f, bits } => Value::Float { f: *f, bits: *bits },
+            Portable::FloatPoison(f) => Value::FloatPoison(*f),
+            Portable::Agg(parts) => {
+                let parts: Vec<Value> = parts.iter().map(|x| self.import(x)).collect();
+                self.new_agg(&parts)
+            }
+        }
+    }
+
+    /// A scalar of this machine as a value of none: `None` for one [`Portable`] doesn't hold
+    /// (a pointer other than null, bytes, a wide integer).
+    fn export(&self, v: Value) -> Option<Portable> {
+        Some(match v {
+            Value::Int { w, bits } => Portable::Int { w, bits },
+            Value::Poison { w } => Portable::IntPoison(w),
+            Value::Ptr(NULL) => Portable::Null,
+            Value::PtrPoison => Portable::PtrPoison,
+            Value::Float { f, bits } => Portable::Float { f, bits },
+            Value::FloatPoison(f) => Portable::FloatPoison(f),
+            _ => return None,
+        })
     }
 
     fn new_agg(&mut self, parts: &[Value]) -> Value {

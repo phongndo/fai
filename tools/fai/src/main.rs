@@ -969,6 +969,14 @@ fn check_evidence(
         None,
     );
     need(&mut bad, "debug_lines_edges", "modules", None);
+    // The lowered signatures were compared with the encoding of their arguments, on runs that
+    // returned a result.
+    for key in [
+        "functions with composite parameters compared on generated arguments",
+        "generated runs compared where the source returned",
+    ] {
+        need(&mut bad, "lower_fixtures", key, None);
+    }
     // `fir check --target` and `fir compile` must have agreed both ways: on modules both
     // accept and on modules both refuse.
     for answer in ["accept", "refuse"] {
