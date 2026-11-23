@@ -1189,9 +1189,30 @@ const USAGE: &str = "usage: fai verify [fast|full] [--no-lean-clean] [--report-d
        fai mutate [NAME...]
        fai evidence DIR
        fai experiment NAME [OPTIONS]   (see tools/fai/src/experiment.rs)
+       fai gate [--update] [--configs C,...] [--timeout SECONDS]
+                                       (Lua and SQLite against the accepted baseline:
+                                        benchmarks/projects/README.md)
        fai matrix REPORT.json...
        fai help
 In a checkout, `cargo fai ...` (or `fai ...` in the dev shell) builds and runs it; `cargo xtask ...` is its old name.";
+
+/// `fai gate`: the projects gate (`benchmarks/projects/projbench.py gate`), from the repository's
+/// root, with its verdict as the exit status. It is its own harness (uv, the pinned Python), so
+/// this only gives it the one name every other check here has.
+fn gate(root: &Path, rest: &[String]) -> i32 {
+    let status = Command::new("uv")
+        .args(["run", "benchmarks/projects/projbench.py", "gate"])
+        .args(rest)
+        .current_dir(root)
+        .status();
+    match status {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("fai gate: uv: {e}");
+            1
+        }
+    }
+}
 
 /// The repository this binary was built from: `tools/fai/../..`.
 fn repo_root() -> PathBuf {
@@ -1209,6 +1230,8 @@ enum Cli<'a> {
     Mutate(&'a [String]),
     Evidence(&'a str),
     Experiment(&'a [String]),
+    /// `gate`: `projbench.py gate` with the rest of the line.
+    Gate(&'a [String]),
     Matrix(&'a [String]),
     /// `help`, `--help`, `-h`: the usage on stdout, exit 0.
     Help,
@@ -1221,6 +1244,7 @@ fn command(args: &[String]) -> Cli<'_> {
         Some("verify") => Cli::Verify,
         Some("mutate") => Cli::Mutate(&args[1..]),
         Some("experiment") => Cli::Experiment(&args[1..]),
+        Some("gate") => Cli::Gate(&args[1..]),
         Some("matrix") if args.len() > 1 => Cli::Matrix(&args[1..]),
         Some("evidence") if args.len() == 2 => Cli::Evidence(&args[1]),
         Some("help" | "--help" | "-h") => Cli::Help,
@@ -1236,6 +1260,7 @@ fn main() {
         Cli::Verify => {}
         Cli::Mutate(names) => std::process::exit(mutate::main(&root, names)),
         Cli::Experiment(rest) => std::process::exit(experiment::main(&root, rest)),
+        Cli::Gate(rest) => std::process::exit(gate(&root, rest)),
         Cli::Matrix(paths) => std::process::exit(matrix(paths)),
         Cli::Help => {
             println!("{usage}");
@@ -1715,6 +1740,9 @@ mod evidence_tests {
         let (exp, mx) = (a("experiment n --gate none"), a("matrix a.json b.json"));
         assert_eq!(command(&exp), Cli::Experiment(&exp[1..]));
         assert_eq!(command(&mx), Cli::Matrix(&mx[1..]));
+        let g = a("gate --update");
+        assert_eq!(command(&g), Cli::Gate(&g[1..]));
+        assert_eq!(command(&a("gate")), Cli::Gate(&[]));
         for h in ["help", "--help", "-h"] {
             assert_eq!(command(&a(h)), Cli::Help);
         }

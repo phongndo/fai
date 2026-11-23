@@ -54,6 +54,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -114,7 +115,10 @@ LUA_TUS = [
     "linit",
     "lua",
 ]
-LUA_FLAGS = ["-std=c23", "-DLUA_COMPAT_5_3", "-DLUA_USE_POSIX"]
+# The seed of Lua's string hashes is fixed: Lua makes it from the time and from addresses, and
+# with that every workload's instruction count differed from run to run (by 0.005% to 0.3%, and
+# lua-nbody's by 5%), for every compiler. With it fixed they repeat to a few dozen instructions.
+LUA_FLAGS = ["-std=c23", "-DLUA_COMPAT_5_3", "-DLUA_USE_POSIX", "-Dluai_makeseed(L)=0u"]
 # Lua's own tests that run alone (portable, soft mode), as luascore ran them.
 LUA_SUITE = [
     "attrib",
@@ -180,9 +184,9 @@ def run(cmd, **kw):
     return cbench.run([str(c) for c in cmd], **kw)
 
 
-def measure(cmd, env, cwd=None):
+def measure(cmd, env, cwd=None, timeout=None):
     """Run cmd: wall seconds, CPU seconds (with waited-for children), peak RSS in KiB, exit code,
-    and stderr."""
+    and stderr. After `timeout` seconds it is killed, and `timed_out` says so."""
     t0 = time.perf_counter()
     p = subprocess.Popen(
         [str(c) for c in cmd],
@@ -192,8 +196,19 @@ def measure(cmd, env, cwd=None):
         cwd=cwd,
     )
     assert p.stderr is not None
+    killed = []
+
+    def kill():
+        killed.append(True)
+        p.kill()
+
+    timer = threading.Timer(timeout, kill) if timeout else None
+    if timer:
+        timer.start()
     err = p.stderr.read().decode(errors="replace")
     _, status, ru = os.wait4(p.pid, 0)
+    if timer:
+        timer.cancel()
     wall = time.perf_counter() - t0
     p.stderr.close()
     return {
@@ -202,6 +217,7 @@ def measure(cmd, env, cwd=None):
         "rss_kib": ru.ru_maxrss,
         "exit": os.waitstatus_to_exitcode(status),
         "stderr": err,
+        "timed_out": bool(killed),
     }
 
 
@@ -345,7 +361,9 @@ def cmd_build(s):
         random.shuffle(jobs)
         for p, tu, src, fl, c in jobs:
             o = obj / f"{p}.{tu}.{c}.o"
-            m = measure(s.compile_cmd(c, src, fl, o), s.env)
+            m = measure(s.compile_cmd(c, src, fl, o), s.env, timeout=s.args.timeout)
+            if m["timed_out"]:
+                die(f"{c} did not compile {src} in {s.args.timeout} s")
             if m["exit"] != 0:
                 die(f"{c} failed on {src}:\n{m['stderr'][-3000:]}")
             runs.setdefault(f"{p}/{tu}/{c}", []).append(
@@ -949,6 +967,180 @@ def forms_report(result):
 
 
 # ---------------------------------------------------------------------------------------------
+# gate: does this tree build both projects correctly, and no worse than the accepted baseline?
+
+
+GATE = Path(__file__).resolve().parent / "gate.json"
+# A build may take this many times the baseline's compile time and memory, plus a second: they
+# are measured once, on whatever else the host is doing.
+GATE_SLACK = 2.0
+# How far a workload's instruction count may sit from the baseline's and still be the same:
+# one part in 100,000. With Lua's hash seed fixed (LUA_FLAGS), every workload's count repeats to
+# within a few dozen instructions, in tens of millions to billions.
+GATE_SAME = 1e-5
+
+
+def gate_measure(s, configs):
+    """What the gate compares, from build.json, check.json, and count.json: per configuration,
+    whether both projects behave as the reference build does, the instructions each workload
+    executes, each project's code size, and its compile time and peak memory."""
+    build, check, count = load(s.out, "build"), load(s.out, "check"), load(s.out, "count")
+    out: dict[str, Any] = {}
+    for c in configs:
+        tus = {k: v for k, v in build["tus"].items() if k.endswith(f"/{c}")}
+        projects = sorted({k.split("/")[0] for k in tus})
+        ref_hash = check["speedtest"][REFERENCE]["hash"]
+        st = check["speedtest"][c]
+        out[c] = {
+            "behavior": {
+                "lua workloads match": all(check["lua_scripts"][f"{n}/{c}"] for n in LUA_SCRIPTS),
+                "lua suite files passed": len(check["lua_suite"][c]),
+                "speedtest1 verifies": st["exit"] == 0
+                and st["hash"] == ref_hash
+                and bool(ref_hash),
+            },
+            "instructions": {w: count["programs"][w][c]["program"] for w in count["programs"]},
+            "text": {
+                p: sum(v["text"] for k, v in tus.items() if k.startswith(f"{p}/")) for p in projects
+            },
+            "compile_seconds": {
+                p: round(sum(v["wall_min"] for k, v in tus.items() if k.startswith(f"{p}/")), 2)
+                for p in projects
+            },
+            "compile_rss_kib": {
+                p: max(v["rss_kib_max"] for k, v in tus.items() if k.startswith(f"{p}/"))
+                for p in projects
+            },
+        }
+    return out
+
+
+def gate_compare(now, base):
+    """What got worse and what got better, as sentences. Behavior, instruction counts (to within
+    GATE_SAME), and code size may not get worse at all; compile time and memory may reach
+    GATE_SLACK times the baseline's (plus a second, or 64 MiB)."""
+    worse, better = [], []
+    want = {
+        "lua workloads match": True,
+        "lua suite files passed": len(LUA_SUITE),
+        "speedtest1 verifies": True,
+    }
+    for k, v in want.items():
+        if now["behavior"][k] != v:
+            worse.append(f"behavior: {k}: {now['behavior'][k]}, not {v}")
+    for w, b in base["instructions"].items():
+        n = now["instructions"].get(w)
+        tol = GATE_SAME
+        if n is None:
+            worse.append(f"instructions: {w} was not run")
+        elif n > b * (1 + tol):
+            worse.append(f"instructions: {w} executes {n:,}, more than {b:,} ({n / b - 1:+.2%})")
+        elif n < b * (1 - tol):
+            better.append(f"instructions: {w} executes {n:,}, fewer than {b:,} ({n / b - 1:+.2%})")
+    for p, b in base["text"].items():
+        n = now["text"][p]
+        if n > b:
+            worse.append(
+                f"code size: {p}'s .text is {n:,} bytes, more than {b:,} ({n / b - 1:+.2%})"
+            )
+        elif n < b:
+            better.append(
+                f"code size: {p}'s .text is {n:,} bytes, less than {b:,} ({n / b - 1:+.2%})"
+            )
+    for p, b in base["compile_seconds"].items():
+        n = now["compile_seconds"][p]
+        if n > GATE_SLACK * b + 1.0:
+            worse.append(f"compile time: {p} takes {n:.2f} s, over {GATE_SLACK:g} times {b:.2f} s")
+    for p, b in base["compile_rss_kib"].items():
+        n = now["compile_rss_kib"][p]
+        if n > GATE_SLACK * b + (64 << 10):
+            worse.append(
+                f"compile memory: {p} peaks at {n >> 10} MiB, over {GATE_SLACK:g} times {b >> 10} MiB"
+            )
+    return worse, better
+
+
+def cmd_gate(s):
+    """One verdict for a change to the compiler, on Lua and SQLite: build both with fcc (`-O`, or
+    the fcc configurations of --configs), check that they behave as GCC -O2's builds do, count
+    the instructions every workload executes, and compare with the accepted baseline
+    (benchmarks/projects/gate.json). FAIL, and exit 1, if a file doesn't compile (in --timeout
+    seconds), behavior differs, or anything is worse than the baseline: a workload's
+    instructions, a project's code size, or (beyond twice) its compile time or memory. A
+    configuration with no baseline of its own is held to `fcc -O`'s: a pipeline proposed for
+    `-O` must not be worse than `-O`.
+
+    --update writes the baseline, and only when the verdict is PASS: the baseline moves one way.
+    To accept a trade, edit gate.json by hand, where the diff shows it."""
+    global BUILD_CONFIGS
+    gated = [c for c in BUILD_CONFIGS if c.startswith("fcc")] if s.args.configs else ["fcc-O"]
+    if not gated:
+        die("gate: --configs names no fcc configuration")
+    BUILD_CONFIGS = [*gated, REFERENCE]
+    s.args.reps = 1
+    if s.args.timeout is None:
+        s.args.timeout = 300
+    baseline = json.loads(GATE.read_text()) if GATE.exists() else None
+    if baseline is None and not s.args.update:
+        die(f"gate: no baseline at {GATE}; make one with `gate --update`")
+    cmd_prepare(s)
+    cmd_build(s)
+    cmd_check(s)
+    cmd_count(s)
+    now = gate_measure(s, gated)
+    report: dict[str, Any] = {"verdict": "PASS", "configs": {}}
+    for c in gated:
+        base_of = c if baseline and c in baseline["configs"] else "fcc-O"
+        base = baseline["configs"].get(base_of) if baseline else None
+        if base is None:
+            # The first baseline: behavior must still be right.
+            base = {k: {} for k in ("instructions", "text", "compile_seconds", "compile_rss_kib")}
+        worse, better = gate_compare(now[c], base)
+        report["configs"][c] = {"against": base_of, "worse": worse, "better": better}
+        if worse:
+            report["verdict"] = "FAIL"
+    save(s.out, "gate", report)
+    for c, r in report["configs"].items():
+        print(f"gate: {c}, against the baseline of {r['against']}:")
+        for line in r["worse"]:
+            print(f"  WORSE   {line}")
+        for line in r["better"]:
+            print(f"  better  {line}")
+        if not r["worse"] and not r["better"]:
+            print("  the same as the baseline")
+    print(f"gate: {report['verdict']}")
+    if report["verdict"] != "PASS":
+        sys.exit(1)
+    if s.args.update:
+        configs = dict(baseline["configs"]) if baseline else {}
+        for c in gated:
+            old = configs.get(c)
+            new = now[c]
+            if old:
+                # The baseline only ever gets better: a count that is the same (within
+                # GATE_SAME) keeps its old value, and the time and memory keep the lower one.
+                for w, n in new["instructions"].items():
+                    b = old["instructions"].get(w, n)
+                    new["instructions"][w] = n if n < b * (1 - GATE_SAME) else b
+                for key in ("compile_seconds", "compile_rss_kib"):
+                    for p, n in new[key].items():
+                        new[key][p] = min(n, old[key].get(p, n))
+            configs[c] = new
+        text = json.dumps(
+            {
+                "about": "The accepted results of `fai gate` (benchmarks/projects/README.md): "
+                "what a change may not make worse. Written by `fai gate --update`, which "
+                "refuses unless the gate passes, and then only moves a number down.",
+                "configs": configs,
+            },
+            indent=1,
+            sort_keys=True,
+        )
+        GATE.write_text(text + "\n")
+        print(f"gate: wrote {GATE}")
+
+
+# ---------------------------------------------------------------------------------------------
 # c23: which compiler accepts and correctly runs each C23 program
 
 
@@ -1445,6 +1637,7 @@ def main():
             "check",
             "count",
             "forms",
+            "gate",
             "c23",
             "time",
             "report",
@@ -1466,6 +1659,17 @@ def main():
         "`report` and `time` are for the default set",
     )
     ap.add_argument(
+        "--timeout",
+        type=float,
+        help="seconds a compiler may take on one file before `build` (and `gate`, where it "
+        "defaults to 300) gives up on it",
+    )
+    ap.add_argument(
+        "--update",
+        action="store_true",
+        help="gate: write the baseline (benchmarks/projects/gate.json), if the gate passes",
+    )
+    ap.add_argument(
         "--plain",
         help="comma-separated source files (by stem: lvm) that the experimental fcc "
         "configurations compile with `fcc -O` instead, for files the backend can't compile "
@@ -1477,15 +1681,18 @@ def main():
         known = [*cbench.CONFIGS, *cbench.FCC_EXPERIMENTAL]
         if bad := [c for c in BUILD_CONFIGS if c not in known]:
             die(f"--configs: unknown {', '.join(bad)} (known: {', '.join(known)})")
-        if REFERENCE not in BUILD_CONFIGS:
+        if REFERENCE not in BUILD_CONFIGS and args.step != "gate":
             die(f"--configs must include {REFERENCE}, which the others are checked against")
         if args.step in ("report", "time", "all"):
-            die(f"--configs is for build, check, and count; `{args.step}` uses the default set")
+            die(
+                f"--configs is for build, check, count, forms, and gate; `{args.step}` uses the default set"
+            )
     s = Setup(args)
     s.out.mkdir(parents=True, exist_ok=True)
     steps = {
         "count": cmd_count,
         "forms": cmd_forms,
+        "gate": cmd_gate,
         "prepare": cmd_prepare,
         "build": cmd_build,
         "frontend": cmd_frontend,

@@ -17,9 +17,47 @@ AROCC=/path/to/arocc uv run benchmarks/projects/projbench.py c23
 uv run benchmarks/projects/projbench.py time --ssh MAC --docker alpine:3.22 \
     --docker-bin '/usr/local/bin/docker --context desktop-linux'   # native AArch64, as cbench
 uv run benchmarks/projects/projbench.py report             # target/projbench/report.md
+
+fai gate                                                   # one verdict for a change: PASS or FAIL
 ```
 
-- **Projects:** Lua 5.4.7 (33 files, `-std=c23 -DLUA_COMPAT_5_3 -DLUA_USE_POSIX`) and SQLite
+## The gate
+
+`fai gate` (`projbench.py gate`) answers one question about a change to the compiler: are Lua
+and SQLite still right, and no worse than what was accepted? It fetches the sources if it must,
+builds both projects with `fcc -O` and with GCC `-O2`, runs Lua's suite, the Lua workloads, and
+speedtest1 `--verify`, counts the instructions every workload executes, and compares with
+`gate.json`, the accepted baseline, which is tracked. It prints what is worse and what is
+better, then `gate: PASS` or `gate: FAIL`, and exits 0 or 1. It takes about five minutes.
+
+It fails if:
+
+- a file doesn't compile, or takes more than `--timeout` seconds (300 unless given);
+- a build's behavior differs from GCC `-O2`'s (a workload's output, a file of Lua's suite,
+  speedtest1's hash);
+- a workload executes more instructions than the baseline's (by more than one part in
+  100,000: the counts repeat to within a few dozen instructions);
+- a project's `.text` is larger than the baseline's, at all;
+- a project compiles in more than twice the baseline's time plus a second, or peaks at more
+  than twice its memory plus 64 MiB (these two are measured once on a shared host, so they get
+  slack; nothing else does).
+
+**A change that fails is not accepted**, whatever else it improves. `fai gate --update` writes
+`gate.json`, and only when the gate passes, and then only lowers a number, so the baseline
+moves one way: an improvement is kept by committing the new `gate.json` with the change that
+made it. To accept a trade (more
+instructions for something the gate doesn't measure), edit `gate.json` by hand, where the
+diff says what was given up.
+
+`--configs fcc-promo` (or any fcc configuration) gates that configuration instead. One with no
+baseline of its own is held to `fcc -O`'s: a pipeline proposed for `-O` must be right and no
+worse than `-O` on these programs. `--plain` and `--out` work as for `build`.
+
+- **Projects:** Lua 5.4.7 (33 files, `-std=c23 -DLUA_COMPAT_5_3 -DLUA_USE_POSIX`, and
+  `-Dluai_makeseed(L)=0u`: Lua seeds its string hashes from the time and from addresses, which
+  made every workload's instruction count differ from run to run, by 0.005% to 0.3% and
+  `lua-nbody`'s by 5%; with the seed fixed they repeat to within a few dozen instructions) and
+  SQLite
   3.53.3 (the 269,613-line amalgamation `sqlite3.c`, which `prepare` generates with SQLite's own
   build, and `test/speedtest1.c`; `-std=gnu23 -DNDEBUG -DSQLITE_THREADSAFE=0
   -DSQLITE_OMIT_LOAD_EXTENSION`). Lua's test suite comes from lua.org.
@@ -31,8 +69,7 @@ uv run benchmarks/projects/projbench.py report             # target/projbench/re
   `count` (it must keep `gcc-O2`, the reference), and may name fcc with an experimental
   pipeline: `fcc-m2r` (`mem2reg,fwd,copyprop,dse,dce`) or `fcc-promo` (the same with
   `stackdce`), both `--experimental`. `--plain FILE,…` makes those two compile the named files
-  with `fcc -O`: the baseline needed `--plain lvm`, since `lvm.c` did not compile with
-  promotion in practical time before `goto *` got one dispatch block
+  with `fcc -O`: `lvm.c` does not compile with promotion in practical time
   ([promotion-baseline.md](../../docs/performance/promotion-baseline.md)). `report` and `time`
   keep the published list.
 - **Behavior:** `check` runs Lua's own test suite (28 files that run alone, portable and soft

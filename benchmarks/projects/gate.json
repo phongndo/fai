@@ -1,0 +1,34 @@
+{
+ "about": "The accepted results of `fai gate` (benchmarks/projects/README.md): what a change may not make worse. Written by `fai gate --update`, which refuses unless the gate passes, and then only moves a number down.",
+ "configs": {
+  "fcc-O": {
+   "behavior": {
+    "lua suite files passed": 28,
+    "lua workloads match": true,
+    "speedtest1 verifies": true
+   },
+   "compile_rss_kib": {
+    "lua": 99712,
+    "sqlite": 231532
+   },
+   "compile_seconds": {
+    "lua": 1.09,
+    "sqlite": 1.1
+   },
+   "instructions": {
+    "lua-fannkuch": 82775144,
+    "lua-fib": 13877359,
+    "lua-nbody": 176910506,
+    "lua-sort": 101048325,
+    "lua-spectral": 108478803,
+    "lua-strings": 32723288,
+    "lua-trees": 71459371,
+    "speedtest1": 2834378111
+   },
+   "text": {
+    "lua": 377020,
+    "sqlite": 1216104
+   }
+  }
+ }
+}

@@ -58,6 +58,7 @@ cmake -S frontends/c -B build/fcc -G Ninja                     # fcc: configure,
 cmake --build build/fcc                                        # and build
 fai verify fast                                                # local; says what it skipped
 fai verify full                                                # the required check (CI)
+fai gate                                                       # Lua and SQLite: right, and no worse than the baseline
 fai experiment NAME --passes P,Q [--experimental]              # propose, test, and measure a change
 fai help                                                       # every `fai` command
 ```

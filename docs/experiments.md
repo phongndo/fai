@@ -19,9 +19,15 @@ fai experiment my-fwd-change --baseline-rev main        # a code change: this tr
 
 # 3. Read target/experiments/NAME/report.md (or report.json). Exit 1 means REJECTED.
 
-# 4. Before anything lands: the required check, which knows nothing of experiments.
-fai verify full
+# 4. Before anything lands: the required checks, which know nothing of experiments.
+fai verify full          # correct: proofs, generated files, every suite
+fai gate                 # no worse on Lua and SQLite than the accepted baseline (PASS or FAIL)
 ```
+
+A change that fails either is not accepted. `fai gate` is what the corpus can't say: the corpus
+measured the experimental promotion pipeline as 32% better, and on Lua and SQLite it is
+several times worse ([benchmarks/projects/README.md](../benchmarks/projects/README.md#the-gate),
+[selection.md](performance/selection.md)).
 
 A quick look without the gate (seconds instead of minutes) is `--gate none`; its verdict says
 `UNGATED`, and it is not evidence that the change is correct beyond the corpus's own runs.
