@@ -1723,7 +1723,21 @@ def cmd_gate(s):
     # judging.rs). It is said above every verdict, and decides none here.
     judging = os.environ.get("FAI_JUDGING")
 
-    def not_run(why):
+    def not_run(why, report=True):
+        # The report says so too: an earlier run's PASS under --out must not stand for this
+        # tree. (Not when another gate holds the lock: the report is that gate's.)
+        if report:
+            s.out.mkdir(parents=True, exist_ok=True)
+            save(
+                s.out,
+                "gate-report",
+                {
+                    "verdict": "NOT RUN",
+                    "why": why,
+                    "tree": os.environ.get("FAI_TREE"),
+                    "run": os.environ.get("FAI_RUN"),
+                },
+            )
         if judging:
             print(judging)
         print(f"gate: NOT RUN: {why}")
@@ -1743,11 +1757,12 @@ def cmd_gate(s):
     # the sources, and the baseline an update writes. Held until the process ends.
     lock_dir = ROOT / "target/fai"
     lock_dir.mkdir(parents=True, exist_ok=True)
-    lock = open(lock_dir / "gate.lock", "w")  # noqa: SIM115 (held for the whole run)
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        not_run("another gate is running in this checkout")
+    lock = open(lock_dir / "gate.lock", "a")  # noqa: SIM115 (held for the whole run)
+    if os.environ.get("FAI_GATE_LOCK_HELD") != "1":
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            not_run("another gate is running in this checkout", report=False)
     baseline_text = GATE.read_bytes() if GATE.exists() else None
     if baseline_text is None and not s.args.update:
         not_run(f"no baseline at {GATE}; make one with `gate --update`")

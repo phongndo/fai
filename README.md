@@ -73,11 +73,11 @@ No verdict here is read from output and judged: each is one command with an exit
 
 | Command | Time | Says |
 |---|---|---|
-| `fai verify quick` | under a minute | `QUICK PASSED: not a verification`, or what failed. Everything but the three C corpus tests, most of the ABI test's random signatures (20 run), the release build, the sanitizer run, and the check that no test skipped work; what it left out is printed, and the named tests never vary |
+| `fai verify quick` | under a minute once Lean is built | `QUICK PASSED: not a verification`, or what failed. Everything but the three C corpus tests, most of the ABI test's random signatures (20 run), the release build, the sanitizer run, and the check that no test skipped work; what it left out is printed, and the named tests never vary |
 | `fai accept` | about 8 minutes | `accept: PASS` (0), `FAIL` (1), `NOT JUDGED` (2: a part could not run, or the tree changed meanwhile), or `PASS, JUDGING FILES CHANGED` with the files (3). It runs `fai verify full` and `fai gate`, and, when the change edits or removes tests that existed at the base, those tests **as they were** against the changed code. On a host that can't run everything (the gate needs one that isn't AArch64) the best it says is `HOST PASS ON host` |
-| `fai status` | a second | whether the last `verify full` and the last `gate` of `fcc -O` are of the tree as it is now and passed (`CURRENT`, exit 0), or not (`STALE`, `NOT VERIFIED`, exit 1). A `quick` or `fast` run doesn't change the answer |
+| `fai status` | a second | whether the last `verify full` and the last `gate` of `fcc -O` are of the tree as it is now and passed (`CURRENT`, exit 0), or not (`STALE`, `NOT VERIFIED`, exit 1). A `quick` or `fast` run doesn't change the answer. On AArch64, where the gate can't run, `CURRENT` means verification alone, and says so |
 | `fai judging` | a second | the tests, baselines, and checkers the change touches, against the merge base with `origin/main` |
-| `fir check FILE --target aarch64` | a moment | whether `fir compile` will accept a module, in the words it would use |
+| `fir check FILE --target aarch64 [-O]` | a moment | whether `fir compile` (with `-O`, if given) will accept a module, in the words it would use |
 
 A change that fails its test is taken out, not kept with an explanation. A change that can
 only pass by editing what judges it (a test, a baseline, a checker) says so: `fai accept` exits

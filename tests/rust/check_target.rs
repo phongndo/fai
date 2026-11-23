@@ -35,9 +35,8 @@ fn check_for_a_target_says_what_compile_says() {
     let next = AtomicUsize::new(0);
     let one = |file: &Path| {
         let name = display_name(file);
-        let Ok(text) = std::fs::read_to_string(file) else {
-            return;
-        };
+        let text =
+            std::fs::read_to_string(file).unwrap_or_else(|e| panic!("{name}: can't read it: {e}"));
         // Only modules that verify: for the others both commands report the same error first.
         let Ok(m) = fir::parse_module(&text) else {
             return;
@@ -74,6 +73,18 @@ fn check_for_a_target_says_what_compile_says() {
                 ));
             } else if check.status.success() {
                 accepted.fetch_add(1, Relaxed);
+            } else if check.status.code() != Some(1)
+                || compile.status.code() != Some(1)
+                || refusal(&check, file).trim().is_empty()
+            {
+                // A refusal exits 1 with its reason; a crash, a signal, or silence is no
+                // refusal, even when both commands do it.
+                fails.lock().unwrap().push(format!(
+                    "{name} for {target}: not a refusal: check exited {:?}, compile {:?}\n  check: {}",
+                    check.status.code(),
+                    compile.status.code(),
+                    refusal(&check, file),
+                ));
             } else {
                 if refusal(&check, file) != refusal(&compile, file) {
                     fails.lock().unwrap().push(format!(

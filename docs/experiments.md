@@ -29,9 +29,10 @@ fai accept               # verify full, the gate, and the tests as they were
 edits tests that existed at the base, those tests as they were against the changed code. A
 change that fails is not accepted, and one that passes only by moving what judges it exits 3
 and names the files. `fai verify quick` is the same checks without the minutes-long ones, for
-after every edit. `fai gate` is what the corpus can't say: the corpus
-measured the experimental promotion pipeline as 32% better, and on Lua and SQLite it is
-several times worse ([benchmarks/projects/README.md](../benchmarks/projects/README.md#the-gate),
+after every edit (under a minute once Lean is built; the Lean build alone takes about 90 s
+from nothing). `fai gate` is what the corpus can't say: the corpus measured the experimental
+promotion pipeline as 32% better, and on Lua and SQLite it executes 3.4 times `-O`'s
+instructions on speedtest1 and doesn't compile Lua's `lvm.c` within the validator's budget ([benchmarks/projects/README.md](../benchmarks/projects/README.md#the-gate),
 [selection.md](performance/selection.md)).
 
 A quick look without the gate (seconds instead of minutes) is `--gate none`; its verdict says
@@ -145,8 +146,8 @@ is the gate, which runs what each host can (below).
 
 ## What runs where
 
-`fai accept` (which runs `fai verify full`) runs on both hosts in CI
-(`.github/workflows/verify.yml`), and
+`fai verify full` runs on both hosts in CI (`.github/workflows/verify.yml`), `fai accept` on
+the Linux one, and
 `fai matrix REPORT.json…` puts their reports side by side.
 
 | | x86-64 Linux | Apple-silicon macOS |

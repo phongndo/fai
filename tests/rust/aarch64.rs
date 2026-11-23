@@ -727,7 +727,10 @@ fn native_profiles_require_agreement_and_use_the_compiled_module() {
 fn unique_scratch_names(files: &[PathBuf]) {
     let mut seen = std::collections::HashSet::new();
     for f in files {
-        let stem = common::display_name(f).replace(['/', '.'], "_");
+        // Lowercase: on a disk that ignores case, two names that differ in it are one file.
+        let stem = common::display_name(f)
+            .replace(['/', '.'], "_")
+            .to_lowercase();
         assert!(
             seen.insert(stem.clone()),
             "two fixtures share the scratch name {stem}: rename one"

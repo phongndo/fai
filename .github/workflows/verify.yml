@@ -99,6 +99,8 @@ jobs:
           BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before }}
         run: |
           set +e
+          # A push that creates the branch has no commit before it: the commit before this one.
+          if [ "$BASE" = 0000000000000000000000000000000000000000 ]; then BASE=HEAD^; fi
           nix develop -c fai accept --base "$BASE"
           code=$?
           echo "fai accept exited with $code"

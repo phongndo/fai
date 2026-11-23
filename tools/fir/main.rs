@@ -112,12 +112,12 @@ fn run(args: &[&str]) -> Result<(), ExitCode> {
             for h in holes {
                 println!("hole ?{}: {} {}", h.name, h.ty, fir::render_loc(h.loc));
             }
-            let Some((x86, o)) = target else {
+            let Some((x86, optimize, o)) = target else {
                 return Ok(());
             };
             // What `fir compile` for the target does, short of writing the assembly: the same
             // lowering, selection, and allocation, so the same refusal in the same words.
-            let refusal = fir::backend::prepare(&m, false).and_then(|l| {
+            let refusal = fir::backend::prepare(&m, optimize).and_then(|l| {
                 if x86 {
                     fir::backend::x86_64::check(&l)
                 } else {
@@ -158,7 +158,7 @@ fn run(args: &[&str]) -> Result<(), ExitCode> {
         }
         _ => {
             eprintln!(
-                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE [--target aarch64|x86_64 [--os linux|darwin]]\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each] [--no-locs]\n         [--print-before P,...] [--print-after P,...] [--print-changed] [--dump-dir DIR] [--check-dce FIR-REF]\n  fir opt --list-passes\n  fir compile FILE [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-g] [--reference-selection] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin] [--target aarch64|x86_64]\n  fir lower FILE [--no-locs]\n  fir measure FILE [-O | --none | --passes P,... [--experimental]] [--fuel N]"
+                "usage:\n  fir run FILE [@FUNC] [ARG...] [--fuel N]\n  fir check FILE [--target aarch64|x86_64 [--os linux|darwin] [-O]]\n  fir fmt FILE [--no-locs] [--unverified]\n  fir opt FILE [-O | --passes P,...] [--experimental] [--remarks] [--stats] [--verify-each] [--no-locs]\n         [--print-before P,...] [--print-after P,...] [--print-changed] [--dump-dir DIR] [--check-dce FIR-REF]\n  fir opt --list-passes\n  fir compile FILE [-O [--check-dce FIR-REF] | --passes P,... [--experimental]] [-g] [--reference-selection] [-o OUT] [--emit mfir|asm|lfir|lfir-vregs] [--os linux|darwin] [--target aarch64|x86_64]\n  fir lower FILE [--no-locs]\n  fir measure FILE [-O | --none | --passes P,... [--experimental]] [--fuel N]"
             );
             Err(ExitCode::from(2))
         }
@@ -385,13 +385,20 @@ fn opt(file: &str, opts: &[&str]) -> Result<(), ExitCode> {
 /// same, to compare the default's with when a miscompile is suspected in selection.
 /// `fir check`'s options: `--target aarch64|x86_64` and, for AArch64, `--os linux|darwin`. With a
 /// target the check also says whether `fir compile` for it accepts the module.
-fn check_target(opts: &[&str]) -> Result<Option<(bool, fir::backend::aarch64::Options)>, ExitCode> {
+fn check_target(
+    opts: &[&str],
+) -> Result<Option<(bool, bool, fir::backend::aarch64::Options)>, ExitCode> {
     use fir::backend::aarch64 as a64;
     let mut target = None;
     let mut o = a64::Options::default();
     let mut os_given = false;
+    let mut optimize = false;
     let mut it = opts.iter();
     while let Some(&opt) = it.next() {
+        if opt == "-O" {
+            optimize = true;
+            continue;
+        }
         match (opt, it.next()) {
             ("--target", Some(&"aarch64")) => target = Some(false),
             ("--target", Some(&"x86_64")) => target = Some(true),
@@ -408,11 +415,11 @@ fn check_target(opts: &[&str]) -> Result<Option<(bool, fir::backend::aarch64::Op
         eprintln!("fir check: x86-64 output is for Linux only");
         return Err(ExitCode::from(2));
     }
-    if target.is_none() && os_given {
-        eprintln!("fir check: --os needs --target");
+    if target.is_none() && (os_given || optimize) {
+        eprintln!("fir check: --os and -O need --target");
         return Err(ExitCode::from(2));
     }
-    Ok(target.map(|x86| (x86, o)))
+    Ok(target.map(|x86| (x86, optimize, o)))
 }
 
 /// The HFIR ops whose lowering works in integers wider than the source's: checked `add` and

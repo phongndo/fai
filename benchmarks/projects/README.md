@@ -39,7 +39,8 @@ better, and always ends with one of three lines:
 The same verdict and reasons are in `gate-report.json` under `--out`, with the tree the verdict
 is of (its content hash, which `fai status` compares with the tree later), the baseline's
 hash, and the judging files the change touches. It takes about five minutes from nothing and
-a little over one once the sources and the reference build exist, and runs where `count`
+two once the sources are prepared (the GCC builds are compiled again each run), and runs
+where `count`
 does: on x86-64 Linux in the dev shell, under `qemu-aarch64`.
 On an AArch64 host the instruction-counting plugin doesn't run, and the gate says `NOT RUN`.
 It says the same for a tree or an output directory whose path has a space or a comma, which
