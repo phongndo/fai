@@ -118,6 +118,33 @@ fn honest_allocation_is_accepted() {
     }
 }
 
+/// The validator refuses an input it would take too long on, by counted work: the output it
+/// accepts within the default budget is "not validated" within a budget of one unit.
+#[test]
+fn a_validation_over_its_budget_is_refused() {
+    let f = fixture();
+    let (_, out) = f.honest();
+    let within = |budget| {
+        a64::regcheck::validate_within(
+            &mut f.input.clone(),
+            out.clone(),
+            &f.shapes,
+            &f.shapes[0],
+            budget,
+        )
+        .map(|_| ())
+    };
+    assert!(within(a64::regcheck::Budget::DEFAULT).is_ok());
+    assert!(within(a64::regcheck::Budget::NONE).is_ok());
+    // One unit in all, whatever the function's size allows.
+    let tiny = a64::regcheck::Budget {
+        max: 1,
+        ..a64::regcheck::Budget::DEFAULT
+    };
+    let e = within(tiny).expect_err("one unit of work can't validate a function");
+    assert!(e.contains("not validated: over budget"), "{e}");
+}
+
 #[test]
 fn unused_virtual_registers_need_no_assignment() {
     let f = fixture();

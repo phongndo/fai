@@ -831,7 +831,87 @@ pub fn validate<'a>(
     shapes: &'a [CallShape],
     own: &'a CallShape,
 ) -> Result<Accepted<'a>, String> {
-    check(input, &out, shapes, own)?;
+    validate_within(input, out, shapes, own, Budget::from_env())
+}
+
+/// How much work one validation may do before it is refused: `per_inst` units for each input
+/// instruction and `base` more, and never more than `max`. A unit is one value read or written
+/// when a dataflow state is joined, compared, or copied, or one instruction walked
+/// (`state::spend`).
+///
+/// The validator's cost is not linear in the function: it visits blocks until the states
+/// settle, and each visit joins states whose size grows with the values the allocation
+/// spilled. On code it was not built for it runs for minutes and gigabytes (the experimental
+/// promotion passes on Lua's `luaV_execute`: 291,494 instructions, more than 4 billion units and
+/// not done after 100 s). A checker must refuse such an input, not hang on it, and by counted
+/// work, not by time, so that the same input gets the same answer on every host.
+///
+/// The default is 4096 units per instruction, which bounds the time by the function's size,
+/// and 2^29 units in all, which bounds the memory (the states kept take about a byte a unit).
+/// Compiling Lua and SQLite with `-O` (2,376 validations) needs at most 632 units per
+/// instruction and 17.6 million in all, for `luaV_execute`. With the promotion passes 13 of
+/// SQLite's functions need more than 4,000 per instruction, up to 169,774, and `luaV_execute`
+/// is refused after 5 s. A refusal for the budget says nothing about the code: it was not
+/// validated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    pub base: u64,
+    pub per_inst: u64,
+    pub max: u64,
+}
+
+impl Budget {
+    pub const DEFAULT: Budget = Budget {
+        base: 1 << 20,
+        per_inst: 4096,
+        max: 1 << 29,
+    };
+
+    /// No limit.
+    pub const NONE: Budget = Budget {
+        base: u64::MAX,
+        per_inst: 0,
+        max: u64::MAX,
+    };
+
+    /// The default, or `FIR_REGCHECK_BUDGET` units per instruction with no limit in all (`0`:
+    /// no limit of either kind). A larger budget lets the validator work longer; it can't make
+    /// it accept anything else.
+    pub fn from_env() -> Budget {
+        static ENV: std::sync::OnceLock<Budget> = std::sync::OnceLock::new();
+        *ENV.get_or_init(|| {
+            match std::env::var("FIR_REGCHECK_BUDGET")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                Some(0) => Budget::NONE,
+                Some(per_inst) => Budget {
+                    per_inst,
+                    max: u64::MAX,
+                    ..Budget::DEFAULT
+                },
+                None => Budget::DEFAULT,
+            }
+        })
+    }
+
+    /// The units a function of `insts` input instructions may take.
+    pub fn of(&self, insts: usize) -> u64 {
+        self.base
+            .saturating_add(self.per_inst.saturating_mul(insts as u64))
+            .min(self.max)
+    }
+}
+
+/// [`validate`] with a budget given.
+pub fn validate_within<'a>(
+    input: &'a mut MFunc,
+    out: MFunc,
+    shapes: &'a [CallShape],
+    own: &'a CallShape,
+    budget: Budget,
+) -> Result<Accepted<'a>, String> {
+    check(input, &out, shapes, own, budget)?;
     Ok(Accepted {
         input,
         out,
@@ -840,7 +920,13 @@ pub fn validate<'a>(
     })
 }
 
-fn check(input: &MFunc, out: &MFunc, callees: &[CallShape], own: &CallShape) -> Result<(), String> {
+fn check(
+    input: &MFunc,
+    out: &MFunc,
+    callees: &[CallShape],
+    own: &CallShape,
+    budget: Budget,
+) -> Result<(), String> {
     if input.index != out.index {
         return Err("the output belongs to a different function index".to_owned());
     }
@@ -904,8 +990,23 @@ fn check(input: &MFunc, out: &MFunc, callees: &[CallShape], own: &CallShape) -> 
     at_start[0] = Some(entry_state());
     let mut work = vec![0usize];
     let mut visits = 0usize;
+    state::reset_work();
+    let limit = budget.of(input.insts.len());
     while let Some(b) = work.pop() {
         visits += 1;
+        state::spend_walk(input.block_range(b).len() + out.block_range(b).len());
+        if state::work() > limit {
+            return Err(format!(
+                "function {}: not validated: over budget ({} units of work on {} instructions; \
+                 the limit is {limit}: {} for each instruction, at most {}; \
+                 FIR_REGCHECK_BUDGET sets another)",
+                out.index,
+                state::work(),
+                input.insts.len(),
+                budget.per_inst,
+                budget.max
+            ));
+        }
         if visits > 64 * nb + 64 {
             return Err(format!(
                 "function {}: the dataflow doesn't settle",

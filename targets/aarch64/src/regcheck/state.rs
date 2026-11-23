@@ -22,7 +22,7 @@
 //! refuses, or its messages: the model-based tests check that every operation agrees with the
 //! model's, on random sequences of operations.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -30,6 +30,33 @@ use fai_ir::ir::Reg;
 
 /// An input value a location may hold.
 pub(super) type Val = u32;
+
+thread_local! {
+    /// The work this thread's validation has done on states, in [`spend`]'s units.
+    static WORK: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Count `n` units of work: one per value read or written when a state is joined, compared,
+/// or copied. The validator refuses a function whose validation takes more than its budget
+/// (`check`): the count, unlike the time, is the same on every host.
+fn spend(n: usize) {
+    WORK.with(|w| w.set(w.get().saturating_add(n as u64)));
+}
+
+/// Count work done outside the state (a walk over a block's instructions).
+pub(super) fn spend_walk(n: usize) {
+    spend(n);
+}
+
+/// The work counted since [`reset_work`].
+pub(super) fn work() -> u64 {
+    WORK.with(Cell::get)
+}
+
+/// Start counting for a new validation.
+pub(super) fn reset_work() {
+    WORK.with(|w| w.set(0));
+}
 
 /// How many values a [`Set`] holds in place.
 pub(super) const INLINE: usize = 5;
@@ -208,8 +235,22 @@ impl Chunk {
     }
 
     fn same(&self, o: &Chunk) -> bool {
+        spend(CHUNK + self.held());
         self.present == o.present && self.sets == o.sets
     }
+
+    /// How many values the chunk's sets hold, counting one in every location it is in.
+    fn held(&self) -> usize {
+        self.sets.iter().map(|s| s.as_slice().len()).sum()
+    }
+}
+
+/// The chunk to change: a copy when another state shares it, which is counted.
+fn own(c: &mut Rc<Chunk>) -> &mut Chunk {
+    if Rc::strong_count(c) > 1 {
+        spend(CHUNK + c.held());
+    }
+    Rc::make_mut(c)
 }
 
 /// A map from dense location numbers to sets, in shared chunks. Chunks past the end are
@@ -233,7 +274,7 @@ impl Locs {
         while self.chunks.len() <= i / CHUNK {
             self.chunks.push(Rc::new(Chunk::new()));
         }
-        let c = Rc::make_mut(&mut self.chunks[i / CHUNK]);
+        let c = own(&mut self.chunks[i / CHUNK]);
         for &v in s.as_slice() {
             c.note(v);
         }
@@ -246,7 +287,7 @@ impl Locs {
     fn remove_everywhere(&mut self, v: Val) {
         for c in &mut self.chunks {
             if c.holds_somewhere(v) {
-                let c = Rc::make_mut(c);
+                let c = own(c);
                 for s in &mut c.sets {
                     s.remove(v);
                 }
@@ -262,7 +303,7 @@ impl Locs {
         let mut any = false;
         for c in &mut self.chunks {
             if c.holds_somewhere(v) {
-                let c = Rc::make_mut(c);
+                let c = own(c);
                 for s in &mut c.sets {
                     if s.contains(v) {
                         s.insert(w);
@@ -288,6 +329,7 @@ impl Locs {
                 if Rc::ptr_eq(a, b) && (keep_empty || !a.has_empty()) {
                     return a.clone();
                 }
+                spend(CHUNK + a.held() + b.held());
                 let mut c = Chunk::new();
                 let both = a.present & b.present;
                 for k in 0..CHUNK {
