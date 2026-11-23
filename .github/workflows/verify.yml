@@ -1,15 +1,24 @@
 # The required checks, on two native hosts:
 #
-# * x86-64 Linux (ubuntu-24.04): the dev shell builds (`nix flake check`), and the full
-#   verification passes (`fai verify full`: Lean from scratch, generated files, the proof
-#   audit, formatting and lints, every Rust suite in debug and release with the Lean reference
-#   and qemu required, the C API under AddressSanitizer, and the evidence that the work ran).
+# * x86-64 Linux (ubuntu-24.04): the dev shell builds (`nix flake check`), and the change is
+#   accepted (`fai accept`). That is the full verification (`fai verify full`: Lean from
+#   scratch, generated files, the proof audit, formatting and lints, every Rust suite in debug
+#   and release with the Lean reference and qemu required, the C API under AddressSanitizer,
+#   and the evidence that the work ran), then the gate (`fai gate`: Lua and SQLite built,
+#   checked, and no worse than the accepted baseline), then, when the change edits tests that
+#   existed at the base, those tests as they were against the changed code.
 #   x86-64 code runs natively here; AArch64 Linux code runs under qemu-user.
 # * Apple-silicon macOS (macos-15, arm64): the same command, natively. AArch64 code runs natively
-#   as Mach-O. What macOS can't run by construction (x86-64 and AArch64 Linux binaries, the
-#   Linux ABI torture test, fcc's corpus, the C API's Linux native half) is declared in
-#   `HOST_GAPS` (tools/fai/src/main.rs); the run must report host verification with exactly those
-#   gaps unverified, and never reports full verification.
+#   as Mach-O, and the gate doesn't run (it counts instructions under qemu). What macOS can't
+#   run by construction (x86-64 and AArch64 Linux binaries, the Linux ABI torture test, fcc's
+#   corpus, the C API's Linux native half) is declared in `HOST_GAPS` (tools/fai/src/main.rs);
+#   the run must report host verification with exactly those gaps unverified, and never
+#   reports full verification.
+#
+# `fai accept` exits 0 for a pass and 3 for a pass that changed files that judge it (a
+# baseline, a checker, or a test whose old version the change fails): both pass this check, and
+# the summary names the files, since merging is the owner's yes. 1 (failed) and 2 (a part could
+# not run) fail it.
 #
 # Each host's report is uploaded whether it passes or not, and the last job puts both side by
 # side (`fai matrix`, run as `cargo fai matrix`) in the run's summary: what ran natively, under an emulator, or not
@@ -39,12 +48,21 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The judging files are compared with the merge base with origin/main.
+          fetch-depth: 0
       - uses: DeterminateSystems/nix-installer-action@v16
       - uses: DeterminateSystems/magic-nix-cache-action@v8
       - name: Dev shell builds
         run: nix flake check
-      - name: Verification
-        run: nix develop -c fai verify full
+      - name: Acceptance
+        shell: bash
+        run: |
+          set +e
+          nix develop -c fai accept --base origin/main
+          code=$?
+          echo "fai accept exited with $code"
+          [ "$code" -eq 0 ] || [ "$code" -eq 3 ]
       - name: Required verdict
         run: |
           nix develop -c uv run python - <<'EOF'
@@ -61,7 +79,16 @@ jobs:
           EOF
       - name: Summary
         if: always()
-        run: cat target/verify/report.md >> "$GITHUB_STEP_SUMMARY" || true
+        run: |
+          nix develop -c uv run python - >> "$GITHUB_STEP_SUMMARY" <<'EOF' || true
+          import json
+          r = json.load(open("target/accept/report.json"))
+          print("# " + r["verdict"], "", *("    " + n for n in r["notes"]), "", sep="\n")
+          for f in r["judging"].get("files", []):
+              print(f"- `{f['status']} {f['path']}` ({f['kind']})")
+          print()
+          EOF
+          cat target/verify/report.md >> "$GITHUB_STEP_SUMMARY" || true
       - name: Upload the verification report
         if: always()
         uses: actions/upload-artifact@v4
@@ -71,6 +98,8 @@ jobs:
             target/verify/report.json
             target/verify/report.md
             target/verify/proofs.md
+            target/accept/report.json
+            target/projbench/gate-report.json
 
   matrix:
     name: what each host verified
