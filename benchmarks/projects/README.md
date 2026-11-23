@@ -42,17 +42,33 @@ hash, and the judging files the change touches. It takes about five minutes from
 a little over one once the sources and the reference build exist, and runs where `count`
 does: on x86-64 Linux in the dev shell, under `qemu-aarch64`.
 On an AArch64 host the instruction-counting plugin doesn't run, and the gate says `NOT RUN`.
+It says the same for a tree or an output directory whose path has a space or a comma, which
+the linker map and QEMU's plugin options can't carry.
+
+It measures the compiler built from the tree as it is: the C API library is built first,
+where cargo builds now, and fcc is configured against exactly that file every time, so a
+build directory left from another target directory can't put an older compiler under the
+gate. The fetched sources are ignored by git, so the gate checks them itself: each unpacked
+source's digest is recorded when it is prepared and compared on every later run.
 
 It fails if:
 
 - a file doesn't compile, or takes more than `--timeout` seconds (300 unless given);
 - a build's behavior differs from GCC `-O2`'s (a workload's output, a file of Lua's suite,
-  speedtest1's hash);
-- a workload executes more instructions than the baseline's (by more than one part in
-  100,000: the counts repeat to within a few dozen instructions, and don't depend on where
-  the tree or the output directory is: every counted run starts in its work directory and
-  names its program and script without a directory, because Lua keeps the script's path in
-  each function and paces its collector by memory);
+  speedtest1's hash, which counts only if the reference build verified too);
+- a workload executes more instructions than the baseline's, in the project's own code or in
+  the whole run with libc (work moved into libc is still work), by more than one part in
+  100,000. The Lua counts repeat exactly and speedtest1's to within a few dozen (it reads the
+  clock). A counted run starts in its work directory and names its program and script
+  without a directory, with an empty environment, because Lua keeps the script's path in each
+  function and paces its collector by memory: its arguments and environment then don't
+  depend on where the tree or the output directory is. Its working directory still does,
+  which these programs don't read;
+- anything that should have been measured wasn't, on either side: a workload or a project
+  the baseline has and the run doesn't or the reverse, a count that isn't above zero, a
+  baseline without one of the measurements, or one with neither the configuration nor
+  `fcc -O`;
+- a run ends in an error (a workload over its time, a trace that was never written);
 - a project's `.text` is larger than the baseline's, at all;
 - a project compiles in more than twice the baseline's CPU time plus a second, or peaks at
   more than twice its memory plus 64 MiB (these two are measured once on a shared host, so
@@ -67,9 +83,11 @@ instructions for something the gate doesn't measure), edit `gate.json` by hand, 
 diff says what was given up.
 
 `gate --self-test` checks the verdict itself on made-up measurements where the right one is
-known (the same, 1% more instructions, wrong behavior, a workload not run, a partial build,
-the baseline's update): no compiler runs, `fai verify` runs it every time, and `fai mutate`
-weakens the gate three ways and requires it to notice.
+known (the same, more instructions by 1% and by one and a half parts in 100,000, more in libc
+alone, wrong behavior, a workload not run or new, a count of zero, a partial build, the time
+and memory bounds at their edges, the baseline's update): no compiler runs, `fai verify` runs
+it every time, and `fai mutate` weakens the gate three ways and requires it to notice. It also
+plants a real slowdown in the compiler and runs the gate itself on it.
 
 `--configs fcc-promo` (or any fcc configuration) gates that configuration instead. One with no
 baseline of its own is held to `fcc -O`'s: a pipeline proposed for `-O` must be right and no
@@ -79,9 +97,9 @@ named files are compiled with `fcc -O` and so not judged: the best verdict is th
 
 What the gate does not cover: run time on hardware (it counts instructions under qemu), x86-64
 output, the 12 kernels of `benchmarks/c`, and anything but these two projects. It is not part
-of `fai verify full` or of CI yet, and `fai mutate` doesn't plant defects against it: that it
-fails what it should was checked by hand
-([selection.md](../../docs/performance/selection.md#the-gate)).
+of `fai verify full`, which needs no network; `fai accept` runs both, and CI runs `fai accept`
+on Linux. Its bounds on compile time and memory were measured on one machine: on a slower one
+they are the first thing likely to fail, before any count.
 
 - **Projects:** Lua 5.4.7 (33 files, `-std=c23 -DLUA_COMPAT_5_3 -DLUA_USE_POSIX`, and
   `-Dluai_makeseed(L)=0u`: Lua seeds its string hashes from the time and from addresses, which

@@ -174,25 +174,31 @@ class Tools:
         return clang, flags
 
     def build_fcc(self):
+        """Build `fir` and `fcc` from the tree as it is. The C API library first, where cargo
+        builds now, and then fcc against exactly that file: a build directory configured for
+        another target directory would otherwise have Ninja link the library left there, an
+        older compiler, and that is what would be measured."""
         build = ROOT / "build/fcc"
-        if not (build / "build.ninja").exists():
-            run(
-                [
-                    "cmake",
-                    "-S",
-                    ROOT / "frontends/c",
-                    "-B",
-                    build,
-                    "-G",
-                    "Ninja",
-                    "-DCMAKE_BUILD_TYPE=Release",
-                    # The library fcc links is the one cargo builds here.
-                    f"-DFIR_CAPI_LIB={self.target / 'release/libfir_capi.a'}",
-                ],
-                capture=False,
-            )
+        lib = self.target / "release/libfir_capi.a"
+        cargo = ["cargo", "build", "--release", "-q", "-p", "fir", "-p", "fir-capi"]
+        run(cargo, cwd=ROOT, capture=False)
+        run(
+            [
+                "cmake",
+                "-S",
+                ROOT / "frontends/c",
+                "-B",
+                build,
+                "-G",
+                "Ninja",
+                "-DCMAKE_BUILD_TYPE=Release",
+                "-DFCC_BUILD_CAPI=ON",
+                f"-DFIR_CAPI_LIB={lib}",
+            ]
+        )
         run(["cmake", "--build", build], capture=False)
-        run(["cargo", "build", "--release", "-q", "-p", "fir"], cwd=ROOT, capture=False)
+        if not self.fcc.exists() or self.fcc.stat().st_mtime_ns < lib.stat().st_mtime_ns:
+            die(f"{self.fcc} is older than {lib}, the library it links: it was not rebuilt")
 
     def compile_cmd(self, config, src, obj):
         if config in FCC_EXPERIMENTAL:
