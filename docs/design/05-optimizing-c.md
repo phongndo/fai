@@ -7,10 +7,13 @@ section 2). This note records a prototype of the missing piece, promoting slots 
 it buys on the C corpus, what it doesn't do yet, what its correctness rests on, and what the
 measurements say to do next. Everything here is opt-in and unproved: it never runs under `-O`.
 
-**On Lua and SQLite it does not pay yet** ([promotion-baseline.md](../performance/promotion-baseline.md)):
-the outputs match, but promoted values are spilled in large functions, `sqlite3VdbeExec` runs
-5.6× the instructions it does with `-O`, and Lua's `lvm.c` does not compile in practical time.
-[06-plan.md](06-plan.md) is the round that follows from that. The corpus numbers below stand.
+**On Lua and SQLite it does not pay yet** ([promotion-baseline.md](../performance/promotion-baseline.md),
+and [selection.md](../performance/selection.md) for where it stands now): the outputs match,
+but promoted values are spilled in large functions. `sqlite3VdbeExec` and `luaV_execute`
+execute about 10× the instructions they do with `-O`, `luaV_execute`'s frame is 129 KB (four
+files of Lua's suite overflow an 8 MiB stack), and `sqlite3.c` and `lvm.c` compile 20× and 58×
+slower. [06-plan.md](06-plan.md) is the round that follows from that. The corpus numbers below
+stand.
 
 ## Summary
 

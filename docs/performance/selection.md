@@ -61,9 +61,10 @@ workloads summed, the project's own code, in millions; "before" is `f82cc88`:
 | everything else | 37.3 | 39.0 | 52.2 | 34.7 |
 | **all** | **1,135.0** | **592.4** | **486.0** | **478.2** |
 
-(One run of each. `lua-nbody` varies by a few percent from run to run, as Lua seeds its hash
-tables from an address and the time; the other workloads' counts are the same every run. The
-summary's 600M is the run after this one.)
+(One run of each. `lua-nbody`'s counts vary by a few percent from run to run, for every
+compiler; a likely cause, not checked, is that Lua seeds its hash tables from an address and
+the time. The other six workloads' counts are the same every run. The summary's 600M is the
+run after this one.)
 
 What the "before" column said:
 
@@ -120,12 +121,13 @@ which gave `luaV_execute` an edge from every case to every case.
 | Test | Result |
 |---|---|
 | `lvm.c` with `fcc-promo` compiles within twice `-O`'s time and memory | **No.** It compiles, which it did not before (stopped at 4.5 minutes and 7.5 GiB): 5.3 s and 359 MiB, against `-O`'s 0.09 s and 79 MiB |
-| Lua's suite passes with promotion | **No.** 24 of 28: `calls`, `coroutine`, `cstack`, and `errors` end in a segmentation fault. They recurse deeply, and the promoted `luaV_execute` has a 128,832-byte frame (3,312 with `-O`, 3,296 from GCC `-O0`): every spilled value has a slot of its own. That is stack exhaustion, not shown to be wrong code; the 7 workloads and speedtest1 match |
-| `-O`'s instructions on Lua don't go up | **No, by 0.6%.** With the new selection, 592.4M with one dispatch block against 588.8M with a switch at each `goto *` |
+| Lua's suite passes with promotion | **No.** 24 of 28: `calls`, `coroutine`, `cstack`, and `errors` end in a segmentation fault under qemu's 8 MiB stack. They recurse deeply, and the promoted `luaV_execute` has a 128,832-byte frame (3,312 with `-O`, 3,296 from GCC `-O0`): every spilled value has a slot of its own. It is stack exhaustion: all four pass with `qemu-aarch64 -s 64M` and with `-s 256M`. (With `-s 1G` the promoted binary faults at once, even on `print(1)`, and `-O`'s does not; that was not looked into) |
+| `-O`'s instructions on Lua don't go up | **No, by 1.3%.** With the new selection, on the six workloads whose counts repeat: 415.6M with one dispatch block against 410.4M with a switch at each `goto *` |
 
 The change is kept. It makes `lvm.c` compile with promotion at all, which checkpoint 1 needs;
 with `-O` it compiles `lvm.c` in 0.09 s instead of 0.19 s into 50 KB of `.text` instead of
-120 KB; and what it costs is one jump and one move at each dispatch. What a shared dispatch
+120 KB; and what it costs is a jump and a move at each dispatch, 1.3% of Lua's instructions.
+It is one commit, and reverts alone. What a shared dispatch
 block does to branch prediction on hardware is not measured.
 
 ## The validator on promoted code (step 3)

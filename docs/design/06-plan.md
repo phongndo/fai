@@ -120,15 +120,16 @@ The baseline's findings, in the order they cost:
   is the hull of a value's uses, without holes, so a variable live across a large function
   takes a stack slot, and a move between two spilled values is a load and a store through
   scratch registers, with `x16` computing far slot addresses (`movk`: 890M executions in
-  speedtest1). `sqlite3VdbeExec` executes 5.6× the instructions it does with `-O`. Split
+  speedtest1). `sqlite3VdbeExec` executed 5.6× the instructions it did with `-O` at the
+  baseline, and 9.9× after step 5 made `-O` faster. Split
   intervals at region boundaries (or allocate per region with one home per value across
   them), and prefer the promoted values of the innermost loop.
 - **Every spilled value has a slot of its own.** The promoted `luaV_execute`'s frame is
   128,832 bytes (3,312 with `-O`), and Lua allows 200 nested C calls: four files of its suite
   overflow an 8 MiB stack. Slots must be shared between values whose intervals don't meet.
 - **The validator's cost.** `aarch64.regcheck` takes 36 s of CPU time in `sqlite3.c`'s 20 s
-  compile, and `lvm.c` doesn't finish in 4.5 minutes and 7.5 GiB; one stack sample of it is
-  in `State::join`. Profile it on the promoted `lvm.c` first; the likely cause, not
+  compile, and `lvm.c` didn't finish in 4.5 minutes and 7.5 GiB before step 4 (5.3 s after
+  it, against `-O`'s 0.09 s); one stack sample of it was in `State::join`. Profile it on the promoted `lvm.c` first; the likely cause, not
   established, is that every omitted `mov` adds the destination to each location's set of
   values, which never shrinks, and every join copies the sets. Step 3 measured it: 42 values
   per location on the promoted `luaV_execute`, and about 85% of the time in joins. Dropping
@@ -256,7 +257,7 @@ steps 1, 2, and 10 start from. No selection rule has been written.
 | 1 | Attribute at least 80% of `fcc -O`'s 649M excess on Lua to forms | **Passed.** `projbench.py forms` names every executed instruction; the forms where fcc executed more than GCC `-O0` add up to 709M: constants in registers, extensions, register adds, spill reloads, frame addresses |
 | 2 | Split `-O`'s extra 114M stack accesses | **Passed.** All of it was the allocator's: 56M spill reloads, every one of an address (each local's address lived in a register, and large functions spilled it), 27M spill stores, and 49M register saves and restores against GCC's 10M. fcc's own slot traffic was GCC's. So the fix was in selection, not allocation: address a slot from `sp` |
 | 3 | Name where the validator's time and memory go on promoted code | **Passed.** About 85% is joining block states. On the promoted `luaV_execute` a location holds 42 values on average: an omitted `mov` gives a value a second name, and no name is dropped when it dies |
-| 4 | `lvm.c` with `fcc-promo` compiles within twice `-O`; Lua's suite passes; `-O`'s instructions on Lua don't go up | **Made; not passed.** It compiles, where it did not (5.3 s against `-O`'s 0.09 s); 4 of Lua's 28 suite files overflow the stack with promotion (a 129 KB frame); `-O` executes 0.6% more. Kept: checkpoint 1 can't be measured on Lua without it, and `-O` compiles `lvm.c` twice as fast into 2.4× less code |
+| 4 | `lvm.c` with `fcc-promo` compiles within twice `-O`; Lua's suite passes; `-O`'s instructions on Lua don't go up | **Made; not passed.** It compiles, where it did not (5.3 s against `-O`'s 0.09 s); 4 of Lua's 28 suite files overflow the stack with promotion (a 129 KB frame; they pass with a 64 MiB stack); `-O` executes 1.3% more. Kept: checkpoint 1 can't be measured on Lua without it, and `-O` compiles `lvm.c` twice as fast into 2.4× less code |
 | 5 | Each rule keeps behavior; `fcc -O` at most 1.3× GCC `-O0` on Lua | **Passed: 1.22×**, from 2.27×, and 0.63× on speedtest1, from 1.16×. Lua's suite, the workloads, speedtest1's hash, and `fai verify full` pass. The rules were measured together, not one by one |
 | 6 | The baseline's tables at the new revision | **Done.** Promotion now executes 7.6× `-O`'s instructions on Lua and 3.4× on speedtest1 |
 
