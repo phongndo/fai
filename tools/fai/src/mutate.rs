@@ -602,7 +602,7 @@ fn mutations() -> Vec<Mutation> {
             edits: vec![edit(
                 "targets/aarch64/src/regcheck.rs",
                 "        if state::work() > limit {",
-                "        if state::work() > limit && limit == 0 {",
+                "        if false && state::work() > limit {",
             )],
             steps: vec![test(&["-p", "fir", "--test", "regcheck", "budget"])],
             expect: vec![
@@ -657,7 +657,7 @@ fn mutations() -> Vec<Mutation> {
                 "sh",
                 &[
                     "-c",
-                    "if [ ! -f \"$FAI_MUTATE_FROM/target/projbench/src/sqlite-src-3530300.digest\" ]; then echo 'slower-code needs the sources of the gate prepared in the tree: run fai gate there once' >&2; exit 1; fi; mkdir -p target/projbench && if [ ! -e target/projbench/src ]; then ln -s \"$FAI_MUTATE_FROM/target/projbench/src\" target/projbench/src; fi; exec cargo fai gate",
+                    "if [ ! -f \"$FAI_MUTATE_FROM/target/projbench/src/sqlite-src-3530300.digest\" ] || [ ! -f \"$FAI_MUTATE_FROM/target/projbench/src/lua-5.4.7.digest\" ] || [ ! -f \"$FAI_MUTATE_FROM/target/projbench/src/lua-5.4.7-tests.digest\" ]; then echo 'slower-code needs the sources of the gate prepared in the tree: run fai gate there once' >&2; exit 1; fi; mkdir -p target/projbench && if [ ! -e target/projbench/src ]; then ln -s \"$FAI_MUTATE_FROM/target/projbench/src\" target/projbench/src; fi; exec cargo fai gate",
                 ],
             )],
             // A workload that ran, and executed more: not one that was not run.
@@ -717,8 +717,16 @@ fn mutations() -> Vec<Mutation> {
 fn make_copy(root: &Path, tree: &Path) {
     let _ = std::fs::remove_dir_all(tree);
     std::fs::create_dir_all(tree).unwrap();
+    // Tracked files and untracked ones git doesn't ignore: the files whose hash the report
+    // carries (`judging::tree_hash`).
     let files = Command::new("git")
-        .args(["ls-files", "-z"])
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
         .current_dir(root)
         .output()
         .unwrap();
@@ -874,6 +882,11 @@ pub fn main(root: &Path, names: &[String]) -> i32 {
                 let step = if is_last { last } else { step };
                 let (ok, out) = run(step, &tree, &target);
                 output = out;
+                // A command that couldn't start caught nothing.
+                if output.starts_with("can't run ") {
+                    problem = Some(output.clone());
+                    break;
+                }
                 if !is_last && !ok {
                     problem = Some(format!("setup step {} failed: {}", i + 1, tail(&output)));
                     break;
@@ -938,7 +951,9 @@ pub fn main(root: &Path, names: &[String]) -> i32 {
         "tree_at_end": crate::judging::tree_hash(root).unwrap_or_default(),
         "subset": !names.is_empty(),
         "mutations": results,
-        "all_caught_for_the_intended_reason": ok_all,
+        // In a --quick run a defect quick misses is a finding: it is not "caught".
+        "all_caught_for_the_intended_reason": ok_all
+            && results.iter().all(|r| r["passed"] == json!(true)),
         "not_planted_in_the_tree": not_planted,
     });
     if quick {

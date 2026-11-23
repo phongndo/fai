@@ -96,13 +96,14 @@ const JUDGING: &[(&str, Kind)] = &[
     ("targets/x86_64/src/regalloc.rs", Kind::Checker),
     // What decides which tests exist, how they build, and with which tools.
     ("Cargo.lock", Kind::Checker),
-    (".cargo/config.toml", Kind::Checker),
+    (".cargo/", Kind::Checker),
     ("flake.nix", Kind::Checker),
     ("flake.lock", Kind::Checker),
     ("nix/", Kind::Checker),
     ("pyproject.toml", Kind::Checker),
     ("uv.lock", Kind::Checker),
     ("spec/lakefile.toml", Kind::Checker),
+    ("spec/lakefile.lean", Kind::Checker),
     ("spec/lake-manifest.json", Kind::Checker),
     ("spec/lean-toolchain", Kind::Checker),
 ];
@@ -171,15 +172,23 @@ pub(crate) fn judged(changed: &[(char, String)]) -> (Vec<Change>, usize) {
 /// `git diff --name-status -z` output as `(status, path)` pairs. With `-z` git separates the
 /// fields with NUL and writes a path as it is: without it, a path with a byte outside ASCII
 /// arrives quoted and escaped (`"tests/caf\303\251.fir"`), and would match nothing.
-pub(crate) fn name_status(z: &[u8]) -> Vec<(char, String)> {
+/// A path that isn't UTF-8 can't be named or replayed faithfully, so it makes the whole list
+/// an error (`NOT JUDGED`), not a path that names no file.
+pub(crate) fn name_status(z: &[u8]) -> Result<Vec<(char, String)>, String> {
     let mut fields = z.split(|&b| b == 0).filter(|f| !f.is_empty());
     let mut out = Vec::new();
     while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
+        let path = String::from_utf8(path.to_vec()).map_err(|_| {
+            format!(
+                "a changed path isn't UTF-8 ({})",
+                String::from_utf8_lossy(path)
+            )
+        })?;
         if let Some(&c) = status.first() {
-            out.push((c as char, String::from_utf8_lossy(path).into_owned()));
+            out.push((c as char, path));
         }
     }
-    out
+    Ok(out)
 }
 
 /// Fill in each change's line counts from `git diff --numstat -z` output
@@ -362,6 +371,19 @@ pub(crate) fn judging(root: &Path, base: Option<&str>, head: Option<&str>) -> Ju
     }
     let tip = head.unwrap_or("HEAD");
     let merge_base = |rev: &str| git(root, &["merge-base", rev, tip]);
+    // The working tree is compared as `tree_hash` reads it: every file from disk, untracked
+    // ones included, and no index mark (`assume-unchanged`, `skip-worktree`) hiding an edit.
+    let now;
+    let head = match head {
+        Some(h) => Some(h),
+        None => match tree_hash(root) {
+            Ok(t) => {
+                now = t;
+                Some(now.as_str())
+            }
+            Err(e) => return Judging::NoBase(e),
+        },
+    };
     let base = match base {
         Some(b) => merge_base(b),
         None => merge_base("origin/main").or_else(|_| merge_base("main")),
@@ -374,21 +396,10 @@ pub(crate) fn judging(root: &Path, base: Option<&str>, head: Option<&str>) -> Ju
     if let Some(h) = head {
         args.push(h);
     }
-    let mut changed = match git_bytes(root, &args) {
-        Ok(z) => name_status(&z),
+    let changed = match git_bytes(root, &args).and_then(|z| name_status(&z)) {
+        Ok(c) => c,
         Err(e) => return Judging::NoBase(e),
     };
-    if head.is_none() {
-        // Files git doesn't track yet are part of the change too.
-        match git_bytes(root, &["ls-files", "-z", "--others", "--exclude-standard"]) {
-            Ok(new) => changed.extend(
-                new.split(|&b| b == 0)
-                    .filter(|f| !f.is_empty())
-                    .map(|f| ('A', String::from_utf8_lossy(f).into_owned())),
-            ),
-            Err(e) => return Judging::NoBase(e),
-        }
-    }
     let (mut changes, added_tests) = judged(&changed);
     args[1] = "--numstat";
     if let Ok(numstat) = git_bytes(root, &args) {
@@ -428,7 +439,12 @@ pub(crate) fn tree_hash(root: &Path) -> Result<String, String> {
             Err(String::from_utf8_lossy(&out.stderr).trim().to_owned())
         }
     };
-    let hash = run(&["add", "-A"]).and_then(|_| run(&["write-tree"]));
+    // From HEAD's files (with no cached stats, so every file is read again, and none of the
+    // real index's marks), then every change on disk: a tracked file stays tracked even if an
+    // exclude rule matches it, and only untracked files are left to the ignore rules.
+    let hash = run(&["read-tree", "HEAD"])
+        .and_then(|_| run(&["add", "-A"]))
+        .and_then(|_| run(&["write-tree"]));
     let _ = std::fs::remove_file(&tmp);
     match hash {
         Ok(h) if h.len() >= 40 => Ok(h),
@@ -580,7 +596,7 @@ mod tests {
     fn paths_come_whole_from_git_whatever_bytes_they_have() {
         // What `git diff --name-status -z` prints: no quotes, NUL between the fields.
         let z = "M\0tests/fir0/caf\u{e9}.fir\0D\0tests/a b\tc.fir\0A\0docs/x.md\0";
-        let got = name_status(z.as_bytes());
+        let got = name_status(z.as_bytes()).unwrap();
         assert_eq!(
             got,
             pairs(&[
@@ -599,6 +615,14 @@ mod tests {
             .iter()
             .find(|c| c.path.ends_with(".fir") && c.status == 'M');
         assert_eq!(caf.unwrap().lines, Some((3, 1)));
+    }
+
+    #[test]
+    fn a_path_that_is_not_utf8_is_not_judged() {
+        let mut z = b"M\0tests/fir0/".to_vec();
+        z.push(0xff);
+        z.extend_from_slice(b".fir\0");
+        assert!(name_status(&z).is_err());
     }
 
     #[test]

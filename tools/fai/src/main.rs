@@ -1301,6 +1301,28 @@ In a checkout, `cargo fai ...` (or `fai ...` in the dev shell) builds and runs i
 /// root, with its verdict as the exit status. It is its own harness (uv, the pinned Python), so
 /// this only gives it the one name every other check here has.
 fn gate(root: &Path, rest: &[String]) -> i32 {
+    // One gate at a time in a checkout, from before the harness starts until its report is
+    // stamped: the harness takes the same lock when run by itself, and is told it is held.
+    let lock_dir = root.join("target/fai");
+    let _ = std::fs::create_dir_all(&lock_dir);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_dir.join("gate.lock"));
+    let _lock = match lock {
+        Ok(f) => match f.try_lock() {
+            Ok(()) => f,
+            Err(_) => {
+                println!("gate: NOT RUN: another gate is running in this checkout");
+                return 2;
+            }
+        },
+        Err(e) => {
+            println!("gate: NOT RUN: target/fai/gate.lock: {e}");
+            return 2;
+        }
+    };
     // The harness prints the judging line above its verdict and keeps it in its report.
     let judging = judging::judging(root, None, None);
     let tree = judging::tree_hash(root).unwrap_or_default();
@@ -1332,6 +1354,7 @@ fn gate(root: &Path, rest: &[String]) -> i32 {
         .env("FAI_JUDGING_JSON", judging.json().to_string())
         .env("FAI_TREE", &tree)
         .env("FAI_RUN", &run)
+        .env("FAI_GATE_LOCK_HELD", "1")
         .status();
     let code = match status {
         Ok(s) => s.code().unwrap_or(1),

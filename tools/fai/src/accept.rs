@@ -136,7 +136,12 @@ pub(crate) fn verify_part(report: Option<&Value>, now: &str) -> Part {
             .next()
             .unwrap_or("?")
             .to_owned(),
-        passed: r["host_verification"] == Value::Bool(true),
+        // A full verification; a host verification only counts on the host it was made on,
+        // and only if that host has declared gaps.
+        passed: r["full_verification"] == Value::Bool(true)
+            || (r["host_verification"] == Value::Bool(true)
+                && r["host"] == json!(crate::host())
+                && crate::HOST_GAPS.iter().any(|g| g.0 == crate::host())),
         fresh: fresh(now, id["tree"].as_str(), id["tree_at_end"].as_str()),
     }
 }
@@ -535,10 +540,28 @@ fn sync_copy(root: &Path, tree: &Path) -> Result<(), String> {
     for f in list.stdout.split(|&b| b == 0).filter(|f| !f.is_empty()) {
         let rel = PathBuf::from(String::from_utf8_lossy(f).into_owned());
         let src = root.join(&rel);
-        if !std::fs::symlink_metadata(&src).is_ok_and(|m| m.is_file()) {
+        let Ok(meta) = std::fs::symlink_metadata(&src) else {
+            continue;
+        };
+        if meta.is_symlink() {
+            // A link in the tree (a fixture shared by two paths) is a link in the copy.
+            let to = std::fs::read_link(&src).map_err(|e| format!("{}: {e}", src.display()))?;
+            let dst = tree.join(&rel);
+            if std::fs::read_link(&dst).ok().as_deref() != Some(to.as_path()) {
+                if std::fs::symlink_metadata(&dst).is_ok_and(|m| m.is_dir()) {
+                    let _ = std::fs::remove_dir_all(&dst);
+                } else {
+                    let _ = std::fs::remove_file(&dst);
+                }
+                std::fs::create_dir_all(dst.parent().unwrap()).map_err(|e| e.to_string())?;
+                std::os::unix::fs::symlink(&to, &dst)
+                    .map_err(|e| format!("{}: {e}", dst.display()))?;
+            }
+        } else if meta.is_file() {
+            copy_if_different(&src, &tree.join(&rel))?;
+        } else {
             continue;
         }
-        copy_if_different(&src, &tree.join(&rel))?;
         keep.insert(rel);
     }
     // Files and links the copy has and the tree no longer does.
@@ -562,8 +585,11 @@ fn sync_copy(root: &Path, tree: &Path) -> Result<(), String> {
             }
         }
     }
-    // The Lean reference the tests compare with is the working tree's build.
-    if std::fs::symlink_metadata(&lake).is_err() {
+    // The Lean reference the tests compare with is this checkout's build, whatever an earlier
+    // copy linked to.
+    if std::fs::read_link(&lake).ok() != Some(root.join("spec/.lake")) {
+        let _ = std::fs::remove_file(&lake);
+        let _ = std::fs::remove_dir_all(&lake);
         std::os::unix::fs::symlink(root.join("spec/.lake"), &lake).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -602,10 +628,11 @@ fn put_base(root: &Path, tree: &Path, base: &str, files: &[String]) -> Result<()
 }
 
 /// Run the tests of `files` as they were at `base` against the tree as it is now, in a copy
-/// (`target/accept/tree`, built in its own `target/`). Each run puts back the base's version of
-/// only the files it speaks for, with every other file as it is now, so that a failure is laid
-/// on those files and on no other. The tests run as `fai verify` runs them: with their own
-/// counts of random programs, and with nothing between cargo and the test binaries.
+/// (`target/accept/tree`, built in its own `target/`): all of them as they were, together.
+/// Only if that fails, each failing run again with only its own files as they were, to say
+/// whose the failure is. The tests run as `fai verify full` runs them in debug: its counts of
+/// random programs, and nothing between cargo and the test binaries (the release build is
+/// not run again).
 ///
 /// Nothing runs the old tests against the old code: a test that failed at the base fails here
 /// too, and is laid on the change.
@@ -632,113 +659,133 @@ pub(crate) fn run_old_tests(root: &Path, base: &str, files: &[String]) -> OldTes
     if !reference.exists() {
         return gone();
     }
-    let (mut failed, mut passed, mut failures) = (Vec::new(), Vec::new(), Vec::new());
-    for (speaks_for, args) in old_test_commands(files) {
+    // First the tests as they were, all together: the verdict. A suite and its fixture that
+    // both changed run as they were together, as nowhere else.
+    if let Err(e) =
+        put_current(root, &tree, files).and_then(|()| put_base(root, &tree, base, files))
+    {
+        return OldTests::NotRun(e);
+    }
+    let commands = old_test_commands(files);
+    let mut failures = Vec::new();
+    let mut failed_runs = Vec::new();
+    for (speaks_for, args) in &commands {
+        match run_cargo(&tree, args) {
+            Err(e) => return OldTests::NotRun(e),
+            Ok(None) => {}
+            Ok(Some(found)) => {
+                failures.extend(found);
+                failed_runs.push((speaks_for.clone(), args.clone()));
+            }
+        }
+    }
+    if failed_runs.is_empty() {
+        return OldTests::Passed(files.to_vec());
+    }
+    if !reference.exists() {
+        return gone();
+    }
+    // Then whose they are: each failed run again with only its own files as they were. A run
+    // that fails alone is laid on its files; if none does, the failure is the files' together,
+    // and is laid on all of them.
+    let mut failed = Vec::new();
+    for (speaks_for, args) in &failed_runs {
         if let Err(e) =
-            put_current(root, &tree, files).and_then(|()| put_base(root, &tree, base, &speaks_for))
+            put_current(root, &tree, files).and_then(|()| put_base(root, &tree, base, speaks_for))
         {
             return OldTests::NotRun(e);
         }
-        eprintln!("accept: the tests as they were: cargo {}", args.join(" "));
-        let mut c = Command::new("cargo");
-        // Cargo's own target directory in the copy, as in a checkout: an old test may assume
-        // it (one did), and a failure here must be the change's.
-        c.args(&args)
-            .current_dir(&tree)
-            .env_remove("CARGO_TARGET_DIR")
-            .stdin(Stdio::null());
-        for v in crate::CLEARED {
-            c.env_remove(v);
+        match run_cargo(&tree, args) {
+            Err(e) => return OldTests::NotRun(e),
+            Ok(Some(_)) => failed.extend(speaks_for.iter().cloned()),
+            Ok(None) => {}
         }
-        for v in ["FIR_REQUIRE_FULL", "FIR_EVIDENCE", "FIR_EVIDENCE_RUN"] {
-            c.env_remove(v);
-        }
-        // A runner between cargo and the test binaries could skip them: none is inherited.
-        for (k, _) in std::env::vars() {
-            if k.starts_with("CARGO_TARGET_") && k.ends_with("_RUNNER") {
-                c.env_remove(k);
-            }
-        }
-        let out = match c.output() {
-            Ok(o) => o,
-            Err(e) => return OldTests::NotRun(format!("can't run cargo: {e}")),
-        };
-        if out.status.success() {
-            passed.extend(speaks_for);
-            continue;
-        }
-        if !reference.exists() {
-            return gone();
-        }
-        let text = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let found = test_failures(&text);
-        if found.is_empty() {
-            failures.push(format!("cargo {} failed", args.join(" ")));
-        }
-        failures.extend(found);
-        failed.extend(speaks_for);
     }
     if failed.is_empty() {
-        OldTests::Passed(passed)
-    } else {
-        OldTests::Failed {
-            files: failed,
-            passed,
-            failures,
+        failed = failed_runs
+            .iter()
+            .flat_map(|(f, _)| f.iter().cloned())
+            .collect();
+    }
+    failed.sort();
+    failed.dedup();
+    let passed: Vec<String> = files
+        .iter()
+        .filter(|f| !failed.contains(f))
+        .cloned()
+        .collect();
+    OldTests::Failed {
+        files: failed,
+        passed,
+        failures,
+    }
+}
+
+/// `cargo ARGS` in the copy, as `fai verify full` runs the tests: its counts of random
+/// programs, nothing inherited that changes them, and nothing between cargo and the test
+/// binaries. `None` when it passed, the failures when not.
+fn run_cargo(tree: &Path, args: &[String]) -> Result<Option<Vec<String>>, String> {
+    eprintln!("accept: the tests as they were: cargo {}", args.join(" "));
+    let mut c = Command::new("cargo");
+    // Cargo's own target directory in the copy, as in a checkout: an old test may assume it
+    // (one did), and a failure here must be the change's.
+    c.args(args)
+        .current_dir(tree)
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .stdin(Stdio::null());
+    for v in crate::CLEARED {
+        c.env_remove(v);
+    }
+    for v in ["FIR_REQUIRE_FULL", "FIR_EVIDENCE", "FIR_EVIDENCE_RUN"] {
+        c.env_remove(v);
+    }
+    for (k, v) in crate::FUZZ {
+        c.env(k, v);
+    }
+    for (k, _) in std::env::vars() {
+        if k.starts_with("CARGO_TARGET_") && k.ends_with("_RUNNER") {
+            c.env_remove(k);
         }
     }
+    let out = c.output().map_err(|e| format!("can't run cargo: {e}"))?;
+    if out.status.success() {
+        return Ok(None);
+    }
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut found = test_failures(&text);
+    if found.is_empty() {
+        found.push(format!("cargo {} failed", args.join(" ")));
+    }
+    Ok(Some(found))
 }
 
 /// One `fai accept` at a time in a checkout: two would share the copy the old tests run in.
-/// The lock is a file that names the process holding it, and is taken over when that process
-/// is gone.
-struct Lock(PathBuf);
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+/// An advisory lock on a file, held by the open file and released by the system when the
+/// process ends, however it ends.
+struct Lock(#[allow(dead_code)] std::fs::File);
 
 fn lock(root: &Path) -> Result<Lock, String> {
-    use std::io::Write as _;
     let dir = root.join("target/fai");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join("accept.lock");
-    for _ in 0..2 {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut f) => {
-                let _ = write!(f, "{}", std::process::id());
-                return Ok(Lock(path));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let holder = std::fs::read_to_string(&path).unwrap_or_default();
-                let alive = !holder.trim().is_empty()
-                    && Command::new("kill")
-                        .args(["-0", holder.trim()])
-                        .stderr(Stdio::null())
-                        .status()
-                        .is_ok_and(|s| s.success());
-                if alive {
-                    return Err(format!(
-                        "another `fai accept` is running in this checkout (process {})",
-                        holder.trim()
-                    ));
-                }
-                let _ = std::fs::remove_file(&path);
-            }
-            Err(e) => return Err(format!("{}: {e}", path.display())),
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    match f.try_lock() {
+        Ok(()) => Ok(Lock(f)),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            Err("another `fai accept` is running in this checkout".to_owned())
         }
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("{}: {e}", path.display())),
     }
-    Err(format!("{} can't be taken", path.display()))
 }
 
 /// Run this binary's `fai ARGS` and give its exit code.
@@ -789,9 +836,9 @@ pub(crate) fn accept(root: &Path, rest: &[String]) -> i32 {
     }
     let verify_code = fai(root, &verify_args);
     let report = read(&root.join("target/verify/report.json"));
-    let ours = report
-        .as_ref()
-        .is_some_and(|r| r["identity"]["tree"] == json!(tree));
+    let ours = report.as_ref().is_some_and(|r| {
+        r["identity"]["tree"] == json!(tree) && r["identity"]["tree_at_end"] == json!(tree)
+    });
     let flag = |k: &str| report.as_ref().is_some_and(|r| r[k] == json!(true));
     let verified = if verify_code == 0 && ours && flag("full_verification") {
         Verified::Full
@@ -805,8 +852,15 @@ pub(crate) fn accept(root: &Path, rest: &[String]) -> i32 {
         Gated::HostGap
     } else {
         eprintln!("accept: fai gate");
-        match fai(root, &["gate"]) {
-            0 => Gated::Pass,
+        let code = fai(root, &["gate"]);
+        // A pass counts only if its report is this tree's from start to end.
+        let r = read(&root.join("target/projbench/gate-report.json"));
+        let ours = r
+            .as_ref()
+            .is_some_and(|r| r["tree"] == json!(tree) && r["tree_at_end"] == json!(tree));
+        match code {
+            0 if ours => Gated::Pass,
+            0 => Gated::Fail,
             2 => Gated::NotRun,
             _ => Gated::Fail,
         }
@@ -895,10 +949,18 @@ mod tests {
     #[test]
     fn only_a_full_verification_and_a_whole_gate_pass() {
         let v = |verdict: &str, host: bool| {
-            json!({"verdict": verdict, "host_verification": host,
+            json!({"verdict": verdict, "host_verification": host, "full_verification": host,
                    "identity": {"tree": "aa", "tree_at_end": "aa"}})
         };
         assert!(verify_part(Some(&v("FULL VERIFICATION PASSED", true)), "aa").holds());
+        // Another host's verification, with its own gaps, is not this host's full one.
+        let mac = json!({"verdict": "HOST VERIFICATION PASSED ON aarch64-macos",
+                         "host_verification": true, "full_verification": false,
+                         "host": "aarch64-macos",
+                         "identity": {"tree": "aa", "tree_at_end": "aa"}});
+        if crate::host() != "aarch64-macos" {
+            assert!(!verify_part(Some(&mac), "aa").holds());
+        }
         // Fast mode never verifies, whatever it found.
         assert!(
             !verify_part(
