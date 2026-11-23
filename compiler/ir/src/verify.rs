@@ -1256,7 +1256,7 @@ impl<'a> FuncVerifier<'a> {
                 )?;
                 // A hole is lowered to a hole per scalar. One of a type without scalars would
                 // be lowered to nothing, and the program would run on where it stopped before.
-                if self.body.types().num_scalars(ty) == 0 {
+                if !self.body.types().has_scalar(ty) {
                     return verr(
                         loc,
                         format!(

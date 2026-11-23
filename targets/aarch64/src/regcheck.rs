@@ -846,8 +846,10 @@ pub fn validate<'a>(
 /// not done after 100 s). A checker must refuse such an input, not hang on it, and by counted
 /// work, not by time, so that the same input gets the same answer on every host.
 ///
-/// The default is 4096 units per instruction, which bounds the time by the function's size,
-/// and 2^29 units in all, which bounds the memory (the states kept take about a byte a unit).
+/// The default is 2^20 units and 4096 more per instruction, which bounds the time by the
+/// function's size, and 2^29 units in all, which bounds the memory (the states kept take about
+/// a byte a unit). The count is checked after every block visit, so a validation is refused at
+/// the first visit that takes it over.
 /// Compiling Lua and SQLite with `-O` (2,376 validations) needs at most 632 units per
 /// instruction and 17.6 million in all, for `luaV_execute`. With the promotion passes 13 of
 /// SQLite's functions need more than 4,000 per instruction, up to 169,774, and `luaV_execute`
@@ -995,18 +997,6 @@ fn check(
     while let Some(b) = work.pop() {
         visits += 1;
         state::spend_walk(input.block_range(b).len() + out.block_range(b).len());
-        if state::work() > limit {
-            return Err(format!(
-                "function {}: not validated: over budget ({} units of work on {} instructions; \
-                 the limit is {limit}: {} for each instruction, at most {}; \
-                 FIR_REGCHECK_BUDGET sets another)",
-                out.index,
-                state::work(),
-                input.insts.len(),
-                budget.per_inst,
-                budget.max
-            ));
-        }
         if visits > 64 * nb + 64 {
             return Err(format!(
                 "function {}: the dataflow doesn't settle",
@@ -1030,6 +1020,21 @@ fn check(
                 at_start[s] = Some(merged);
                 work.push(s);
             }
+        }
+        // After every visit, the last one too: nothing is accepted on more work than the
+        // budget, whichever block it ends in.
+        if state::work() > limit {
+            return Err(format!(
+                "function {}: not validated: over budget ({} units of work on {} instructions; \
+                 the limit is {limit}: {} and {} for each instruction, at most {}; \
+                 FIR_REGCHECK_BUDGET sets another)",
+                out.index,
+                state::work(),
+                input.insts.len(),
+                budget.base,
+                budget.per_inst,
+                budget.max
+            ));
         }
     }
     // The frame: outgoing arguments, locals, spill slots, then saves up to x29.

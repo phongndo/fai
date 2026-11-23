@@ -389,18 +389,28 @@ fn check_target(opts: &[&str]) -> Result<Option<(bool, fir::backend::aarch64::Op
     use fir::backend::aarch64 as a64;
     let mut target = None;
     let mut o = a64::Options::default();
+    let mut os_given = false;
     let mut it = opts.iter();
     while let Some(&opt) = it.next() {
         match (opt, it.next()) {
             ("--target", Some(&"aarch64")) => target = Some(false),
             ("--target", Some(&"x86_64")) => target = Some(true),
-            ("--os", Some(&"linux")) => o.os = a64::Os::Linux,
-            ("--os", Some(&"darwin")) => o.os = a64::Os::Darwin,
+            ("--os", Some(&"linux")) => (o.os, os_given) = (a64::Os::Linux, true),
+            ("--os", Some(&"darwin")) => (o.os, os_given) = (a64::Os::Darwin, true),
             _ => {
                 eprintln!("fir check: bad option '{opt}'");
                 return Err(ExitCode::from(2));
             }
         }
+    }
+    // As `fir compile` has it.
+    if target == Some(true) && os_given && o.os != a64::Os::Linux {
+        eprintln!("fir check: x86-64 output is for Linux only");
+        return Err(ExitCode::from(2));
+    }
+    if target.is_none() && os_given {
+        eprintln!("fir check: --os needs --target");
+        return Err(ExitCode::from(2));
     }
     Ok(target.map(|x86| (x86, o)))
 }

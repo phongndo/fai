@@ -373,6 +373,17 @@ impl Types {
         }
     }
 
+    /// Whether a value of type `t` has a scalar in it (Lean's `Ty.hasScalar`): a struct without
+    /// fields, an array of none, and structs and arrays of only those hold nothing. It counts
+    /// nothing, so no size can overflow it.
+    pub fn has_scalar(&self, t: Ty) -> bool {
+        match self.shape_of(t) {
+            Some(Shape::Struct(_, fs)) => fs.iter().any(|&f| self.has_scalar(f)),
+            Some(Shape::Array(n, e)) => n > 0 && self.has_scalar(e),
+            _ => true,
+        }
+    }
+
     /// How many scalars `t` becomes.
     pub fn num_scalars(&self, t: Ty) -> usize {
         match t {

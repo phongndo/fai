@@ -225,6 +225,9 @@ fn darwin_limit(e: &str) -> Option<&'static str> {
     .map(|(_, why)| why)
 }
 
+/// How an error of the reference selection begins ([`lfir_modules`]).
+const REFERENCE_SELECTION: &str = "the reference selection";
+
 /// The LFIR of a module, before and after register allocation, and after allocation with
 /// selection in the reference mode (`select_eager`: a register for every value, no operand
 /// folded), each verified. All three must run as the source does, so what the default
@@ -237,8 +240,8 @@ fn lfir_modules(m: &Module) -> Result<[Module; 3], String> {
     a64::allocate(m, &mut mm)?;
     let after = a64::lfir::to_module(m, &mm);
     fir::verify_module(&after).map_err(|e| format!("LFIR after allocation doesn't verify: {e}"))?;
-    let mut em = a64::select_eager(m).map_err(|e| format!("the reference selection: {e}"))?;
-    a64::allocate(m, &mut em).map_err(|e| format!("the reference selection: {e}"))?;
+    let mut em = a64::select_eager(m).map_err(|e| format!("{REFERENCE_SELECTION}: {e}"))?;
+    a64::allocate(m, &mut em).map_err(|e| format!("{REFERENCE_SELECTION}: {e}"))?;
     let eager = a64::lfir::to_module(m, &em);
     fir::verify_module(&eager)
         .map_err(|e| format!("LFIR of the reference selection doesn't verify: {e}"))?;
@@ -484,7 +487,9 @@ fn check_module(
         Ok(ms) => ms,
         Err(e) => {
             let mut t = tally.lock().unwrap();
-            match known_limit(&e) {
+            // A limit excuses a module the backend refuses. It doesn't excuse the reference
+            // selection alone: that one is reached only after the default compiled the module.
+            match known_limit(&e).filter(|_| !e.starts_with(REFERENCE_SELECTION)) {
                 Some(why) => t.count(format!("not compiled: {why}")),
                 None => {
                     t.fails.push(format!("{name}: not compiled: {e}"));
@@ -495,7 +500,7 @@ fn check_module(
         }
     };
     let files: Vec<PathBuf> = match lean {
-        Some(_) => ["vregs", "allocated"]
+        Some(_) => ["vregs", "allocated", "reference"]
             .iter()
             .zip(&modules)
             .map(|(stage, lm)| {
@@ -717,6 +722,19 @@ fn native_profiles_require_agreement_and_use_the_compiled_module() {
     assert!(native_profile(&optimized, "f", &args, 0, "returned i32 3").is_none());
 }
 
+/// Each fixture's scratch files are named by its path with `/` and `.` as `_`. The files run
+/// at once, so two paths with one name (`a/b.fir` and `a_b.fir`) would write over each other.
+fn unique_scratch_names(files: &[PathBuf]) {
+    let mut seen = std::collections::HashSet::new();
+    for f in files {
+        let stem = common::display_name(f).replace(['/', '.'], "_");
+        assert!(
+            seen.insert(stem.clone()),
+            "two fixtures share the scratch name {stem}: rename one"
+        );
+    }
+}
+
 #[test]
 fn fixtures_run_natively() {
     let ev = common::evidence::Evidence::new("aarch64_fixtures");
@@ -728,6 +746,7 @@ fn fixtures_run_natively() {
     // One fixture file per step, on every core: each file is compiled and run by itself.
     let modules = std::sync::atomic::AtomicU64::new(0);
     let files = common::fir_files();
+    unique_scratch_names(&files);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let one = |file: &Path| {
         let text = std::fs::read_to_string(file).unwrap();

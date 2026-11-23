@@ -426,6 +426,16 @@ fn fixtures_run_natively() {
     // One fixture file per step, on every core: each file is compiled and run by itself.
     let modules = std::sync::atomic::AtomicU64::new(0);
     let files = common::fir_files();
+    // The files run at once, each writing scratch files named by its path with `/` and `.` as
+    // `_`: two paths with one name would write over each other.
+    let mut seen = std::collections::HashSet::new();
+    for f in &files {
+        let stem = common::display_name(f).replace(['/', '.'], "_");
+        assert!(
+            seen.insert(stem.clone()),
+            "two fixtures share the scratch name {stem}: rename one"
+        );
+    }
     let next = std::sync::atomic::AtomicUsize::new(0);
     let one = |file: &Path| {
         let text = std::fs::read_to_string(file).unwrap();
