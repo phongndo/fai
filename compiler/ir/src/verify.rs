@@ -1254,6 +1254,18 @@ impl<'a> FuncVerifier<'a> {
                     || format!("the hole ?{}", self.body.hole_name(h)),
                     ty,
                 )?;
+                // A hole is lowered to a hole per scalar. One of a type without scalars would
+                // be lowered to nothing, and the program would run on where it stopped before.
+                if self.body.types().num_scalars(ty) == 0 {
+                    return verr(
+                        loc,
+                        format!(
+                            "the hole ?{} is of {}, which holds nothing: a hole stands for at least one scalar",
+                            self.body.hole_name(h),
+                            self.body.types().show(ty)
+                        ),
+                    );
+                }
                 self.holes.push(Hole {
                     name: self.body.hole_name(h).to_owned(),
                     ty,

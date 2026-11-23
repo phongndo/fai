@@ -160,6 +160,14 @@ def checkValueTy (loc : Option Loc) (t : Ty) : VM Unit := do
   checkTy loc t
   unless (← get).layer.valueTy t && !t.hasVaList do verr loc s!"{t} is not a value type"
 
+/-- Whether a value of type `t` has a scalar in it, which is whether lowering turns it into
+anything (`Lower.scalars` is nonempty): a struct without fields, an array of none, and structs
+and arrays of only those hold nothing. -/
+partial def Ty.hasScalar : Ty → Bool
+  | .struct _ fs => fs.any Ty.hasScalar
+  | .array n e => n > 0 && e.hasScalar
+  | _ => true
+
 /-- Outside HFIR a struct or an array is a value only where calls pass it whole (decision:
 Aggregates): a function's parameters and results, a call's arguments and results, `va.arg`, and
 `agg.*`. A region's state stays scalar there, which is all the lowering produces and all a
@@ -210,6 +218,10 @@ def operandTy (loc : Option Loc) (scope : VScope) : Operand → VM Ty
   | .hole n t => do
     checkValueTy loc t
     checkScalarState loc s!"the hole ?{n}" t
+    -- A hole is lowered to a hole per scalar. One of a type without scalars would be lowered
+    -- to nothing, and the program would run on where it stopped before.
+    unless t.hasScalar do
+      verr loc s!"the hole ?{n} is of {t}, which holds nothing: a hole stands for at least one scalar"
     modify fun s => { s with holes := s.holes.push { name := n, ty := t, loc } }
     pure t
 
