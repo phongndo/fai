@@ -79,7 +79,7 @@ def claims : List Claim := [
   { name := ``Fir.Slot.load_keeps, role := "promotion: one op (mem2reg is not proved)",
     summary := "A scalar load through any pointer changes no allocation's bytes, no scope, and not the memory space." },
   { name := ``Fir.Slot.fresh_tracks, role := "promotion: one op (mem2reg is not proved)",
-    summary := "At a promoted field's type (whole-byte integers, pointers, floats), the poison op gives one value of that type without changing the core, and fresh bytes are its encoding: a field nothing was stored to holds poison." },
+    summary := "At a promoted field's type (whole-byte integers, pointers, floats), the poison op gives one value of that type without changing the core, and bytes never written (an empty map) read as its encoding. That a newly made slot has no bytes under its id is not proved here." },
   { name := ``Fir.CopyProp.refines, role := "pass correctness",
     summary := "Copy propagation through straight-line code (up to the first op with regions or a call) refines the function, if the source is Decided." },
   { name := ``Fir.Lower.Proof.Expand.refines, role := "lowering correctness",

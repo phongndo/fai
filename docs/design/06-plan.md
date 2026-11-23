@@ -37,6 +37,14 @@ B and S are independent and both are in the tested tier already (instruction sel
 allocation have no proofs to keep), so neither changes what is proved. P1 was done first
 because it is cheap and sizes the rest; P2 to P6 wait for checkpoint 1.
 
+**How the targets add up.** The gates of S and of checkpoint 1 are minimums for going on, and
+they don't reach item 2 by themselves: S at 1.3× with promotion at the checkpoint's 10% is
+1.17× GCC `-O0` on Lua. Item 2 needs promotion to do on these programs what it does on the
+corpus once its values are in registers (32% fewer: 1.3× becomes 0.88×), or S to end nearer
+1.1×. Neither is measured yet: S's rules were counted on the 12 kernels, not on Lua. So item 2
+is the round's target and may be reported as missed, with the number, the way 04's "Round
+status" reports its items.
+
 ## Checkpoints and the stop rule
 
 1. **After B: promotion pays.** `fcc-promo` executes at least 10% fewer instructions than
@@ -74,9 +82,10 @@ The baseline's findings, in the order they cost:
   intervals at region boundaries (or allocate per region with one home per value across
   them), and prefer the promoted values of the innermost loop.
 - **The validator's cost.** `aarch64.regcheck` takes 36 s of CPU time in `sqlite3.c`'s 20 s
-  compile, and `lvm.c` doesn't finish in 4.5 minutes and 7.5 GiB. Profile it on the promoted
-  `luaV_execute` first; the likely cause is that every omitted `mov` adds the destination to
-  each location's set of values, which never shrinks. Dropping values that are dead in the
+  compile, and `lvm.c` doesn't finish in 4.5 minutes and 7.5 GiB; one stack sample of it is
+  in `State::join`. Profile it on the promoted `lvm.c` first; the likely cause, not
+  established, is that every omitted `mov` adds the destination to each location's set of
+  values, which never shrinks, and every join copies the sets. Dropping values that are dead in the
   input needs a liveness pass over the input, and must not change a verdict: the differential
   run of [compile-speed.md](../performance/compile-speed.md) (186,468 validations, identical
   verdicts and messages) is the check.
@@ -105,8 +114,8 @@ phases that match what the pass does to the cores:
 
 | Step | What | Size | Status |
 |---|---|---|---|
-| P1 | **One op on a slot** (parts 2 and 3 of the argument): a load of a tracked field gives the tracked value and changes nothing; a store sets it and keeps the other fields; no load and no store elsewhere changes it; a fresh slot holds `poison` | `Fir/Slot.lean`, 313 lines | **done**: four registered claims |
-| P2 | **Nothing else reaches the slot** (part 1): an invariant `Private a` of the core (no scope on `a`, no exposed tag of `a`, no byte in memory and no global address whose pointer reaches `a`) and of the stack (only the slot's own names hold a pointer to `a`), kept by every core computation whose operands don't reach `a` and by every step of the machine, with the slot's bytes unchanged | estimate: 1,500 to 3,000 lines. `Fir.Space` proves a much simpler fact (the space is fixed) for the same 49 named computations and the control layer in 586 lines; this one needs a postcondition per computation ("the result doesn't reach `a`") | next |
+| P1 | **One op on a slot** (parts 2 and 3 of the argument): a load of a tracked field gives the tracked value and changes nothing; a store sets it and keeps the other fields; no load and no store elsewhere changes it; bytes never written are `poison`'s encoding | `Fir/Slot.lean`, 313 lines | **done**: four registered claims |
+| P2 | **Nothing else reaches the slot** (part 1): an invariant `Private a` of the core (no scope on `a`, no exposed tag of `a`, no byte in memory and no global address whose pointer reaches `a`) and of the stack (only the slot's own names hold a pointer to `a`), kept by every core computation whose operands don't reach `a` and by every step of the machine, with the slot's bytes unchanged. Also that a new allocation's id has no bytes yet (the keys of `mem` are among those of `allocs`), which P1's `fresh_tracks` assumes | estimate: 1,500 to 3,000 lines. `Fir.Space` proves a much simpler fact (the space is fixed) for the same 49 named computations and the control layer in 586 lines; this one needs a postcondition per computation ("the result doesn't reach `a`") | next |
 | P3 | **Forwarding in one region**: the simulation for a slot whose accesses are in straight-line code, with any ops between them | estimate: 500 to 800 lines, on P2 | |
 | P4 | **Threading** (part 4): values through `cf.if` results, loop parameters, and block parameters, where live. The rewritten ops contain rewritten regions, which `OpsRel` doesn't relate today | estimate: 1,000 to 2,000 lines; the least certain | |
 | P5 | **Store deletion**: cores equal except in the slot's bytes. Needs P2 in relational form (two runs that differ only in `a`'s bytes stay so), which is why P2 should be proved that way once | estimate: 500 to 1,000 lines | |
@@ -187,8 +196,9 @@ pipeline: `fcc-m2r`, `fcc-promo`) and `--plain` (files those compile with `-O`).
   and not the space. `store_elsewhere`: a store that resolves to another allocation leaves this
   one's bytes and the scopes.
 - `Slot.fresh_tracks`: at a field's type (`Slot.Field`: whole-byte integers, pointers,
-  floats), the `poison` op gives one value of that type without changing the core, and fresh
-  bytes are its encoding.
+  floats), the `poison` op gives one value of that type without changing the core, and bytes
+  never written (an empty map) read as its encoding. That a newly made slot has no bytes
+  under its id is not proved: it is P2's.
 
 These are single ops under hypotheses the simulation will have to supply (`Quiet`, and where
 each pointer points). They say nothing yet about a program.

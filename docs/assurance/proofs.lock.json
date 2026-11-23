@@ -2672,7 +2672,7 @@
    "axioms": ["propext", "Classical.choice", "Quot.sound"]},
   "Fir.Slot.fresh_tracks":
   {"summary":
-   "At a promoted field's type (whole-byte integers, pointers, floats), the poison op gives one value of that type without changing the core, and fresh bytes are its encoding: a field nothing was stored to holds poison.",
+   "At a promoted field's type (whole-byte integers, pointers, floats), the poison op gives one value of that type without changing the core, and bytes never written (an empty map) read as its encoding. That a newly made slot has no bytes under its id is not proved here.",
    "statement_hash": "000000009655b26c",
    "statement":
    "∀ {loc : Option Fir.Loc} {r : Fir.Result} {c c' : Fir.Core} {vs : List Fir.RVal},\n  Fir.Slot.Field r.ty →\n    Fir.evalSimple loc Fir.OpKind.poison [r] [] c = Except.ok (vs, c') →\n      ∀ (off : Nat),\n        ∃ v,\n          vs = [v] ∧\n            c' = c ∧\n              v.hasTy r.ty = true ∧\n                Fir.readBytes ∅ off (Fir.Ty.size c.space r.ty) = Fir.RVal.encode c.space v",

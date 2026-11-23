@@ -13,8 +13,10 @@ simulation still to be written.
    store to one field leaves the others as they were (`store_keeps`). So does a store through
    a pointer into another allocation (`store_elsewhere`), and so does every load
    (`load_keeps`).
-3. *Before any store, a field holds `poison`* (`fresh_tracks`): fresh bytes are the encoding of
-   the value the `poison` op gives.
+3. *Before any store, a field holds `poison`* (`fresh_tracks`): bytes never written are the
+   encoding of the value the `poison` op gives. That a newly made slot has no bytes under its
+   id (ids are fresh, and `mem` holds bytes only for allocations) is an invariant of whole
+   runs too, and not proved here.
 
 The facts hold for an allocation no active `noalias` or `readonly` scope watches (`Quiet`): an
 access to it then records nothing, so a load leaves the core exactly as it was and a store
@@ -24,8 +26,8 @@ part of fact 1.
 
 A field is *tracked* at `v` when its bytes are `v`'s encoding:
 `readBytes (c.mem.getD a ∅) off (T.size c.space) = v.encode c.space`. The three theorems say
-how each op moves that equation: a fresh slot starts it at `poison`, a store sets it, and a load
-reads it back without changing anything.
+how each op moves that equation: bytes never written start it at `poison`, a store sets it, and
+a load reads it back without changing anything.
 -/
 
 namespace Fir.Slot
@@ -284,9 +286,10 @@ theorem load_keeps {loc : Option Loc} {T : Ty} {A : Nat} {p : Option Ptr} {c c' 
 
 /-! ## A fresh slot -/
 
-/-- **A fresh slot holds `poison`.** At a field type, the `poison` op gives one value of that
-type and leaves the core alone, and that value's encoding is what fresh bytes read as. So a
-field nothing was stored to is tracked at `poison`. -/
+/-- **Bytes never written are `poison`'s encoding.** At a field type, the `poison` op gives one
+value of that type and leaves the core alone, and that value's encoding is what an allocation
+with no bytes reads as. So a field of a slot with no bytes yet is tracked at `poison`; that a
+newly made slot has none is not shown here. -/
 theorem fresh_tracks {loc : Option Loc} {r : Result} {c c' : Core} {vs : List RVal}
     (hT : Field r.ty) (e : evalSimple loc .poison [r] [] c = .ok (vs, c')) (off : Nat) :
     ∃ v, vs = [v] ∧ c' = c ∧ v.hasTy r.ty = true ∧

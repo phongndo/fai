@@ -176,7 +176,7 @@ A scalar load through any pointer changes no allocation's bytes, no scope, and n
 
 ## `Fir.Slot.fresh_tracks` (promotion: one op (mem2reg is not proved))
 
-At a promoted field's type (whole-byte integers, pointers, floats), the poison op gives one value of that type without changing the core, and fresh bytes are its encoding: a field nothing was stored to holds poison.
+At a promoted field's type (whole-byte integers, pointers, floats), the poison op gives one value of that type without changing the core, and bytes never written (an empty map) read as its encoding. That a newly made slot has no bytes under its id is not proved here.
 
 ```lean
 ∀ {loc : Option Fir.Loc} {r : Fir.Result} {c c' : Fir.Core} {vs : List Fir.RVal},

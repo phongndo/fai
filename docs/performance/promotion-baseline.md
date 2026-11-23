@@ -19,10 +19,11 @@ Every number comes from `benchmarks/projects/projbench.py`; the commands are at 
   - SQLite outside `sqlite3VdbeExec`: 2.5% fewer.
   - `sqlite3VdbeExec`, SQLite's bytecode interpreter: **5.6× more** (1,389M to 7,790M), which
     makes speedtest1 as a whole 2.2× slower than with `-O`.
-- **Lua's interpreter loop does not compile with promotion.** `fcc` on `lvm.c` was stopped after
-  4.5 minutes at 7.5 GiB and growing (0.33 s and 87 MiB with `-O`). `mem2reg` itself takes
-  0.03 s; the time is in register allocation and its validator. The Lua numbers here are
-  therefore with `lvm.c` compiled by `fcc -O` in every configuration.
+- **Lua's interpreter loop does not compile with promotion.** `fcc` on `lvm.c` takes 0.45 s and
+  142 MiB with `-O`. With `fcc-m2r` it was stopped after 4.5 minutes at 7.5 GiB and growing,
+  and with `fcc-promo` at 120 s and 2.9 GiB. `mem2reg` itself takes 0.03 s; a stack sample
+  40 s into the compile is in the allocation validator, joining block states. The Lua numbers
+  here are therefore with `lvm.c` compiled by `fcc -O` in every configuration.
 - **SQLite compiles 14× slower with promotion**: `sqlite3.c` takes 20.5 s and 1.6 GiB against
   1.4 s and 253 MiB. The allocation validator (`aarch64.regcheck`) is 36 s of CPU time there.
 - **Where `-O` stands:** `fcc -O` executes 2.27× GCC `-O0`'s instructions on Lua and 1.16× on
@@ -106,7 +107,9 @@ validator (`aarch64.regcheck`) takes 36.3 s of CPU time over its worker threads 
 into 3.9 MB, because every branch of every `switch` now carries the promoted values as block
 arguments. Instruction selection takes 0.06 s and gives 324,066 lines of LFIR against 54,597
 without promotion (54,724 `mov`s against 6,328). `fir compile` of that module was stopped at
-120 s and 3 GiB; `fcc` on the C file at 4.5 minutes and 7.5 GiB.
+120 s and 3 GiB (0.33 s and 87 MiB for the module without promotion). One stack sample of it
+under gdb, 40 s in: the main thread waits for the allocation workers, and the one worker
+still running is in `regcheck::validate`, in `State::join`, copying a state's chunks.
 
 Lua's objects are 9% smaller with promotion (518,748 bytes of `.text` against 569,252, with
 `lvm.c`'s `-O` object in both); SQLite's are 44% larger.
@@ -119,11 +122,11 @@ Lua's objects are 9% smaller with promotion (518,748 bytes of `.text` against 56
    intervals (or allocate per region) so a value live across a large function isn't spilled
    everywhere. Both are in the unproved allocator, whose every output the validator checks.
 2. **The validator must scale on promoted code.** It takes 36 s of CPU time in SQLite's 20 s
-   compile, and `lvm.c` does not finish. [c-baseline.md](c-baseline.md#3-the-register-allocation-validator-is-quadratic-compile-time)
+   compile, and `lvm.c` does not finish: its one sample is in the validator's join. [c-baseline.md](c-baseline.md#3-the-register-allocation-validator-is-quadratic-compile-time)
    named its cost before promotion made it bite: its state is a set of values per location,
-   per block. A likely cause of the growth here, not yet confirmed by a profile: a `mov` the
-   output left out makes the destination live wherever the source does, so the sets grow with
-   every block-parameter move.
+   per block. A likely cause of the growth here, which one sample doesn't establish: a `mov`
+   the output left out makes the destination live wherever the source does, so the sets grow
+   with every block-parameter move, and every join copies them.
 3. **Compare against `-O` per function, not per corpus.** A gate for moving promotion into `-O`
    needs these two programs: the corpus alone said 32% better.
 
@@ -138,11 +141,14 @@ $P build --reps 1 --configs $C    # objects, binaries, compile times, sizes: bui
 $P check --configs $C             # Lua's suite, the Lua workloads, speedtest1 --verify: check.json
 $P count --configs $C             # executed instructions under qemu: count.json
 
-# lvm.c with promotion (stop it by hand): the same command without --plain, or
+# lvm.c with promotion (stop it by hand): the same commands without --plain, or
 build/fcc/fcc target/projbench-promo/src/lua-5.4.7/src/lvm.c -std=c23 -DLUA_COMPAT_5_3 \
   -DLUA_USE_POSIX --emit mfir -o lvm.mfir
 target/release/fir opt lvm.mfir --passes mem2reg,fwd,copyprop,dse,dce --experimental > lvm.promoted.mfir
 FIR_TIME=1 target/release/fir compile lvm.promoted.mfir --emit asm > /dev/null
+# where it is, 40 s in (gdb as the parent: ptrace_scope is 1 here)
+timeout -s INT 40 gdb -q -batch -ex "set args compile lvm.promoted.mfir --emit asm > /dev/null" \
+  -ex run -ex 'thread apply all bt 9' target/release/fir
 ```
 
 `--configs` replaces projbench's configurations for `build`, `check`, and `count` (`report` and
