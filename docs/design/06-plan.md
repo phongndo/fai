@@ -12,6 +12,12 @@ It starts from a measurement, not from the proof
 experimental pipeline is correct and does not pay. So the order below is "make it pay, then
 prove it", with a stop rule after each.
 
+Two gaps are in play, and the work below closes them separately. The **speed gap** is fcc's
+code against GCC `-O0`'s: instruction selection (track S) closes most of it, and does so
+without any proved pass. The **thesis gap** is that the proved passes are not the ones that
+make code fast: only promotion proved and in `-O` (track P) closes that. S alone would leave
+the project with a faster compiler and the same thesis gap.
+
 ## Done when
 
 1. `mem2reg` is in `-O`, and every pass in `-O` still has a Lean refinement proof registered in
@@ -29,27 +35,55 @@ prove it", with a stop rule after each.
 |---|---|---|---|
 | Z: Baseline | Promotion on Lua and SQLite: behavior, instructions, compile time | **done**: [promotion-baseline.md](../performance/promotion-baseline.md) | — |
 | B: Make promotion pay | The allocator gives promoted values registers, or one home each; the validator scales on promoted code | checkpoint 1, below | Z |
-| S: Selection | The local rules [c-baseline.md](../performance/c-baseline.md#2-instruction-selection-one-op-at-a-time-generated-code) lists: immediates, compare-and-branch, no-op and repeated extensions, scaled indices | `fcc -O`, without promotion, executes at most 1.3× GCC `-O0`'s instructions on Lua | — |
+| S: Selection | The local rules [c-baseline.md](../performance/c-baseline.md#2-instruction-selection-one-op-at-a-time-generated-code) lists: immediates, compare-and-branch, no-op and repeated extensions, constant offsets and scaled indices in addresses. A jump table for `cf.switch` is parked (step 10) | `fcc -O`, without promotion, executes at most 1.3× GCC `-O0`'s instructions on Lua | step 1 |
 | P: Promotion proved | `mem2reg`'s rewrite relation refines, in Lean, and the Rust pass is bound to it | `Fir.Promote.refines` (or a checker's soundness) is a registered claim with no hypothesis beyond the other passes' (`Decided` source, one function, a fixed module); P1 is **done** | P2 onward: checkpoint 1 |
 | V: Validator proved | `regcheck::validate` against `Fir.AArch64Machine` (obligation 1 of [assurance](../assurance/README.md#remaining-obligations)) | acceptance implies LFIR refinement, registered | B (which changes the validator's state) |
 
-B and S are independent and both are in the tested tier already (instruction selection and
-allocation have no proofs to keep), so neither changes what is proved. P1 was done first
-because it is cheap and sizes the rest; P2 to P6 wait for checkpoint 1.
+B and S are both in the tested tier already (instruction selection and allocation have no
+proofs to keep), so neither changes what is proved, and they touch different files
+(`isel.rs`; `regalloc.rs` and `regcheck`). They are not independent in what they measure: S
+makes `-O` faster, which is what checkpoint 1 compares promotion with, so the baseline is
+measured again between them (step 6). P1 was done first because it is cheap and sizes the
+rest; P2 to P6 wait for checkpoint 1.
+
+## Next steps, in order
+
+Each step is one piece of work with a test that passes or fails. Steps 1 to 4 are probes: small,
+and they decide the order and size of the rest, so they come before any larger work on a
+compiler that checkpoint 1 may stop. None is started.
+
+| # | Step | Test | Feeds |
+|---|---|---|---|
+| 1 | **Lua's instructions by form.** Run the per-address plugin (`benchmarks/c/hist.c`, which `bench.py` uses on the corpus) on the 7 Lua workloads and name each form by function, as c-baseline's table does for the kernels. The baseline has them by mnemonic only | a table that attributes at least 80% of fcc `-O`'s 649M excess over GCC `-O0` to forms | step 5's rules and their order |
+| 2 | **Where `-O`'s extra stack traffic comes from.** fcc `-O` makes 301M stack accesses on Lua against GCC `-O0`'s 187M | the 114M split into spill code, the frontend's own slots, and call setup, in `luaV_execute` and outside it | if it is spills, step 8 pays for `-O` itself and moves ahead of step 5 |
+| 3 | **Profile the validator on promoted code**: `sqlite3.c` with `fcc-promo` (20 s) and the promoted `lvm.c` (doesn't finish) | where the time and the memory go, by function, with the sizes of the sets per location over the walk | step 7 |
+| 4 | **One dispatch block for computed `goto`.** fcc emits a `switch` over every address-taken label at each `goto *` (`frontends/c/src/Lower.cpp`, `IndirectGotoStmt`), so `luaV_execute` has an edge from every case to every case. Jump to one block that switches. A hypothesis: it should cut the edges promotion threads values over, and the code | `lvm.c` with `fcc-promo` compiles within twice `-O`'s time and memory; Lua's suite passes; `-O`'s instructions on Lua don't go up | whether checkpoint 1 can be measured on Lua at all. It can't help SQLite, whose loop is a plain `switch` |
+| 5 | **Selection rules that need no new op** (track S), cheapest first by step 1's table: drop the no-op extension, use immediates, branch on a compare's flags, don't extend what is already extended, fold constant offsets into loads and stores, shift instead of multiplying by a power of two | each rule: the corpus and both projects behave the same, and Lua's instructions go down; all: track S's gate | Done when 2 |
+| 6 | **Measure the baseline again**: `-O` and both promotion pipelines on Lua and SQLite, at the revision after step 5 | promotion-baseline's tables, again | checkpoint 1's denominator |
+| 7 | **The validator scales** (track B), by what step 3 finds | `sqlite3.c` and `lvm.c` with `fcc-promo` within twice `-O`'s compile time and memory; the differential run's verdicts and messages identical | checkpoint 1 |
+| 8 | **The allocator gives promoted values homes** (track B): one home for a block parameter and its arguments, and intervals split at region boundaries | checkpoint 1 | — |
+| | **Checkpoint 1**: go on, or stop the round | below | |
+| 9 | **P2 to P6** (track P): promotion proved, bound to the Rust pass, and in `-O` | checkpoint 2, then Done when 1 | |
+| 10 | **A jump table for `cf.switch`**: the one selection item that needs a new LFIR op (an indirect branch) with Lean semantics, both interpreters, and the emitter. Its ceiling on Lua is about 10% of fcc's instructions: every `b.eq`, `b.cs`, and `cmp` together is 117M of 1,135M, and some of those are ordinary branches | Lua's instructions down, and track S's gate still met | parked until after checkpoint 1 |
+| 11 | **Track V**: the validator proved | its track's | after steps 7 and 8 settle its state |
+
+Steps 5 and 7 to 8 can run side by side. Steps 1 to 4 are the next thing to do.
 
 **How the targets add up.** The gates of S and of checkpoint 1 are minimums for going on, and
 they don't reach item 2 by themselves: S at 1.3× with promotion at the checkpoint's 10% is
 1.17× GCC `-O0` on Lua. Item 2 needs promotion to do on these programs what it does on the
 corpus once its values are in registers (32% fewer: 1.3× becomes 0.88×), or S to end nearer
-1.1×. Neither is measured yet: S's rules were counted on the 12 kernels, not on Lua. So item 2
-is the round's target and may be reported as missed, with the number, the way 04's "Round
-status" reports its items.
+1.1×. Neither is measured yet: on Lua the excess is known by mnemonic
+([promotion-baseline.md](../performance/promotion-baseline.md#where-luas-instructions-go-with--o)),
+and by form only for the 12 kernels (step 1). So item 2 is the round's target and may be
+reported as missed, with the number, the way 04's "Round status" reports its items.
 
 ## Checkpoints and the stop rule
 
-1. **After B: promotion pays.** `fcc-promo` executes at least 10% fewer instructions than
-   `fcc -O` on each of Lua (its 7 workloads' geometric mean, with `lvm.c` promoted) and
-   speedtest1, no more than `-O` in `sqlite3VdbeExec` and `luaV_execute`, and compiles
+1. **After steps 4 to 8: promotion pays.** `fcc-promo` executes at least 10% fewer instructions
+   than `fcc -O` at the same revision (so with track S's rules in both) on each of Lua (its 7
+   workloads' geometric mean, with `lvm.c` promoted) and speedtest1, no more than `-O` in
+   `sqlite3VdbeExec` and `luaV_execute`, and compiles
    `lvm.c` and `sqlite3.c` within twice `-O`'s time and memory. **If it doesn't**, with
    coalescing and split intervals both in, stop the round here: promotion as designed isn't
    worth its proof, and the proof budget goes unspent. What is then worth keeping is the
@@ -89,9 +123,7 @@ The baseline's findings, in the order they cost:
   input needs a liveness pass over the input, and must not change a verdict: the differential
   run of [compile-speed.md](../performance/compile-speed.md) (186,468 validations, identical
   verdicts and messages) is the check.
-- **A gate that sees it.** `fai experiment` measures the `.fir` corpus, which said promotion was
-  32% better. Before promotion moves into `-O`, an experiment must also build and count Lua
-  and SQLite (`projbench.py --configs`, which this round's baseline added).
+- **A gate that sees it**: under [Improvements outside the tracks](#improvements-outside-the-tracks).
 
 A cheaper stopgap exists and is not the plan: have `mem2reg` skip slots it would thread through
 a `cf.blocks` with many blocks. It would hide the regression and give up the interpreter
@@ -153,6 +185,22 @@ Read from the semantics while sizing it:
   promoted slot never gets one (its pointer is only loaded and stored through), so it doesn't
   move the others: needed for P5, where the slot's bytes differ.
 
+## Improvements outside the tracks
+
+Found while measuring. Each is small, and none is started.
+
+- **A gate that includes real programs.** `fai experiment` judges a change on the `.fir` corpus,
+  which said promotion was 32% better. Give it a mode that also builds, checks, and counts Lua
+  and SQLite (`projbench.py` with `--configs`, which the baseline added), and require it before
+  any pass moves into `-O`. Done when an experiment on today's promotion pipeline comes out
+  `REGRESSED` on speedtest1 instead of `IMPROVED`.
+- **A `bN` argument's fragments** ([What P2 has to face](#what-p2-has-to-face)): whether an
+  external function reaches the allocation of a pointer whose bytes it is given as a top-level
+  `bN` argument. Today's semantics says no; native code can. **The owner's decision**: change
+  `RVal.pairs`, or record that the model is meant so.
+- **The decision log's "Next round" row** still names the C round. **The owner's decision**:
+  point it at this plan, or elsewhere.
+
 ## Alternatives not taken
 
 Recorded for the owner; none is decided here.
@@ -178,6 +226,12 @@ interpreter loop, 2.5% fewer in SQLite outside `sqlite3VdbeExec`, and 5.6× more
 `lvm.c` does not compile with it in practical time and `sqlite3.c` takes 14× longer.
 `projbench.py` gained `--configs` (any of its configurations, and fcc with an experimental
 pipeline: `fcc-m2r`, `fcc-promo`) and `--plain` (files those compile with `-O`).
+
+### Lua's instructions with `-O` (measured)
+
+[promotion-baseline.md](../performance/promotion-baseline.md#where-luas-instructions-go-with--o):
+by mnemonic over the 7 workloads, with `luaV_execute` at 782M of fcc's 1,135M. It is what
+steps 1, 2, and 10 start from. No selection rule has been written.
 
 ### Track P1: one op on a slot (done)
 

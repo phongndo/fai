@@ -87,6 +87,46 @@ With promotion, speedtest1's most executed instructions are `mov` (3,398M, from 
 from none in the first ten): moves between spill slots, and the addresses of slots too far from
 `sp` for an immediate.
 
+## Where Lua's instructions go with `-O`
+
+From the same `count` run, summed over the 7 Lua workloads, the project's own code: fcc `-O`
+executes 1,135M instructions, GCC `-O0` 486M, Clang `-O0` 480M, GCC `-O2` 187M. `luaV_execute`
+is 782M of fcc's and 313M of GCC `-O0`'s.
+
+By mnemonic, as objdump names it (millions; fcc's 16 most executed, then `br`):
+
+| | fcc-O | gcc-O0 | clang-O0 |
+|---|---:|---:|---:|
+| `ldr` | 209.9 | 151.3 | 145.8 |
+| `mov` | 188.4 | 30.4 | 10.8 |
+| `add` | 133.6 | 28.9 | 34.4 |
+| `str` | 99.7 | 63.4 | 60.6 |
+| `ubfx` | 99.0 | 0.0 | 0.0 |
+| `cmp` | 56.8 | 36.9 | 0.0 |
+| `b.eq` | 42.1 | 15.5 | 9.0 |
+| `cset` | 32.8 | 7.8 | 7.0 |
+| `tst` | 26.5 | 0.0 | 0.0 |
+| `mul` | 26.0 | 0.1 | 0.0 |
+| `asr` | 25.6 | 0.2 | 0.0 |
+| `sxtw` | 24.4 | 3.1 | 0.0 |
+| `and` | 19.7 | 35.8 | 17.3 |
+| `b` | 19.3 | 13.2 | 31.9 |
+| `b.cs` | 18.5 | 0.0 | 0.0 |
+| `ldur` | 15.3 | 0.0 | 35.8 |
+| `br` | 0.0 | 4.1 | 3.8 |
+
+- **These are mnemonics, not selection rules.** `mov` is constants and register copies both,
+  and `add` is arithmetic and addresses, so a row's excess is not what one rule would save.
+  [c-baseline.md](c-baseline.md#2-instruction-selection-one-op-at-a-time-generated-code) has the
+  table by form for the 12 kernels; the one for Lua is not made yet
+  ([06-plan.md](../design/06-plan.md#next-steps-in-order), step 1).
+- **Stack traffic.** fcc `-O` makes 194M loads and 107M stores to the stack, GCC `-O0` 127M and
+  60M, Clang `-O0` 156M and 69M; every build makes about 47M loads and 13M stores elsewhere.
+  Whether fcc's extra 114M are spills or the frontend's own slots is not measured (step 2).
+- **Dispatch.** GCC and Clang execute `br` 4.1M and 3.8M times: Lua's computed `goto`. fcc
+  executes none. It compiles each `goto *` to a `switch` over every label whose address is
+  taken, and a `switch` to a tree of compares (`switch_tree` in `isel.rs`).
+
 ## Compile time and size
 
 | `sqlite3.c` | wall | peak RSS | `.text` bytes |
