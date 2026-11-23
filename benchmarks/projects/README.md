@@ -12,6 +12,7 @@ uv run benchmarks/projects/projbench.py build              # compile times, size
 AROCC=/path/to/arocc uv run benchmarks/projects/projbench.py frontend
 uv run benchmarks/projects/projbench.py check              # behavior under qemu-aarch64
 uv run benchmarks/projects/projbench.py count              # executed instructions under qemu
+uv run benchmarks/projects/projbench.py forms              # the same, each instruction named by form
 AROCC=/path/to/arocc uv run benchmarks/projects/projbench.py c23
 uv run benchmarks/projects/projbench.py time --ssh MAC --docker alpine:3.22 \
     --docker-bin '/usr/local/bin/docker --context desktop-linux'   # native AArch64, as cbench
@@ -46,6 +47,15 @@ uv run benchmarks/projects/projbench.py report             # target/projbench/re
 - **Instructions:** `count` runs every workload under qemu with cbench's plugin
   (`insn_count.c`) and splits executed instructions into the project's own code and libc by
   the linker map, as `cbench.py count` does for the kernels.
+- **Forms:** `forms` runs every workload as `count` does (for `--configs`, or fcc `-O` and GCC
+  and Clang at `-O0`) and names each executed instruction of the project's own code by form,
+  from its mnemonic and operands as objdump prints them: a constant into a register, an
+  extension, a compare, a frame address, a spill reload (a load into one of fai's scratch
+  registers from the frame), a stack load, and so on. It also reports what follows each
+  constant, what each spill reload is for (an address or a value), the stack's accesses by
+  form, and the same for the interpreter loops alone (`luaV_execute`, `sqlite3VdbeExec`). It
+  writes `forms.json` and `forms.md`;
+  [docs/performance/selection.md](../../docs/performance/selection.md) reads them.
 - **arocc** has no code generator yet (any function definition fails with "TODO implement
   lowering functions"), so it is compared as a parser and type checker only. Build it from
   https://github.com/Vexu/arocc with the Zig its `build.zig.zon` names

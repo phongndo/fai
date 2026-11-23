@@ -659,6 +659,296 @@ def cmd_count(s):
 
 
 # ---------------------------------------------------------------------------------------------
+# forms: executed instructions by form, and the stack's accesses by kind
+
+
+# The registers fai's allocator loads spilled values into and stores them from (regalloc.rs).
+SPILL_REGS = {"x15", "x17", "w15", "w17", "d29", "d30", "d31", "s29", "s30", "s31"}
+SAVED_REGS = {f"x{i}" for i in range(19, 31)} | {f"d{i}" for i in range(8, 16)}
+EXTENDS = {"sxtw", "sxtb", "sxth", "uxtb", "uxth", "ubfx", "sbfx", "ubfiz", "sbfiz"}
+FLAG_TO_REG = {"cset", "csetm", "csel", "csinc", "csinv", "csneg", "cinc", "cneg"}
+COMPARES = {"cmp", "cmn", "ccmp", "ccmn", "fcmp", "fcmpe"}
+MULTIPLIES = {"mul", "madd", "msub", "mneg", "smull", "umull", "smulh", "umulh", "smaddl", "umaddl"}
+LOGIC = {"and", "ands", "orr", "eor", "bic", "bics", "orn", "eon", "mvn", "neg", "negs"}
+# The interpreter loops, counted apart from the rest of each project.
+HOT = ("luaV_execute", "sqlite3VdbeExec")
+FORMS_DEFAULT = ["fcc-O", "gcc-O0", "clang-O0"]
+
+
+def split_ops(ops):
+    """An instruction's operands, a memory operand `[…]` kept whole."""
+    out, depth, cur = [], 0, ""
+    for ch in ops:
+        depth += (ch == "[") - (ch == "]")
+        if ch == "," and depth == 0:
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
+def mem_base(o):
+    """The base register of the instruction's memory operand, if it has one."""
+    for x in o:
+        if x.startswith("["):
+            return x[1:].split("]")[0].split(",")[0].strip()
+    return None
+
+
+def insn_form(mn, o):
+    """The form of an instruction that isn't a load or a store, by mnemonic and operands as
+    objdump prints them (aliases included: `sbfx x, x, #0, #32` is `sxtw`, a `movz` is `mov`)."""
+    if mn in ("mov", "movz", "movn", "movk", "fmov"):
+        if mn == "movk" or (len(o) > 1 and o[1].startswith("#")):
+            return "constant into a register"
+        if len(o) > 1 and o[1] == "sp":
+            return "frame address"
+        if o and o[0] == "sp":
+            return "stack pointer adjustment"
+        return "register copy"
+    if mn in EXTENDS:
+        return "extension"
+    if mn == "asr" and len(o) == 3 and o[2] == "#0":
+        return "shift by zero"
+    if mn in FLAG_TO_REG:
+        return "flags into a register"
+    if mn == "tst":
+        return "test of a register"
+    if mn in COMPARES:
+        return "compare"
+    if mn in MULTIPLIES:
+        return "multiply"
+    if mn in ("add", "sub", "adds", "subs"):
+        if o and o[0] == "sp":
+            return "stack pointer adjustment"
+        if len(o) > 1 and o[1] == "sp":
+            return "frame address"
+        if any(x.startswith("#") for x in o[2:]):
+            return "add or subtract an immediate"
+        return "add or subtract registers"
+    if mn in ("lsl", "lsr", "asr", "ror"):
+        return "shift"
+    if mn in LOGIC:
+        return "logic"
+    if mn == "b":
+        return "jump"
+    if mn.startswith("b.") or mn in ("cbz", "cbnz", "tbz", "tbnz"):
+        return "conditional branch"
+    if mn == "br":
+        return "indirect jump"
+    if mn in ("bl", "blr", "ret"):
+        return "call or return"
+    if mn in ("adrp", "adr"):
+        return "address of a global"
+    if cbench.FP.match(mn):
+        return "float"
+    return "other"
+
+
+def mem_form(mn, o):
+    """A load's or store's form when its registers alone decide it: spill code (a scratch
+    register to or from the frame), or a save or restore of a callee-saved register."""
+    load = bool(cbench.LOAD.match(mn))
+    data = [x for x in o if not x.startswith(("[", "#"))]
+    base = mem_base(o)
+    if data and all(d in SPILL_REGS for d in data) and base in ("sp", "x16"):
+        return "spill reload" if load else "spill store"
+    if data and all(d in SAVED_REGS for d in data) and base in ("sp", "x29"):
+        return "register restore" if load else "register save"
+    return None
+
+
+def forms_of_run(tools, exe, ranges, trace):
+    """One run's executed instructions by form, in all of the program's code and in its
+    interpreter loop; what follows each constant; what each spill reload is for; and the
+    stack's accesses by the form of the instruction making them."""
+    import bisect
+
+    insns, syms = cbench.disassemble(tools, exe, ranges)
+    starts = [a for a, _ in syms]
+
+    def inside(a):
+        return any(lo <= a < hi for lo, hi in ranges)
+
+    execs: dict[int, int] = {}
+    mem: dict[int, list[int]] = {}
+    for line in trace.read_text().splitlines():
+        kind, *f = line.split()
+        if kind == "B":
+            vaddr, n, count = int(f[0], 16), int(f[1]), int(f[2])
+            for i in range(n):
+                a = vaddr + 4 * i
+                if inside(a):
+                    execs[a] = execs.get(a, 0) + count
+        elif kind == "M":
+            a = int(f[0], 16)
+            if inside(a):
+                m = mem.setdefault(a, [0, 0, 0, 0])
+                for i, v in enumerate(f[1:5]):
+                    m[i] += int(v)
+    out: dict[str, dict[str, float]] = {
+        "all": {},
+        "hot": {},
+        "after_constant": {},
+        "reload_for": {},
+        "stack_accesses": {},
+    }
+
+    def add(table, key, n):
+        out[table][key] = out[table].get(key, 0) + n
+
+    for a, count in execs.items():
+        mn, ops = insns.get(a, ("?", ""))
+        o = split_ops(ops)
+        k = bisect.bisect_right(starts, a) - 1
+        hot = k >= 0 and syms[k][1].startswith(HOT)
+        is_mem = "[" in ops and (cbench.LOAD.match(mn) or cbench.STORE.match(mn))
+        if not is_mem:
+            parts = {insn_form(mn, o): 1.0}
+        else:
+            load = bool(cbench.LOAD.match(mn))
+            sl, ss, ol, os_ = mem.get(a, [0, 0, 0, 0])
+            total = sl + ss + ol + os_
+            share = (sl + ss) / total if total else 0.0
+            fixed = mem_form(mn, o)
+            if fixed:
+                parts = {fixed: 1.0}
+                add("stack_accesses", fixed, sl + ss)
+            else:
+                word = "load" if load else "store"
+                parts = {f"stack {word}": share, f"other {word}": 1.0 - share}
+                add("stack_accesses", f"stack {word}", sl + ss)
+        for form, w in parts.items():
+            if w:
+                add("all", form, count * w)
+                if hot:
+                    add("hot", form, count * w)
+        nxt = insns.get(a + 4)
+        if nxt and "constant into a register" in parts:
+            no = split_ops(nxt[1])
+            reg = o[0].lstrip("wx") if o else ""
+            reads = any(x.lstrip("wx") == reg for x in no[1:]) or (
+                nxt[0] in COMPARES | {"tst"} and no and no[0].lstrip("wx") == reg
+            )
+            add("after_constant", nxt[0] if reads else "(not read next)", count)
+        if nxt and "spill reload" in parts:
+            reg = next((x for x in o if x in SPILL_REGS), "")
+            base = mem_base(split_ops(nxt[1]))
+            as_address = base is not None and base.lstrip("wx") == reg.lstrip("wx")
+            add("reload_for", "an address" if as_address else "a value", count)
+    return out
+
+
+def cmd_forms(s):
+    """Every workload of some builds (`--configs`, or fcc -O and GCC and Clang at -O0) under
+    cbench's QEMU plugin, as `count` runs them, with each executed instruction named by form:
+    what instruction selection, the allocator, and the frontend each cost. Writes forms.json
+    and forms.md."""
+    if s_native():
+        die("forms needs qemu-aarch64's plugin: run it off AArch64")
+    if not load(s.out, "build"):
+        die("run `projbench.py build` first")
+    configs = BUILD_CONFIGS if s.args.configs else FORMS_DEFAULT
+    tools = s.tools
+    so = cbench.plugin(tools, s.out)
+    work = s.out / "forms"
+    work.mkdir(exist_ok=True)
+    obj = s.out / "obj"
+    workloads: list[tuple[str, str, list[Any]]] = [
+        ("lua", f"lua-{n}", [BENCH / "lua" / f"{n}.lua", a[0]]) for n, a in LUA_SCRIPTS.items()
+    ]
+    workloads.append(
+        (
+            "speedtest1",
+            "speedtest1",
+            ["--size", SPEEDTEST_SIZE[0], "--memdb", "--testset", SPEEDTEST_SET],
+        )
+    )
+    tus = {
+        "lua": [("lua", t) for t in LUA_TUS],
+        "speedtest1": [("sqlite", "sqlite3"), ("sqlite", "speedtest1")],
+    }
+    result: dict[str, Any] = {"configs": configs, "programs": {}}
+    for exe_name, files in tus.items():
+        for c in configs:
+            exe = work / f"{exe_name}.{c}"
+            mapfile = work / f"{exe_name}.{c}.map"
+            objs = [obj / f"{p}.{tu}.{c}.o" for p, tu in files]
+            link = [tools.cc, "-static", *objs, "-o", exe, f"-L{tools.libc}", "-lm"]
+            run([*link, f"-Wl,-Map={mapfile}"], env=s.env)
+            ranges = merged(r for o in objs for r in code_ranges(mapfile, o))
+            for prog, name, args in workloads:
+                if prog != exe_name:
+                    continue
+                trace = work / f"{name}.{c}.trace"
+                plug = (
+                    f"{so},outfile={trace},below={cbench.STACK_BELOW},"
+                    f"above={cbench.STACK_ABOVE},deep={cbench.STACK_DEEP}"
+                )
+                qemu_cmd = ["env", "-i", shutil.which("qemu-aarch64"), "-s", cbench.QEMU_STACK]
+                p = run([*qemu_cmd, "-plugin", plug, exe, *args], check=False, timeout=3600)
+                if p.returncode != 0:
+                    die(f"forms: {name} {c} exited with {p.returncode}")
+                result["programs"].setdefault(name, {})[c] = forms_of_run(tools, exe, ranges, trace)
+                trace.unlink()
+                print(f"forms: {name} {c}", file=sys.stderr)
+    save(s.out, "forms", result)
+    (s.out / "forms.md").write_text(forms_report(result))
+    print(f"wrote {s.out / 'forms.md'}", file=sys.stderr)
+
+
+def forms_report(result):
+    """forms.json as tables: Lua's workloads summed, then speedtest1."""
+    configs = result["configs"]
+    groups = {
+        "Lua (7 workloads)": [p for p in result["programs"] if p.startswith("lua-")],
+        "speedtest1": [p for p in result["programs"] if p == "speedtest1"],
+    }
+
+    def total(progs, c, which):
+        acc: dict[str, float] = {}
+        for p in progs:
+            for k, v in result["programs"][p][c][which].items():
+                acc[k] = acc.get(k, 0) + v
+        return acc
+
+    def mil(x):
+        return f"{x / 1e6:,.1f}"
+
+    lines = ["# Executed instructions by form", ""]
+    for title, progs in groups.items():
+        if not progs:
+            continue
+        for which, what in (("all", "the project's own code"), ("hot", "the interpreter loop")):
+            data = {c: total(progs, c, which) for c in configs}
+            forms = sorted(
+                {k for d in data.values() for k in d}, key=lambda k: -data[configs[0]].get(k, 0)
+            )
+            lines += [f"## {title}: {what} (millions)", ""]
+            rows = [[f, *[mil(data[c].get(f, 0)) for c in configs]] for f in forms]
+            rows.append(["**all**", *[f"**{mil(sum(data[c].values()))}**" for c in configs]])
+            lines += [table(["form", *configs], rows), ""]
+        for which, what in (
+            ("after_constant", "the instruction after each constant, when it reads it"),
+            ("reload_for", "what a spill reload is for, by the next instruction"),
+            ("stack_accesses", "accesses to the stack, by the form of the instruction"),
+        ):
+            data = {c: total(progs, c, which) for c in configs}
+            keys = sorted(
+                {k for d in data.values() for k in d}, key=lambda k: -data[configs[0]].get(k, 0)
+            )[:12]
+            if not keys:
+                continue
+            lines += [f"## {title}: {what} (millions)", ""]
+            rows = [[k, *[mil(data[c].get(k, 0)) for c in configs]] for k in keys]
+            lines += [table(["", *configs], rows), ""]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------------------------
 # c23: which compiler accepts and correctly runs each C23 program
 
 
@@ -1148,7 +1438,18 @@ def main():
     )
     ap.add_argument(
         "step",
-        choices=["prepare", "build", "frontend", "check", "count", "c23", "time", "report", "all"],
+        choices=[
+            "prepare",
+            "build",
+            "frontend",
+            "check",
+            "count",
+            "forms",
+            "c23",
+            "time",
+            "report",
+            "all",
+        ],
     )
     ap.add_argument("--out", default=str(ROOT / "target/projbench"))
     ap.add_argument("--arocc", help="arocc's path (or AROCC)")
@@ -1184,6 +1485,7 @@ def main():
     s.out.mkdir(parents=True, exist_ok=True)
     steps = {
         "count": cmd_count,
+        "forms": cmd_forms,
         "prepare": cmd_prepare,
         "build": cmd_build,
         "frontend": cmd_frontend,
