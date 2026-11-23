@@ -657,7 +657,7 @@ fn mutations() -> Vec<Mutation> {
         },
         Mutation {
             name: "struct-parameter-lowered-apart",
-            what: "the lowering takes a struct parameter apart in the signature, where calls pass it whole, in Lean and in Rust alike, so the two print the same text; the lowered module's own callers then pass what the callee no longer takes, and the lowering's output doesn't verify",
+            what: "the lowering takes a struct parameter apart in the signature, where calls pass it whole, in Lean and in Rust alike, so the two print the same text; where the function has a caller in its module the lowering's output no longer verifies, and where it has none (tests/blocks/lone-composite-parameters.fir) only running it on its arguments' encoding shows that it doesn't take them",
             edits: vec![
                 edit(
                     "spec/Fir/Lower.lean",
@@ -676,11 +676,11 @@ fn mutations() -> Vec<Mutation> {
                 ),
             ],
             steps: vec![lake_build(), test(&["-p", "fir", "--test", "lower"])],
-            // Every fixture function with a struct parameter has a caller in its module, so
-            // the verifier sees this before the comparison on generated arguments does.
             expect: vec![
-                "the lowering doesn't verify",
+                // A function with a caller: the verifier sees it.
                 "arguments of @swap: expected (i8, i32) but got (struct<C>{i8, i32})",
+                // A function without one: the comparison on generated arguments sees it.
+                "@fields is lowered to 2 parameters, and its arguments' encoding has 1 values",
             ],
             in_decl: None,
         },

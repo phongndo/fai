@@ -266,9 +266,11 @@ pub(crate) enum OldTests {
     NotNeeded,
     /// The tests as they were still pass: these edited files didn't need to change.
     Passed(Vec<String>),
-    /// The change fails the tests as they were: the files, and what failed.
+    /// The change fails the tests as they were in `files`, with what failed; those in `passed`
+    /// still pass.
     Failed {
         files: Vec<String>,
+        passed: Vec<String>,
         failures: Vec<String>,
     },
     /// They could not be run, and why.
@@ -284,26 +286,39 @@ pub(crate) fn moved_tests(changes: &[Change]) -> Vec<String> {
         .collect()
 }
 
-/// The `cargo test` arguments that run the tests in `files`: the suites by name when every
-/// file is one of `fir`'s integration tests (`tests/rust/NAME.rs`), and the whole workspace
-/// otherwise (a fixture or a shared helper is read by many suites).
-pub(crate) fn old_test_commands(files: &[String]) -> Vec<Vec<String>> {
-    let suites: Option<Vec<&str>> = files
-        .iter()
-        .map(|f| {
-            f.strip_prefix("tests/rust/")
-                .and_then(|n| n.strip_suffix(".rs"))
-                .filter(|n| !n.contains('/'))
-        })
-        .collect();
+/// The `cargo test` runs for the tests in `files`, each with the files it speaks for, so that
+/// a failure is laid on the file whose tests failed and on no other. One of `fir`'s
+/// integration tests (`tests/rust/NAME.rs`) or of the C API's (`sdk/c/tests/NAME.rs`) is run
+/// by its name. Whatever is left (a fixture, a shared helper) is read by many suites: one run
+/// of the whole workspace speaks for all of it.
+pub(crate) fn old_test_commands(files: &[String]) -> Vec<(Vec<String>, Vec<String>)> {
     let args = |a: &[&str]| a.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
-    match suites {
-        Some(names) if !names.is_empty() => names
-            .iter()
-            .map(|n| args(&["test", "-p", "fir", "--test", n, "--no-fail-fast"]))
-            .collect(),
-        _ => vec![args(&["test", "--workspace", "--no-fail-fast"])],
+    let suite = |f: &str, dir: &str| {
+        f.strip_prefix(dir)
+            .and_then(|n| n.strip_suffix(".rs"))
+            .filter(|n| !n.contains('/'))
+            .map(str::to_owned)
+    };
+    let mut runs = Vec::new();
+    let mut rest = Vec::new();
+    for f in files {
+        let package = if let Some(n) = suite(f, "tests/rust/") {
+            Some(("fir", n))
+        } else {
+            suite(f, "sdk/c/tests/").map(|n| ("fir-capi", n))
+        };
+        match package {
+            Some((p, n)) => runs.push((
+                vec![f.clone()],
+                args(&["test", "-p", p, "--test", &n, "--no-fail-fast"]),
+            )),
+            None => rest.push(f.clone()),
+        }
     }
+    if !rest.is_empty() {
+        runs.push((rest, args(&["test", "--workspace", "--no-fail-fast"])));
+    }
+    runs
 }
 
 /// What failed in `cargo test`'s output: the tests, and the first lines of a build error.
@@ -384,12 +399,23 @@ pub(crate) fn decide(
         .map(|c| c.path.clone())
         .collect();
     match old {
-        OldTests::Failed { files, failures } => {
+        OldTests::Failed {
+            files,
+            passed,
+            failures,
+        } => {
             notes.push(format!(
                 "the change fails the tests as they were at the base ({}):",
                 files.join(", ")
             ));
             notes.extend(failures.iter().map(|f| format!("  {f}")));
+            if !passed.is_empty() {
+                notes.push(format!(
+                    "{} more test files were edited, and the tests as they were still pass: {}",
+                    passed.len(),
+                    passed.join(", ")
+                ));
+            }
             moved.extend(files.iter().cloned());
         }
         OldTests::Passed(files) => notes.push(format!(
@@ -466,6 +492,10 @@ fn sync_copy(root: &Path, tree: &Path) -> Result<(), String> {
             let p = e.path();
             let Ok(kind) = e.file_type() else { continue };
             if kind.is_dir() {
+                // The copy's own build output stays, so that its next build is incremental.
+                if d == tree && (e.file_name() == "target" || e.file_name() == "build") {
+                    continue;
+                }
                 dirs.push(p);
             } else if kind.is_file()
                 && let Ok(rel) = p.strip_prefix(tree)
@@ -484,8 +514,11 @@ fn sync_copy(root: &Path, tree: &Path) -> Result<(), String> {
 }
 
 /// Run the tests of `files` as they were at `base` against the tree as it is now: in a copy
-/// (`target/accept/tree`, with its own Cargo target directory), put the base's version of each
-/// file back, and run the suites that read them.
+/// (`target/accept/tree`, built in its own `target/`), put the base's version of each file
+/// back, and run the suites that read them, each file's by itself where it has one.
+///
+/// Nothing runs the old tests against the old code: a test that failed at the base fails here
+/// too, and is laid on the change.
 pub(crate) fn run_old_tests(root: &Path, base: &str, files: &[String]) -> OldTests {
     if files.is_empty() {
         return OldTests::NotNeeded;
@@ -514,13 +547,15 @@ pub(crate) fn run_old_tests(root: &Path, base: &str, files: &[String]) -> OldTes
             _ => return OldTests::NotRun(format!("git can't show {base}:{f}")),
         }
     }
-    let mut failures = Vec::new();
-    for args in old_test_commands(files) {
+    let (mut failed, mut passed, mut failures) = (Vec::new(), Vec::new(), Vec::new());
+    for (speaks_for, args) in old_test_commands(files) {
         eprintln!("accept: the tests as they were: cargo {}", args.join(" "));
         let mut c = Command::new("cargo");
+        // Cargo's own target directory in the copy, as in a checkout: an old test may assume
+        // it (one did), and a failure here must be the change's.
         c.args(&args)
             .current_dir(&tree)
-            .env("CARGO_TARGET_DIR", dir.join("target"))
+            .env_remove("CARGO_TARGET_DIR")
             .stdin(Stdio::null());
         for v in crate::CLEARED {
             c.env_remove(v);
@@ -534,24 +569,28 @@ pub(crate) fn run_old_tests(root: &Path, base: &str, files: &[String]) -> OldTes
             Ok(o) => o,
             Err(e) => return OldTests::NotRun(format!("can't run cargo: {e}")),
         };
-        if !out.status.success() {
-            let text = format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let found = test_failures(&text);
-            if found.is_empty() {
-                failures.push(format!("cargo {} failed", args.join(" ")));
-            }
-            failures.extend(found);
+        if out.status.success() {
+            passed.extend(speaks_for);
+            continue;
         }
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let found = test_failures(&text);
+        if found.is_empty() {
+            failures.push(format!("cargo {} failed", args.join(" ")));
+        }
+        failures.extend(found);
+        failed.extend(speaks_for);
     }
-    if failures.is_empty() {
-        OldTests::Passed(files.to_vec())
+    if failed.is_empty() {
+        OldTests::Passed(passed)
     } else {
         OldTests::Failed {
-            files: files.to_vec(),
+            files: failed,
+            passed,
             failures,
         }
     }
@@ -818,15 +857,28 @@ mod tests {
         assert_eq!((ok.code, ok.line.as_str()), (0, "accept: PASS"));
         assert!(ok.notes[0].contains("still pass"));
         // The change fails them: named, with what failed.
+        // The change fails one file's old tests and not another's: only the first is named
+        // in the verdict, and the second is said to pass.
+        let two = against(&[
+            ('M', "tests/rust/regcheck.rs"),
+            ('M', "tests/rust/aarch64.rs"),
+        ]);
         let failed = OldTests::Failed {
             files: files.clone(),
+            passed: vec!["tests/rust/aarch64.rs".to_owned()],
             failures: vec!["test honest_allocation_is_accepted failed".into()],
         };
-        let moved = decide(Verified::Full, Gated::Pass, &edited, &failed, host);
+        let moved = decide(Verified::Full, Gated::Pass, &two, &failed, host);
         assert_eq!(moved.code, 3);
         assert_eq!(
             moved.line,
             "accept: PASS, JUDGING FILES CHANGED (1): tests/rust/regcheck.rs"
+        );
+        assert!(
+            moved
+                .notes
+                .iter()
+                .any(|n| n.contains("still pass: tests/rust/aarch64.rs"))
         );
         assert!(
             moved
@@ -857,32 +909,46 @@ mod tests {
     #[test]
     fn old_tests_run_by_suite_or_all_together() {
         let s = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+        // Each suite by itself, with the one file it speaks for.
         assert_eq!(
-            old_test_commands(&s(&["tests/rust/regcheck.rs", "tests/rust/debug_lines.rs"])),
+            old_test_commands(&s(&["tests/rust/regcheck.rs", "sdk/c/tests/fcc_cache.rs"])),
             vec![
-                s(&["test", "-p", "fir", "--test", "regcheck", "--no-fail-fast"]),
-                s(&[
-                    "test",
-                    "-p",
-                    "fir",
-                    "--test",
-                    "debug_lines",
-                    "--no-fail-fast"
-                ]),
+                (
+                    s(&["tests/rust/regcheck.rs"]),
+                    s(&["test", "-p", "fir", "--test", "regcheck", "--no-fail-fast"])
+                ),
+                (
+                    s(&["sdk/c/tests/fcc_cache.rs"]),
+                    s(&[
+                        "test",
+                        "-p",
+                        "fir-capi",
+                        "--test",
+                        "fcc_cache",
+                        "--no-fail-fast"
+                    ])
+                ),
             ]
         );
-        // A fixture, or a helper every suite uses, is read by many suites.
-        for f in [
-            "tests/fir0/holes.fir",
-            "tests/rust/common/mod.rs",
-            "sdk/c/tests/fcc.rs",
-        ] {
-            assert_eq!(
-                old_test_commands(&s(&["tests/rust/regcheck.rs", f])),
-                vec![s(&["test", "--workspace", "--no-fail-fast"])],
-                "{f}"
-            );
-        }
+        // A fixture, or a helper every suite uses, is read by many suites: one run of the
+        // workspace speaks for all of those, after the suites that have a name.
+        assert_eq!(
+            old_test_commands(&s(&[
+                "tests/fir0/holes.fir",
+                "tests/rust/regcheck.rs",
+                "tests/rust/common/mod.rs"
+            ])),
+            vec![
+                (
+                    s(&["tests/rust/regcheck.rs"]),
+                    s(&["test", "-p", "fir", "--test", "regcheck", "--no-fail-fast"])
+                ),
+                (
+                    s(&["tests/fir0/holes.fir", "tests/rust/common/mod.rs"]),
+                    s(&["test", "--workspace", "--no-fail-fast"])
+                ),
+            ]
+        );
         let out = "test a::b ... ok\ntest honest ... FAILED\nerror[E0425]: cannot find value\n\
                    error: test failed, to rerun pass `-p fir --test regcheck`\nerror: 1 target failed:\n";
         assert_eq!(
